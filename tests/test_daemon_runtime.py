@@ -193,6 +193,67 @@ def test_daemon_runtime_processes_queued_bot_commands_after_safety_tick():
         assert commands.get("c1")["state"] == "done"
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+    def monotonic(self):
+        return self.now
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class CountingLoop:
+    def __init__(self, name):
+        self.name = name
+        self.calls = []
+    def __call__(self):
+        self.calls.append(self.name)
+        return {"loop": self.name, "calls": len(self.calls)}
+
+
+def test_daemon_runtime_runs_design_multirate_loops_and_records_events():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = FakeClock()
+        planner = CountingLoop("planner")
+        file_batch = CountingLoop("file_batch")
+        maintenance = CountingLoop("maintenance")
+        carousel = CountingLoop("carousel")
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=2,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+            loop_tasks=[
+                LoopTask("planner", 15, planner),
+                LoopTask("file_batch", 60, file_batch),
+                LoopTask("maintenance", 300, maintenance),
+                LoopTask("carousel", 1800, carousel),
+            ],
+        )
+
+        daemon.run(max_safety_ticks=31)
+
+        assert len(planner.calls) == 4  # t=0,16,32,48 with 2s ticks
+        assert len(file_batch.calls) == 2  # t=0,60
+        assert len(maintenance.calls) == 1
+        assert len(carousel.calls) == 1
+        con = sqlite3.connect(db)
+        events = con.execute("select event_type,count(*) from events_v2 group by event_type").fetchall()
+        con.close()
+        assert ("loop_tick", 8) in events
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

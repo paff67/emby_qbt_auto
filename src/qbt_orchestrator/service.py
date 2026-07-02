@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import signal
 import sqlite3
 import threading
@@ -13,6 +14,20 @@ from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .observability import redact
 from .runtime import BotCommandRepository, ObservabilityStore
 from .telegram_control import TelegramAuthorizer
+
+
+@dataclass
+class LoopTask:
+    name: str
+    interval_sec: float
+    callback: Callable[[], object]
+    next_due: float = 0.0
+
+    def due(self, now_monotonic: float) -> bool:
+        return now_monotonic >= self.next_due
+
+    def mark_ran(self, now_monotonic: float) -> None:
+        self.next_due = now_monotonic + self.interval_sec
 
 
 class TelegramSupervisor:
@@ -110,6 +125,9 @@ class DaemonRuntime:
         managed_count_provider: Callable[[], int] | None = None,
         telegram_supervisor: TelegramSupervisor | None = None,
         command_processor=None,
+        loop_tasks: list[LoopTask] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -120,6 +138,9 @@ class DaemonRuntime:
         self.safety_interval = safety_interval
         self.telegram_supervisor = telegram_supervisor
         self.command_processor = command_processor
+        self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
+        self.monotonic = monotonic
+        self.sleeper = sleeper
         self.monitor = SafetyMonitor(qbt, executor, free_bytes_provider, managed_count_provider=managed_count_provider)
         self.obs = ObservabilityStore(self.state_db)
         self._stopping = False
@@ -130,6 +151,14 @@ class DaemonRuntime:
     def install_signal_handlers(self) -> None:
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
+
+    def _default_loop_tasks(self) -> list[LoopTask]:
+        return [
+            LoopTask("planner", 15, lambda: {"status": "not_configured"}),
+            LoopTask("file_batch", 60, lambda: {"status": "not_configured"}),
+            LoopTask("maintenance", 300, lambda: {"status": "not_configured"}),
+            LoopTask("carousel", 1800, lambda: {"status": "not_configured"}),
+        ]
 
     def tick_safety(self) -> None:
         result = self.monitor.tick()
@@ -156,6 +185,22 @@ class DaemonRuntime:
             self.obs.event("info", "telegram", "commands_processed", f"processed={processed}", {"count": processed})
         return processed
 
+    def run_due_loop_tasks(self) -> int:
+        ran = 0
+        now_monotonic = self.monotonic()
+        for task in self.loop_tasks:
+            if not task.due(now_monotonic):
+                continue
+            try:
+                result = task.callback()
+                self.obs.event("info", task.name, "loop_tick", f"{task.name} loop completed", {"result": result, "dry_run": self.dry_run})
+            except Exception as exc:
+                self.obs.event("error", task.name, "loop_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+            finally:
+                task.mark_ran(now_monotonic)
+                ran += 1
+        return ran
+
     def _persist_disk_state(self, free_bytes: int, state: str) -> None:
         now = int(time.time())
         con = sqlite3.connect(self.state_db)
@@ -180,11 +225,12 @@ class DaemonRuntime:
         ticks = 0
         try:
             while not self._stopping:
-                started = time.monotonic()
+                started = self.monotonic()
                 try:
                     self.tick_safety()
                 except Exception as exc:  # keep safety process supervised and observable
                     self.obs.event("error", "daemon", "safety_tick_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                self.run_due_loop_tasks()
                 try:
                     self.process_bot_commands()
                 except Exception as exc:
@@ -192,9 +238,9 @@ class DaemonRuntime:
                 ticks += 1
                 if max_safety_ticks is not None and ticks >= max_safety_ticks:
                     break
-                sleep_for = self.safety_interval - (time.monotonic() - started)
+                sleep_for = self.safety_interval - (self.monotonic() - started)
                 if sleep_for > 0:
-                    time.sleep(sleep_for)
+                    self.sleeper(sleep_for)
         finally:
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.stop()
