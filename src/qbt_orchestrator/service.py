@@ -109,6 +109,7 @@ class DaemonRuntime:
         safety_interval: float = 2.0,
         managed_count_provider: Callable[[], int] | None = None,
         telegram_supervisor: TelegramSupervisor | None = None,
+        command_processor=None,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -118,6 +119,7 @@ class DaemonRuntime:
         self.dry_run = dry_run
         self.safety_interval = safety_interval
         self.telegram_supervisor = telegram_supervisor
+        self.command_processor = command_processor
         self.monitor = SafetyMonitor(qbt, executor, free_bytes_provider, managed_count_provider=managed_count_provider)
         self.obs = ObservabilityStore(self.state_db)
         self._stopping = False
@@ -140,6 +142,19 @@ class DaemonRuntime:
             f"disk={result.disk_state} sync={result.sync_health}",
             {"free_bytes": free_bytes, "sync_health": result.sync_health, "dry_run": self.dry_run},
         )
+
+    def process_bot_commands(self, max_commands: int = 20) -> int:
+        if self.command_processor is None:
+            return 0
+        processed = 0
+        for _ in range(max_commands):
+            command_id = self.command_processor.run_next()
+            if command_id is None:
+                break
+            processed += 1
+        if processed:
+            self.obs.event("info", "telegram", "commands_processed", f"processed={processed}", {"count": processed})
+        return processed
 
     def _persist_disk_state(self, free_bytes: int, state: str) -> None:
         now = int(time.time())
@@ -170,6 +185,10 @@ class DaemonRuntime:
                     self.tick_safety()
                 except Exception as exc:  # keep safety process supervised and observable
                     self.obs.event("error", "daemon", "safety_tick_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                try:
+                    self.process_bot_commands()
+                except Exception as exc:
+                    self.obs.event("error", "telegram", "command_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                 ticks += 1
                 if max_safety_ticks is not None and ticks >= max_safety_ticks:
                     break

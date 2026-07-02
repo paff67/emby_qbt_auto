@@ -166,6 +166,33 @@ def test_build_telegram_supervisor_from_env_requires_token_and_parses_roles():
         assert not supervisor.service.authorizer.allowed(10, "cleanup")
 
 
+def test_daemon_runtime_processes_queued_bot_commands_after_safety_tick():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from qbt_orchestrator.service import DaemonRuntime
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db)
+        commands.insert_command("c1", 100, 30, "pause", {"args": ["h1"]})
+        executor = FakeExecutor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=executor,
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            command_processor=CommandProcessor(commands, executor),
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h1"})]
+        assert commands.get("c1")["state"] == "done"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

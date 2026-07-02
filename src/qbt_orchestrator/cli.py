@@ -6,6 +6,7 @@ from .config import load_config
 from .db import migrate, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient
+from .runtime import BotCommandRepository, CommandProcessor
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
 
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -47,7 +48,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         executor = Executor(qbt, dry_run=dry_run)
         disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
         telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
-        runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=ns.safety_interval, telegram_supervisor=telegram_supervisor)
+        command_processor = CommandProcessor(BotCommandRepository(state_db), executor)
+        runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=ns.safety_interval, telegram_supervisor=telegram_supervisor, command_processor=command_processor)
         runtime.install_signal_handlers()
         ticks = runtime.run(max_safety_ticks=ns.max_safety_ticks)
         print(f"daemon {'dry-run' if dry_run else 'live'} stopped after {ticks} safety ticks")
