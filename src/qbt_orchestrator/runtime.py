@@ -63,6 +63,13 @@ class TorrentJobRepository:
         con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (int(time.time()) + 1800, int(time.time()), row["id"]))
         con.commit(); out = dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone()); con.close(); return out
 
+    def peek_next(self, job_type: str) -> dict[str, Any] | None:
+        con = _connect(self.state_db)
+        row = con.execute("select * from torrent_jobs where job_type=? and state in ('queued','retry_wait','verify_pending') order by priority,id limit 1", (job_type,)).fetchone()
+        out = dict(row) if row else None
+        con.close()
+        return out
+
     def update_state(self, job_id: int, state: str, stderr_tail: str | None = None, exit_code: int | None = None) -> None:
         con = _connect(self.state_db)
         con.execute("update torrent_jobs set state=?, last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?", (state, stderr_tail, exit_code, int(time.time()), job_id))

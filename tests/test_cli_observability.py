@@ -106,6 +106,66 @@ def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes():
         assert action == ("/api/v2/torrents/start", "dry_run", 1)
 
 
+def test_cli_once_wires_upload_worker_in_dry_run_by_default():
+    from qbt_orchestrator import cli
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    class FakeQbt:
+        def get_maindata(self, rid):
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+        def post(self, path, payload):
+            raise AssertionError("dry-run must not post to qBT")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+
+    class FakeRcloneClient:
+        calls = []
+        def __init__(self, *args, **kwargs):
+            pass
+        def copyto(self, local, remote):
+            self.calls.append((local, remote))
+            raise AssertionError("upload dry-run must not call rclone")
+        def lsjson_size(self, remote):
+            raise AssertionError("upload dry-run must not verify remote")
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        TorrentJobRepository(db).enqueue("h1", 1, "upload", {"local": "/tmp/a.mp4", "remote": "gcrypt:/A/a.mp4", "size": 100, "full_torrent": True}, priority=1)
+        old_qbt = cli.QbtDockerClient
+        old_rclone = getattr(cli, "RcloneClient", None)
+        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
+        old_upload = os.environ.get("QBT_ORCH_UPLOAD_DRY_RUN")
+        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
+        cli.RcloneClient = FakeRcloneClient
+        os.environ["QBT_ORCH_DISK_PATH"] = td
+        os.environ.pop("QBT_ORCH_UPLOAD_DRY_RUN", None)
+        try:
+            rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
+        finally:
+            cli.QbtDockerClient = old_qbt
+            if old_rclone is not None:
+                cli.RcloneClient = old_rclone
+            if old_disk is None:
+                os.environ.pop("QBT_ORCH_DISK_PATH", None)
+            else:
+                os.environ["QBT_ORCH_DISK_PATH"] = old_disk
+            if old_upload is None:
+                os.environ.pop("QBT_ORCH_UPLOAD_DRY_RUN", None)
+            else:
+                os.environ["QBT_ORCH_UPLOAD_DRY_RUN"] = old_upload
+
+        assert rc == 0
+        assert FakeRcloneClient.calls == []
+        con = sqlite3.connect(db)
+        action = con.execute("select action_type,status,dry_run from action_log where action_type='upload_job'").fetchone()
+        state = con.execute("select state from torrent_jobs where job_type='upload'").fetchone()[0]
+        con.close()
+        assert action == ("upload_job", "dry_run", 1)
+        assert state == "queued"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

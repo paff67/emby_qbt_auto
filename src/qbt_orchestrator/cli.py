@@ -6,7 +6,8 @@ from .config import load_config
 from .db import migrate, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient
-from .runtime import BotCommandRepository, CommandProcessor
+from .integrations.rclone import RcloneClient
+from .runtime import BotCommandRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner
 from .runtime import ObservabilityStore
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
 
@@ -71,7 +72,16 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     command_processor = CommandProcessor(BotCommandRepository(state_db), executor)
     planner_env = _truthy(os.environ.get("QBT_ORCH_PLANNER_DRY_RUN"))
     planner_dry_run = True if dry_run else (planner_env if planner_env is not None else True)
-    runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=getattr(ns, "safety_interval", 2.0), telegram_supervisor=telegram_supervisor, command_processor=command_processor, planner_dry_run=planner_dry_run)
+    rclone_cfg = cfg.rclone if cfg else None
+    rclone = RcloneClient(
+        config_path=rclone_cfg.config if rclone_cfg else "/root/.config/rclone/rclone.conf",
+        transfers=rclone_cfg.transfers if rclone_cfg else 1,
+        checkers=rclone_cfg.checkers if rclone_cfg else 2,
+    )
+    upload_env = _truthy(os.environ.get("QBT_ORCH_UPLOAD_DRY_RUN"))
+    upload_dry_run = True if dry_run else (upload_env if upload_env is not None else True)
+    upload_runner = UploadJobRunner(TorrentJobRepository(state_db), rclone, executor)
+    runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=getattr(ns, "safety_interval", 2.0), telegram_supervisor=telegram_supervisor, command_processor=command_processor, planner_dry_run=planner_dry_run, upload_runner=upload_runner, upload_dry_run=upload_dry_run)
     return runtime, dry_run
 
 def main(argv: Sequence[str] | None = None) -> int:

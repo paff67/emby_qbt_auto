@@ -361,6 +361,74 @@ def test_daemon_planner_can_be_explicitly_enabled_for_live_apply():
         assert executor.posts == [("/api/v2/torrents/start", {"hashes": "h1"})]
 
 
+def test_daemon_upload_worker_dry_run_does_not_claim_or_call_rclone():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db)
+        job_id = repo.enqueue("h1", 1, "upload", {"local": "/tmp/a.mp4", "remote": "gcrypt:/A/a.mp4", "size": 100, "full_torrent": True}, priority=1)
+        rclone = FakeRclone(copy_ok=True, remote_sizes={"gcrypt:/A/a.mp4": 100})
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            upload_runner=UploadJobRunner(repo, rclone, FakeExecutor()),
+            upload_dry_run=True,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert rclone.copies == []
+        assert repo.get(job_id)["state"] == "queued"
+        con = sqlite3.connect(db)
+        action = con.execute("select action_type,path,status,dry_run from action_log where action_type='upload_job'").fetchone()
+        event = con.execute("select event_type from events_v2 where component='upload' order by id desc limit 1").fetchone()[0]
+        con.close()
+        assert action == ("upload_job", "torrent_jobs/upload", "dry_run", 1)
+        assert event == "upload_dry_run"
+
+
+def test_daemon_upload_worker_live_processes_job_and_verify_pending():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db)
+        job_id = repo.enqueue("h2", 2, "upload", {"local": "/tmp/b.mp4", "remote": "gcrypt:/B/b.mp4", "size": 100, "full_torrent": True}, priority=1)
+        rclone = FakeRclone(copy_ok=True, remote_sizes={"gcrypt:/B/b.mp4": 99})
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            upload_runner=UploadJobRunner(repo, rclone, FakeExecutor()),
+            upload_dry_run=False,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert rclone.copies == [("/tmp/b.mp4", "gcrypt:/B/b.mp4")]
+        assert repo.get(job_id)["state"] == "verify_pending"
+        con = sqlite3.connect(db)
+        event = con.execute("select event_type from events_v2 where component='upload' order by id desc limit 1").fetchone()[0]
+        con.close()
+        assert event == "upload_job_processed"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

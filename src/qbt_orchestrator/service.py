@@ -130,6 +130,8 @@ class DaemonRuntime:
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         planner_dry_run: bool = True,
+        upload_runner=None,
+        upload_dry_run: bool = True,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -141,6 +143,8 @@ class DaemonRuntime:
         self.telegram_supervisor = telegram_supervisor
         self.command_processor = command_processor
         self.planner_dry_run = planner_dry_run or dry_run
+        self.upload_runner = upload_runner
+        self.upload_dry_run = upload_dry_run or dry_run
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -204,6 +208,33 @@ class DaemonRuntime:
             self.obs.event("info", "telegram", "commands_processed", f"processed={processed}", {"count": processed})
         return processed
 
+    def process_upload_jobs(self, max_jobs: int = 1) -> int:
+        if self.upload_runner is None:
+            return 0
+        processed = 0
+        if self.upload_dry_run:
+            row = self.upload_runner.repo.peek_next("upload")
+            if not row:
+                return 0
+            self.obs.action(
+                hash=row.get("hash"),
+                job_id=int(row["id"]),
+                action_type="upload_job",
+                path="torrent_jobs/upload",
+                payload={"job_id": row["id"], "state": row.get("state"), "job_type": row.get("job_type")},
+                status="dry_run",
+                dry_run=True,
+            )
+            self.obs.event("info", "upload", "upload_dry_run", f"upload job {row['id']} pending", {"job_id": row["id"]}, hash=row.get("hash"), job_id=int(row["id"]))
+            return 1
+        for _ in range(max_jobs):
+            job_id = self.upload_runner.run_next()
+            if job_id is None:
+                break
+            processed += 1
+            self.obs.event("info", "upload", "upload_job_processed", f"upload job {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
+        return processed
+
     def run_due_loop_tasks(self) -> int:
         ran = 0
         now_monotonic = self.monotonic()
@@ -254,6 +285,10 @@ class DaemonRuntime:
                     self.process_bot_commands()
                 except Exception as exc:
                     self.obs.event("error", "telegram", "command_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                try:
+                    self.process_upload_jobs()
+                except Exception as exc:
+                    self.obs.event("error", "upload", "upload_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                 ticks += 1
                 if max_safety_ticks is not None and ticks >= max_safety_ticks:
                     break
