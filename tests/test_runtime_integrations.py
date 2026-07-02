@@ -185,6 +185,48 @@ def test_telegram_callback_approval_updates_store_once_and_rejects_duplicate_cli
     assert service.next_offset == 23
 
 
+def test_telegram_notification_sender_sends_queued_messages_and_retries_failures():
+    import tempfile
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.integrations.telegram import TelegramNotificationSender
+    from qbt_orchestrator.runtime import BotNotificationRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = BotNotificationRepository(db, now=lambda: 100)
+        first = repo.enqueue(100, "status", "hello")
+        second = repo.enqueue(100, "status", "will retry")
+
+        sent = []
+
+        class Api:
+            def __init__(self):
+                self.calls = 0
+
+            def get_updates(self, offset, timeout):
+                return []
+
+            def send_message(self, chat_id, text, reply_markup=None):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("telegram down token " + "123456:" + "secret-token")
+                sent.append((chat_id, text, reply_markup))
+                return {"ok": True}
+
+        sender = TelegramNotificationSender(repo, Api(), retry_delay=60)
+
+        assert sender.send_next() == first
+        assert sender.send_next() == second
+
+        assert sent == [(100, "hello", None)]
+        assert repo.get(first)["state"] == "sent"
+        failed = repo.get(second)
+        assert failed["state"] == "retry_wait"
+        assert failed["next_run_at"] == 160
+        assert "secret-token" not in failed["last_error"]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

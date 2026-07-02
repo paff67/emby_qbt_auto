@@ -152,6 +152,88 @@ def test_approved_dangerous_command_executes_once_after_approval():
         assert commands.pending_approvals()[0]["state"] == "approved"
 
 
+def test_bot_notification_repository_redacts_dedupes_and_retries():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotNotificationRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = BotNotificationRepository(db, now=lambda: 100)
+
+        first = repo.enqueue(
+            chat_id=100,
+            topic="status",
+            message="token " + "123456:" + "secret-token" + " mag" + "net:?xt=urn:btih:" + "A" * 40,
+            payload={"api_key": "abc123"},
+            dedupe_key="status-c1",
+        )
+        second = repo.enqueue(chat_id=100, topic="status", message="duplicate", dedupe_key="status-c1")
+
+        assert second == first
+        claimed = repo.claim_next()
+        assert claimed is not None
+        assert claimed["id"] == first
+        assert "secret-token" not in claimed["message"]
+        assert "mag" + "net:?" not in claimed["message"]
+        assert "<redacted-token>" in claimed["message"]
+
+        repo.schedule_retry(first, error="telegram token " + "123456:" + "secret-token", delay_sec=60)
+        assert repo.claim_next() is None
+
+        due_repo = BotNotificationRepository(db, now=lambda: 161)
+        claimed_retry = due_repo.claim_next()
+        assert claimed_retry is not None
+        assert claimed_retry["attempts"] == 2
+        due_repo.mark_sent(first)
+        assert due_repo.get(first)["state"] == "sent"
+        assert "secret-token" not in due_repo.get(first)["last_error"]
+
+
+def test_command_processor_status_trace_perf_enqueue_readonly_notifications_without_qbt_writes():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, ObservabilityStore
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert or replace into disk_state(id,sampled_at,free_bytes,pressure_state,resume_allowed) values(1,100,?,?,1)",
+            (6 * 1024**3, "ok"),
+        )
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state,priority,payload_json,created_at,updated_at) values('h1','upload','queued',1,'{}',100,100)"
+        )
+        con.commit()
+        con.close()
+        obs = ObservabilityStore(db, now=lambda: 101)
+        obs.event("info", "qbt", "sync_ok", "hash h1", {"rid": 7}, hash="h1", correlation_id="corr-1")
+        obs.action(hash="h1", job_id=7, action_type="qbt_post", path="/api/v2/torrents/stop", payload={"hashes": "h1"}, status="succeeded")
+
+        commands = BotCommandRepository(db, now=lambda: 102)
+        notifications = BotNotificationRepository(db, now=lambda: 102)
+        commands.insert_command("s1", 100, 1, "status", {"args": ["disk"]})
+        commands.insert_command("t1", 100, 1, "trace", {"args": ["h1"]})
+        commands.insert_command("p1", 100, 1, "perf", {"args": []})
+        executor = FakeExecutor()
+        processor = CommandProcessor(commands, executor, notifications=notifications)
+
+        assert processor.run_next() == "s1"
+        assert processor.run_next() == "t1"
+        assert processor.run_next() == "p1"
+        assert executor.posts == []
+        assert commands.get("s1")["state"] == "done"
+        assert commands.get("t1")["state"] == "done"
+        assert commands.get("p1")["state"] == "done"
+
+        messages = [row["message"] for row in notifications.list_all()]
+        assert any("disk=ok" in msg and "free=6.00GiB" in msg for msg in messages)
+        assert any("trace h1" in msg and "sync_ok" in msg and "qbt_post" in msg for msg in messages)
+        assert any("perf" in msg and "events=" in msg and "actions=" in msg for msg in messages)
+
+
 class ExplodingRclone:
     def copyto(self, local, remote):
         raise RuntimeError("backend rate limit token " + "123456:" + "secret-token")

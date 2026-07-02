@@ -8,8 +8,9 @@ from .executor import Executor
 from .integrations.qbt import QbtDockerClient
 from .integrations.rclone import RcloneClient
 from .integrations.emby import EmbyClient
+from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
-from .runtime import BotCommandRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
+from .runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
 
@@ -76,7 +77,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     executor = Executor(qbt, dry_run=dry_run)
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
     telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
-    command_processor = CommandProcessor(BotCommandRepository(state_db), executor)
+    notification_repo = BotNotificationRepository(state_db)
+    command_processor = CommandProcessor(BotCommandRepository(state_db), executor, notifications=notification_repo)
+    telegram_token = os.environ.get("QBT_ORCH_TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+    telegram_notification_sender = TelegramNotificationSender(notification_repo, TelegramHttpApi(telegram_token)) if telegram_token else None
+    notification_env = _truthy(os.environ.get("QBT_ORCH_NOTIFICATION_DRY_RUN"))
+    notification_dry_run = True if dry_run else (notification_env if notification_env is not None else True)
     planner_env = _truthy(os.environ.get("QBT_ORCH_PLANNER_DRY_RUN"))
     planner_dry_run = True if dry_run else (planner_env if planner_env is not None else True)
     rclone_cfg = cfg.rclone if cfg else None
@@ -124,6 +130,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         media_pipeline_dry_run=media_pipeline_dry_run,
         emby_refresh_worker=emby_worker,
         emby_refresh_dry_run=emby_refresh_dry_run,
+        telegram_notification_sender=telegram_notification_sender,
+        notification_dry_run=notification_dry_run,
     )
     return runtime, dry_run
 

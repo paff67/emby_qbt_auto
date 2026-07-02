@@ -17,8 +17,9 @@ def _connect(path: str | Path) -> sqlite3.Connection:
 
 
 class ObservabilityStore:
-    def __init__(self, state_db: str | Path):
+    def __init__(self, state_db: str | Path, now=None):
         self.state_db = Path(state_db)
+        self.now = now or (lambda: int(time.time()))
 
     def event(self, level: str, component: str, event_type: str, message: str, data: dict[str, Any] | None = None, hash: str | None = None, job_id: int | None = None, correlation_id: str | None = None) -> int:
         safe_message = redact(message)
@@ -26,15 +27,15 @@ class ObservabilityStore:
         con = _connect(self.state_db)
         cur = con.execute(
             "insert into events_v2(ts,level,component,event_type,hash,job_id,correlation_id,message,data_json) values(?,?,?,?,?,?,?,?,?)",
-            (int(time.time()), level, component, event_type, hash, job_id, correlation_id, safe_message, json.dumps(safe_data, ensure_ascii=False)),
+            (int(self.now()), level, component, event_type, hash, job_id, correlation_id, safe_message, json.dumps(safe_data, ensure_ascii=False)),
         )
         con.commit(); con.close(); return int(cur.lastrowid)
 
-    def action(self, hash: str | None, job_id: int | None, action_type: str, path: str, payload: dict[str, Any], status: str, dry_run: bool, correlation_id: str | None = None, error: str | None = None) -> int:
+    def action(self, hash: str | None, job_id: int | None, action_type: str, path: str, payload: dict[str, Any], status: str, dry_run: bool = False, correlation_id: str | None = None, error: str | None = None) -> int:
         con = _connect(self.state_db)
         cur = con.execute(
             "insert into action_log(ts,correlation_id,hash,job_id,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?,?,?,?)",
-            (int(time.time()), correlation_id, hash, job_id, action_type, path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
+            (int(self.now()), correlation_id, hash, job_id, action_type, path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
         )
         con.commit(); con.close(); return int(cur.lastrowid)
 
@@ -284,9 +285,117 @@ class BotCommandRepository:
         return rows
 
 
+class BotNotificationRepository:
+    def __init__(self, state_db: str | Path, now=None):
+        self.state_db = Path(state_db)
+        self.now = now or (lambda: int(time.time()))
+
+    def enqueue(
+        self,
+        chat_id: int | str,
+        topic: str,
+        message: str,
+        level: str = "info",
+        payload: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+    ) -> int:
+        now = int(self.now())
+        safe_message = str(redact(message))
+        safe_payload = json.dumps(redact(payload or {}), ensure_ascii=False)
+        con = _connect(self.state_db)
+        if dedupe_key:
+            con.execute(
+                "insert or ignore into bot_notifications(dedupe_key,chat_id,level,topic,message,payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+                (str(dedupe_key), str(chat_id), level, topic, safe_message, safe_payload, "queued", 0, now, now),
+            )
+            row = con.execute("select id from bot_notifications where dedupe_key=?", (str(dedupe_key),)).fetchone()
+            assert row is not None
+            note_id = int(row["id"])
+        else:
+            cur = con.execute(
+                "insert into bot_notifications(chat_id,level,topic,message,payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+                (str(chat_id), level, topic, safe_message, safe_payload, "queued", 0, now, now),
+            )
+            note_id = int(cur.lastrowid)
+        con.commit()
+        con.close()
+        return note_id
+
+    def peek_next(self) -> dict[str, Any] | None:
+        con = _connect(self.state_db)
+        now = int(self.now())
+        row = con.execute(
+            "select * from bot_notifications where state in ('queued','retry_wait') "
+            "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by id limit 1",
+            (now,),
+        ).fetchone()
+        out = dict(row) if row else None
+        con.close()
+        return out
+
+    def claim_next(self) -> dict[str, Any] | None:
+        con = _connect(self.state_db)
+        now = int(self.now())
+        row = con.execute(
+            "select * from bot_notifications where state in ('queued','retry_wait') "
+            "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by id limit 1",
+            (now,),
+        ).fetchone()
+        if not row:
+            con.close()
+            return None
+        con.execute(
+            "update bot_notifications set state='running', attempts=attempts+1, updated_at=? where id=?",
+            (now, row["id"]),
+        )
+        con.commit()
+        out = dict(con.execute("select * from bot_notifications where id=?", (row["id"],)).fetchone())
+        con.close()
+        return out
+
+    def mark_sent(self, notification_id: int) -> None:
+        now = int(self.now())
+        con = _connect(self.state_db)
+        con.execute(
+            "update bot_notifications set state='sent', sent_at=?, updated_at=? where id=?",
+            (now, now, int(notification_id)),
+        )
+        con.commit()
+        con.close()
+
+    def schedule_retry(self, notification_id: int, error: str, delay_sec: int = 60) -> None:
+        now = int(self.now())
+        con = _connect(self.state_db)
+        con.execute(
+            "update bot_notifications set state='retry_wait', next_run_at=?, last_error=?, updated_at=? where id=?",
+            (now + int(delay_sec), str(redact(error))[:1000], now, int(notification_id)),
+        )
+        con.commit()
+        con.close()
+
+    def get(self, notification_id: int) -> dict[str, Any]:
+        con = _connect(self.state_db)
+        row = con.execute("select * from bot_notifications where id=?", (int(notification_id),)).fetchone()
+        con.close()
+        if row is None:
+            raise KeyError(notification_id)
+        return dict(row)
+
+    def list_all(self) -> list[dict[str, Any]]:
+        con = _connect(self.state_db)
+        rows = [dict(r) for r in con.execute("select * from bot_notifications order by id")]
+        con.close()
+        return rows
+
+
 class CommandProcessor:
     DANGEROUS = {"cleanup", "force_upload", "preempt", "config"}
-    def __init__(self, commands: BotCommandRepository, executor): self.commands = commands; self.executor = executor
+
+    def __init__(self, commands: BotCommandRepository, executor, notifications: BotNotificationRepository | None = None):
+        self.commands = commands
+        self.executor = executor
+        self.notifications = notifications
+
     def run_next(self) -> str | None:
         row = self.commands.claim_next()
         if not row: return None
@@ -300,4 +409,45 @@ class CommandProcessor:
             self.executor.qbt_post("/api/v2/torrents/start", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
         if command == "preempt" and args:
             self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
+        if command in {"status", "trace", "perf"}:
+            if self.notifications is not None:
+                self.notifications.enqueue(
+                    chat_id=row["chat_id"],
+                    topic=command,
+                    message=self._readonly_message(command, args),
+                    dedupe_key=f"command-result:{command_id}",
+                )
+            self.commands.set_state(command_id, "done")
+            return command_id
         self.commands.set_state(command_id, "ignored"); return command_id
+
+    def _readonly_message(self, command: str, args: list[Any]) -> str:
+        if command == "status":
+            return self._status_message(str(args[0]) if args else "all")
+        if command == "trace":
+            target = str(args[0]) if args else ""
+            trace = ObservabilityStore(self.commands.state_db).trace(target)
+            event_types = [str(e.get("event_type")) for e in trace["events"][:5]]
+            action_types = [str(a.get("action_type")) for a in trace["actions"][:5]]
+            return f"trace {target}: events={len(trace['events'])} {','.join(event_types)} actions={len(trace['actions'])} {','.join(action_types)} decisions={len(trace['decisions'])}"
+        if command == "perf":
+            con = _connect(self.commands.state_db)
+            events = con.execute("select count(*) from events_v2").fetchone()[0]
+            actions = con.execute("select count(*) from action_log").fetchone()[0]
+            jobs = con.execute("select count(*) from torrent_jobs where state in ('queued','running','retry_wait','verify_pending')").fetchone()[0]
+            con.close()
+            return f"perf: events={int(events)} actions={int(actions)} active_jobs={int(jobs)}"
+        return f"{command}: unsupported"
+
+    def _status_message(self, view: str) -> str:
+        con = _connect(self.commands.state_db)
+        try:
+            disk = con.execute("select pressure_state,free_bytes,resume_allowed from disk_state where id=1").fetchone()
+            job_rows = con.execute("select state,count(*) as c from torrent_jobs group by state").fetchall()
+        finally:
+            con.close()
+        jobs = ",".join(f"{r['state']}={int(r['c'])}" for r in job_rows) or "none"
+        if disk:
+            gib = int(disk["free_bytes"] or 0) / 1024**3
+            return f"status {view}: disk={disk['pressure_state']} free={gib:.2f}GiB resume_allowed={int(disk['resume_allowed'] or 0)} jobs={jobs}"
+        return f"status {view}: disk=unknown jobs={jobs}"

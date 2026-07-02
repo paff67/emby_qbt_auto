@@ -193,6 +193,86 @@ def test_daemon_runtime_processes_queued_bot_commands_after_safety_tick():
         assert commands.get("c1")["state"] == "done"
 
 
+def test_daemon_notification_sender_dry_run_does_not_claim_or_send():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotNotificationRepository
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class Sender:
+        def __init__(self):
+            self.calls = 0
+        def has_pending(self):
+            return True
+        def send_next(self):
+            self.calls += 1
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = BotNotificationRepository(db)
+        note_id = repo.enqueue(100, "status", "hello")
+        sender = Sender()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            telegram_notification_sender=sender,
+            notification_dry_run=True,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert sender.calls == 0
+        assert repo.get(note_id)["state"] == "queued"
+        con = sqlite3.connect(db)
+        action = con.execute("select action_type,path,status,dry_run from action_log where action_type='telegram_notify'").fetchone()
+        con.close()
+        assert action == ("telegram_notify", "bot_notifications", "dry_run", 1)
+
+
+def test_daemon_notification_sender_live_sends_one_message():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotNotificationRepository
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class Sender:
+        def __init__(self, repo):
+            self.repo = repo
+            self.calls = 0
+        def has_pending(self):
+            return self.repo.peek_next() is not None
+        def send_next(self):
+            self.calls += 1
+            row = self.repo.claim_next()
+            self.repo.mark_sent(row["id"])
+            return row["id"]
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = BotNotificationRepository(db)
+        note_id = repo.enqueue(100, "status", "hello")
+        sender = Sender(repo)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            telegram_notification_sender=sender,
+            notification_dry_run=False,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert sender.calls == 1
+        assert repo.get(note_id)["state"] == "sent"
+
+
 class FakeClock:
     def __init__(self):
         self.now = 0.0

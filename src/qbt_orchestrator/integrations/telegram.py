@@ -4,6 +4,8 @@ import json
 from typing import Any, Protocol
 from urllib import parse, request
 
+from ..observability import redact
+from ..runtime import BotNotificationRepository
 from ..telegram_control import TelegramAuthorizer
 
 
@@ -105,4 +107,34 @@ class TelegramPollingService:
             self.api.send_message(chat_id, "approved" if action == "approve" else "denied")
         else:
             self.api.send_message(chat_id, "approval unavailable")
+
+
+class TelegramNotificationSender:
+    """Drain persistent bot_notifications to Telegram sendMessage.
+
+    Polling only records commands/approvals in SQLite.  This sender is the
+    opposite direction and is intentionally queue-backed so daemon restarts do
+    not lose status/trace/perf replies.
+    """
+
+    def __init__(self, repo: BotNotificationRepository, api: TelegramApiProtocol, retry_delay: int = 60):
+        self.repo = repo
+        self.api = api
+        self.retry_delay = retry_delay
+
+    def has_pending(self) -> bool:
+        return self.repo.peek_next() is not None
+
+    def send_next(self) -> int | None:
+        row = self.repo.claim_next()
+        if row is None:
+            return None
+        notification_id = int(row["id"])
+        try:
+            self.api.send_message(int(row["chat_id"]), str(row["message"]))
+        except Exception as exc:
+            self.repo.schedule_retry(notification_id, error=str(redact(str(exc))), delay_sec=self.retry_delay)
+            return notification_id
+        self.repo.mark_sent(notification_id)
+        return notification_id
 

@@ -141,6 +141,8 @@ class DaemonRuntime:
         media_pipeline_dry_run: bool = True,
         emby_refresh_worker=None,
         emby_refresh_dry_run: bool = True,
+        telegram_notification_sender=None,
+        notification_dry_run: bool = True,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -162,6 +164,8 @@ class DaemonRuntime:
         self.media_pipeline_dry_run = media_pipeline_dry_run or dry_run
         self.emby_refresh_worker = emby_refresh_worker
         self.emby_refresh_dry_run = emby_refresh_dry_run or dry_run
+        self.telegram_notification_sender = telegram_notification_sender
+        self.notification_dry_run = notification_dry_run or dry_run
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -241,6 +245,34 @@ class DaemonRuntime:
             processed += 1
         if processed:
             self.obs.event("info", "telegram", "commands_processed", f"processed={processed}", {"count": processed})
+        return processed
+
+    def process_bot_notifications(self, max_notifications: int = 5) -> int:
+        if self.telegram_notification_sender is None:
+            return 0
+        if self.notification_dry_run:
+            if not self.telegram_notification_sender.has_pending():
+                return 0
+            self.obs.action(
+                hash=None,
+                job_id=None,
+                action_type="telegram_notify",
+                path="bot_notifications",
+                payload={"state": "queued"},
+                status="dry_run",
+                dry_run=True,
+            )
+            self.obs.event("info", "telegram", "notification_dry_run", "telegram notification pending", {"dry_run": True})
+            return 1
+        processed = 0
+        for _ in range(max_notifications):
+            if not self.telegram_notification_sender.has_pending():
+                break
+            notification_id = self.telegram_notification_sender.send_next()
+            if notification_id is None:
+                break
+            processed += 1
+            self.obs.event("info", "telegram", "notification_processed", f"notification {notification_id} processed", {"notification_id": notification_id})
         return processed
 
     def process_upload_jobs(self, max_jobs: int = 1) -> int:
@@ -374,6 +406,10 @@ class DaemonRuntime:
                     self.process_bot_commands()
                 except Exception as exc:
                     self.obs.event("error", "telegram", "command_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                try:
+                    self.process_bot_notifications()
+                except Exception as exc:
+                    self.obs.event("error", "telegram", "notification_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                 try:
                     self.process_upload_jobs()
                 except Exception as exc:
