@@ -76,6 +76,34 @@ def test_command_processor_executes_safe_commands_and_requires_cleanup_approval(
         assert commands.pending_approvals()[0]["action"] == "cleanup"
 
 
+def test_approved_dangerous_command_executes_once_after_approval():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command("c4", 100, 3, "preempt", {"args": ["h9"]})
+        executor = FakeExecutor()
+        processor = CommandProcessor(commands, executor)
+
+        assert processor.run_next() == "c4"
+        assert commands.get("c4")["state"] == "approval_required"
+        assert commands.pending_approvals()[0]["approval_id"] == "approval-c4"
+
+        assert commands.approve_once("approval-c4", user_id=3) is True
+        assert commands.approve_once("approval-c4", user_id=3) is False
+        assert commands.get("c4")["state"] == "approved"
+
+        assert processor.run_next() == "c4"
+        assert processor.run_next() is None
+        assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h9"})]
+        assert commands.get("c4")["state"] == "done"
+        assert commands.pending_approvals()[0]["state"] == "approved"
+
+
 class ExplodingRclone:
     def copyto(self, local, remote):
         raise RuntimeError("backend rate limit token " + "123456:" + "secret-token")

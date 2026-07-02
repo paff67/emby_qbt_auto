@@ -140,24 +140,113 @@ def reconcile_jobs(state_db: str | Path, now: int | None = None, dry_run: bool =
 
 
 class BotCommandRepository:
-    def __init__(self, state_db: str | Path): self.state_db = Path(state_db)
+    def __init__(self, state_db: str | Path, now=None):
+        self.state_db = Path(state_db)
+        self.now = now or (lambda: int(time.time()))
+
     def insert_command(self, command_id, chat_id, user_id, command, payload):
-        now = int(time.time()); con = _connect(self.state_db)
-        con.execute("insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)", (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now))
-        con.commit(); con.close()
+        now = int(self.now())
+        con = _connect(self.state_db)
+        con.execute(
+            "insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
+            (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now),
+        )
+        con.commit()
+        con.close()
+
     def claim_next(self) -> dict[str, Any] | None:
-        con = _connect(self.state_db); row = con.execute("select * from bot_commands where state='queued' order by id limit 1").fetchone()
-        if not row: con.close(); return None
-        con.execute("update bot_commands set state='running', updated_at=? where id=?", (int(time.time()), row["id"])); con.commit(); out = dict(con.execute("select * from bot_commands where id=?", (row["id"],)).fetchone()); con.close(); return out
+        con = _connect(self.state_db)
+        row = con.execute(
+            "select * from bot_commands where state in ('queued','approved') order by id limit 1"
+        ).fetchone()
+        if not row:
+            con.close()
+            return None
+        con.execute("update bot_commands set state='running', updated_at=? where id=?", (int(self.now()), row["id"]))
+        con.commit()
+        out = dict(con.execute("select * from bot_commands where id=?", (row["id"],)).fetchone())
+        con.close()
+        out["_claimed_from_state"] = row["state"]
+        return out
+
     def set_state(self, command_id: str, state: str) -> None:
-        con = _connect(self.state_db); con.execute("update bot_commands set state=?, updated_at=? where command_id=?", (state, int(time.time()), command_id)); con.commit(); con.close()
+        con = _connect(self.state_db)
+        con.execute("update bot_commands set state=?, updated_at=? where command_id=?", (state, int(self.now()), command_id))
+        con.commit()
+        con.close()
+
     def create_approval(self, command_id: str, action: str, payload: dict[str, Any], ttl: int = 300) -> str:
-        aid = f"approval-{command_id}"; now = int(time.time()); con = _connect(self.state_db)
-        con.execute("insert or ignore into bot_approvals(approval_id,command_id,action,payload_json,state,expires_at,created_at) values(?,?,?,?,?,?,?)", (aid, command_id, action, json.dumps(payload, ensure_ascii=False), "pending", now + ttl, now)); con.commit(); con.close(); return aid
+        aid = f"approval-{command_id}"
+        now = int(self.now())
+        con = _connect(self.state_db)
+        con.execute(
+            "insert or ignore into bot_approvals(approval_id,command_id,action,payload_json,state,expires_at,created_at) values(?,?,?,?,?,?,?)",
+            (aid, command_id, action, json.dumps(payload, ensure_ascii=False), "pending", now + ttl, now),
+        )
+        con.commit()
+        con.close()
+        return aid
+
+    def approve_once(self, approval_id: str, user_id: int | str) -> bool:
+        return self._decide_once(approval_id, user_id, "approved")
+
+    def deny_once(self, approval_id: str, user_id: int | str) -> bool:
+        return self._decide_once(approval_id, user_id, "denied")
+
+    def _decide_once(self, approval_id: str, user_id: int | str, decision: str) -> bool:
+        now = int(self.now())
+        con = _connect(self.state_db)
+        try:
+            row = con.execute(
+                "select * from bot_approvals where approval_id=? and state='pending'",
+                (str(approval_id),),
+            ).fetchone()
+            if not row:
+                return False
+            if row["expires_at"] is not None and int(row["expires_at"]) < now:
+                con.execute(
+                    "update bot_approvals set state='expired', approved_by=?, approved_at=? where approval_id=? and state='pending'",
+                    (str(user_id), now, str(approval_id)),
+                )
+                con.execute(
+                    "update bot_commands set state='expired', updated_at=? where command_id=? and state='approval_required'",
+                    (now, row["command_id"]),
+                )
+                con.commit()
+                return False
+            cur = con.execute(
+                "update bot_approvals set state=?, approved_by=?, approved_at=? where approval_id=? and state='pending'",
+                (decision, str(user_id), now, str(approval_id)),
+            )
+            if cur.rowcount != 1:
+                con.rollback()
+                return False
+            if decision == "approved":
+                con.execute(
+                    "update bot_commands set state='approved', updated_at=? where command_id=? and state='approval_required'",
+                    (now, row["command_id"]),
+                )
+            else:
+                con.execute(
+                    "update bot_commands set state='denied', updated_at=? where command_id=? and state='approval_required'",
+                    (now, row["command_id"]),
+                )
+            con.commit()
+            return True
+        finally:
+            con.close()
+
     def get(self, command_id: str) -> dict[str, Any]:
-        con = _connect(self.state_db); row = dict(con.execute("select * from bot_commands where command_id=?", (command_id,)).fetchone()); con.close(); return row
+        con = _connect(self.state_db)
+        row = dict(con.execute("select * from bot_commands where command_id=?", (command_id,)).fetchone())
+        con.close()
+        return row
+
     def pending_approvals(self) -> list[dict[str, Any]]:
-        con = _connect(self.state_db); rows = [dict(r) for r in con.execute("select * from bot_approvals where state='pending' order by id")]; con.close(); return rows
+        con = _connect(self.state_db)
+        rows = [dict(r) for r in con.execute("select * from bot_approvals where state in ('pending','approved','denied','expired') order by id")]
+        con.close()
+        return rows
 
 
 class CommandProcessor:
@@ -167,10 +256,13 @@ class CommandProcessor:
         row = self.commands.claim_next()
         if not row: return None
         command_id = row["command_id"]; command = row["command"]; payload = json.loads(row["payload_json"] or "{}"); args = payload.get("args") or []
-        if command in self.DANGEROUS:
+        claimed_from = row.get("_claimed_from_state") or row.get("state")
+        if command in self.DANGEROUS and claimed_from != "approved":
             self.commands.create_approval(command_id, command, payload); self.commands.set_state(command_id, "approval_required"); return command_id
         if command == "pause" and args:
             self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
         if command == "resume" and args:
             self.executor.qbt_post("/api/v2/torrents/start", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
+        if command == "preempt" and args:
+            self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
         self.commands.set_state(command_id, "ignored"); return command_id

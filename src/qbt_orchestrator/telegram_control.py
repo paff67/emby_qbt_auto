@@ -5,7 +5,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Set
-VIEWER = {"status", "trace", "perf"}; OPERATOR = VIEWER | {"pause", "resume", "queue"}; ADMIN = OPERATOR | {"force_upload", "cleanup", "preempt", "config"}
+VIEWER = {"status", "trace", "perf"}
+OPERATOR = VIEWER | {"pause", "resume", "queue"}
+ADMIN = OPERATOR | {"force_upload", "cleanup", "preempt", "config", "approve", "deny"}
 class TelegramAuthorizer:
     def __init__(self, viewers: Set[int] | None = None, operators: Set[int] | None = None, admins: Set[int] | None = None): self.viewers = viewers or set(); self.operators = operators or set(); self.admins = admins or set()
     def role_for(self, user_id: int) -> str | None:

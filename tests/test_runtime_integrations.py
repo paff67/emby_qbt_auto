@@ -115,6 +115,76 @@ def test_telegram_polling_errors_are_counted_not_raised():
     assert service.consecutive_failures == 1
 
 
+def test_telegram_callback_approval_updates_store_once_and_rejects_duplicate_click():
+    from qbt_orchestrator.integrations.telegram import TelegramPollingService
+    from qbt_orchestrator.telegram_control import TelegramAuthorizer
+
+    updates = [
+        {
+            "update_id": 20,
+            "callback_query": {
+                "id": "cb-1",
+                "from": {"id": 3},
+                "message": {"chat": {"id": 100}},
+                "data": "approve:approval-c3",
+            },
+        },
+        {
+            "update_id": 21,
+            "callback_query": {
+                "id": "cb-2",
+                "from": {"id": 3},
+                "message": {"chat": {"id": 100}},
+                "data": "approve:approval-c3",
+            },
+        },
+        {
+            "update_id": 22,
+            "callback_query": {
+                "id": "cb-3",
+                "from": {"id": 1},
+                "message": {"chat": {"id": 101}},
+                "data": "deny:approval-c4",
+            },
+        },
+    ]
+    sent = []
+
+    class Store:
+        def __init__(self):
+            self.approvals = []
+
+        def approve_once(self, approval_id, user_id):
+            self.approvals.append(("approve", approval_id, user_id))
+            return len(self.approvals) == 1
+
+        def deny_once(self, approval_id, user_id):
+            self.approvals.append(("deny", approval_id, user_id))
+            return True
+
+    class Api:
+        def get_updates(self, offset, timeout):
+            return updates if offset is None else []
+
+        def send_message(self, chat_id, text, reply_markup=None):
+            sent.append((chat_id, text, reply_markup))
+
+    store = Store()
+    service = TelegramPollingService(api=Api(), authorizer=TelegramAuthorizer(viewers={1}, admins={3}), command_store=store)
+
+    assert service.poll_once() == 3
+    assert store.approvals == [
+        ("approve", "approval-c3", 3),
+        ("approve", "approval-c3", 3),
+    ]
+    assert sent == [
+        (100, "approved", None),
+        (100, "approval unavailable", None),
+        (101, "unauthorized", None),
+    ]
+    assert service.next_offset == 23
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -61,6 +61,9 @@ class TelegramPollingService:
         return len(updates)
 
     def _handle_update(self, update: dict[str, Any]) -> None:
+        if update.get("callback_query"):
+            self._handle_callback(update)
+            return
         msg = update.get("message") or {}
         if not msg:
             return
@@ -77,4 +80,29 @@ class TelegramPollingService:
             return
         if self.command_store is not None:
             self.command_store.insert_command(f"tg-{update.get('update_id')}", chat_id, user_id, command, {"args": args, "text": text})
+
+    def _handle_callback(self, update: dict[str, Any]) -> None:
+        callback = update.get("callback_query") or {}
+        data = str(callback.get("data") or "")
+        if ":" not in data:
+            return
+        action, approval_id = data.split(":", 1)
+        action = action.replace("-", "_")
+        chat_id = int((callback.get("message") or {}).get("chat", {}).get("id"))
+        user_id = int((callback.get("from") or {}).get("id"))
+        if action not in {"approve", "deny"}:
+            return
+        if not self.authorizer.allowed(user_id, action):
+            self.api.send_message(chat_id, "unauthorized")
+            return
+        ok = False
+        if self.command_store is not None:
+            if action == "approve" and hasattr(self.command_store, "approve_once"):
+                ok = bool(self.command_store.approve_once(approval_id, user_id))
+            elif action == "deny" and hasattr(self.command_store, "deny_once"):
+                ok = bool(self.command_store.deny_once(approval_id, user_id))
+        if ok:
+            self.api.send_message(chat_id, "approved" if action == "approve" else "denied")
+        else:
+            self.api.send_message(chat_id, "approval unavailable")
 
