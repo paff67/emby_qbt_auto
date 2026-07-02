@@ -1,5 +1,9 @@
 from __future__ import annotations
+import json
+import sqlite3
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, Set
 VIEWER = {"status", "trace", "perf"}; OPERATOR = VIEWER | {"pause", "resume", "queue"}; ADMIN = OPERATOR | {"force_upload", "cleanup", "preempt", "config"}
 class TelegramAuthorizer:
@@ -16,10 +20,17 @@ class TelegramAuthorizer:
 class Approval:
     action: str; payload: dict; expires_at: int; approved: bool = False
 class ApprovalStore:
-    def __init__(self, now: Callable[[], int] | None = None): self.now = now or (lambda: int(__import__("time").time())); self._items: Dict[str, Approval] = {}; self._next = 1
+    def __init__(self, now: Callable[[], int] | None = None): self.now = now or (lambda: int(time.time())); self._items: Dict[str, Approval] = {}; self._next = 1
     def create(self, action: str, payload: dict, ttl: int) -> str:
         aid = f"approval-{self._next}"; self._next += 1; self._items[aid] = Approval(action, payload, self.now() + ttl); return aid
     def approve_once(self, approval_id: str, user_id: int) -> bool:
         item = self._items.get(approval_id)
         if not item or item.approved or item.expires_at < self.now(): return False
         item.approved = True; return True
+class SQLiteBotCommandStore:
+    def __init__(self, state_db: str | Path): self.state_db = Path(state_db)
+    def insert_command(self, command_id, chat_id, user_id, command, payload):
+        now = int(time.time())
+        con = sqlite3.connect(self.state_db)
+        con.execute("insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)", (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now))
+        con.commit(); con.close()
