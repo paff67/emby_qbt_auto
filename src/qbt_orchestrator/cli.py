@@ -7,7 +7,7 @@ from .db import migrate, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient
 from .integrations.rclone import RcloneClient
-from .runtime import BotCommandRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner
+from .runtime import BotCommandRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
 
@@ -109,6 +109,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if name == "daemon":
             p.add_argument("--max-safety-ticks", type=int, default=None)
             p.add_argument("--safety-interval", type=float, default=2.0)
+        if name == "reconcile":
+            p.add_argument("--now", type=int, default=None)
     ns = parser.parse_args(list(argv) if argv is not None else None); db = Path(ns.state_db)
     if ns.cmd == "migrate":
         sql = migrate(db, dry_run=not ns.apply); print((json.dumps({"dry_run": not ns.apply, "statements": len(sql)}) if ns.json else f"migration {'dry-run' if not ns.apply else 'applied'}: {len(sql)} statements")); return 0
@@ -133,6 +135,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         ticks = runtime.run(max_safety_ticks=ns.max_safety_ticks)
         print(f"daemon {'dry-run' if dry_run else 'live'} stopped after {ticks} safety ticks")
         return 0
-    if ns.cmd in {"reconcile"}: print(f"{ns.cmd} {'dry-run' if ns.dry_run else 'live'} completed without external actions"); return 0
+    if ns.cmd in {"reconcile"}:
+        payload = reconcile_jobs(db, now=ns.now, dry_run=not ns.apply)
+        _print_json(payload) if ns.json else print(payload)
+        return 0
     return 2
 if __name__ == "__main__": raise SystemExit(main())

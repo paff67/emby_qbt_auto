@@ -48,19 +48,26 @@ class ObservabilityStore:
 
 
 class TorrentJobRepository:
-    def __init__(self, state_db: str | Path): self.state_db = Path(state_db)
+    def __init__(self, state_db: str | Path, now=None):
+        self.state_db = Path(state_db)
+        self.now = now or (lambda: int(time.time()))
 
     def enqueue(self, hash: str | None, batch_id: int | None, job_type: str, payload: dict[str, Any], priority: int = 100) -> int:
-        now = int(time.time()); con = _connect(self.state_db)
+        now = int(self.now()); con = _connect(self.state_db)
         cur = con.execute("insert into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?)", (hash, batch_id, job_type, "queued", priority, json.dumps(payload, ensure_ascii=False), now, now))
         con.commit(); con.close(); return int(cur.lastrowid)
 
     def claim_next(self, job_type: str) -> dict[str, Any] | None:
         con = _connect(self.state_db)
-        row = con.execute("select * from torrent_jobs where job_type=? and state in ('queued','retry_wait','verify_pending') order by priority,id limit 1", (job_type,)).fetchone()
+        now = int(self.now())
+        row = con.execute(
+            "select * from torrent_jobs where job_type=? and state in ('queued','verify_pending','retry_wait') "
+            "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by priority,id limit 1",
+            (job_type, now),
+        ).fetchone()
         if not row:
             con.close(); return None
-        con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (int(time.time()) + 1800, int(time.time()), row["id"]))
+        con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
         con.commit(); out = dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone()); con.close(); return out
 
     def peek_next(self, job_type: str) -> dict[str, Any] | None:
@@ -72,7 +79,16 @@ class TorrentJobRepository:
 
     def update_state(self, job_id: int, state: str, stderr_tail: str | None = None, exit_code: int | None = None) -> None:
         con = _connect(self.state_db)
-        con.execute("update torrent_jobs set state=?, last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?", (state, stderr_tail, exit_code, int(time.time()), job_id))
+        con.execute("update torrent_jobs set state=?, last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?", (state, stderr_tail, exit_code, int(self.now()), job_id))
+        con.commit(); con.close()
+
+    def schedule_retry(self, job_id: int, stderr_tail: str | None = None, exit_code: int | None = None, delay_sec: int = 60) -> None:
+        con = _connect(self.state_db)
+        con.execute(
+            "update torrent_jobs set state='retry_wait', lease_owner=null, lease_until=null, next_run_at=?, "
+            "last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?",
+            (int(self.now()) + int(delay_sec), stderr_tail, exit_code, int(self.now()), job_id),
+        )
         con.commit(); con.close()
 
     def get(self, job_id: int) -> dict[str, Any]:
@@ -80,19 +96,47 @@ class TorrentJobRepository:
 
 
 class UploadJobRunner:
-    def __init__(self, repo: TorrentJobRepository, rclone, executor):
-        self.repo = repo; self.worker = RcloneUploadWorker(rclone, executor)
+    def __init__(self, repo: TorrentJobRepository, rclone, executor, backoff_schedule=(60, 180, 600, 1800, 7200, 21600)):
+        self.repo = repo; self.worker = RcloneUploadWorker(rclone, executor); self.backoff_schedule = tuple(int(x) for x in backoff_schedule)
 
     def run_next(self) -> int | None:
         row = self.repo.claim_next("upload")
         if not row: return None
         payload = json.loads(row["payload_json"] or "{}")
         job = UploadJob(hash=row["hash"], batch_id=row["batch_id"], local=payload["local"], remote=payload["remote"], size=int(payload["size"]), full_torrent=bool(payload.get("full_torrent")))
-        result = self.worker.run_once(job)
+        try:
+            result = self.worker.run_once(job)
+        except Exception as exc:
+            delay = self._delay_for_attempt(int(row.get("attempts") or 1))
+            self.repo.schedule_retry(row["id"], redact(str(exc))[:500], exit_code=1, delay_sec=delay)
+            return int(row["id"])
         if result.state == "done": self.repo.update_state(row["id"], "done", exit_code=0)
         elif result.state == "verify_pending": self.repo.update_state(row["id"], "verify_pending", "remote size mismatch")
+        elif result.state == "retry_wait": self.repo.schedule_retry(row["id"], "retry requested", exit_code=1, delay_sec=self._delay_for_attempt(int(row.get("attempts") or 1)))
         else: self.repo.update_state(row["id"], result.state)
         return int(row["id"])
+
+    def _delay_for_attempt(self, attempt: int) -> int:
+        if not self.backoff_schedule:
+            return 60
+        idx = max(0, min(int(attempt) - 1, len(self.backoff_schedule) - 1))
+        return self.backoff_schedule[idx]
+
+
+def reconcile_jobs(state_db: str | Path, now: int | None = None, dry_run: bool = True, retry_delay_sec: int = 60) -> dict[str, int]:
+    now = int(now if now is not None else time.time())
+    con = _connect(state_db)
+    rows = [dict(r) for r in con.execute("select * from torrent_jobs where state='running' and lease_until is not null and lease_until<?", (now,))]
+    if not dry_run:
+        for row in rows:
+            con.execute(
+                "update torrent_jobs set state='retry_wait', lease_owner=null, lease_until=null, next_run_at=?, "
+                "last_stderr_tail=?, last_exit_code=coalesce(last_exit_code,1), updated_at=? where id=?",
+                (now + retry_delay_sec, "lease expired during reconcile", now, row["id"]),
+            )
+        con.commit()
+    con.close()
+    return {"expired_running": len(rows), "dry_run": 1 if dry_run else 0}
 
 
 class BotCommandRepository:

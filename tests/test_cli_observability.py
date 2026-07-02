@@ -212,6 +212,32 @@ def test_cli_once_wires_file_batch_dry_run_by_default():
         assert action == ("enqueue_upload", "dry_run", 1)
 
 
+def test_cli_reconcile_dry_run_and_apply_reports_expired_running_jobs():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 100)
+        job_id = repo.enqueue("h1", None, "upload", {"local": "a", "remote": "b", "size": 1}, priority=1)
+        assert repo.claim_next("upload") is not None
+
+        rc1, out1 = run_cli(["reconcile", "--dry-run", "--state-db", str(db), "--json", "--now", "2000"])
+        assert rc1 == 0
+        assert json.loads(out1)["expired_running"] == 1
+        assert repo.get(job_id)["state"] == "running"
+
+        rc2, out2 = run_cli(["reconcile", "--apply", "--state-db", str(db), "--json", "--now", "2000"])
+        assert rc2 == 0
+        payload = json.loads(out2)
+        assert payload["expired_running"] == 1
+        assert payload["dry_run"] == 0
+        row = repo.get(job_id)
+        assert row["state"] == "retry_wait"
+        assert row["next_run_at"] == 2060
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

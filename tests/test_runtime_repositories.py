@@ -76,6 +76,76 @@ def test_command_processor_executes_safe_commands_and_requires_cleanup_approval(
         assert commands.pending_approvals()[0]["action"] == "cleanup"
 
 
+class ExplodingRclone:
+    def copyto(self, local, remote):
+        raise RuntimeError("backend rate limit token " + "123456:" + "secret-token")
+    def lsjson_size(self, remote):
+        raise AssertionError("verify must not run after failed copy")
+
+
+def test_torrent_job_repository_skips_retry_wait_until_next_run_at():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 100)
+        job_id = repo.enqueue("h1", None, "upload", {"local": "a", "remote": "b", "size": 1}, priority=1)
+        repo.schedule_retry(job_id, stderr_tail="later", exit_code=5, delay_sec=60)
+
+        assert repo.claim_next("upload") is None
+
+        due_repo = TorrentJobRepository(db, now=lambda: 161)
+        claimed = due_repo.claim_next("upload")
+        assert claimed is not None
+        assert claimed["id"] == job_id
+        assert due_repo.get(job_id)["state"] == "running"
+
+
+def test_upload_job_runner_schedules_retry_wait_on_rclone_exception_with_redaction():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 100)
+        job_id = repo.enqueue("h1", None, "upload", {"local": "/tmp/a.mp4", "remote": "gcrypt:/A/a.mp4", "size": 100, "full_torrent": True}, priority=1)
+        runner = UploadJobRunner(repo, ExplodingRclone(), FakeExecutor(), backoff_schedule=(60, 180))
+
+        assert runner.run_next() == job_id
+
+        row = repo.get(job_id)
+        assert row["state"] == "retry_wait"
+        assert row["next_run_at"] == 160
+        assert row["last_exit_code"] == 1
+        assert "secret-token" not in row["last_stderr_tail"]
+        assert "<redacted-token>" in row["last_stderr_tail"]
+
+
+def test_reconcile_expired_running_upload_job_to_retry_wait():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, reconcile_jobs
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 100)
+        job_id = repo.enqueue("h1", None, "upload", {"local": "a", "remote": "b", "size": 1}, priority=1)
+        claimed = repo.claim_next("upload")
+        assert claimed is not None
+
+        report = reconcile_jobs(db, now=2000, dry_run=False)
+
+        assert report["expired_running"] == 1
+        row = repo.get(job_id)
+        assert row["state"] == "retry_wait"
+        assert row["next_run_at"] == 2060
+        assert "lease expired" in row["last_stderr_tail"]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
