@@ -219,6 +219,56 @@ def test_cli_wires_io_governor_limits_provider_to_rclone_client():
         assert limits.bwlimit == "2M"
 
 
+def test_cli_wires_sqlite_maintenance_retention_env_to_runtime():
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def get_maindata(self, rid):
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+        def post(self, path, payload):
+            raise AssertionError("dry-run must not post to qBT")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        old_qbt = cli.QbtDockerClient
+        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
+        old_retention = os.environ.get("QBT_ORCH_RETENTION_DAYS")
+        old_batch = os.environ.get("QBT_ORCH_RETENTION_DELETE_BATCH_SIZE")
+        old_limit = os.environ.get("QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES")
+        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
+        os.environ["QBT_ORCH_DISK_PATH"] = td
+        os.environ["QBT_ORCH_RETENTION_DAYS"] = "0"
+        os.environ["QBT_ORCH_RETENTION_DELETE_BATCH_SIZE"] = "7"
+        os.environ["QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES"] = "123456"
+        try:
+            rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
+        finally:
+            cli.QbtDockerClient = old_qbt
+            for key, old in [
+                ("QBT_ORCH_DISK_PATH", old_disk),
+                ("QBT_ORCH_RETENTION_DAYS", old_retention),
+                ("QBT_ORCH_RETENTION_DELETE_BATCH_SIZE", old_batch),
+                ("QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES", old_limit),
+            ]:
+                if old is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old
+
+        assert rc == 0
+        con = sqlite3.connect(db)
+        loop_json = con.execute(
+            "select data_json from events_v2 where component='maintenance' and event_type='loop_tick' order by id desc limit 1"
+        ).fetchone()[0]
+        con.close()
+        result = json.loads(loop_json)["result"]
+        assert result["retention_days"] == 0
+        assert result["retention_delete_batch_size"] == 7
+        assert result["journal_size_limit_bytes"] == 123456
+
+
 def test_cli_once_wires_file_batch_dry_run_by_default():
     from qbt_orchestrator import cli
 

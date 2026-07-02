@@ -695,6 +695,7 @@ def test_daemon_file_batch_can_enqueue_when_explicitly_enabled():
 def test_daemon_file_batch_live_respects_upload_backpressure_policy():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.io_governor import UploadBackpressurePolicy
+    from qbt_orchestrator.maintenance import SQLiteMaintenanceService
     from qbt_orchestrator.runtime import TorrentJobRepository
     from qbt_orchestrator.service import DaemonRuntime
 
@@ -738,6 +739,7 @@ def test_daemon_file_batch_live_respects_upload_backpressure_policy():
             safety_interval=0,
             file_batch_dry_run=False,
             upload_backpressure_policy=UploadBackpressurePolicy(max_backlog_bytes=20 * 1024**3, now=lambda: 5000),
+            maintenance_service=SQLiteMaintenanceService(db, now=lambda: 5000, retention_days=5),
         )
 
         daemon.run(max_safety_ticks=1)

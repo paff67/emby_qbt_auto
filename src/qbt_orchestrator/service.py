@@ -12,6 +12,7 @@ from .daemon import SafetyMonitor
 from .db import migrate
 from .file_batch import FileBatchService
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
+from .maintenance import SQLiteMaintenanceService
 from .observability import redact
 from .planner import DownloadPlanner
 from .runtime import BotCommandRepository, ObservabilityStore
@@ -144,6 +145,7 @@ class DaemonRuntime:
         emby_refresh_dry_run: bool = True,
         telegram_notification_sender=None,
         notification_dry_run: bool = True,
+        maintenance_service=None,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -168,6 +170,7 @@ class DaemonRuntime:
         self.emby_refresh_dry_run = emby_refresh_dry_run or dry_run
         self.telegram_notification_sender = telegram_notification_sender
         self.notification_dry_run = notification_dry_run or dry_run
+        self.maintenance_service = maintenance_service or SQLiteMaintenanceService(self.state_db)
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -186,9 +189,12 @@ class DaemonRuntime:
         return [
             LoopTask("planner", 15, self.planner_tick),
             LoopTask("file_batch", 60, self.file_batch_tick),
-            LoopTask("maintenance", 300, lambda: {"status": "not_configured"}),
+            LoopTask("maintenance", 300, self.maintenance_tick),
             LoopTask("carousel", 1800, lambda: {"status": "not_configured"}),
         ]
+
+    def maintenance_tick(self) -> dict:
+        return self.maintenance_service.run_once()
 
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}

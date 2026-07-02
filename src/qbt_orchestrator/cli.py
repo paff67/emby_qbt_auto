@@ -10,6 +10,7 @@ from .integrations.rclone import RcloneClient
 from .integrations.emby import EmbyClient
 from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
 from .io_governor import IoGovernor, UploadBackpressurePolicy
+from .maintenance import SQLiteMaintenanceService
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
 from .runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
@@ -128,6 +129,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt",
     )
     emby_worker = EmbyRefreshWorker(state_db, emby_client, media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt")
+    maintenance_service = SQLiteMaintenanceService(
+        state_db,
+        retention_days=int(os.environ.get("QBT_ORCH_RETENTION_DAYS", "5")),
+        retention_delete_batch_size=int(os.environ.get("QBT_ORCH_RETENTION_DELETE_BATCH_SIZE", "1000")),
+        journal_size_limit_bytes=int(os.environ.get("QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES", str(64 * 1024 * 1024))),
+    )
     runtime = DaemonRuntime(
         state_db=state_db,
         qbt=qbt,
@@ -151,6 +158,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         emby_refresh_dry_run=emby_refresh_dry_run,
         telegram_notification_sender=telegram_notification_sender,
         notification_dry_run=notification_dry_run,
+        maintenance_service=maintenance_service,
     )
     return runtime, dry_run
 
