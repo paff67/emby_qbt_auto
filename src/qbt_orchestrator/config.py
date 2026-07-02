@@ -22,6 +22,7 @@ def load_config_from_dict(data: Mapping[str, Any]) -> AppConfig:
     paths = _section(data, "paths")
     rclone_raw = _section(data, "rclone")
     emby_raw = _section(data, "emby")
+    qbt_prefs_raw = _section(data, "qbt_preferences")
     disk_raw = _section(data, "disk_pressure") or _section(data, "disk")
     warnings = ("incomplete_files_ext is observed false on VPS; v2 records drift but does not force change by default",)
     qbt = QbtConfig(
@@ -54,4 +55,9 @@ def load_config_from_dict(data: Mapping[str, Any]) -> AppConfig:
         critical_free_bytes=int(float(disk_raw.get("critical_free_gb", 2)) * 1024**3),
         emergency_free_bytes=2 * 1024**3,
     )
-    return AppConfig(qbt=qbt, disk=disk, emby=emby, rclone=rclone, qbt_preferences=QbtPreferencesConfig(False, None), state_db=str(paths.get("state_db", "/var/lib/qbt-orchestrator/state.sqlite")), dry_run=bool(data.get("dry_run", True)), runtime_warnings=warnings)
+    incomplete_desired = qbt_prefs_raw.get("incomplete_files_ext_desired", qbt_prefs_raw.get("incomplete_files_ext", None))
+    qbt_preferences = QbtPreferencesConfig(
+        preallocate_all=bool(qbt_prefs_raw.get("preallocate_all", False)),
+        incomplete_files_ext_desired=None if incomplete_desired is None else bool(incomplete_desired),
+    )
+    return AppConfig(qbt=qbt, disk=disk, emby=emby, rclone=rclone, qbt_preferences=qbt_preferences, state_db=str(paths.get("state_db", "/var/lib/qbt-orchestrator/state.sqlite")), dry_run=bool(data.get("dry_run", True)), runtime_warnings=warnings)

@@ -237,11 +237,13 @@ def test_cli_wires_sqlite_maintenance_retention_env_to_runtime():
         old_retention = os.environ.get("QBT_ORCH_RETENTION_DAYS")
         old_batch = os.environ.get("QBT_ORCH_RETENTION_DELETE_BATCH_SIZE")
         old_limit = os.environ.get("QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES")
+        old_guard = os.environ.get("QBT_ORCH_QBT_PREFERENCES_GUARD")
         cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
         os.environ["QBT_ORCH_DISK_PATH"] = td
         os.environ["QBT_ORCH_RETENTION_DAYS"] = "0"
         os.environ["QBT_ORCH_RETENTION_DELETE_BATCH_SIZE"] = "7"
         os.environ["QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES"] = "123456"
+        os.environ["QBT_ORCH_QBT_PREFERENCES_GUARD"] = "0"
         try:
             rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
         finally:
@@ -251,6 +253,60 @@ def test_cli_wires_sqlite_maintenance_retention_env_to_runtime():
                 ("QBT_ORCH_RETENTION_DAYS", old_retention),
                 ("QBT_ORCH_RETENTION_DELETE_BATCH_SIZE", old_batch),
                 ("QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES", old_limit),
+                ("QBT_ORCH_QBT_PREFERENCES_GUARD", old_guard),
+            ]:
+                if old is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old
+
+        assert rc == 0
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select data_json from events_v2 where component='maintenance' and event_type='loop_tick' order by id desc limit 1"
+        ).fetchone()
+        con.close()
+        assert row is not None
+        loop_json = row[0]
+        result = json.loads(loop_json)["result"]
+        assert result["retention_days"] == 0
+        assert result["retention_delete_batch_size"] == 7
+        assert result["journal_size_limit_bytes"] == 123456
+
+
+def test_cli_wires_qbt_preferences_guard_into_maintenance_loop():
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def get_maindata(self, rid):
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+        def post(self, path, payload):
+            raise AssertionError("dry-run must not post to qBT")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+        def get_preferences(self):
+            return {"preallocate_all": True, "incomplete_files_ext": False}
+        def set_preferences(self, prefs):
+            raise AssertionError("preference guard default must dry-run")
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        old_qbt = cli.QbtDockerClient
+        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
+        old_guard = os.environ.get("QBT_ORCH_QBT_PREFERENCES_GUARD")
+        old_guard_dry = os.environ.get("QBT_ORCH_QBT_PREFERENCES_DRY_RUN")
+        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
+        os.environ["QBT_ORCH_DISK_PATH"] = td
+        os.environ["QBT_ORCH_QBT_PREFERENCES_GUARD"] = "1"
+        os.environ.pop("QBT_ORCH_QBT_PREFERENCES_DRY_RUN", None)
+        try:
+            rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
+        finally:
+            cli.QbtDockerClient = old_qbt
+            for key, old in [
+                ("QBT_ORCH_DISK_PATH", old_disk),
+                ("QBT_ORCH_QBT_PREFERENCES_GUARD", old_guard),
+                ("QBT_ORCH_QBT_PREFERENCES_DRY_RUN", old_guard_dry),
             ]:
                 if old is None:
                     os.environ.pop(key, None)
@@ -262,11 +318,12 @@ def test_cli_wires_sqlite_maintenance_retention_env_to_runtime():
         loop_json = con.execute(
             "select data_json from events_v2 where component='maintenance' and event_type='loop_tick' order by id desc limit 1"
         ).fetchone()[0]
+        action = con.execute("select action_type,status,dry_run from action_log where action_type='qbt_preferences'").fetchone()
         con.close()
         result = json.loads(loop_json)["result"]
-        assert result["retention_days"] == 0
-        assert result["retention_delete_batch_size"] == 7
-        assert result["journal_size_limit_bytes"] == 123456
+        assert result["qbt_preferences"]["would_set"] == {"preallocate_all": False}
+        assert result["qbt_preferences"]["drift"]["incomplete_files_ext"]["desired"] is None
+        assert action == ("qbt_preferences", "dry_run", 1)
 
 
 def test_cli_once_wires_file_batch_dry_run_by_default():

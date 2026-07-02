@@ -25,12 +25,14 @@ class SQLiteMaintenanceService:
         retention_days: int = 5,
         retention_delete_batch_size: int = 1000,
         journal_size_limit_bytes: int = 64 * 1024 * 1024,
+        preferences_guard=None,
     ):
         self.state_db = Path(state_db)
         self.now = now or (lambda: int(time.time()))
         self.retention_days = int(retention_days)
         self.retention_delete_batch_size = max(1, int(retention_delete_batch_size))
         self.journal_size_limit_bytes = int(journal_size_limit_bytes)
+        self.preferences_guard = preferences_guard
 
     def run_once(self) -> dict:
         cutoff = int(self.now()) - self.retention_days * 86400
@@ -47,7 +49,7 @@ class SQLiteMaintenanceService:
             journal_size_limit = int(con.execute("pragma journal_size_limit").fetchone()[0])
         finally:
             con.close()
-        return {
+        result = {
             "retention_cutoff": cutoff,
             "retention_deleted": deleted,
             "retention_days": self.retention_days,
@@ -55,6 +57,9 @@ class SQLiteMaintenanceService:
             "wal_checkpoint": checkpoint,
             "journal_size_limit_bytes": journal_size_limit,
         }
+        if self.preferences_guard is not None:
+            result["qbt_preferences"] = self.preferences_guard.reconcile()
+        return result
 
     def _delete_old_rows(self, con: sqlite3.Connection, table: str, cutoff: int) -> int:
         total = 0

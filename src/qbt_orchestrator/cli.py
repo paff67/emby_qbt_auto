@@ -12,6 +12,7 @@ from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
 from .io_governor import IoGovernor, UploadBackpressurePolicy
 from .maintenance import SQLiteMaintenanceService
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
+from .preferences import QbtPreferencesGuard
 from .runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
@@ -27,6 +28,11 @@ def _truthy(value: str | None) -> bool | None:
     if value is None:
         return None
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def _bool_or_none(value: str | None) -> bool | None:
+    if value is None or value.strip() == "":
+        return None
+    return _truthy(value)
 
 def _free_bytes_for(path: str):
     def sample() -> int:
@@ -129,11 +135,25 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt",
     )
     emby_worker = EmbyRefreshWorker(state_db, emby_client, media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt")
+    preferences_guard = None
+    prefs_guard_enabled = _truthy(os.environ.get("QBT_ORCH_QBT_PREFERENCES_GUARD"))
+    if prefs_guard_enabled is None:
+        prefs_guard_enabled = True
+    if prefs_guard_enabled:
+        prefs_dry_env = _truthy(os.environ.get("QBT_ORCH_QBT_PREFERENCES_DRY_RUN"))
+        preferences_guard = QbtPreferencesGuard(
+            state_db,
+            qbt,
+            desired_preallocate_all=_truthy(os.environ.get("QBT_ORCH_QBT_PREALLOCATE_ALL")) if os.environ.get("QBT_ORCH_QBT_PREALLOCATE_ALL") is not None else (cfg.qbt_preferences.preallocate_all if cfg else False),
+            desired_incomplete_files_ext=_bool_or_none(os.environ.get("QBT_ORCH_QBT_INCOMPLETE_FILES_EXT")),
+            dry_run=True if dry_run else (prefs_dry_env if prefs_dry_env is not None else True),
+        )
     maintenance_service = SQLiteMaintenanceService(
         state_db,
         retention_days=int(os.environ.get("QBT_ORCH_RETENTION_DAYS", "5")),
         retention_delete_batch_size=int(os.environ.get("QBT_ORCH_RETENTION_DELETE_BATCH_SIZE", "1000")),
         journal_size_limit_bytes=int(os.environ.get("QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES", str(64 * 1024 * 1024))),
+        preferences_guard=preferences_guard,
     )
     runtime = DaemonRuntime(
         state_db=state_db,

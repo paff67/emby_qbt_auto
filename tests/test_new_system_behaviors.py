@@ -32,6 +32,22 @@ def test_config_merges_legacy_with_vps_runtime_defaults():
     assert "incomplete_files_ext" in cfg.runtime_warnings[0]
 
 
+def test_config_reads_explicit_qbt_preferences_guard_values():
+    from qbt_orchestrator.config import load_config_from_dict
+
+    cfg = load_config_from_dict(
+        {
+            "qbt_preferences": {
+                "preallocate_all": True,
+                "incomplete_files_ext_desired": True,
+            }
+        }
+    )
+
+    assert cfg.qbt_preferences.preallocate_all is True
+    assert cfg.qbt_preferences.incomplete_files_ext_desired is True
+
+
 def test_redaction_masks_tokens_magnets_and_rclone_config_paths():
     from qbt_orchestrator.observability import redact
 
