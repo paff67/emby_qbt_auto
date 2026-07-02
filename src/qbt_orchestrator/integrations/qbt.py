@@ -96,6 +96,15 @@ class QbtDockerClient:
         rows = json.loads(self._curl("/api/v2/torrents/info", {"hashes": hash}))
         return rows[0] if rows else {"hash": hash}
 
+    def torrent_files(self, hash: str) -> list[dict[str, Any]]:
+        rows = json.loads(self._curl("/api/v2/torrents/files", {"hash": hash}))
+        out = []
+        for idx, row in enumerate(rows if isinstance(rows, list) else []):
+            item = dict(row)
+            item.setdefault("index", idx)
+            out.append(item)
+        return out
+
     def get_preferences(self) -> dict[str, Any]:
         return json.loads(self._curl("/api/v2/app/preferences"))
 

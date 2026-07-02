@@ -26,11 +26,17 @@ class RecordingRunner:
 def test_qbt_docker_client_uses_container_local_api_and_parses_json():
     from qbt_orchestrator.integrations.qbt import QbtDockerClient
 
-    runner = RecordingRunner(outputs=[json.dumps({"rid": 2, "full_update": False, "torrents": {}}), json.dumps([{"hash": "h1", "seq_dl": False}]), "Ok."])
+    runner = RecordingRunner(outputs=[
+        json.dumps({"rid": 2, "full_update": False, "torrents": {}}),
+        json.dumps([{"hash": "h1", "seq_dl": False}]),
+        json.dumps([{"name": "a.mp4", "size": 10}, {"index": 9, "name": "b.nfo", "size": 1}]),
+        "Ok.",
+    ])
     client = QbtDockerClient(container="qbittorrent", api_base="http://127.0.0.1:8080", runner=runner)
 
     assert client.get_maindata(1)["rid"] == 2
     assert client.torrent_info("h1")["seq_dl"] is False
+    assert client.torrent_files("h1") == [{"name": "a.mp4", "size": 10, "index": 0}, {"index": 9, "name": "b.nfo", "size": 1}]
     assert client.post("/api/v2/torrents/stop", {"hashes": "h1"}) == "Ok."
 
     first = runner.calls[0][0]
@@ -38,7 +44,7 @@ def test_qbt_docker_client_uses_container_local_api_and_parses_json():
     assert "--connect-timeout" in first
     assert "--max-time" in first
     assert "http://127.0.0.1:8080/api/v2/sync/maindata?rid=1" in first
-    assert runner.calls[2][1] == "hashes=h1"
+    assert runner.calls[3][1] == "hashes=h1"
 
 
 def test_rclone_client_copyto_and_lsjson_size_use_root_config_without_logging_secret():

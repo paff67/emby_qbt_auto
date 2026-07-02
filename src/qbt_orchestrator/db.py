@@ -29,6 +29,11 @@ def migration_sql() -> list[str]:
         "create table if not exists bot_notifications(id integer primary key autoincrement, dedupe_key text unique, chat_id text not null, level text default 'info', topic text, message text not null, payload_json text, state text default 'queued', attempts integer default 0, next_run_at integer, last_error text, created_at integer, updated_at integer, sent_at integer)",
         "create table if not exists orphan_candidates(path text primary key, first_seen_at integer, last_seen_at integer, confirmations integer default 0, state text default 'seen', quarantined_at integer, trash_path text)",
         "create table if not exists carousel_state(hash text primary key, state text not null, probe_started_at integer, last_probe_at integer, backoff_until integer, backoff_level integer default 0, updated_at integer)",
+        "create table if not exists dynamic_junk_rules(id integer primary key autoincrement, pattern text not null, pattern_type text not null, confidence text default 'hard', source text, hits integer default 0, created_at integer, updated_at integer, enabled integer default 1)",
+        "create index if not exists idx_dynamic_junk_rules_enabled on dynamic_junk_rules(enabled, confidence)",
+        "create table if not exists junk_janitor_events(id integer primary key autoincrement, ts integer not null, hash text, file_index integer, path text not null, size integer, action text, reason text, rule_id integer, qbt_priority integer, mtime integer, data_json text)",
+        "create index if not exists idx_junk_janitor_events_ts on junk_janitor_events(ts)",
+        "create index if not exists idx_junk_janitor_events_hash on junk_janitor_events(hash)",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
     ]
 

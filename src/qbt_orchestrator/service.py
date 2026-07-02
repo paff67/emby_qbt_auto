@@ -13,6 +13,7 @@ from .daemon import SafetyMonitor
 from .db import migrate
 from .file_batch import FileBatchService
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
+from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .observability import redact
 from .planner import DownloadPlanner
@@ -148,6 +149,8 @@ class DaemonRuntime:
         notification_dry_run: bool = True,
         maintenance_service=None,
         orphan_janitor=None,
+        junk_janitor=None,
+        junk_file_refresh_limit: int = 3,
         carousel_service=None,
         carousel_enabled: bool = True,
         carousel_dry_run: bool = True,
@@ -177,6 +180,8 @@ class DaemonRuntime:
         self.notification_dry_run = notification_dry_run or dry_run
         self.maintenance_service = maintenance_service or SQLiteMaintenanceService(self.state_db)
         self.orphan_janitor = orphan_janitor
+        self.junk_janitor = junk_janitor
+        self.junk_file_refresh_limit = int(junk_file_refresh_limit)
         self.carousel_dry_run = carousel_dry_run or dry_run
         if carousel_service is not None:
             self.carousel_service = carousel_service
@@ -243,13 +248,37 @@ class DaemonRuntime:
             backpressure_policy=self.upload_backpressure_policy,
         )
         result = service.sync_completed(snapshots)
-        return {
+        payload = {
             "scanned": result.scanned,
             "eligible": result.eligible,
             "enqueued": result.enqueued,
             "skipped_existing": result.skipped_existing,
             "file_batch_dry_run": bool(result.dry_run),
         }
+        if self.junk_janitor is not None:
+            payload["junk_janitor"] = self.junk_janitor.reconcile(
+                snapshots,
+                self._junk_file_lists(snapshots),
+                sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+            )
+        return payload
+
+    def _junk_file_lists(self, snapshots: Mapping[str, Mapping[str, object]]) -> dict[str, list[dict]]:
+        if not hasattr(self.qbt, "torrent_files"):
+            return {}
+        out: dict[str, list[dict]] = {}
+        for h, torrent in snapshots.items():
+            if len(out) >= self.junk_file_refresh_limit:
+                break
+            tags = {p.strip() for p in str(torrent.get("tags") or "").split(",") if p.strip()}
+            managed = (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
+            if not managed:
+                continue
+            try:
+                out[h] = list(self.qbt.torrent_files(h))
+            except Exception as exc:
+                self.obs.event("error", "junk_janitor", "file_list_failed", str(redact(str(exc))), {"hash": h, "dry_run": self.dry_run}, hash=h)
+        return out
 
     def carousel_tick(self) -> dict:
         if self.carousel_service is None:

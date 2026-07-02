@@ -11,6 +11,7 @@ from .integrations.rclone import RcloneClient
 from .integrations.emby import EmbyClient
 from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
 from .io_governor import IoGovernor, UploadBackpressurePolicy
+from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
 from .orphan_janitor import OrphanJanitorService
@@ -178,6 +179,24 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
             container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
         )
+    junk_janitor = None
+    junk_enabled = _truthy(os.environ.get("QBT_ORCH_JUNK_JANITOR"))
+    if junk_enabled is None:
+        junk_enabled = True
+    if junk_enabled:
+        junk_dry_env = _truthy(os.environ.get("QBT_ORCH_JUNK_JANITOR_DRY_RUN"))
+        junk_janitor = JunkJanitorService(
+            state_db,
+            executor,
+            managed_root=os.environ.get("QBT_ORCH_JUNK_ROOT", "/data/downloads/active"),
+            trash_dir=os.environ.get("QBT_ORCH_JUNK_TRASH_DIR", "/data/downloads/.orchestrator-trash"),
+            dry_run=True if dry_run else (junk_dry_env if junk_dry_env is not None else True),
+            stable_mtime_sec=int(os.environ.get("QBT_ORCH_JUNK_STABLE_MTIME_SEC", "60")),
+            max_auto_quarantine_bytes=int(os.environ.get("QBT_ORCH_JUNK_MAX_AUTO_QUARANTINE_BYTES", str(10 * 1024 * 1024))),
+            active_fast_download_bps=int(os.environ.get("QBT_ORCH_JUNK_ACTIVE_FAST_BPS", str(2 * 1024 * 1024))),
+            host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
+            container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
+        )
     carousel_enabled = _truthy(os.environ.get("QBT_ORCH_CAROUSEL"))
     if carousel_enabled is None:
         carousel_enabled = True
@@ -217,6 +236,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         notification_dry_run=notification_dry_run,
         maintenance_service=maintenance_service,
         orphan_janitor=orphan_janitor,
+        junk_janitor=junk_janitor,
+        junk_file_refresh_limit=int(os.environ.get("QBT_ORCH_JUNK_FILE_REFRESH_LIMIT", "3")),
         carousel_service=carousel_service,
         carousel_enabled=carousel_enabled,
         carousel_dry_run=carousel_dry_run,
