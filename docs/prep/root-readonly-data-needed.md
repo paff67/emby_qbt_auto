@@ -1,3 +1,7 @@
+# Status: completed on 2026-07-02 via root SSH
+
+See docs/prep/root-verification-20260702.md for the redacted results. The commands below remain for reproducibility.
+
 # Root-only read-only data still needed
 
 Codex verified that `sudo -n true` fails for `paffops`, so this data was intentionally not collected.
@@ -40,3 +44,4 @@ sudo rclone about gcrypt: --json
 ```
 
 Do not paste raw tokens, rclone config, cookies, API keys, or full magnet links into chat.
+
