@@ -146,6 +146,7 @@ class DaemonRuntime:
         telegram_notification_sender=None,
         notification_dry_run: bool = True,
         maintenance_service=None,
+        orphan_janitor=None,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -171,6 +172,7 @@ class DaemonRuntime:
         self.telegram_notification_sender = telegram_notification_sender
         self.notification_dry_run = notification_dry_run or dry_run
         self.maintenance_service = maintenance_service or SQLiteMaintenanceService(self.state_db)
+        self.orphan_janitor = orphan_janitor
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -194,7 +196,14 @@ class DaemonRuntime:
         ]
 
     def maintenance_tick(self) -> dict:
-        return self.maintenance_service.run_once()
+        result = self.maintenance_service.run_once()
+        if self.orphan_janitor is not None:
+            snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+            result["orphan_janitor"] = self.orphan_janitor.reconcile(
+                snapshots,
+                sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+            )
+        return result
 
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}

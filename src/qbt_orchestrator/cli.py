@@ -12,6 +12,7 @@ from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
 from .io_governor import IoGovernor, UploadBackpressurePolicy
 from .maintenance import SQLiteMaintenanceService
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
+from .orphan_janitor import OrphanJanitorService
 from .preferences import QbtPreferencesGuard
 from .runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
@@ -155,6 +156,22 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         journal_size_limit_bytes=int(os.environ.get("QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES", str(64 * 1024 * 1024))),
         preferences_guard=preferences_guard,
     )
+    orphan_janitor = None
+    orphan_enabled = _truthy(os.environ.get("QBT_ORCH_ORPHAN_JANITOR"))
+    if orphan_enabled is None:
+        orphan_enabled = True
+    if orphan_enabled:
+        orphan_dry_env = _truthy(os.environ.get("QBT_ORCH_ORPHAN_JANITOR_DRY_RUN"))
+        orphan_janitor = OrphanJanitorService(
+            state_db=state_db,
+            managed_root=os.environ.get("QBT_ORCH_ORPHAN_ROOT", "/data/downloads/active"),
+            trash_dir=os.environ.get("QBT_ORCH_ORPHAN_TRASH_DIR", "/data/downloads/.orchestrator-trash"),
+            dry_run=True if dry_run else (orphan_dry_env if orphan_dry_env is not None else True),
+            min_age_sec=int(os.environ.get("QBT_ORCH_ORPHAN_MIN_AGE_SEC", "86400")),
+            min_confirmations=int(os.environ.get("QBT_ORCH_ORPHAN_CONFIRMATIONS", "2")),
+            host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
+            container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
+        )
     runtime = DaemonRuntime(
         state_db=state_db,
         qbt=qbt,
@@ -179,6 +196,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         telegram_notification_sender=telegram_notification_sender,
         notification_dry_run=notification_dry_run,
         maintenance_service=maintenance_service,
+        orphan_janitor=orphan_janitor,
     )
     return runtime, dry_run
 

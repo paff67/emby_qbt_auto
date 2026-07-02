@@ -99,6 +99,8 @@ class TorrentSnapshot:
     amount_left: int = 0
     size: int = 0
     progress: float = 0.0
+    content_path: str = ""
+    save_path: str = ""
 
     @classmethod
     def from_qbt(cls, payload: Dict[str, Any]) -> "TorrentSnapshot":
@@ -111,6 +113,8 @@ class TorrentSnapshot:
             amount_left=int(payload.get("amount_left") or 0),
             size=int(payload.get("size") or payload.get("total_size") or 0),
             progress=float(payload.get("progress") or 0),
+            content_path=str(payload.get("content_path") or ""),
+            save_path=str(payload.get("save_path") or ""),
         )
 
 @dataclass(frozen=True)
