@@ -81,6 +81,91 @@ def test_daemon_runtime_emergency_tick_pauses_managed_downloads():
         assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h1"})]
 
 
+class FakeTelegramService:
+    def __init__(self, fail_once=False):
+        self.calls = 0
+        self.fail_once = fail_once
+
+    def poll_once(self):
+        self.calls += 1
+        if self.fail_once and self.calls == 1:
+            raise RuntimeError("telegram boom")
+        return 1
+
+
+def test_telegram_supervisor_polls_and_survives_crash():
+    from qbt_orchestrator.service import TelegramSupervisor
+
+    service = FakeTelegramService(fail_once=True)
+    supervisor = TelegramSupervisor(service, interval=0, max_backoff=0)
+
+    assert supervisor.poll_once_supervised() == 0
+    assert supervisor.poll_once_supervised() == 1
+    assert service.calls == 2
+    assert supervisor.consecutive_failures == 0
+
+
+def test_daemon_runtime_starts_optional_telegram_supervisor():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, TelegramSupervisor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        telegram_service = FakeTelegramService()
+        supervisor = TelegramSupervisor(telegram_service, interval=0, max_backoff=0)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0,
+            telegram_supervisor=supervisor,
+        )
+
+        daemon.run(max_safety_ticks=2)
+
+        assert telegram_service.calls >= 1
+
+
+def test_build_telegram_supervisor_from_env_requires_token_and_parses_roles():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import build_telegram_supervisor_from_env
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        assert build_telegram_supervisor_from_env(db, env={}) is None
+
+        made = {}
+
+        class FakeApi:
+            def __init__(self, token):
+                made["token"] = token
+            def get_updates(self, offset, timeout):
+                return []
+            def send_message(self, chat_id, text, reply_markup=None):
+                return {"ok": True}
+
+        supervisor = build_telegram_supervisor_from_env(
+            db,
+            env={
+                "QBT_ORCH_TELEGRAM_TOKEN": "123456:abc",
+                "QBT_ORCH_TG_VIEWERS": "10",
+                "QBT_ORCH_TG_OPERATORS": "20,21",
+                "QBT_ORCH_TG_ADMINS": "30",
+            },
+            api_factory=FakeApi,
+        )
+        assert supervisor is not None
+        assert made["token"] == "123456:abc"
+        assert supervisor.service.authorizer.allowed(10, "status")
+        assert supervisor.service.authorizer.allowed(20, "pause")
+        assert supervisor.service.authorizer.allowed(30, "cleanup")
+        assert not supervisor.service.authorizer.allowed(10, "cleanup")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

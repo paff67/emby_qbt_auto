@@ -2,14 +2,92 @@ from __future__ import annotations
 
 import signal
 import sqlite3
+import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from .daemon import SafetyMonitor
 from .db import migrate
+from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .observability import redact
-from .runtime import ObservabilityStore
+from .runtime import BotCommandRepository, ObservabilityStore
+from .telegram_control import TelegramAuthorizer
+
+
+class TelegramSupervisor:
+    """Supervise Telegram polling outside the 2s safety loop."""
+
+    def __init__(self, service, interval: float = 1.0, max_backoff: float = 60.0):
+        self.service = service
+        self.interval = interval
+        self.max_backoff = max_backoff
+        self.consecutive_failures = 0
+        self._stopping = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def poll_once_supervised(self) -> int:
+        try:
+            count = int(self.service.poll_once())
+            self.consecutive_failures = 0
+            return count
+        except Exception:
+            self.consecutive_failures += 1
+            return 0
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stopping.clear()
+        self._thread = threading.Thread(target=self._run, name="telegram-supervisor", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stopping.is_set():
+            self.poll_once_supervised()
+            if self.consecutive_failures:
+                sleep_for = min(self.max_backoff, max(self.interval, 2 ** min(self.consecutive_failures, 6)))
+            else:
+                sleep_for = self.interval
+            self._stopping.wait(sleep_for)
+
+
+def _parse_id_set(raw: str | None) -> set[int]:
+    if not raw:
+        return set()
+    out: set[int] = set()
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if item:
+            out.add(int(item))
+    return out
+
+
+def build_telegram_supervisor_from_env(
+    state_db: str | Path,
+    env: Mapping[str, str] | None = None,
+    api_factory=TelegramHttpApi,
+) -> TelegramSupervisor | None:
+    env = env or {}
+    token = env.get("QBT_ORCH_TELEGRAM_TOKEN") or env.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return None
+    authorizer = TelegramAuthorizer(
+        viewers=_parse_id_set(env.get("QBT_ORCH_TG_VIEWERS")),
+        operators=_parse_id_set(env.get("QBT_ORCH_TG_OPERATORS")),
+        admins=_parse_id_set(env.get("QBT_ORCH_TG_ADMINS")),
+    )
+    command_store = BotCommandRepository(state_db)
+    api = api_factory(token)
+    poll_timeout = int(env.get("QBT_ORCH_TG_POLL_TIMEOUT", "30"))
+    interval = float(env.get("QBT_ORCH_TG_SUPERVISOR_INTERVAL", "1"))
+    max_backoff = float(env.get("QBT_ORCH_TG_MAX_BACKOFF", "60"))
+    return TelegramSupervisor(TelegramPollingService(api, authorizer, command_store, poll_timeout=poll_timeout), interval=interval, max_backoff=max_backoff)
 
 
 class DaemonRuntime:
@@ -30,6 +108,7 @@ class DaemonRuntime:
         dry_run: bool,
         safety_interval: float = 2.0,
         managed_count_provider: Callable[[], int] | None = None,
+        telegram_supervisor: TelegramSupervisor | None = None,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -38,6 +117,7 @@ class DaemonRuntime:
         self.free_bytes_provider = free_bytes_provider
         self.dry_run = dry_run
         self.safety_interval = safety_interval
+        self.telegram_supervisor = telegram_supervisor
         self.monitor = SafetyMonitor(qbt, executor, free_bytes_provider, managed_count_provider=managed_count_provider)
         self.obs = ObservabilityStore(self.state_db)
         self._stopping = False
@@ -80,18 +160,24 @@ class DaemonRuntime:
 
     def run(self, max_safety_ticks: int | None = None) -> int:
         self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
+        if self.telegram_supervisor is not None:
+            self.telegram_supervisor.start()
         ticks = 0
-        while not self._stopping:
-            started = time.monotonic()
-            try:
-                self.tick_safety()
-            except Exception as exc:  # keep safety process supervised and observable
-                self.obs.event("error", "daemon", "safety_tick_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-            ticks += 1
-            if max_safety_ticks is not None and ticks >= max_safety_ticks:
-                break
-            sleep_for = self.safety_interval - (time.monotonic() - started)
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-        self.obs.event("info", "daemon", "stopped", "qbt orchestrator daemon stopped", {"ticks": ticks})
+        try:
+            while not self._stopping:
+                started = time.monotonic()
+                try:
+                    self.tick_safety()
+                except Exception as exc:  # keep safety process supervised and observable
+                    self.obs.event("error", "daemon", "safety_tick_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                ticks += 1
+                if max_safety_ticks is not None and ticks >= max_safety_ticks:
+                    break
+                sleep_for = self.safety_interval - (time.monotonic() - started)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+        finally:
+            if self.telegram_supervisor is not None:
+                self.telegram_supervisor.stop()
+            self.obs.event("info", "daemon", "stopped", "qbt orchestrator daemon stopped", {"ticks": ticks})
         return ticks
