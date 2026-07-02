@@ -35,6 +35,8 @@ def test_qbt_docker_client_uses_container_local_api_and_parses_json():
 
     first = runner.calls[0][0]
     assert first[:5] == ["docker", "exec", "qbittorrent", "curl", "-fsS"]
+    assert "--connect-timeout" in first
+    assert "--max-time" in first
     assert "http://127.0.0.1:8080/api/v2/sync/maindata?rid=1" in first
     assert runner.calls[2][1] == "hashes=h1"
 
