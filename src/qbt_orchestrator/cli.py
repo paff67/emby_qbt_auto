@@ -69,7 +69,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
     telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
     command_processor = CommandProcessor(BotCommandRepository(state_db), executor)
-    runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=getattr(ns, "safety_interval", 2.0), telegram_supervisor=telegram_supervisor, command_processor=command_processor)
+    planner_env = _truthy(os.environ.get("QBT_ORCH_PLANNER_DRY_RUN"))
+    planner_dry_run = True if dry_run else (planner_env if planner_env is not None else True)
+    runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=getattr(ns, "safety_interval", 2.0), telegram_supervisor=telegram_supervisor, command_processor=command_processor, planner_dry_run=planner_dry_run)
     return runtime, dry_run
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -129,6 +129,7 @@ class DaemonRuntime:
         loop_tasks: list[LoopTask] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        planner_dry_run: bool = True,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -139,6 +140,7 @@ class DaemonRuntime:
         self.safety_interval = safety_interval
         self.telegram_supervisor = telegram_supervisor
         self.command_processor = command_processor
+        self.planner_dry_run = planner_dry_run or dry_run
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -163,7 +165,7 @@ class DaemonRuntime:
 
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
-        planner = DownloadPlanner(self.state_db, self.executor, dry_run=self.dry_run)
+        planner = DownloadPlanner(self.state_db, self.executor, dry_run=self.planner_dry_run)
         result = planner.plan_and_apply(
             snapshots,
             free_bytes=int(self.free_bytes_provider()),
@@ -174,6 +176,7 @@ class DaemonRuntime:
             "paused": result.paused_hashes,
             "conservative": result.conservative,
             "budget_bytes": result.budget_bytes,
+            "planner_dry_run": self.planner_dry_run,
         }
 
     def tick_safety(self) -> None:

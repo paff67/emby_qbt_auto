@@ -292,6 +292,75 @@ def test_daemon_default_planner_loop_uses_sync_cache_and_records_allocations():
         assert "not_configured" not in loop
 
 
+def test_daemon_live_safety_keeps_planner_dry_run_until_explicitly_enabled():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class PlannerQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {"h1": {"name": "small", "category": "auto", "state": "stoppedDL", "amount_left": 1, "size": 2, "progress": 0.1}},
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=PlannerQbt(),
+            executor=executor,
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert executor.posts == []
+        con = sqlite3.connect(db)
+        action = con.execute("select path,status,dry_run from action_log").fetchone()
+        con.close()
+        assert action == ("/api/v2/torrents/start", "dry_run", 1)
+
+
+def test_daemon_planner_can_be_explicitly_enabled_for_live_apply():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class PlannerQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {"h1": {"name": "small", "category": "auto", "state": "stoppedDL", "amount_left": 1, "size": 2, "progress": 0.1}},
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=PlannerQbt(),
+            executor=executor,
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            planner_dry_run=False,
+            safety_interval=0,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "h1"})]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
