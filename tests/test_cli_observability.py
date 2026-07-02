@@ -212,6 +212,72 @@ def test_cli_once_wires_file_batch_dry_run_by_default():
         assert action == ("enqueue_upload", "dry_run", 1)
 
 
+def test_cli_once_wires_media_pipeline_and_emby_refresh_dry_run_by_default():
+    from qbt_orchestrator import cli
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    class FakeQbt:
+        def get_maindata(self, rid):
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+        def post(self, path, payload):
+            raise AssertionError("dry-run must not post")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        TorrentJobRepository(db).enqueue(
+            "h1",
+            None,
+            "media_pipeline",
+            {"upload_manifest_id": "m1", "files": [{"remote_path": "gcrypt:/ABC-123/ABC-123.mp4", "size": 1024**3, "duration_sec": 120}]},
+            priority=1,
+        )
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            ("/media/gcrypt/ABC-123", "queued", 1, 1, "{}", 1, 1),
+        )
+        con.commit()
+        con.close()
+        old_qbt = cli.QbtDockerClient
+        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
+        old_media = os.environ.get("QBT_ORCH_MEDIA_PIPELINE_DRY_RUN")
+        old_emby = os.environ.get("QBT_ORCH_EMBY_REFRESH_DRY_RUN")
+        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
+        os.environ["QBT_ORCH_DISK_PATH"] = td
+        os.environ.pop("QBT_ORCH_MEDIA_PIPELINE_DRY_RUN", None)
+        os.environ.pop("QBT_ORCH_EMBY_REFRESH_DRY_RUN", None)
+        try:
+            rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
+        finally:
+            cli.QbtDockerClient = old_qbt
+            if old_disk is None:
+                os.environ.pop("QBT_ORCH_DISK_PATH", None)
+            else:
+                os.environ["QBT_ORCH_DISK_PATH"] = old_disk
+            if old_media is None:
+                os.environ.pop("QBT_ORCH_MEDIA_PIPELINE_DRY_RUN", None)
+            else:
+                os.environ["QBT_ORCH_MEDIA_PIPELINE_DRY_RUN"] = old_media
+            if old_emby is None:
+                os.environ.pop("QBT_ORCH_EMBY_REFRESH_DRY_RUN", None)
+            else:
+                os.environ["QBT_ORCH_EMBY_REFRESH_DRY_RUN"] = old_emby
+
+        assert rc == 0
+        con = sqlite3.connect(db)
+        actions = con.execute("select action_type,status,dry_run from action_log where action_type in ('media_pipeline_job','emby_refresh') order by id").fetchall()
+        media_state = con.execute("select state from torrent_jobs where job_type='media_pipeline'").fetchone()[0]
+        refresh_state = con.execute("select state from emby_refresh_tasks").fetchone()[0]
+        con.close()
+        assert actions == [("media_pipeline_job", "dry_run", 1), ("emby_refresh", "dry_run", 1)]
+        assert media_state == "queued"
+        assert refresh_state == "queued"
+
+
 def test_cli_reconcile_dry_run_and_apply_reports_expired_running_jobs():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import TorrentJobRepository

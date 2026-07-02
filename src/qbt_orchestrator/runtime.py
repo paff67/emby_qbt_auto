@@ -70,6 +70,26 @@ class TorrentJobRepository:
         con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
         con.commit(); out = dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone()); con.close(); return out
 
+    def claim_next_any(self, job_types: tuple[str, ...] | list[str]) -> dict[str, Any] | None:
+        if not job_types:
+            return None
+        con = _connect(self.state_db)
+        now = int(self.now())
+        placeholders = ",".join("?" for _ in job_types)
+        row = con.execute(
+            f"select * from torrent_jobs where job_type in ({placeholders}) and state in ('queued','verify_pending','retry_wait') "
+            "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by priority,id limit 1",
+            (*tuple(job_types), now),
+        ).fetchone()
+        if not row:
+            con.close()
+            return None
+        con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
+        con.commit()
+        out = dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone())
+        con.close()
+        return out
+
     def peek_next(self, job_type: str) -> dict[str, Any] | None:
         con = _connect(self.state_db)
         row = con.execute("select * from torrent_jobs where job_type=? and state in ('queued','retry_wait','verify_pending') order by priority,id limit 1", (job_type,)).fetchone()
@@ -96,11 +116,11 @@ class TorrentJobRepository:
 
 
 class UploadJobRunner:
-    def __init__(self, repo: TorrentJobRepository, rclone, executor, backoff_schedule=(60, 180, 600, 1800, 7200, 21600)):
-        self.repo = repo; self.worker = RcloneUploadWorker(rclone, executor); self.backoff_schedule = tuple(int(x) for x in backoff_schedule)
+    def __init__(self, repo: TorrentJobRepository, rclone, executor, backoff_schedule=(60, 180, 600, 1800, 7200, 21600), job_types=("upload", "sidecar_upload")):
+        self.repo = repo; self.worker = RcloneUploadWorker(rclone, executor); self.backoff_schedule = tuple(int(x) for x in backoff_schedule); self.job_types = tuple(job_types)
 
     def run_next(self) -> int | None:
-        row = self.repo.claim_next("upload")
+        row = self.repo.claim_next_any(self.job_types)
         if not row: return None
         payload = json.loads(row["payload_json"] or "{}")
         job = UploadJob(hash=row["hash"], batch_id=row["batch_id"], local=payload["local"], remote=payload["remote"], size=int(payload["size"]), full_torrent=bool(payload.get("full_torrent")))
@@ -113,8 +133,23 @@ class UploadJobRunner:
         if result.state == "done": self.repo.update_state(row["id"], "done", exit_code=0)
         elif result.state == "verify_pending": self.repo.update_state(row["id"], "verify_pending", "remote size mismatch")
         elif result.state == "retry_wait": self.repo.schedule_retry(row["id"], "retry requested", exit_code=1, delay_sec=self._delay_for_attempt(int(row.get("attempts") or 1)))
+        elif row["job_type"] == "sidecar_upload" and result.remote_verified: self.repo.update_state(row["id"], "done", exit_code=0)
         else: self.repo.update_state(row["id"], result.state)
+        if row["job_type"] == "upload" and result.remote_verified:
+            self._enqueue_media_pipeline_if_present(row, payload)
         return int(row["id"])
+
+    def _enqueue_media_pipeline_if_present(self, row: dict[str, Any], payload: dict[str, Any]) -> None:
+        media_files = payload.get("media_files")
+        if not media_files:
+            return
+        manifest_id = str(payload.get("upload_manifest_id") or f"upload-job-{row['id']}")
+        media_payload = {
+            "upload_job_id": int(row["id"]),
+            "upload_manifest_id": manifest_id,
+            "files": media_files,
+        }
+        self.repo.enqueue(row.get("hash"), row.get("batch_id"), "media_pipeline", media_payload, priority=30)
 
     def _delay_for_attempt(self, attempt: int) -> int:
         if not self.backoff_schedule:

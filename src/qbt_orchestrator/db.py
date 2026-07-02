@@ -23,6 +23,7 @@ def migration_sql() -> list[str]:
         "create table if not exists media_pipeline_runs(id integer primary key autoincrement, upload_manifest_id text, media_group_id integer, state text, created_at integer, updated_at integer, unique(upload_manifest_id, media_group_id))",
         "create table if not exists sidecar_manifests(id integer primary key autoincrement, media_group_id integer, staging_dir text, artifacts_json text, state text, created_at integer, updated_at integer)",
         "create table if not exists emby_refresh_tasks(id integer primary key autoincrement, emby_media_dir text, state text default 'queued', earliest_run_at integer, max_run_at integer, payload_json text, created_at integer, updated_at integer)",
+        "alter table emby_refresh_tasks add column last_error text",
         "create table if not exists bot_commands(id integer primary key autoincrement, command_id text unique, chat_id text, user_id text, command text, payload_json text, state text default 'queued', created_at integer, updated_at integer)",
         "create table if not exists bot_approvals(id integer primary key autoincrement, approval_id text unique, command_id text, action text, payload_json text, state text default 'pending', expires_at integer, approved_by text, approved_at integer, created_at integer)",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
@@ -33,7 +34,12 @@ def migrate(path: str | Path, dry_run: bool = False) -> list[str]:
     if dry_run: return sql
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = _connect(path); con.execute("pragma journal_mode=WAL"); con.execute("pragma busy_timeout=5000")
-    for stmt in sql: con.execute(stmt)
+    for stmt in sql:
+        try:
+            con.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
     con.commit(); con.close(); return sql
 
 def readonly_counts(path: str | Path) -> Dict[str, int]:

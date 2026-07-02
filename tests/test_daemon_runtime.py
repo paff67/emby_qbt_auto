@@ -429,6 +429,115 @@ def test_daemon_upload_worker_live_processes_job_and_verify_pending():
         assert event == "upload_job_processed"
 
 
+class RecordingBackfill:
+    def __init__(self, result=None):
+        self.result = result or {"status": "not_found", "artifacts": []}
+        self.calls = []
+
+    def scrape_one(self, media_group_key, manifest_id):
+        self.calls.append((media_group_key, manifest_id))
+        return self.result
+
+
+def test_daemon_media_and_emby_workers_dry_run_do_not_claim_or_call_emby():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
+    from qbt_orchestrator.runtime import TorrentJobRepository
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeEmby
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1000)
+        job_id = repo.enqueue(
+            "h1",
+            None,
+            "media_pipeline",
+            {"upload_manifest_id": "m1", "files": [{"remote_path": "gcrypt:/ABC-123/ABC-123.mp4", "size": 1024**3, "duration_sec": 120}]},
+            priority=1,
+        )
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            ("/media/gcrypt/ABC-123", "queued", 900, 1200, "{}", 800, 800),
+        )
+        con.commit()
+        con.close()
+        emby = FakeEmby()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_pipeline_runner=MediaPipelineJobRunner(repo, MediaPipelineService(db, RecordingBackfill(), now=lambda: 1000)),
+            media_pipeline_dry_run=True,
+            emby_refresh_worker=EmbyRefreshWorker(db, emby=emby, now=lambda: 1000),
+            emby_refresh_dry_run=True,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert repo.get(job_id)["state"] == "queued"
+        assert emby.refreshes == []
+        con = sqlite3.connect(db)
+        task_state = con.execute("select state from emby_refresh_tasks").fetchone()[0]
+        actions = con.execute("select action_type,path,status,dry_run from action_log where action_type in ('media_pipeline_job','emby_refresh') order by id").fetchall()
+        con.close()
+        assert task_state == "queued"
+        assert actions == [
+            ("media_pipeline_job", "torrent_jobs/media_pipeline", "dry_run", 1),
+            ("emby_refresh", "/media/gcrypt/ABC-123", "dry_run", 1),
+        ]
+
+
+def test_daemon_media_pipeline_then_emby_refresh_live_path():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
+    from qbt_orchestrator.runtime import TorrentJobRepository
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeEmby
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1000)
+        job_id = repo.enqueue(
+            "h1",
+            None,
+            "media_pipeline",
+            {"upload_manifest_id": "m1", "files": [{"remote_path": "gcrypt:/ABC-123/ABC-123.mp4", "size": 1024**3, "duration_sec": 120}]},
+            priority=1,
+        )
+        emby = FakeEmby()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_pipeline_runner=MediaPipelineJobRunner(repo, MediaPipelineService(db, RecordingBackfill(), now=lambda: 1000)),
+            media_pipeline_dry_run=False,
+            emby_refresh_worker=EmbyRefreshWorker(db, emby=emby, now=lambda: 1400),
+            emby_refresh_dry_run=False,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert repo.get(job_id)["state"] == "done"
+        assert emby.refreshes == [{"Updates": [{"Path": "/media/gcrypt/ABC-123", "UpdateType": "Created"}]}]
+        con = sqlite3.connect(db)
+        refresh_state = con.execute("select state from emby_refresh_tasks").fetchone()[0]
+        events = con.execute("select component,event_type from events_v2 where component in ('media_pipeline','emby') order by id").fetchall()
+        con.close()
+        assert refresh_state == "done"
+        assert ("media_pipeline", "media_pipeline_job_processed") in events
+        assert ("emby", "emby_refresh_processed") in events
+
+
 def test_daemon_default_file_batch_loop_uses_sync_cache_and_dry_run_records_upload():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime

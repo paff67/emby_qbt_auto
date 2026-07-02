@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 from typing import Iterable
 
 from .runtime import TorrentJobRepository
+from .observability import redact
 @dataclass(frozen=True)
 class UploadedFile:
     remote_path: str; size: int; duration_sec: int | None = None
@@ -229,3 +230,96 @@ class MediaPipelineService:
             )
         con.commit()
         con.close()
+
+
+class MediaPipelineJobRunner:
+    def __init__(self, repo: TorrentJobRepository, service: MediaPipelineService, retry_delay_sec: int = 300):
+        self.repo = repo
+        self.service = service
+        self.retry_delay_sec = int(retry_delay_sec)
+
+    def run_next(self) -> int | None:
+        row = self.repo.claim_next("media_pipeline")
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+            files = [
+                UploadedFile(
+                    remote_path=str(item["remote_path"]),
+                    size=int(item.get("size") or 0),
+                    duration_sec=item.get("duration_sec"),
+                )
+                for item in payload.get("files", [])
+            ]
+            self.service.handle_upload_verified(str(payload.get("upload_manifest_id") or f"media-job-{row['id']}"), files)
+            self.repo.update_state(int(row["id"]), "done", exit_code=0)
+        except Exception as exc:
+            self.repo.schedule_retry(int(row["id"]), redact(str(exc))[:500], exit_code=1, delay_sec=self.retry_delay_sec)
+        return int(row["id"])
+
+
+class EmbyRefreshWorker:
+    def __init__(self, state_db, emby, *, now=None, media_prefix: str = "/media/gcrypt"):
+        self.state_db = state_db
+        self.emby = emby
+        self.now = now or (lambda: int(time.time()))
+        self.media_prefix = media_prefix.rstrip("/")
+
+    def run_next(self) -> int | None:
+        row = self._claim_next()
+        if not row:
+            return None
+        task_id = int(row["id"])
+        path = str(row["emby_media_dir"] or "").rstrip("/")
+        try:
+            self._validate_path(path)
+            self.emby.media_updated(path)
+            self._finish(task_id, "done", None)
+        except Exception as exc:
+            self._finish(task_id, "blocked", redact(str(exc))[:500])
+        return task_id
+
+    def _claim_next(self) -> dict | None:
+        now = int(self.now())
+        con = _connect(self.state_db)
+        row = con.execute(
+            "select * from emby_refresh_tasks where state='queued' and "
+            "((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)) "
+            "order by coalesce(max_run_at, earliest_run_at, created_at), id limit 1",
+            (now, now),
+        ).fetchone()
+        if not row:
+            con.close()
+            return None
+        con.execute("update emby_refresh_tasks set state='running', updated_at=? where id=? and state='queued'", (now, row["id"]))
+        con.commit()
+        out = dict(con.execute("select * from emby_refresh_tasks where id=?", (row["id"],)).fetchone())
+        con.close()
+        return out
+
+    def peek_next(self) -> dict | None:
+        now = int(self.now())
+        con = _connect(self.state_db)
+        row = con.execute(
+            "select * from emby_refresh_tasks where state='queued' and "
+            "((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)) "
+            "order by coalesce(max_run_at, earliest_run_at, created_at), id limit 1",
+            (now, now),
+        ).fetchone()
+        out = dict(row) if row else None
+        con.close()
+        return out
+
+    def _finish(self, task_id: int, state: str, error: str | None) -> None:
+        con = _connect(self.state_db)
+        con.execute(
+            "update emby_refresh_tasks set state=?, last_error=?, updated_at=? where id=?",
+            (state, error, int(self.now()), task_id),
+        )
+        con.commit()
+        con.close()
+
+    def _validate_path(self, path: str) -> None:
+        if path == self.media_prefix or not path.startswith(self.media_prefix + "/"):
+            raise ValueError("refresh path too broad or outside media prefix")

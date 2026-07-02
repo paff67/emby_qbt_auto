@@ -115,6 +115,67 @@ def test_persistent_media_pipeline_allows_unknown_metadata_passthrough_but_block
         assert backfill.calls == [("UNKNOWN-001", "manifest-ok")]
 
 
+def test_media_pipeline_job_runner_processes_recoverable_jobs():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineJobRunner, MediaPipelineService
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        backfill = RecordingBackfill({"status": "not_found", "artifacts": []})
+        repo = TorrentJobRepository(db, now=lambda: 3000)
+        job_id = repo.enqueue(
+            "h1",
+            None,
+            "media_pipeline",
+            {
+                "upload_manifest_id": "manifest-h1",
+                "files": [{"remote_path": "gcrypt:/ABC-123/ABC-123.mp4", "size": 1024**3, "duration_sec": 120}],
+            },
+            priority=1,
+        )
+        service = MediaPipelineService(db, backfill=backfill, now=lambda: 3000)
+        runner = MediaPipelineJobRunner(repo, service)
+
+        assert runner.run_next() == job_id
+        assert repo.get(job_id)["state"] == "done"
+        assert rows(db, "select media_group_key from media_groups") == [{"media_group_key": "ABC-123"}]
+        assert rows(db, "select emby_media_dir from emby_refresh_tasks") == [{"emby_media_dir": "/media/gcrypt/ABC-123"}]
+
+
+def test_emby_refresh_worker_calls_precise_media_updated_and_rejects_root_path():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker
+    from tests.fakes import FakeEmby
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            ("/media/gcrypt/ABC-123", "queued", 3900, 4500, "{}", 3000, 3000),
+        )
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            ("/media/gcrypt", "queued", 3900, 4500, "{}", 3000, 3000),
+        )
+        con.commit()
+        con.close()
+        emby = FakeEmby()
+        worker = EmbyRefreshWorker(db, emby=emby, now=lambda: 4000, media_prefix="/media/gcrypt")
+
+        assert worker.run_next() == 1
+        assert emby.refreshes == [{"Updates": [{"Path": "/media/gcrypt/ABC-123", "UpdateType": "Created"}]}]
+        assert worker.run_next() == 2
+
+        states = rows(db, "select id,state,last_error from emby_refresh_tasks order by id")
+        assert states[0]["state"] == "done"
+        assert states[1]["state"] == "blocked"
+        assert "too broad" in states[1]["last_error"]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

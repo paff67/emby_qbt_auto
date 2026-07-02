@@ -137,6 +137,10 @@ class DaemonRuntime:
         host_downloads: str = "/data/downloads",
         container_downloads: str = "/downloads",
         rclone_remote: str = "gcrypt:",
+        media_pipeline_runner=None,
+        media_pipeline_dry_run: bool = True,
+        emby_refresh_worker=None,
+        emby_refresh_dry_run: bool = True,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -154,6 +158,10 @@ class DaemonRuntime:
         self.host_downloads = host_downloads
         self.container_downloads = container_downloads
         self.rclone_remote = rclone_remote
+        self.media_pipeline_runner = media_pipeline_runner
+        self.media_pipeline_dry_run = media_pipeline_dry_run or dry_run
+        self.emby_refresh_worker = emby_refresh_worker
+        self.emby_refresh_dry_run = emby_refresh_dry_run or dry_run
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -262,6 +270,60 @@ class DaemonRuntime:
             self.obs.event("info", "upload", "upload_job_processed", f"upload job {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
         return processed
 
+    def process_media_pipeline_jobs(self, max_jobs: int = 1) -> int:
+        if self.media_pipeline_runner is None:
+            return 0
+        processed = 0
+        if self.media_pipeline_dry_run:
+            row = self.media_pipeline_runner.repo.peek_next("media_pipeline")
+            if not row:
+                return 0
+            self.obs.action(
+                hash=row.get("hash"),
+                job_id=int(row["id"]),
+                action_type="media_pipeline_job",
+                path="torrent_jobs/media_pipeline",
+                payload={"job_id": row["id"], "state": row.get("state"), "job_type": row.get("job_type")},
+                status="dry_run",
+                dry_run=True,
+            )
+            self.obs.event("info", "media_pipeline", "media_pipeline_dry_run", f"media pipeline job {row['id']} pending", {"job_id": row["id"]}, hash=row.get("hash"), job_id=int(row["id"]))
+            return 1
+        for _ in range(max_jobs):
+            job_id = self.media_pipeline_runner.run_next()
+            if job_id is None:
+                break
+            processed += 1
+            self.obs.event("info", "media_pipeline", "media_pipeline_job_processed", f"media pipeline job {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
+        return processed
+
+    def process_emby_refresh_tasks(self, max_tasks: int = 1) -> int:
+        if self.emby_refresh_worker is None:
+            return 0
+        processed = 0
+        if self.emby_refresh_dry_run:
+            row = self.emby_refresh_worker.peek_next()
+            if not row:
+                return 0
+            self.obs.action(
+                hash=None,
+                job_id=None,
+                action_type="emby_refresh",
+                path=str(row.get("emby_media_dir") or ""),
+                payload={"task_id": row["id"], "state": row.get("state")},
+                status="dry_run",
+                dry_run=True,
+            )
+            self.obs.event("info", "emby", "emby_refresh_dry_run", f"emby refresh task {row['id']} pending", {"task_id": row["id"], "path": row.get("emby_media_dir")})
+            return 1
+        for _ in range(max_tasks):
+            task_id = self.emby_refresh_worker.run_next()
+            if task_id is None:
+                break
+            processed += 1
+            self.obs.event("info", "emby", "emby_refresh_processed", f"emby refresh task {task_id} processed", {"task_id": task_id})
+        return processed
+
     def run_due_loop_tasks(self) -> int:
         ran = 0
         now_monotonic = self.monotonic()
@@ -316,6 +378,14 @@ class DaemonRuntime:
                     self.process_upload_jobs()
                 except Exception as exc:
                     self.obs.event("error", "upload", "upload_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                try:
+                    self.process_media_pipeline_jobs()
+                except Exception as exc:
+                    self.obs.event("error", "media_pipeline", "media_pipeline_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                try:
+                    self.process_emby_refresh_tasks()
+                except Exception as exc:
+                    self.obs.event("error", "emby", "emby_refresh_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                 ticks += 1
                 if max_safety_ticks is not None and ticks >= max_safety_ticks:
                     break

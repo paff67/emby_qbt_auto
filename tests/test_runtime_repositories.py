@@ -50,6 +50,54 @@ def test_upload_job_runner_claims_job_updates_done_and_verify_pending():
         assert repo.get(bad)["last_stderr_tail"] == "remote size mismatch"
 
 
+def test_upload_verified_enqueues_media_pipeline_and_sidecar_upload_uses_upload_worker():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor, FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 100)
+        upload_id = repo.enqueue(
+            "h1",
+            1,
+            "upload",
+            {
+                "local": "/tmp/ABC-123.mp4",
+                "remote": "gcrypt:/ABC-123/ABC-123.mp4",
+                "size": 100,
+                "full_torrent": True,
+                "upload_manifest_id": "manifest-h1",
+                "media_files": [{"remote_path": "gcrypt:/ABC-123/ABC-123.mp4", "size": 100, "duration_sec": 120}],
+            },
+            priority=1,
+        )
+        sidecar_id = repo.enqueue(
+            None,
+            None,
+            "sidecar_upload",
+            {"local": "/staging/ABC-123.nfo", "remote": "gcrypt:/ABC-123/ABC-123.nfo", "size": 10, "full_torrent": False},
+            priority=2,
+        )
+        runner = UploadJobRunner(
+            repo,
+            FakeRclone(copy_ok=True, remote_sizes={"gcrypt:/ABC-123/ABC-123.mp4": 100, "gcrypt:/ABC-123/ABC-123.nfo": 10}),
+            FakeExecutor(),
+        )
+
+        assert runner.run_next() == upload_id
+        assert repo.get(upload_id)["state"] == "done"
+        media_job = repo.claim_next("media_pipeline")
+        assert media_job is not None
+        media_payload = json.loads(media_job["payload_json"])
+        assert media_payload["upload_manifest_id"] == "manifest-h1"
+        assert media_payload["files"][0]["remote_path"] == "gcrypt:/ABC-123/ABC-123.mp4"
+
+        assert runner.run_next() == sidecar_id
+        assert repo.get(sidecar_id)["state"] == "done"
+
+
 def test_command_processor_executes_safe_commands_and_requires_cleanup_approval():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor

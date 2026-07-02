@@ -7,9 +7,16 @@ from .db import migrate, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient
 from .integrations.rclone import RcloneClient
+from .integrations.emby import EmbyClient
+from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
 from .runtime import BotCommandRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
+
+
+class PassthroughBackfill:
+    def scrape_one(self, media_group_key, manifest_id):
+        return {"status": "not_found", "artifacts": [], "media_group_key": media_group_key, "manifest_id": manifest_id}
 
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
 
@@ -83,6 +90,20 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     upload_runner = UploadJobRunner(TorrentJobRepository(state_db), rclone, executor)
     file_batch_env = _truthy(os.environ.get("QBT_ORCH_FILE_BATCH_DRY_RUN"))
     file_batch_dry_run = True if dry_run else (file_batch_env if file_batch_env is not None else True)
+    media_env = _truthy(os.environ.get("QBT_ORCH_MEDIA_PIPELINE_DRY_RUN"))
+    media_pipeline_dry_run = True if dry_run else (media_env if media_env is not None else True)
+    media_runner = MediaPipelineJobRunner(
+        TorrentJobRepository(state_db),
+        MediaPipelineService(state_db, PassthroughBackfill(), emby_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt"),
+    )
+    emby_env = _truthy(os.environ.get("QBT_ORCH_EMBY_REFRESH_DRY_RUN"))
+    emby_refresh_dry_run = True if dry_run else (emby_env if emby_env is not None else True)
+    emby_client = EmbyClient(
+        base_url=os.environ.get("EMBY_BASE_URL", "http://127.0.0.1:8096"),
+        api_key=os.environ.get("EMBY_API_KEY", ""),
+        media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt",
+    )
+    emby_worker = EmbyRefreshWorker(state_db, emby_client, media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt")
     runtime = DaemonRuntime(
         state_db=state_db,
         qbt=qbt,
@@ -99,6 +120,10 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
         container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
         rclone_remote=rclone_cfg.remote if rclone_cfg else "gcrypt:",
+        media_pipeline_runner=media_runner,
+        media_pipeline_dry_run=media_pipeline_dry_run,
+        emby_refresh_worker=emby_worker,
+        emby_refresh_dry_run=emby_refresh_dry_run,
     )
     return runtime, dry_run
 
