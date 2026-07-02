@@ -254,6 +254,44 @@ def test_daemon_runtime_runs_design_multirate_loops_and_records_events():
         assert ("loop_tick", 8) in events
 
 
+def test_daemon_default_planner_loop_uses_sync_cache_and_records_allocations():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class PlannerQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {"h1": {"name": "small", "category": "auto", "state": "stoppedDL", "amount_left": 1, "size": 2, "progress": 0.1}},
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=PlannerQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        con = sqlite3.connect(db)
+        alloc = con.execute("select hash,desired_state,slot_kind from scheduler_allocations").fetchone()
+        action = con.execute("select path,status,dry_run from action_log").fetchone()
+        loop = con.execute("select data_json from events_v2 where component='planner' and event_type='loop_tick' order by id desc limit 1").fetchone()[0]
+        con.close()
+        assert alloc == ("h1", "active", "stable")
+        assert action == ("/api/v2/torrents/start", "dry_run", 1)
+        assert "not_configured" not in loop
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

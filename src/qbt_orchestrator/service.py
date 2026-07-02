@@ -12,6 +12,7 @@ from .daemon import SafetyMonitor
 from .db import migrate
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .observability import redact
+from .planner import DownloadPlanner
 from .runtime import BotCommandRepository, ObservabilityStore
 from .telegram_control import TelegramAuthorizer
 
@@ -154,11 +155,26 @@ class DaemonRuntime:
 
     def _default_loop_tasks(self) -> list[LoopTask]:
         return [
-            LoopTask("planner", 15, lambda: {"status": "not_configured"}),
+            LoopTask("planner", 15, self.planner_tick),
             LoopTask("file_batch", 60, lambda: {"status": "not_configured"}),
             LoopTask("maintenance", 300, lambda: {"status": "not_configured"}),
             LoopTask("carousel", 1800, lambda: {"status": "not_configured"}),
         ]
+
+    def planner_tick(self) -> dict:
+        snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        planner = DownloadPlanner(self.state_db, self.executor, dry_run=self.dry_run)
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=int(self.free_bytes_provider()),
+            sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+        )
+        return {
+            "selected": result.selected_hashes,
+            "paused": result.paused_hashes,
+            "conservative": result.conservative,
+            "budget_bytes": result.budget_bytes,
+        }
 
     def tick_safety(self) -> None:
         result = self.monitor.tick()

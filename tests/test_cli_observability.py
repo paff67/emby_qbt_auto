@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -62,6 +63,47 @@ def test_cli_status_subcommands_are_readonly_views():
         assert json.loads(run_cli(["status", "queue", "--state-db", str(db), "--json"])[1])["by_state"]["queued"] == 1
         assert json.loads(run_cli(["status", "db", "--state-db", str(db), "--json"])[1])["counts"]["torrent_jobs"] == 1
         assert json.loads(run_cli(["status", "perf", "--state-db", str(db), "--json"])[1])["recent_events"] >= 1
+
+
+def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes():
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def get_maindata(self, rid):
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {"h1": {"name": "small", "category": "auto", "state": "stoppedDL", "amount_left": 1, "size": 2, "progress": 0.1}},
+                "server_state": {},
+            }
+        def post(self, path, payload):
+            raise AssertionError("dry-run must not post to qBT")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        old_qbt = cli.QbtDockerClient
+        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
+        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
+        os.environ["QBT_ORCH_DISK_PATH"] = td
+        try:
+            rc, out = run_cli(["once", "--dry-run", "--state-db", str(db)])
+        finally:
+            cli.QbtDockerClient = old_qbt
+            if old_disk is None:
+                os.environ.pop("QBT_ORCH_DISK_PATH", None)
+            else:
+                os.environ["QBT_ORCH_DISK_PATH"] = old_disk
+
+        assert rc == 0
+        assert "once dry-run completed" in out
+        con = sqlite3.connect(db)
+        alloc = con.execute("select hash,desired_state from scheduler_allocations").fetchone()
+        action = con.execute("select path,status,dry_run from action_log").fetchone()
+        con.close()
+        assert alloc == ("h1", "active")
+        assert action == ("/api/v2/torrents/start", "dry_run", 1)
 
 
 if __name__ == "__main__":

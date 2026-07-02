@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, os, sqlite3
+import argparse, json, os, shutil, sqlite3
 from pathlib import Path
 from typing import Sequence
 from .config import load_config
@@ -19,8 +19,10 @@ def _truthy(value: str | None) -> bool | None:
 
 def _free_bytes_for(path: str):
     def sample() -> int:
-        st = os.statvfs(path)
-        return int(st.f_bavail * st.f_frsize)
+        if hasattr(os, "statvfs"):
+            st = os.statvfs(path)
+            return int(st.f_bavail * st.f_frsize)
+        return int(shutil.disk_usage(path).free)
     return sample
 
 def _connect_readonly(db: Path) -> sqlite3.Connection:
@@ -56,6 +58,20 @@ def _status_payload(db: Path, view: str | None) -> dict:
         con.close()
     raise SystemExit(f"unknown status view: {view}")
 
+def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[DaemonRuntime, bool]:
+    cfg = load_config(ns.config) if ns.config else None
+    env_dry_run = _truthy(os.environ.get("QBT_ORCH_DRY_RUN"))
+    dry_run = bool(ns.dry_run or (force_dry_run if force_dry_run is not None else (env_dry_run if env_dry_run is not None else (cfg.dry_run if cfg else True))))
+    state_db = Path(os.environ.get("QBT_ORCH_STATE_DB") or (cfg.state_db if cfg else str(db)))
+    qbt_cfg = cfg.qbt if cfg else None
+    qbt = QbtDockerClient(container=qbt_cfg.container if qbt_cfg else "qbittorrent", api_base=qbt_cfg.api_base if qbt_cfg else "http://127.0.0.1:8080")
+    executor = Executor(qbt, dry_run=dry_run)
+    disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
+    telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
+    command_processor = CommandProcessor(BotCommandRepository(state_db), executor)
+    runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=getattr(ns, "safety_interval", 2.0), telegram_supervisor=telegram_supervisor, command_processor=command_processor)
+    return runtime, dry_run
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="qbt-orchestrator"); sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ["status", "events", "trace", "once", "daemon", "reconcile", "migrate"]:
@@ -76,22 +92,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = {"target": ns.target, **trace}
         _print_json(payload) if ns.json else print(payload)
         return 0
+    if ns.cmd == "once":
+        runtime, dry_run = _build_runtime(ns, db)
+        ticks = runtime.run(max_safety_ticks=1)
+        print(f"once {'dry-run' if dry_run else 'live'} completed after {ticks} safety tick")
+        return 0
     if ns.cmd == "daemon":
-        cfg = load_config(ns.config) if ns.config else None
-        env_dry_run = _truthy(os.environ.get("QBT_ORCH_DRY_RUN"))
-        dry_run = bool(ns.dry_run or (env_dry_run if env_dry_run is not None else (cfg.dry_run if cfg else True)))
-        state_db = Path(os.environ.get("QBT_ORCH_STATE_DB") or (cfg.state_db if cfg else str(db)))
-        qbt_cfg = cfg.qbt if cfg else None
-        qbt = QbtDockerClient(container=qbt_cfg.container if qbt_cfg else "qbittorrent", api_base=qbt_cfg.api_base if qbt_cfg else "http://127.0.0.1:8080")
-        executor = Executor(qbt, dry_run=dry_run)
-        disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
-        telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
-        command_processor = CommandProcessor(BotCommandRepository(state_db), executor)
-        runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=ns.safety_interval, telegram_supervisor=telegram_supervisor, command_processor=command_processor)
+        runtime, dry_run = _build_runtime(ns, db)
         runtime.install_signal_handlers()
         ticks = runtime.run(max_safety_ticks=ns.max_safety_ticks)
         print(f"daemon {'dry-run' if dry_run else 'live'} stopped after {ticks} safety ticks")
         return 0
-    if ns.cmd in {"once", "reconcile"}: print(f"{ns.cmd} {'dry-run' if ns.dry_run else 'live'} completed without external actions"); return 0
+    if ns.cmd in {"reconcile"}: print(f"{ns.cmd} {'dry-run' if ns.dry_run else 'live'} completed without external actions"); return 0
     return 2
 if __name__ == "__main__": raise SystemExit(main())
