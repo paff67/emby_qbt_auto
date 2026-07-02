@@ -429,6 +429,80 @@ def test_daemon_upload_worker_live_processes_job_and_verify_pending():
         assert event == "upload_job_processed"
 
 
+def test_daemon_default_file_batch_loop_uses_sync_cache_and_dry_run_records_upload():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class CompletedQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {"h1": {"name": "Done", "category": "auto", "tags": "auto", "state": "uploading", "amount_left": 0, "size": 100, "progress": 1.0, "content_path": "/downloads/active/Done"}},
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=CompletedQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            file_batch_dry_run=True,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        con = sqlite3.connect(db)
+        jobs = con.execute("select count(*) from torrent_jobs").fetchone()[0]
+        action = con.execute("select action_type,status,dry_run from action_log where action_type='enqueue_upload'").fetchone()
+        loop = con.execute("select data_json from events_v2 where component='file_batch' and event_type='loop_tick' order by id desc limit 1").fetchone()[0]
+        con.close()
+        assert jobs == 0
+        assert action == ("enqueue_upload", "dry_run", 1)
+        assert "not_configured" not in loop
+
+
+def test_daemon_file_batch_can_enqueue_when_explicitly_enabled():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class CompletedQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {"h2": {"name": "Done2", "category": "auto", "tags": "auto", "state": "uploading", "amount_left": 0, "size": 100, "progress": 1.0, "content_path": "/downloads/active/Done2"}},
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=CompletedQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            file_batch_dry_run=False,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        con = sqlite3.connect(db)
+        job = con.execute("select hash,job_type,state from torrent_jobs").fetchone()
+        con.close()
+        assert job == ("h2", "upload", "queued")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

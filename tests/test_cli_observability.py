@@ -166,6 +166,52 @@ def test_cli_once_wires_upload_worker_in_dry_run_by_default():
         assert state == "queued"
 
 
+def test_cli_once_wires_file_batch_dry_run_by_default():
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def get_maindata(self, rid):
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {"h1": {"name": "Done", "category": "auto", "tags": "auto", "state": "uploading", "amount_left": 0, "size": 100, "progress": 1.0, "content_path": "/downloads/active/Done"}},
+                "server_state": {},
+            }
+        def post(self, path, payload):
+            raise AssertionError("dry-run must not post")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        old_qbt = cli.QbtDockerClient
+        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
+        old_file_batch = os.environ.get("QBT_ORCH_FILE_BATCH_DRY_RUN")
+        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
+        os.environ["QBT_ORCH_DISK_PATH"] = td
+        os.environ.pop("QBT_ORCH_FILE_BATCH_DRY_RUN", None)
+        try:
+            rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
+        finally:
+            cli.QbtDockerClient = old_qbt
+            if old_disk is None:
+                os.environ.pop("QBT_ORCH_DISK_PATH", None)
+            else:
+                os.environ["QBT_ORCH_DISK_PATH"] = old_disk
+            if old_file_batch is None:
+                os.environ.pop("QBT_ORCH_FILE_BATCH_DRY_RUN", None)
+            else:
+                os.environ["QBT_ORCH_FILE_BATCH_DRY_RUN"] = old_file_batch
+
+        assert rc == 0
+        con = sqlite3.connect(db)
+        jobs = con.execute("select count(*) from torrent_jobs").fetchone()[0]
+        action = con.execute("select action_type,status,dry_run from action_log where action_type='enqueue_upload'").fetchone()
+        con.close()
+        assert jobs == 0
+        assert action == ("enqueue_upload", "dry_run", 1)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

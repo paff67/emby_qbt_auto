@@ -81,7 +81,25 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     upload_env = _truthy(os.environ.get("QBT_ORCH_UPLOAD_DRY_RUN"))
     upload_dry_run = True if dry_run else (upload_env if upload_env is not None else True)
     upload_runner = UploadJobRunner(TorrentJobRepository(state_db), rclone, executor)
-    runtime = DaemonRuntime(state_db=state_db, qbt=qbt, executor=executor, free_bytes_provider=_free_bytes_for(disk_path), dry_run=dry_run, safety_interval=getattr(ns, "safety_interval", 2.0), telegram_supervisor=telegram_supervisor, command_processor=command_processor, planner_dry_run=planner_dry_run, upload_runner=upload_runner, upload_dry_run=upload_dry_run)
+    file_batch_env = _truthy(os.environ.get("QBT_ORCH_FILE_BATCH_DRY_RUN"))
+    file_batch_dry_run = True if dry_run else (file_batch_env if file_batch_env is not None else True)
+    runtime = DaemonRuntime(
+        state_db=state_db,
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=_free_bytes_for(disk_path),
+        dry_run=dry_run,
+        safety_interval=getattr(ns, "safety_interval", 2.0),
+        telegram_supervisor=telegram_supervisor,
+        command_processor=command_processor,
+        planner_dry_run=planner_dry_run,
+        upload_runner=upload_runner,
+        upload_dry_run=upload_dry_run,
+        file_batch_dry_run=file_batch_dry_run,
+        host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
+        container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
+        rclone_remote=rclone_cfg.remote if rclone_cfg else "gcrypt:",
+    )
     return runtime, dry_run
 
 def main(argv: Sequence[str] | None = None) -> int:

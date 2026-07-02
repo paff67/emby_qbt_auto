@@ -10,6 +10,7 @@ from typing import Callable, Mapping
 
 from .daemon import SafetyMonitor
 from .db import migrate
+from .file_batch import FileBatchService
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .observability import redact
 from .planner import DownloadPlanner
@@ -132,6 +133,10 @@ class DaemonRuntime:
         planner_dry_run: bool = True,
         upload_runner=None,
         upload_dry_run: bool = True,
+        file_batch_dry_run: bool = True,
+        host_downloads: str = "/data/downloads",
+        container_downloads: str = "/downloads",
+        rclone_remote: str = "gcrypt:",
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -145,6 +150,10 @@ class DaemonRuntime:
         self.planner_dry_run = planner_dry_run or dry_run
         self.upload_runner = upload_runner
         self.upload_dry_run = upload_dry_run or dry_run
+        self.file_batch_dry_run = file_batch_dry_run or dry_run
+        self.host_downloads = host_downloads
+        self.container_downloads = container_downloads
+        self.rclone_remote = rclone_remote
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -162,7 +171,7 @@ class DaemonRuntime:
     def _default_loop_tasks(self) -> list[LoopTask]:
         return [
             LoopTask("planner", 15, self.planner_tick),
-            LoopTask("file_batch", 60, lambda: {"status": "not_configured"}),
+            LoopTask("file_batch", 60, self.file_batch_tick),
             LoopTask("maintenance", 300, lambda: {"status": "not_configured"}),
             LoopTask("carousel", 1800, lambda: {"status": "not_configured"}),
         ]
@@ -181,6 +190,24 @@ class DaemonRuntime:
             "conservative": result.conservative,
             "budget_bytes": result.budget_bytes,
             "planner_dry_run": self.planner_dry_run,
+        }
+
+    def file_batch_tick(self) -> dict:
+        snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        service = FileBatchService(
+            state_db=self.state_db,
+            dry_run=self.file_batch_dry_run,
+            host_downloads=self.host_downloads,
+            container_downloads=self.container_downloads,
+            remote=self.rclone_remote,
+        )
+        result = service.sync_completed(snapshots)
+        return {
+            "scanned": result.scanned,
+            "eligible": result.eligible,
+            "enqueued": result.enqueued,
+            "skipped_existing": result.skipped_existing,
+            "file_batch_dry_run": bool(result.dry_run),
         }
 
     def tick_safety(self) -> None:
