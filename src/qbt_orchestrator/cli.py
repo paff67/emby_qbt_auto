@@ -3,6 +3,7 @@ import argparse, json, os, shutil, sqlite3
 from pathlib import Path
 from typing import Sequence
 from .config import load_config
+from .carousel import CarouselService
 from .db import migrate, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient
@@ -172,6 +173,20 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
             container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
         )
+    carousel_enabled = _truthy(os.environ.get("QBT_ORCH_CAROUSEL"))
+    if carousel_enabled is None:
+        carousel_enabled = True
+    carousel_dry_env = _truthy(os.environ.get("QBT_ORCH_CAROUSEL_DRY_RUN"))
+    carousel_dry_run = True if dry_run else (carousel_dry_env if carousel_dry_env is not None else True)
+    carousel_service = None
+    if carousel_enabled:
+        carousel_service = CarouselService(
+            state_db,
+            executor,
+            dry_run=carousel_dry_run,
+            concurrency=int(os.environ.get("QBT_ORCH_CAROUSEL_CONCURRENCY", "3")),
+            probe_duration_sec=int(os.environ.get("QBT_ORCH_CAROUSEL_PROBE_DURATION_SEC", "1800")),
+        )
     runtime = DaemonRuntime(
         state_db=state_db,
         qbt=qbt,
@@ -197,6 +212,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         notification_dry_run=notification_dry_run,
         maintenance_service=maintenance_service,
         orphan_janitor=orphan_janitor,
+        carousel_service=carousel_service,
+        carousel_enabled=carousel_enabled,
+        carousel_dry_run=carousel_dry_run,
     )
     return runtime, dry_run
 

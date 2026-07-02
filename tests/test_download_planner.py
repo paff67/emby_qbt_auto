@@ -91,6 +91,37 @@ def test_planner_dry_run_records_actions_without_qbt_writes():
         assert actions == [{"action_type": "qbt_post", "path": "/api/v2/torrents/start", "status": "dry_run", "dry_run": 1}]
 
 
+def test_planner_preserves_existing_dead_allocations_for_carousel():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) values('dead1','dead','dead','dead',1,'no_swarm')"
+        )
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=2)
+        snapshots = {
+            "dead1": {"hash": "dead1", "category": "auto", "state": "stoppedDL", "amount_left": 1, "size": 2, "progress": 0.1, "num_seeds": 0, "num_peers": 0},
+            "fresh": {"hash": "fresh", "category": "auto", "state": "stoppedDL", "amount_left": 1, "size": 2, "progress": 0.1, "num_seeds": 5, "num_peers": 5},
+        }
+
+        result = planner.plan_and_apply(snapshots, free_bytes=6 * 1024**3, sync_healthy=True)
+
+        assert result.selected_hashes == ["fresh"]
+        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "fresh"})]
+        alloc = _rows(db, "select hash,desired_state,slot_kind from scheduler_allocations order by hash")
+        assert {r["hash"]: (r["desired_state"], r["slot_kind"]) for r in alloc} == {
+            "dead1": ("dead", "dead"),
+            "fresh": ("active", "stable"),
+        }
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

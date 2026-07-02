@@ -101,6 +101,8 @@ class TorrentSnapshot:
     progress: float = 0.0
     content_path: str = ""
     save_path: str = ""
+    num_seeds: int = 0
+    num_peers: int = 0
 
     @classmethod
     def from_qbt(cls, payload: Dict[str, Any]) -> "TorrentSnapshot":
@@ -115,6 +117,8 @@ class TorrentSnapshot:
             progress=float(payload.get("progress") or 0),
             content_path=str(payload.get("content_path") or ""),
             save_path=str(payload.get("save_path") or ""),
+            num_seeds=int(payload.get("num_seeds") or payload.get("num_complete") or 0),
+            num_peers=int(payload.get("num_peers") or payload.get("num_incomplete") or 0),
         )
 
 @dataclass(frozen=True)

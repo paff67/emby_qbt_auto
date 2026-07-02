@@ -63,6 +63,7 @@ class DownloadPlanner:
 
     def plan_and_apply(self, snapshots: Mapping[str, Mapping[str, Any]], free_bytes: int, sync_healthy: bool) -> PlannerResult:
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
+        dead_hashes = self._dead_allocations()
         budget = max(0, int(free_bytes) - self.disk_floor_bytes)
         if not sync_healthy:
             for torrent in managed:
@@ -70,7 +71,7 @@ class DownloadPlanner:
             return PlannerResult([], [], conservative=True, budget_bytes=budget)
 
         candidates = sorted(
-            [t for t in managed if int(t.get("amount_left") or 0) > 0],
+            [t for t in managed if int(t.get("amount_left") or 0) > 0 and str(t.get("hash")) not in dead_hashes],
             key=lambda t: (int(t.get("amount_left") or 0), -int(t.get("num_seeds") or 0), -int(t.get("num_peers") or 0), str(t.get("hash"))),
         )
         selected: list[dict[str, Any]] = []
@@ -105,6 +106,14 @@ class DownloadPlanner:
         self._qbt_post("/api/v2/torrents/start", selected_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
         return PlannerResult(selected_hashes, paused_hashes, conservative=False, budget_bytes=budget)
+
+    def _dead_allocations(self) -> set[str]:
+        con = _connect(self.state_db)
+        try:
+            rows = con.execute("select hash from scheduler_allocations where desired_state='dead'").fetchall()
+            return {str(r["hash"]) for r in rows}
+        finally:
+            con.close()
 
     def _qbt_post(self, path: str, hashes: list[str]) -> None:
         if not hashes:

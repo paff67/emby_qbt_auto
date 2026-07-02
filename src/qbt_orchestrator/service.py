@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Callable, Mapping
 
+from .carousel import CarouselService
 from .daemon import SafetyMonitor
 from .db import migrate
 from .file_batch import FileBatchService
@@ -147,6 +148,9 @@ class DaemonRuntime:
         notification_dry_run: bool = True,
         maintenance_service=None,
         orphan_janitor=None,
+        carousel_service=None,
+        carousel_enabled: bool = True,
+        carousel_dry_run: bool = True,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -173,6 +177,13 @@ class DaemonRuntime:
         self.notification_dry_run = notification_dry_run or dry_run
         self.maintenance_service = maintenance_service or SQLiteMaintenanceService(self.state_db)
         self.orphan_janitor = orphan_janitor
+        self.carousel_dry_run = carousel_dry_run or dry_run
+        if carousel_service is not None:
+            self.carousel_service = carousel_service
+        elif carousel_enabled:
+            self.carousel_service = CarouselService(self.state_db, self.executor, dry_run=self.carousel_dry_run)
+        else:
+            self.carousel_service = None
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -192,7 +203,7 @@ class DaemonRuntime:
             LoopTask("planner", 15, self.planner_tick),
             LoopTask("file_batch", 60, self.file_batch_tick),
             LoopTask("maintenance", 300, self.maintenance_tick),
-            LoopTask("carousel", 1800, lambda: {"status": "not_configured"}),
+            LoopTask("carousel", 1800, self.carousel_tick),
         ]
 
     def maintenance_tick(self) -> dict:
@@ -239,6 +250,15 @@ class DaemonRuntime:
             "skipped_existing": result.skipped_existing,
             "file_batch_dry_run": bool(result.dry_run),
         }
+
+    def carousel_tick(self) -> dict:
+        if self.carousel_service is None:
+            return {"status": "disabled"}
+        snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        return self.carousel_service.run_once(
+            snapshots,
+            sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+        )
 
     def tick_safety(self) -> None:
         result = self.monitor.tick()
