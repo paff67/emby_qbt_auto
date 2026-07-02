@@ -90,7 +90,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     dry_run = bool(ns.dry_run or (force_dry_run if force_dry_run is not None else (env_dry_run if env_dry_run is not None else (cfg.dry_run if cfg else True))))
     state_db = Path(os.environ.get("QBT_ORCH_STATE_DB") or (cfg.state_db if cfg else str(db)))
     qbt_cfg = cfg.qbt if cfg else None
-    qbt = QbtDockerClient(container=qbt_cfg.container if qbt_cfg else "qbittorrent", api_base=qbt_cfg.api_base if qbt_cfg else "http://127.0.0.1:8080")
+    qbt = QbtDockerClient(
+        container=qbt_cfg.container if qbt_cfg else "qbittorrent",
+        api_base=qbt_cfg.api_base if qbt_cfg else "http://127.0.0.1:8080",
+        timeout=int(os.environ.get("QBT_ORCH_QBT_API_TIMEOUT_SEC", "10")),
+        api_max_requests_per_sec=float(os.environ.get("QBT_ORCH_QBT_API_MAX_RPS", "4")),
+    )
     executor = Executor(qbt, dry_run=dry_run)
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
     telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)

@@ -464,6 +464,45 @@ def test_cli_reconcile_dry_run_and_apply_reports_expired_running_jobs():
         assert row["next_run_at"] == 2060
 
 
+def test_cli_wires_qbt_api_rate_limit_env_to_client():
+    from qbt_orchestrator import cli
+
+    class FakeQbtClient:
+        kwargs = None
+        def __init__(self, *args, **kwargs):
+            FakeQbtClient.kwargs = kwargs
+        def get_maindata(self, rid):
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+        def post(self, path, payload):
+            raise AssertionError("dry-run must not post")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        old_qbt = cli.QbtDockerClient
+        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
+        old_rps = os.environ.get("QBT_ORCH_QBT_API_MAX_RPS")
+        cli.QbtDockerClient = FakeQbtClient
+        os.environ["QBT_ORCH_DISK_PATH"] = td
+        os.environ["QBT_ORCH_QBT_API_MAX_RPS"] = "2"
+        try:
+            rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
+        finally:
+            cli.QbtDockerClient = old_qbt
+            if old_disk is None:
+                os.environ.pop("QBT_ORCH_DISK_PATH", None)
+            else:
+                os.environ["QBT_ORCH_DISK_PATH"] = old_disk
+            if old_rps is None:
+                os.environ.pop("QBT_ORCH_QBT_API_MAX_RPS", None)
+            else:
+                os.environ["QBT_ORCH_QBT_API_MAX_RPS"] = old_rps
+
+        assert rc == 0
+        assert FakeQbtClient.kwargs["api_max_requests_per_sec"] == 2.0
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

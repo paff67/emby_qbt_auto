@@ -227,6 +227,30 @@ def test_telegram_notification_sender_sends_queued_messages_and_retries_failures
         assert "secret-token" not in failed["last_error"]
 
 
+def test_qbt_docker_client_rate_limits_api_calls_with_token_bucket():
+    from qbt_orchestrator.integrations.qbt import QbtDockerClient
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+            self.sleeps = []
+        def monotonic(self):
+            return self.now
+        def sleep(self, seconds):
+            self.sleeps.append(round(seconds, 3))
+            self.now += seconds
+
+    runner = RecordingRunner(outputs=[json.dumps({"rid": 2, "full_update": False, "torrents": {}}), "Ok."])
+    clock = FakeClock()
+    client = QbtDockerClient(runner=runner, api_max_requests_per_sec=1, clock=clock.monotonic, sleeper=clock.sleep)
+
+    client.get_maindata(1)
+    client.post("/api/v2/torrents/stop", {"hashes": "h1"})
+
+    assert clock.sleeps == [1.0]
+    assert len(runner.calls) == 2
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
