@@ -1,0 +1,20 @@
+[Unit]
+Description=qBT Orchestrator daemon v2
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=-/etc/qbt-orchestrator/daemon.env
+WorkingDirectory=/opt/emby_qbt_auto/current
+ExecStart=/usr/bin/python3 -m qbt_orchestrator.cli daemon --config /etc/qbt-orchestrator/config.json
+Restart=on-failure
+RestartSec=10
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target
