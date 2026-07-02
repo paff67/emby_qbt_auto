@@ -9,6 +9,7 @@ from .integrations.qbt import QbtDockerClient
 from .integrations.rclone import RcloneClient
 from .integrations.emby import EmbyClient
 from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
+from .io_governor import IoGovernor, UploadBackpressurePolicy
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
 from .runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
@@ -32,6 +33,13 @@ def _free_bytes_for(path: str):
             st = os.statvfs(path)
             return int(st.f_bavail * st.f_frsize)
         return int(shutil.disk_usage(path).free)
+    return sample
+
+def _iowait_provider_from_env():
+    raw = os.environ.get("QBT_ORCH_IOWAIT_PERCENT")
+    fixed = float(raw) if raw not in (None, "") else 0.0
+    def sample() -> float:
+        return fixed
     return sample
 
 def _connect_readonly(db: Path) -> sqlite3.Connection:
@@ -86,16 +94,26 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     planner_env = _truthy(os.environ.get("QBT_ORCH_PLANNER_DRY_RUN"))
     planner_dry_run = True if dry_run else (planner_env if planner_env is not None else True)
     rclone_cfg = cfg.rclone if cfg else None
+    free_bytes_provider = _free_bytes_for(disk_path)
+    io_governor = IoGovernor(
+        iowait_provider=_iowait_provider_from_env(),
+        free_bytes_provider=free_bytes_provider,
+    )
     rclone = RcloneClient(
         config_path=rclone_cfg.config if rclone_cfg else "/root/.config/rclone/rclone.conf",
         transfers=rclone_cfg.transfers if rclone_cfg else 1,
         checkers=rclone_cfg.checkers if rclone_cfg else 2,
+        limits_provider=io_governor.rclone_limits,
     )
     upload_env = _truthy(os.environ.get("QBT_ORCH_UPLOAD_DRY_RUN"))
     upload_dry_run = True if dry_run else (upload_env if upload_env is not None else True)
     upload_runner = UploadJobRunner(TorrentJobRepository(state_db), rclone, executor)
     file_batch_env = _truthy(os.environ.get("QBT_ORCH_FILE_BATCH_DRY_RUN"))
     file_batch_dry_run = True if dry_run else (file_batch_env if file_batch_env is not None else True)
+    upload_backpressure_policy = UploadBackpressurePolicy(
+        max_backlog_bytes=int(float(os.environ.get("QBT_ORCH_UPLOAD_BACKPRESSURE_MAX_BACKLOG_GB", "20")) * 1024**3),
+        max_oldest_pending_sec=int(os.environ.get("QBT_ORCH_UPLOAD_BACKPRESSURE_MAX_OLDEST_PENDING_SEC", "3600")),
+    )
     media_env = _truthy(os.environ.get("QBT_ORCH_MEDIA_PIPELINE_DRY_RUN"))
     media_pipeline_dry_run = True if dry_run else (media_env if media_env is not None else True)
     media_runner = MediaPipelineJobRunner(
@@ -114,7 +132,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         state_db=state_db,
         qbt=qbt,
         executor=executor,
-        free_bytes_provider=_free_bytes_for(disk_path),
+        free_bytes_provider=free_bytes_provider,
         dry_run=dry_run,
         safety_interval=getattr(ns, "safety_interval", 2.0),
         telegram_supervisor=telegram_supervisor,
@@ -123,6 +141,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         upload_runner=upload_runner,
         upload_dry_run=upload_dry_run,
         file_batch_dry_run=file_batch_dry_run,
+        upload_backpressure_policy=upload_backpressure_policy,
         host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
         container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
         rclone_remote=rclone_cfg.remote if rclone_cfg else "gcrypt:",

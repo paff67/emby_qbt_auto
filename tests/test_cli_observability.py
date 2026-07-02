@@ -166,6 +166,59 @@ def test_cli_once_wires_upload_worker_in_dry_run_by_default():
         assert state == "queued"
 
 
+def test_cli_wires_io_governor_limits_provider_to_rclone_client():
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def get_maindata(self, rid):
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+        def post(self, path, payload):
+            raise AssertionError("dry-run must not post to qBT")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+
+    class FakeRcloneClient:
+        kwargs = None
+        def __init__(self, *args, **kwargs):
+            FakeRcloneClient.kwargs = kwargs
+        def copyto(self, local, remote):
+            raise AssertionError("upload dry-run must not call rclone")
+        def lsjson_size(self, remote):
+            raise AssertionError("upload dry-run must not verify remote")
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        old_qbt = cli.QbtDockerClient
+        old_rclone = getattr(cli, "RcloneClient", None)
+        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
+        old_iowait = os.environ.get("QBT_ORCH_IOWAIT_PERCENT")
+        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
+        cli.RcloneClient = FakeRcloneClient
+        os.environ["QBT_ORCH_DISK_PATH"] = td
+        os.environ["QBT_ORCH_IOWAIT_PERCENT"] = "40"
+        try:
+            rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
+        finally:
+            cli.QbtDockerClient = old_qbt
+            if old_rclone is not None:
+                cli.RcloneClient = old_rclone
+            if old_disk is None:
+                os.environ.pop("QBT_ORCH_DISK_PATH", None)
+            else:
+                os.environ["QBT_ORCH_DISK_PATH"] = old_disk
+            if old_iowait is None:
+                os.environ.pop("QBT_ORCH_IOWAIT_PERCENT", None)
+            else:
+                os.environ["QBT_ORCH_IOWAIT_PERCENT"] = old_iowait
+
+        assert rc == 0
+        provider = FakeRcloneClient.kwargs["limits_provider"]
+        limits = provider()
+        assert limits.transfers == 1
+        assert limits.checkers == 2
+        assert limits.bwlimit == "2M"
+
+
 def test_cli_once_wires_file_batch_dry_run_by_default():
     from qbt_orchestrator import cli
 

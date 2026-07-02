@@ -134,6 +134,7 @@ class DaemonRuntime:
         upload_runner=None,
         upload_dry_run: bool = True,
         file_batch_dry_run: bool = True,
+        upload_backpressure_policy=None,
         host_downloads: str = "/data/downloads",
         container_downloads: str = "/downloads",
         rclone_remote: str = "gcrypt:",
@@ -157,6 +158,7 @@ class DaemonRuntime:
         self.upload_runner = upload_runner
         self.upload_dry_run = upload_dry_run or dry_run
         self.file_batch_dry_run = file_batch_dry_run or dry_run
+        self.upload_backpressure_policy = upload_backpressure_policy
         self.host_downloads = host_downloads
         self.container_downloads = container_downloads
         self.rclone_remote = rclone_remote
@@ -212,6 +214,7 @@ class DaemonRuntime:
             host_downloads=self.host_downloads,
             container_downloads=self.container_downloads,
             remote=self.rclone_remote,
+            backpressure_policy=self.upload_backpressure_policy,
         )
         result = service.sync_completed(snapshots)
         return {

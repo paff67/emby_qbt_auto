@@ -692,6 +692,64 @@ def test_daemon_file_batch_can_enqueue_when_explicitly_enabled():
         assert job == ("h2", "upload", "queued")
 
 
+def test_daemon_file_batch_live_respects_upload_backpressure_policy():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.io_governor import UploadBackpressurePolicy
+    from qbt_orchestrator.runtime import TorrentJobRepository
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class CompletedQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "new": {
+                        "name": "New",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "uploading",
+                        "amount_left": 0,
+                        "size": 100,
+                        "progress": 1.0,
+                        "content_path": "/downloads/active/New",
+                    }
+                },
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        TorrentJobRepository(db, now=lambda: 1000).enqueue(
+            "old",
+            None,
+            "upload",
+            {"local": "/tmp/old", "remote": "gcrypt:/old", "size": 21 * 1024**3, "full_torrent": True},
+            priority=1,
+        )
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=CompletedQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            file_batch_dry_run=False,
+            upload_backpressure_policy=UploadBackpressurePolicy(max_backlog_bytes=20 * 1024**3, now=lambda: 5000),
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        con = sqlite3.connect(db)
+        jobs = con.execute("select hash from torrent_jobs order by id").fetchall()
+        event = con.execute("select component,event_type from events_v2 where component='upload_backpressure' order by id desc limit 1").fetchone()
+        con.close()
+        assert jobs == [("old",)]
+        assert event == ("upload_backpressure", "new_upload_blocked")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

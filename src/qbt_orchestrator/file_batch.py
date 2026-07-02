@@ -52,12 +52,21 @@ class FileBatchService:
     durable upload job for the event-driven UploadWorker.
     """
 
-    def __init__(self, state_db, dry_run: bool = True, host_downloads: str = "/data/downloads", container_downloads: str = "/downloads", remote: str = "gcrypt:"):
+    def __init__(
+        self,
+        state_db,
+        dry_run: bool = True,
+        host_downloads: str = "/data/downloads",
+        container_downloads: str = "/downloads",
+        remote: str = "gcrypt:",
+        backpressure_policy=None,
+    ):
         self.state_db = state_db
         self.dry_run = dry_run
         self.host_downloads = host_downloads.rstrip("/")
         self.container_downloads = container_downloads.rstrip("/")
         self.remote = remote.rstrip("/")
+        self.backpressure_policy = backpressure_policy
         self.jobs = TorrentJobRepository(state_db)
         self.obs = ObservabilityStore(state_db)
 
@@ -77,6 +86,12 @@ class FileBatchService:
             if self._existing_upload_job(torrent_hash):
                 skipped_existing += 1
                 continue
+            if self.backpressure_policy is not None:
+                decision = self.backpressure_policy.evaluate(self.state_db, candidate_bytes=int(payload.get("size") or 0))
+                if not decision.allow_new_upload_jobs:
+                    self.backpressure_policy.record(self.state_db, decision, torrent_hash=torrent_hash)
+                    continue
+                self.backpressure_policy.record(self.state_db, decision, torrent_hash=torrent_hash)
             if self.dry_run:
                 self.obs.action(torrent_hash, None, "enqueue_upload", "torrent_jobs/upload", payload, "dry_run", True)
                 self.obs.event("info", "file_batch", "upload_queue_dry_run", f"would enqueue upload for {torrent_hash[:8]}", payload, hash=torrent_hash)

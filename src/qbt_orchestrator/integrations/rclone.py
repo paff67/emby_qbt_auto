@@ -4,6 +4,8 @@ import json
 import subprocess
 from typing import Callable, Sequence
 
+from ..io_governor import RcloneLimits
+
 Runner = Callable[[Sequence[str], str | None, int | None], tuple[int, str, str]]
 
 
@@ -13,15 +15,42 @@ def default_runner(argv: Sequence[str], input_text: str | None = None, timeout: 
 
 
 class RcloneClient:
-    def __init__(self, config_path: str, transfers: int = 1, checkers: int = 2, runner: Runner = default_runner, timeout: int = 21600):
+    def __init__(
+        self,
+        config_path: str,
+        transfers: int = 1,
+        checkers: int = 2,
+        runner: Runner = default_runner,
+        timeout: int = 21600,
+        limits_provider: Callable[[], RcloneLimits | dict] | None = None,
+        bwlimit: str | None = None,
+    ):
         self.config_path = config_path
         self.transfers = transfers
         self.checkers = checkers
         self.runner = runner
         self.timeout = timeout
+        self.limits_provider = limits_provider
+        self.bwlimit = bwlimit
 
     def _base(self) -> list[str]:
-        return ["rclone", "--config", self.config_path, "--transfers", str(self.transfers), "--checkers", str(self.checkers)]
+        transfers = self.transfers
+        checkers = self.checkers
+        bwlimit = self.bwlimit
+        if self.limits_provider is not None:
+            limits = self.limits_provider()
+            if isinstance(limits, dict):
+                transfers = int(limits.get("transfers", transfers))
+                checkers = int(limits.get("checkers", checkers))
+                bwlimit = limits.get("bwlimit", bwlimit)
+            else:
+                transfers = int(limits.transfers)
+                checkers = int(limits.checkers)
+                bwlimit = limits.bwlimit if limits.bwlimit is not None else bwlimit
+        base = ["rclone", "--config", self.config_path, "--transfers", str(transfers), "--checkers", str(checkers)]
+        if bwlimit:
+            base.extend(["--bwlimit", str(bwlimit)])
+        return base
 
     def copyto(self, local: str, remote: str) -> bool:
         rc, _out, err = self.runner(self._base() + ["copyto", local, remote], None, self.timeout)
