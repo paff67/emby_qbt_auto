@@ -1,0 +1,15 @@
+[project]
+name = "emby-qbt-auto"
+version = "0.0.0"
+description = "qBittorrent orchestrator, scraper, rclone upload, and Emby automation refactor"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

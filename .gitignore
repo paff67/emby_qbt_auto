@@ -1,0 +1,38 @@
+# Secrets / live state
+*.env
+.env
+.env.*
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+*.pid
+*.lock
+*.cookie
+*.token
+*.key
+*.pem
+*.crt
+*.p12
+*.bak
+*.bak.*
+config.json
+rclone.conf
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
