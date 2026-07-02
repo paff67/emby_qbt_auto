@@ -11,5 +11,5 @@
 | Media pipeline + Emby precise refresh | Emby container path `/media/gcrypt` | `qbt_orchestrator.media` | `test_media_pipeline_groups_multi_cd_passthrough_and_emby_precise_refresh` |
 | scraper 不得直接写远端 | backfill 当前可直接上传 sidecar，v2 要收口 | `integrations.gdrive_backfill` | `test_sidecar_scraper_guard_blocks_remote_writes` |
 | Telegram auth/approval | 设计要求 viewer/operator/admin；VPS 未配置 token 时不启动外联 | `telegram_control`, `integrations.telegram`, `service.TelegramSupervisor`, `runtime.CommandProcessor` | `test_telegram_auth_approval_and_duplicate_click_idempotency`, `test_build_telegram_supervisor_from_env_requires_token_and_parses_roles`, `test_daemon_runtime_processes_queued_bot_commands_after_safety_tick` |
-| CLI dry-run/status/trace/migrate | VPS 无 pytest/sqlite3 CLI，需 python3 可执行 | `qbt_orchestrator.cli` | `test_cli_status_trace_migrate_and_events_json` |
+| CLI dry-run/status/trace/migrate | VPS 无 pytest/sqlite3 CLI，需 python3 可执行；运维需要 readonly status/trace | `qbt_orchestrator.cli`, `runtime.ObservabilityStore` | `test_cli_status_trace_migrate_and_events_json`, `test_cli_trace_reads_events_actions_and_decisions_from_sqlite`, `test_cli_status_subcommands_are_readonly_views` |
 | redaction | 不允许 token/magnet/rclone config 泄漏 | `observability.redact` | `test_redaction_masks_tokens_magnets_and_rclone_config_paths` |

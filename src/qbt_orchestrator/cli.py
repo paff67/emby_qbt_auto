@@ -7,6 +7,7 @@ from .db import migrate, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient
 from .runtime import BotCommandRepository, CommandProcessor
+from .runtime import ObservabilityStore
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
 
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -22,6 +23,39 @@ def _free_bytes_for(path: str):
         return int(st.f_bavail * st.f_frsize)
     return sample
 
+def _connect_readonly(db: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+def _status_payload(db: Path, view: str | None) -> dict:
+    if view in {None, "all"}:
+        return {"counts": readonly_counts(db), "recoverable_jobs": len(recover_jobs(db))}
+    con = _connect_readonly(db)
+    try:
+        if view == "disk":
+            row = con.execute("select * from disk_state where id=1").fetchone()
+            return dict(row) if row else {}
+        if view == "queue":
+            rows = con.execute("select state,count(*) as count from torrent_jobs group by state").fetchall()
+            by_state = {str(r["state"]): int(r["count"]) for r in rows}
+            return {"by_state": by_state, "recoverable_jobs": len(recover_jobs(db))}
+        if view == "db":
+            return {"counts": readonly_counts(db), "recoverable_jobs": len(recover_jobs(db))}
+        if view == "perf":
+            recent_events = con.execute("select count(*) from events_v2").fetchone()[0]
+            latest_metrics = [dict(r) for r in con.execute("select * from metrics_snapshots order by id desc limit 10")]
+            return {"recent_events": int(recent_events), "latest_metrics": latest_metrics}
+        if view == "io":
+            rows = [dict(r) for r in con.execute("select * from metrics_snapshots where component in ('io','rclone','upload') order by id desc limit 10")]
+            return {"metrics": rows}
+        if view == "api":
+            rows = [dict(r) for r in con.execute("select ts,level,component,event_type,message from events_v2 where component in ('qbt','telegram','emby','rclone') order by id desc limit 20")]
+            return {"events": rows}
+    finally:
+        con.close()
+    raise SystemExit(f"unknown status view: {view}")
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="qbt-orchestrator"); sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ["status", "events", "trace", "once", "daemon", "reconcile", "migrate"]:
@@ -34,10 +68,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         sql = migrate(db, dry_run=not ns.apply); print((json.dumps({"dry_run": not ns.apply, "statements": len(sql)}) if ns.json else f"migration {'dry-run' if not ns.apply else 'applied'}: {len(sql)} statements")); return 0
     if not db.exists(): migrate(db, False)
     if ns.cmd == "status":
-        payload = {"counts": readonly_counts(db), "recoverable_jobs": len(recover_jobs(db))}; _print_json(payload) if ns.json else print(payload); return 0
+        payload = _status_payload(db, ns.target); _print_json(payload) if ns.json else print(payload); return 0
     if ns.cmd == "events":
         con = sqlite3.connect(db); rows = con.execute("select ts,level,component,event_type,message from events_v2 order by id desc limit 50").fetchall(); con.close(); _print_json([tuple(r) for r in rows]) if ns.json else print(rows); return 0
-    if ns.cmd == "trace": _print_json({"target": ns.target, "events": [], "actions": [], "decisions": []}) if ns.json else print(f"trace {ns.target}: no records"); return 0
+    if ns.cmd == "trace":
+        trace = ObservabilityStore(db).trace(str(ns.target or ""))
+        payload = {"target": ns.target, **trace}
+        _print_json(payload) if ns.json else print(payload)
+        return 0
     if ns.cmd == "daemon":
         cfg = load_config(ns.config) if ns.config else None
         env_dry_run = _truthy(os.environ.get("QBT_ORCH_DRY_RUN"))
