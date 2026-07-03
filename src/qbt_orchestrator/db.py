@@ -148,6 +148,9 @@ def migration_sql() -> list[str]:
         "create table if not exists junk_janitor_events(id integer primary key autoincrement, ts integer not null, hash text, file_index integer, path text not null, size integer, action text, reason text, rule_id integer, qbt_priority integer, mtime integer, data_json text)",
         "create index if not exists idx_junk_janitor_events_ts on junk_janitor_events(ts)",
         "create index if not exists idx_junk_janitor_events_hash on junk_janitor_events(hash)",
+        "create table if not exists seeding_preemptions(id integer primary key autoincrement, ts integer not null, seeding_hash text not null, target_hash text, disk_state text, new_task_score real, preemptability_score real, score_margin real, released_bytes_estimate integer, reason text, guard_json text, decision_json text, upload_job_id integer, cleanup_done_at integer)",
+        "create index if not exists idx_seeding_preemptions_ts on seeding_preemptions(ts)",
+        "create index if not exists idx_seeding_preemptions_hash on seeding_preemptions(seeding_hash)",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
     ]
 

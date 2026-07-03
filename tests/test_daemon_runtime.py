@@ -422,6 +422,55 @@ def test_daemon_default_planner_loop_uses_sync_cache_and_records_allocations():
         assert "not_configured" not in loop
 
 
+def test_daemon_planner_loop_invokes_seeding_preemption_policy_for_waiting_hot_task():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class PlannerQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "newhot": {"name": "NEW-HOT", "category": "auto", "tags": "auto,hot", "state": "stoppedDL", "amount_left": 4 * 1024**3, "size": 5 * 1024**3, "progress": 0.5, "dlspeed": 5 * 1024**2},
+                    "seed1": {"name": "OLD-SEED", "category": "auto", "tags": "auto", "state": "uploading", "amount_left": 0, "progress": 1.0, "size": 6 * 1024**3, "seeding_time": 7200, "ratio": 1.0},
+                },
+                "server_state": {},
+            }
+
+    class FakePreemption:
+        def __init__(self):
+            self.calls = []
+
+        def evaluate_and_apply(self, snapshots, *, disk_state, trigger_reason, selected_hashes):
+            self.calls.append((set(snapshots), disk_state, trigger_reason, set(selected_hashes)))
+            return None
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        preemption = FakePreemption()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=PlannerQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: int(4.5 * 1024**3),
+            dry_run=True,
+            safety_interval=0,
+            preemption_service=preemption,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert preemption.calls
+        hashes, disk_state, trigger_reason, selected_hashes = preemption.calls[0]
+        assert {"newhot", "seed1"}.issubset(hashes)
+        assert disk_state == "watch"
+        assert trigger_reason == "planner_pressure"
+        assert "newhot" not in selected_hashes
+
+
 def test_daemon_live_safety_keeps_planner_dry_run_until_explicitly_enabled():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime

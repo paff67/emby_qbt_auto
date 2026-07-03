@@ -403,10 +403,11 @@ class BotNotificationRepository:
 class CommandProcessor:
     DANGEROUS = {"cleanup", "force_upload", "preempt", "config"}
 
-    def __init__(self, commands: BotCommandRepository, executor, notifications: BotNotificationRepository | None = None):
+    def __init__(self, commands: BotCommandRepository, executor, notifications: BotNotificationRepository | None = None, preemption_service=None):
         self.commands = commands
         self.executor = executor
         self.notifications = notifications
+        self.preemption_service = preemption_service
 
     def run_next(self) -> str | None:
         row = self.commands.claim_next()
@@ -420,7 +421,12 @@ class CommandProcessor:
         if command == "resume" and args:
             self.executor.qbt_post("/api/v2/torrents/start", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
         if command == "preempt" and args:
-            self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
+            if self.preemption_service is not None and hasattr(self.preemption_service, "force_preempt_hash"):
+                target_hash = str(args[1]) if len(args) > 1 else None
+                self.preemption_service.force_preempt_hash(str(args[0]), target_hash=target_hash, reason="telegram")
+            else:
+                self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]})
+            self.commands.set_state(command_id, "done"); return command_id
         if command in {"status", "trace", "perf"}:
             if self.notifications is not None:
                 self.notifications.enqueue(

@@ -20,6 +20,7 @@ from .path_reconcile import QbtPathReconciler
 from .preferences import QbtPreferencesGuard
 from .runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
+from .seeding_preemption import PreemptionConfig, SeedingPreemptionService
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
 
 
@@ -37,6 +38,31 @@ def _build_backfill_from_env(env=os.environ):
     timeout = int(env.get("QBT_ORCH_BACKFILL_TIMEOUT_SEC", "1020"))
     remote = env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:")
     return GDriveBackfillScraper(script_path=script, staging_root=staging, remote=remote, timeout_sec=timeout)
+
+
+def _build_preemption_from_env(state_db: Path, executor, env=os.environ, global_dry_run: bool = True):
+    enabled = _truthy(env.get("QBT_ORCH_PREEMPTION"))
+    if enabled is not True:
+        return None
+    dry_env = _truthy(env.get("QBT_ORCH_PREEMPTION_DRY_RUN"))
+    dry_run = True if global_dry_run else (dry_env if dry_env is not None else True)
+    config = PreemptionConfig(
+        min_new_task_score=float(env.get("QBT_ORCH_PREEMPTION_MIN_NEW_SCORE", "75")),
+        min_preemptability_score=float(env.get("QBT_ORCH_PREEMPTION_MIN_SEED_SCORE", "65")),
+        preemption_score_margin=float(env.get("QBT_ORCH_PREEMPTION_SCORE_MARGIN", "10")),
+        min_absolute_seed_sec=int(env.get("QBT_ORCH_PREEMPTION_MIN_SEED_SEC", "900")),
+        do_not_preempt_if_upload_bps_above=int(env.get("QBT_ORCH_PREEMPTION_MAX_UPLOAD_BPS", str(64 * 1024))),
+        max_preemptions_per_hour=int(env.get("QBT_ORCH_PREEMPTION_MAX_PER_HOUR", "3")),
+    )
+    return SeedingPreemptionService(
+        state_db,
+        executor,
+        dry_run=dry_run,
+        config=config,
+        host_downloads=env.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
+        container_downloads=env.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
+        remote=env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:"),
+    )
 
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
 
@@ -114,7 +140,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
     telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
     notification_repo = BotNotificationRepository(state_db)
-    command_processor = CommandProcessor(BotCommandRepository(state_db), executor, notifications=notification_repo)
+    preemption_service = _build_preemption_from_env(state_db, executor, os.environ, global_dry_run=dry_run)
+    command_processor = CommandProcessor(BotCommandRepository(state_db), executor, notifications=notification_repo, preemption_service=preemption_service)
     telegram_token = os.environ.get("QBT_ORCH_TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
     telegram_notification_sender = TelegramNotificationSender(notification_repo, TelegramHttpApi(telegram_token)) if telegram_token else None
     notification_env = _truthy(os.environ.get("QBT_ORCH_NOTIFICATION_DRY_RUN"))
@@ -266,6 +293,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         carousel_enabled=carousel_enabled,
         carousel_dry_run=carousel_dry_run,
         path_reconciler=path_reconciler,
+        preemption_service=preemption_service,
     )
     return runtime, dry_run
 

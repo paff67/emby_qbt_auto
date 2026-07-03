@@ -152,6 +152,38 @@ def test_approved_dangerous_command_executes_once_after_approval():
         assert commands.pending_approvals()[0]["state"] == "approved"
 
 
+def test_approved_preempt_command_uses_preemption_service_when_configured():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    class FakePreemptionService:
+        def __init__(self):
+            self.forced = []
+
+        def force_preempt_hash(self, seeding_hash, *, target_hash=None, reason="telegram"):
+            self.forced.append((seeding_hash, target_hash, reason))
+            return {"accepted": True, "seeding_hash": seeding_hash}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command("c-preempt", 100, 3, "preempt", {"args": ["seed1", "newhot"]})
+        executor = FakeExecutor()
+        preemption = FakePreemptionService()
+        processor = CommandProcessor(commands, executor, preemption_service=preemption)
+
+        assert processor.run_next() == "c-preempt"
+        assert commands.get("c-preempt")["state"] == "approval_required"
+        assert commands.approve_once("approval-c-preempt", user_id=3) is True
+        assert processor.run_next() == "c-preempt"
+
+        assert preemption.forced == [("seed1", "newhot", "telegram")]
+        assert executor.posts == []
+        assert commands.get("c-preempt")["state"] == "done"
+
+
 def test_bot_notification_repository_redacts_dedupes_and_retries():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import BotNotificationRepository

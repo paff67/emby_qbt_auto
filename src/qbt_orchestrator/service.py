@@ -17,6 +17,7 @@ from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .observability import redact
 from .planner import DownloadPlanner
+from .policies.disk import classify_disk
 from .runtime import BotCommandRepository, ObservabilityStore
 from .telegram_control import TelegramAuthorizer
 
@@ -155,6 +156,7 @@ class DaemonRuntime:
         carousel_enabled: bool = True,
         carousel_dry_run: bool = True,
         path_reconciler=None,
+        preemption_service=None,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -183,6 +185,7 @@ class DaemonRuntime:
         self.orphan_janitor = orphan_janitor
         self.junk_janitor = junk_janitor
         self.path_reconciler = path_reconciler
+        self.preemption_service = preemption_service
         self.junk_file_refresh_limit = int(junk_file_refresh_limit)
         self.carousel_dry_run = carousel_dry_run or dry_run
         if carousel_service is not None:
@@ -228,17 +231,27 @@ class DaemonRuntime:
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
         planner = DownloadPlanner(self.state_db, self.executor, dry_run=self.planner_dry_run)
+        free_bytes = int(self.free_bytes_provider())
         result = planner.plan_and_apply(
             snapshots,
-            free_bytes=int(self.free_bytes_provider()),
+            free_bytes=free_bytes,
             sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
         )
+        preemption_result = None
+        if self.preemption_service is not None and bool(self.monitor.sync.high_risk_actions_allowed):
+            preemption_result = self.preemption_service.evaluate_and_apply(
+                snapshots,
+                disk_state=classify_disk(free_bytes).state.value,
+                trigger_reason="planner_pressure",
+                selected_hashes=set(result.selected_hashes),
+            )
         return {
             "selected": result.selected_hashes,
             "paused": result.paused_hashes,
             "conservative": result.conservative,
             "budget_bytes": result.budget_bytes,
             "planner_dry_run": self.planner_dry_run,
+            "preemption": None if preemption_result is None else getattr(preemption_result, "__dict__", preemption_result),
         }
 
     def file_batch_tick(self) -> dict:
