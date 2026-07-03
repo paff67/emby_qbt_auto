@@ -50,6 +50,33 @@ def test_planner_selects_budget_fit_active_and_pauses_unplanned_managed_download
         assert ("h3", "soak", "budget_or_slot_exhausted") in [(r["hash"], r["decision"], r["reason_code"]) for r in decisions]
 
 
+def test_planner_resets_active_and_low_speed_timers_when_promoting_from_soak():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute("insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,desired_seq_dl,allocated_at,reason) values('again','soak','soak','soak',0,900,'active_slow_5min')")
+        con.execute("insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,low_speed_since,active_since,soak_since,updated_at) values('again',900,0,100,100,0.5,2,2,100,100,900,900)")
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        snapshots = {"again": {"hash": "again", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 2, "progress": 0.5, "dlspeed": 0, "completed": 100, "num_seeds": 2, "num_peers": 2}}
+
+        first = DownloadPlanner(db, executor, dry_run=False, active_slots=1, disk_floor_bytes=0, now=lambda: 1000)
+        assert first.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True).selected_hashes == ["again"]
+        health = _rows(db, "select active_since,low_speed_since from torrent_health where hash='again'")[0]
+        assert health == {"active_since": 1000, "low_speed_since": 1000}
+
+        snapshots["again"]["state"] = "downloading"
+        second = DownloadPlanner(db, executor, dry_run=False, active_slots=1, disk_floor_bytes=0, now=lambda: 1016)
+        assert second.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True).selected_hashes == ["again"]
+        alloc = _rows(db, "select desired_state,reason from scheduler_allocations where hash='again'")[0]
+        assert alloc == {"desired_state": "active", "reason": "budget_fit"}
+
+
 def test_planner_updates_health_samples_so_slow_active_demotes_on_later_tick():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner

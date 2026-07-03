@@ -88,7 +88,9 @@ class DownloadPlanner:
         active_slow = {
             str(t["hash"])
             for t in managed
-            if str(t["hash"]) not in auto_dead and self._should_demote_active(str(t["hash"]), t, health_rows.get(str(t["hash"])), now)
+            if str(t["hash"]) not in auto_dead
+            and str((previous_allocations.get(str(t["hash"])) or {}).get("desired_state") or "") == "active"
+            and self._should_demote_active(str(t["hash"]), t, health_rows.get(str(t["hash"])), now)
         }
         candidates = sorted(
             [t for t in managed if int(t.get("amount_left") or 0) > 0 and str(t.get("hash")) not in dead_hashes],
@@ -143,7 +145,7 @@ class DownloadPlanner:
                 if self._needs_seq_false(h, previous_allocations):
                     seq_false_hashes.append(h)
 
-        self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead)
+        self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead, previous_allocations=previous_allocations)
         self._force_seq_false(seq_false_hashes)
         self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
@@ -210,8 +212,10 @@ class DownloadPlanner:
         now: int,
         previous: dict[str, dict[str, Any]],
         dead_set: set[str] | None = None,
+        previous_allocations: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         dead_set = dead_set or set()
+        previous_allocations = previous_allocations or {}
         con = _connect(self.state_db)
         try:
             for torrent in torrents:
@@ -225,9 +229,14 @@ class DownloadPlanner:
                 progress = float(torrent.get("progress") or 0)
                 seeds = int(torrent.get("num_seeds") or torrent.get("num_complete") or 0)
                 peers = int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0)
-                low_speed_since = old.get("low_speed_since") if dlspeed < 100 * 1024 else None
-                if dlspeed < 100 * 1024 and low_speed_since is None:
-                    low_speed_since = now
+                prev_alloc_state = str((previous_allocations.get(h) or {}).get("desired_state") or "")
+                if dlspeed < 100 * 1024:
+                    if h in selected_set and prev_alloc_state != "active":
+                        low_speed_since = now
+                    else:
+                        low_speed_since = old.get("low_speed_since") or now
+                else:
+                    low_speed_since = None
                 old_completed = int(old.get("completed_bytes") or 0)
                 old_progress = float(old.get("progress") or 0)
                 no_progress_since = old.get("no_progress_since") if (completed <= old_completed and progress <= old_progress and old) else None
@@ -235,7 +244,9 @@ class DownloadPlanner:
                     no_progress_since = now
                 last_swarm_seen_at = now if (seeds > 0 or peers > 0) else old.get("last_swarm_seen_at")
                 if h in selected_set:
-                    active_since = old.get("active_since") or now
+                    active_since = old.get("active_since") if prev_alloc_state == "active" else now
+                    if active_since is None:
+                        active_since = now
                     soak_since = None
                     dead_since = None
                 elif h in dead_set:
