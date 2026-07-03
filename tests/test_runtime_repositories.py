@@ -374,6 +374,89 @@ def test_approved_preempt_command_uses_preemption_service_when_configured():
         assert commands.get("c-preempt")["state"] == "done"
 
 
+def test_command_processor_queue_and_approved_force_upload_create_durable_jobs():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 200)
+        queue_payload = {
+            "hash": "h-queue",
+            "batch_id": 7,
+            "priority": 5,
+            "job_payload": {"local": "/tmp/q.mp4", "remote": "gcrypt:/Q/q.mp4", "size": 10, "full_torrent": True},
+        }
+        force_payload = {
+            "args": ["h-force"],
+            "job_payload": {"local": "/tmp/f.mp4", "remote": "gcrypt:/F/f.mp4", "size": 20, "full_torrent": True},
+        }
+        commands.insert_command("queue-1", 100, 2, "queue", queue_payload)
+        commands.insert_command("force-1", 100, 3, "force_upload", force_payload)
+        executor = FakeExecutor()
+        processor = CommandProcessor(commands, executor)
+
+        assert processor.run_next() == "queue-1"
+        assert commands.get("queue-1")["state"] == "done"
+        assert processor.run_next() == "force-1"
+        assert commands.get("force-1")["state"] == "approval_required"
+        assert commands.approve_once("approval-force-1", user_id=3) is True
+        assert processor.run_next() == "force-1"
+
+        assert executor.posts == []
+        rows = _rows(db, "select hash,batch_id,job_type,state,priority,payload_json from torrent_jobs order by id")
+        assert len(rows) == 2
+        assert rows[0]["hash"] == "h-queue"
+        assert rows[0]["batch_id"] == 7
+        assert rows[0]["job_type"] == "upload"
+        assert rows[0]["priority"] == 5
+        assert json.loads(rows[0]["payload_json"])["remote"] == "gcrypt:/Q/q.mp4"
+        assert rows[1]["hash"] == "h-force"
+        assert rows[1]["job_type"] == "upload"
+        assert rows[1]["priority"] == 0
+        assert json.loads(rows[1]["payload_json"])["force_upload"] is True
+        assert commands.get("force-1")["state"] == "done"
+
+
+def test_approved_cleanup_enqueues_request_without_deleting_files_and_config_is_audited():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 300)
+        commands.insert_command("cleanup-1", 100, 3, "cleanup", {"args": ["h-clean"]})
+        commands.insert_command("config-1", 100, 3, "config", {"args": ["set", "batch.enabled", "false"]})
+        executor = FakeExecutor()
+        processor = CommandProcessor(commands, executor)
+
+        assert processor.run_next() == "cleanup-1"
+        assert commands.approve_once("approval-cleanup-1", user_id=3) is True
+        assert processor.run_next() == "cleanup-1"
+        assert processor.run_next() == "config-1"
+        assert commands.approve_once("approval-config-1", user_id=3) is True
+        assert processor.run_next() == "config-1"
+
+        assert executor.posts == []
+        jobs = _rows(db, "select hash,job_type,state,priority,payload_json from torrent_jobs")
+        assert len(jobs) == 1
+        assert jobs[0]["hash"] == "h-clean"
+        assert jobs[0]["job_type"] == "cleanup_request"
+        assert jobs[0]["state"] == "queued"
+        assert json.loads(jobs[0]["payload_json"]) == {"target": "h-clean", "args": ["h-clean"], "source": "telegram"}
+        actions = _rows(db, "select action_type,path,status,dry_run,payload_json from action_log where action_type='bot_config'")
+        assert len(actions) == 1
+        assert actions[0]["path"] == "config"
+        assert actions[0]["status"] == "queued"
+        assert json.loads(actions[0]["payload_json"])["args"] == ["set", "batch.enabled", "false"]
+        assert commands.get("cleanup-1")["state"] == "done"
+        assert commands.get("config-1")["state"] == "done"
+
+
 def test_bot_notification_repository_redacts_dedupes_and_retries():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import BotNotificationRepository

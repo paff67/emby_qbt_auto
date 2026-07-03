@@ -661,6 +661,7 @@ class CommandProcessor:
         self.executor = executor
         self.notifications = notifications
         self.preemption_service = preemption_service
+        self.jobs = TorrentJobRepository(commands.state_db, now=commands.now)
 
     def run_next(self) -> str | None:
         row = self.commands.claim_next()
@@ -673,6 +674,22 @@ class CommandProcessor:
             self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
         if command == "resume" and args:
             self.executor.qbt_post("/api/v2/torrents/start", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
+        if command == "queue":
+            self._enqueue_command_job(command, payload, args, default_job_type="upload", default_priority=50)
+            self.commands.set_state(command_id, "done")
+            return command_id
+        if command == "force_upload":
+            self._enqueue_command_job(command, payload, args, default_job_type="upload", default_priority=0, force_upload=True)
+            self.commands.set_state(command_id, "done")
+            return command_id
+        if command == "cleanup":
+            self._enqueue_command_job(command, payload, args, default_job_type="cleanup_request", default_priority=10)
+            self.commands.set_state(command_id, "done")
+            return command_id
+        if command == "config":
+            self._audit_config_command(payload, args)
+            self.commands.set_state(command_id, "done")
+            return command_id
         if command == "preempt" and args:
             if self.preemption_service is not None and hasattr(self.preemption_service, "force_preempt_hash"):
                 target_hash = str(args[1]) if len(args) > 1 else None
@@ -722,3 +739,45 @@ class CommandProcessor:
             gib = int(disk["free_bytes"] or 0) / 1024**3
             return f"status {view}: disk={disk['pressure_state']} free={gib:.2f}GiB resume_allowed={int(disk['resume_allowed'] or 0)} jobs={jobs}"
         return f"status {view}: disk=unknown jobs={jobs}"
+
+    def _enqueue_command_job(
+        self,
+        command: str,
+        payload: dict[str, Any],
+        args: list[Any],
+        *,
+        default_job_type: str,
+        default_priority: int,
+        force_upload: bool = False,
+    ) -> int:
+        target = str(payload.get("hash") or payload.get("target") or (args[0] if args else "") or "")
+        raw_batch_id = payload.get("batch_id")
+        try:
+            batch_id = int(raw_batch_id) if raw_batch_id not in (None, "") else None
+        except (TypeError, ValueError):
+            batch_id = None
+
+        job_payload = payload.get("job_payload") or payload.get("upload_payload") or payload.get("payload")
+        if isinstance(job_payload, dict) and job_payload:
+            durable_payload = dict(job_payload)
+            job_type = str(payload.get("job_type") or default_job_type)
+        else:
+            durable_payload = {"target": target, "args": [str(a) for a in args], "source": "telegram"}
+            fallback_job_type = f"{command}_request" if default_job_type == "upload" else default_job_type
+            job_type = str(payload.get("job_type") or fallback_job_type)
+        if force_upload:
+            durable_payload["force_upload"] = True
+        priority = int(payload.get("priority") if payload.get("priority") is not None else default_priority)
+        return self.jobs.enqueue(target or None, batch_id, job_type, durable_payload, priority=priority)
+
+    def _audit_config_command(self, payload: dict[str, Any], args: list[Any]) -> None:
+        now = int(self.commands.now())
+        audit_payload = dict(payload)
+        audit_payload.setdefault("args", [str(a) for a in args])
+        write_transaction(
+            self.commands.state_db,
+            lambda con: con.execute(
+                "insert into action_log(ts,action_type,path,payload_json,status,dry_run) values(?,?,?,?,?,?)",
+                (now, "bot_config", "config", json.dumps(redact(audit_payload), ensure_ascii=False), "queued", 0),
+            ),
+        )
