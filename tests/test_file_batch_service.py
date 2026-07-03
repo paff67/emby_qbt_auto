@@ -125,6 +125,164 @@ def test_file_batch_service_dry_run_records_without_inserting_job():
         assert actions == [{"action_type": "enqueue_upload", "path": "torrent_jobs/upload", "status": "dry_run", "dry_run": 1}]
 
 
+class BatchQbt:
+    def __init__(self, files, piece_size=16 * 1024 * 1024, fail_on_post=False):
+        self.files = files
+        self.piece_size = piece_size
+        self.fail_on_post = fail_on_post
+        self.calls = []
+
+    def torrent_files(self, hash):
+        self.calls.append(("torrent_files", hash))
+        return list(self.files)
+
+    def torrent_properties(self, hash):
+        self.calls.append(("torrent_properties", hash))
+        return {"piece_size": self.piece_size}
+
+    def qbt_post(self, path, payload):
+        self.calls.append((path, payload))
+        if self.fail_on_post:
+            raise RuntimeError("qbt filePrio failed")
+
+
+def test_file_batch_service_creates_pipeline_batch_with_reservation_and_file_priorities():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([
+            {"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0},
+            {"index": 1, "name": "B.mp4", "size": gib, "progress": 0, "priority": 0},
+            {"index": 2, "name": "C.mp4", "size": 5 * gib, "progress": 0, "priority": 0},
+        ])
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            host_downloads="/data/downloads",
+            container_downloads="/downloads",
+            remote="gcrypt:",
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+            now=lambda: 10_000,
+        )
+
+        result = service.sync_completed(
+            {
+                "big": {
+                    "hash": "big",
+                    "name": "Big",
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "stoppedDL",
+                    "amount_left": 7 * gib,
+                    "size": 7 * gib,
+                    "progress": 0.0,
+                }
+            },
+            free_bytes=6 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "0|1", "priority": "1"}) in qbt.calls
+        assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "2", "priority": "0"}) in qbt.calls
+        assert ("/api/v2/torrents/start", {"hashes": "big"}) in qbt.calls
+        assert not any(call[0] == "/api/v2/torrents/delete" for call in qbt.calls)
+
+        batch = _rows(db, "select hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,piece_size,selected_extents,piece_spill_overhead_bytes,priority_applied from torrent_batches")[0]
+        assert batch["hash"] == "big"
+        assert batch["batch_no"] == 1
+        assert batch["state"] == "downloading"
+        assert batch["mode"] == "pipeline"
+        assert json.loads(batch["indices_json"]) == [0, 1]
+        assert batch["total_bytes"] == 2 * gib
+        assert batch["reserved_bytes"] == 2 * gib + 32 * 1024**2 + 128 * 1024**2
+        assert batch["piece_size"] == 16 * 1024**2
+        assert batch["selected_extents"] == 1
+        assert batch["piece_spill_overhead_bytes"] == 32 * 1024**2
+        assert batch["priority_applied"] == 1
+
+        reservation = _rows(db, "select hash,batch_id,kind,bytes,state,expires_at,reason from resource_reservations where kind='batch'")[0]
+        assert reservation["hash"] == "big"
+        assert reservation["batch_id"] == 1
+        assert reservation["bytes"] == batch["reserved_bytes"]
+        assert reservation["state"] == "active"
+        assert reservation["expires_at"] == 13_600
+        assert reservation["reason"] == "batch_pipeline_reserved"
+
+
+def test_file_batch_service_blocks_pipeline_batch_when_reservation_budget_is_insufficient():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
+            ("other", "active_download", 2 * gib, "active", 100, 10_000, "existing"),
+        )
+        con.commit(); con.close()
+        qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0}])
+        service = FileBatchService(state_db=db, dry_run=False, qbt=qbt, disk_floor_bytes=2 * gib, now=lambda: 1_000)
+
+        result = service.sync_completed(
+            {"big": {"hash": "big", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0}},
+            free_bytes=4 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 0
+        assert qbt.calls == [("torrent_files", "big"), ("torrent_properties", "big")]
+        assert _rows(db, "select * from torrent_batches") == []
+        assert _rows(db, "select * from resource_reservations where kind='batch'") == []
+        decision = _rows(db, "select component,hash,decision,reason_code,data_json from decision_log where component='file_batch' order by id desc limit 1")[0]
+        assert decision["hash"] == "big"
+        assert decision["decision"] == "prefetch_blocked"
+        assert decision["reason_code"] == "batch_budget_insufficient"
+
+
+def test_file_batch_service_pipeline_dry_run_and_qbt_failure_do_not_leave_active_reservation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    snapshots = {"big": {"hash": "big", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0}}
+    files = [{"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0}]
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        dry = FileBatchService(state_db=db, dry_run=True, qbt=BatchQbt(files), disk_floor_bytes=2 * gib, now=lambda: 1_000)
+
+        result = dry.sync_completed(snapshots, free_bytes=5 * gib, sync_healthy=True)
+
+        assert result.batches_created == 0
+        assert _rows(db, "select * from torrent_batches") == []
+        assert _rows(db, "select * from resource_reservations where kind='batch'") == []
+        action = _rows(db, "select action_type,path,status,dry_run from action_log where action_type='batch_pipeline'")[0]
+        assert action == {"action_type": "batch_pipeline", "path": "torrent_batches", "status": "dry_run", "dry_run": 1}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        failing = FileBatchService(state_db=db, dry_run=False, qbt=BatchQbt(files, fail_on_post=True), disk_floor_bytes=2 * gib, now=lambda: 1_000)
+
+        result = failing.sync_completed(snapshots, free_bytes=5 * gib, sync_healthy=True)
+
+        assert result.batches_created == 0
+        batch = _rows(db, "select state,priority_applied from torrent_batches")[0]
+        assert batch == {"state": "failed", "priority_applied": 0}
+        reservation = _rows(db, "select state,released_at,reason from resource_reservations where kind='batch'")[0]
+        assert reservation == {"state": "released", "released_at": 1_000, "reason": "qbt_apply_failed"}
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

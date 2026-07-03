@@ -372,6 +372,32 @@ def test_cli_once_wires_file_batch_dry_run_by_default():
         assert action == ("enqueue_upload", "dry_run", 1)
 
 
+def test_cli_runtime_disables_batch_pipeline_by_default_and_enables_with_env(monkeypatch):
+    from qbt_orchestrator.cli import _build_runtime
+    from qbt_orchestrator.db import migrate
+
+    class Ns:
+        config = None
+        dry_run = False
+        safety_interval = 0
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+        monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+        monkeypatch.delenv("QBT_ORCH_BATCH_PIPELINE", raising=False)
+
+        runtime, _ = _build_runtime(Ns(), db)
+
+        assert runtime.batch_pipeline_enabled is False
+
+        monkeypatch.setenv("QBT_ORCH_BATCH_PIPELINE", "1")
+        runtime, _ = _build_runtime(Ns(), db)
+
+        assert runtime.batch_pipeline_enabled is True
+
+
 def test_cli_once_wires_media_pipeline_and_emby_refresh_dry_run_by_default():
     from qbt_orchestrator import cli
     from qbt_orchestrator.db import migrate

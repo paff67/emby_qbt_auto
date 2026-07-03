@@ -157,6 +157,7 @@ class DaemonRuntime:
         carousel_dry_run: bool = True,
         path_reconciler=None,
         preemption_service=None,
+        batch_pipeline_enabled: bool = False,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -186,6 +187,7 @@ class DaemonRuntime:
         self.junk_janitor = junk_janitor
         self.path_reconciler = path_reconciler
         self.preemption_service = preemption_service
+        self.batch_pipeline_enabled = bool(batch_pipeline_enabled)
         self.junk_file_refresh_limit = int(junk_file_refresh_limit)
         self.carousel_dry_run = carousel_dry_run or dry_run
         if carousel_service is not None:
@@ -263,14 +265,23 @@ class DaemonRuntime:
             container_downloads=self.container_downloads,
             remote=self.rclone_remote,
             backpressure_policy=self.upload_backpressure_policy,
+            qbt=self.qbt,
+            executor=self.executor,
+            batch_pipeline_enabled=self.batch_pipeline_enabled,
         )
-        result = service.sync_completed(snapshots)
+        result = service.sync_completed(
+            snapshots,
+            free_bytes=int(self.free_bytes_provider()),
+            sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+        )
         payload = {
             "scanned": result.scanned,
             "eligible": result.eligible,
             "enqueued": result.enqueued,
             "skipped_existing": result.skipped_existing,
             "file_batch_dry_run": bool(result.dry_run),
+            "batches_created": result.batches_created,
+            "batches_blocked": result.batches_blocked,
         }
         if self.junk_janitor is not None:
             payload["junk_janitor"] = self.junk_janitor.reconcile(

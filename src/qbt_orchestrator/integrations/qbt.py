@@ -113,6 +113,9 @@ class QbtDockerClient:
             out.append(item)
         return out
 
+    def torrent_properties(self, hash: str) -> dict[str, Any]:
+        return json.loads(self._curl("/api/v2/torrents/properties", {"hash": hash}))
+
     def get_preferences(self) -> dict[str, Any]:
         return json.loads(self._curl("/api/v2/app/preferences"))
 

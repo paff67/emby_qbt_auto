@@ -165,6 +165,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     upload_runner = UploadJobRunner(TorrentJobRepository(state_db), rclone, executor)
     file_batch_env = _truthy(os.environ.get("QBT_ORCH_FILE_BATCH_DRY_RUN"))
     file_batch_dry_run = True if dry_run else (file_batch_env if file_batch_env is not None else True)
+    batch_pipeline_env = _truthy(os.environ.get("QBT_ORCH_BATCH_PIPELINE"))
+    batch_pipeline_enabled = batch_pipeline_env if batch_pipeline_env is not None else False
     upload_backpressure_policy = UploadBackpressurePolicy(
         max_backlog_bytes=int(float(os.environ.get("QBT_ORCH_UPLOAD_BACKPRESSURE_MAX_BACKLOG_GB", "20")) * 1024**3),
         max_oldest_pending_sec=int(os.environ.get("QBT_ORCH_UPLOAD_BACKPRESSURE_MAX_OLDEST_PENDING_SEC", "3600")),
@@ -294,6 +296,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         carousel_dry_run=carousel_dry_run,
         path_reconciler=path_reconciler,
         preemption_service=preemption_service,
+        batch_pipeline_enabled=batch_pipeline_enabled,
     )
     return runtime, dry_run
 

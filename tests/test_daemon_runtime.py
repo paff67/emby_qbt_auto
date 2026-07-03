@@ -791,6 +791,73 @@ def test_daemon_file_batch_can_enqueue_when_explicitly_enabled():
         assert job == ("h2", "upload", "queued")
 
 
+def test_daemon_file_batch_loop_creates_pipeline_batch_from_qbt_file_list():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    gib = 1024**3
+
+    class BatchQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.posts = []
+
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "big": {
+                        "name": "Big",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 2 * gib,
+                        "size": 2 * gib,
+                        "progress": 0.0,
+                    }
+                },
+                "server_state": {},
+            }
+
+        def torrent_files(self, hash):
+            return [{"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0}]
+
+        def torrent_properties(self, hash):
+            return {"piece_size": 16 * 1024**2}
+
+        def qbt_post(self, path, payload):
+            self.posts.append((path, payload))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=qbt,
+            free_bytes_provider=lambda: 6 * gib,
+            dry_run=False,
+            safety_interval=0,
+            file_batch_dry_run=False,
+            batch_pipeline_enabled=True,
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "0", "priority": "1"}) in qbt.posts
+        con = sqlite3.connect(db)
+        batch = con.execute("select hash,state,indices_json from torrent_batches").fetchone()
+        reservation = con.execute("select hash,kind,state from resource_reservations where kind='batch'").fetchone()
+        loop = con.execute("select data_json from events_v2 where component='file_batch' and event_type='loop_tick' order by id desc limit 1").fetchone()[0]
+        con.close()
+        assert batch == ("big", "downloading", "[0]")
+        assert reservation == ("big", "batch", "active")
+        assert '"batches_created": 1' in loop
+
+
 def test_daemon_file_batch_live_respects_upload_backpressure_policy():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.io_governor import UploadBackpressurePolicy
