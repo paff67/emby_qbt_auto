@@ -79,10 +79,16 @@ class DownloadPlanner:
 
         health_rows = self._health_rows()
         now = int(self.now())
+        auto_dead = {
+            str(t["hash"])
+            for t in managed
+            if self._should_mark_dead(str(t["hash"]), t, health_rows.get(str(t["hash"])), previous_allocations.get(str(t["hash"])), now)
+        }
+        dead_hashes |= auto_dead
         active_slow = {
             str(t["hash"])
             for t in managed
-            if self._should_demote_active(str(t["hash"]), t, health_rows.get(str(t["hash"])), now)
+            if str(t["hash"]) not in auto_dead and self._should_demote_active(str(t["hash"]), t, health_rows.get(str(t["hash"])), now)
         }
         candidates = sorted(
             [t for t in managed if int(t.get("amount_left") or 0) > 0 and str(t.get("hash")) not in dead_hashes],
@@ -105,6 +111,16 @@ class DownloadPlanner:
         paused_hashes = [str(t["hash"]) for t in managed if str(t["hash"]) not in selected_set and _is_running_download(t)]
 
         seq_false_hashes: list[str] = []
+        for torrent in managed:
+            h = str(torrent["hash"])
+            if h in auto_dead:
+                self._allocation(h, "dead", "dead", 0, False, now, "health_no_swarm_no_progress")
+                self._decision(
+                    h,
+                    "dead",
+                    "health_no_swarm_no_progress",
+                    {"last_swarm_seen_at": (health_rows.get(h) or {}).get("last_swarm_seen_at"), "no_progress_since": (health_rows.get(h) or {}).get("no_progress_since")},
+                )
         for torrent in candidates:
             h = str(torrent["hash"])
             if h in selected_set:
@@ -127,7 +143,7 @@ class DownloadPlanner:
                 if self._needs_seq_false(h, previous_allocations):
                     seq_false_hashes.append(h)
 
-        self._update_health(candidates, selected_set, now, health_rows)
+        self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead)
         self._force_seq_false(seq_false_hashes)
         self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
@@ -163,13 +179,39 @@ class DownloadPlanner:
         dlspeed = int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or health.get("dlspeed_bps") or 0)
         return int(now) - int(active_since) >= 90 and int(now) - int(low_speed_since) >= 300 and dlspeed < 100 * 1024
 
+    def _should_mark_dead(
+        self,
+        hash: str,
+        torrent: Mapping[str, Any],
+        health: dict[str, Any] | None,
+        allocation: dict[str, Any] | None,
+        now: int,
+    ) -> bool:
+        if not health or not allocation:
+            return False
+        if str(allocation.get("desired_state") or "") not in {"soak", "dead"}:
+            return False
+        if int(torrent.get("amount_left") or 0) <= 0:
+            return False
+        if int(torrent.get("num_seeds") or torrent.get("num_complete") or 0) > 0:
+            return False
+        if int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0) > 0:
+            return False
+        last_swarm_seen_at = health.get("last_swarm_seen_at")
+        no_progress_since = health.get("no_progress_since")
+        if last_swarm_seen_at is None or no_progress_since is None:
+            return False
+        return int(now) - int(last_swarm_seen_at) >= 3600 and int(now) - int(no_progress_since) >= 3600
+
     def _update_health(
         self,
         torrents: list[Mapping[str, Any]],
         selected_set: set[str],
         now: int,
         previous: dict[str, dict[str, Any]],
+        dead_set: set[str] | None = None,
     ) -> None:
+        dead_set = dead_set or set()
         con = _connect(self.state_db)
         try:
             for torrent in torrents:
@@ -195,13 +237,19 @@ class DownloadPlanner:
                 if h in selected_set:
                     active_since = old.get("active_since") or now
                     soak_since = None
+                    dead_since = None
+                elif h in dead_set:
+                    active_since = None
+                    soak_since = None
+                    dead_since = old.get("dead_since") or now
                 else:
                     active_since = None
                     soak_since = old.get("soak_since") or now
+                    dead_since = old.get("dead_since")
                 con.execute(
-                    "insert into torrent_health(hash,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,low_speed_since,no_progress_since,active_since,soak_since,updated_at) "
-                    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                    "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,updated_at=excluded.updated_at",
+                    "insert into torrent_health(hash,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,low_speed_since,no_progress_since,active_since,soak_since,dead_since,updated_at) "
+                    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,dead_since=excluded.dead_since,updated_at=excluded.updated_at",
                     (
                         h,
                         now,
@@ -217,6 +265,7 @@ class DownloadPlanner:
                         no_progress_since,
                         active_since,
                         soak_since,
+                        dead_since,
                         now,
                     ),
                 )

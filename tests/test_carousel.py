@@ -106,6 +106,31 @@ def test_carousel_service_promotes_probe_with_swarm_and_stops_expired_dead_probe
         assert states["cold"]["backoff_until"] == 2000 + 30 * 60
 
 
+def test_carousel_can_probe_dead_allocation_created_by_planner_health_policy():
+    from qbt_orchestrator.carousel import CarouselService
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute("insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,desired_seq_dl,allocated_at,reason) values('deadish','soak','soak','soak',0,100,'budget_or_slot_exhausted')")
+        con.execute("insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,no_progress_since,soak_since,updated_at) values('deadish',1000,0,100,100,0.2,0,0,1000,1000,1000,1000)")
+        con.commit(); con.close()
+        snapshots = {"deadish": {"hash": "deadish", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 10, "size": 20, "progress": 0.2, "dlspeed": 0, "completed": 100, "num_seeds": 0, "num_peers": 0}}
+        DownloadPlanner(db, FakeExecutor(), dry_run=False, active_slots=0, disk_floor_bytes=0, now=lambda: 4601).plan_and_apply(snapshots, free_bytes=100, sync_healthy=True)
+        executor = RecordingExecutor()
+        carousel = CarouselService(db, executor, dry_run=False, concurrency=3, now=lambda: 4700)
+
+        result = carousel.run_once(snapshots, sync_healthy=True)
+
+        assert result["started"] == ["deadish"]
+        assert executor.seq == [("deadish", False)]
+        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "deadish"})]
+
+
 def test_carousel_service_suspends_when_sync_unhealthy_without_qbt_writes():
     from qbt_orchestrator.carousel import CarouselService
     from qbt_orchestrator.db import migrate

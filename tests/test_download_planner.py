@@ -129,6 +129,38 @@ def test_planner_only_starts_selected_torrents_that_are_stopped_or_paused():
         assert executor.posts == [("/api/v2/torrents/start", {"hashes": "paused"})]
 
 
+def test_planner_marks_soak_dead_after_one_hour_without_swarm_or_progress():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute("insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,desired_seq_dl,allocated_at,reason) values('deadish','soak','soak','soak',0,100,'budget_or_slot_exhausted')")
+        con.execute("insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,no_progress_since,soak_since,updated_at) values('deadish',1000,0,100,100,0.2,0,0,1000,1000,1000,1000)")
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=0, now=lambda: 4601)
+        snapshots = {
+            "deadish": {"hash": "deadish", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 10, "size": 20, "progress": 0.2, "dlspeed": 0, "completed": 100, "num_seeds": 0, "num_peers": 0},
+            "fresh": {"hash": "fresh", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 2, "progress": 0.1, "dlspeed": 0, "completed": 0, "num_seeds": 2, "num_peers": 2},
+        }
+
+        result = planner.plan_and_apply(snapshots, free_bytes=100, sync_healthy=True)
+
+        assert result.selected_hashes == ["fresh"]
+        assert ("/api/v2/torrents/stop", {"hashes": "deadish"}) in executor.posts
+        alloc = _rows(db, "select hash,desired_state,slot_kind,desired_seq_dl,reason from scheduler_allocations order by hash")
+        assert {r["hash"]: (r["desired_state"], r["slot_kind"], r["desired_seq_dl"], r["reason"]) for r in alloc} == {
+            "deadish": ("dead", "dead", 0, "health_no_swarm_no_progress"),
+            "fresh": ("active", "stable", 0, "budget_fit"),
+        }
+        decisions = _rows(db, "select hash,decision,reason_code from decision_log where hash='deadish'")
+        assert decisions[-1] == {"hash": "deadish", "decision": "dead", "reason_code": "health_no_swarm_no_progress"}
+
+
 def test_planner_forces_sequential_download_off_for_soak_torrents():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner
