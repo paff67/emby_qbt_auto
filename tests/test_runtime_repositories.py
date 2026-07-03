@@ -12,6 +12,14 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 
+def _rows(db: Path, sql: str):
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute(sql)]
+    con.close()
+    return rows
+
+
 def test_observability_store_persists_redacted_events_actions_and_trace():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import ObservabilityStore
@@ -96,6 +104,57 @@ def test_upload_verified_enqueues_media_pipeline_and_sidecar_upload_uses_upload_
 
         assert runner.run_next() == sidecar_id
         assert repo.get(sidecar_id)["state"] == "done"
+
+
+def test_upload_job_runner_marks_pipeline_batch_cleanup_deferred_and_counts_pending_cleanup():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor, FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,downloaded_bytes,reserved_bytes,upload_job_id,local_pinned_bytes,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (1, "h1", 1, "upload_queued", "pipeline", "[0]", 10, 10, 100, None, 10, 50, 50),
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
+            ("h1", 1, "cleanup_pending", 10, "active", 50, None, "batch_upload_queued"),
+        )
+        con.commit(); con.close()
+        repo = TorrentJobRepository(db, now=lambda: 100)
+        job_id = repo.enqueue(
+            "h1",
+            1,
+            "upload",
+            {
+                "local": "/tmp/Big",
+                "remote": "gcrypt:/Big",
+                "size": 10,
+                "full_torrent": False,
+                "copy_mode": "copy_files",
+                "files": [{"relative_path": "A.mp4", "local_path": "/tmp/Big/A.mp4", "remote_path": "gcrypt:/Big/A.mp4", "size": 10}],
+                "media_files": [{"remote_path": "gcrypt:/Big/A.mp4", "size": 10, "duration_sec": 120}],
+            },
+            priority=1,
+        )
+        rclone = FakeRclone(copy_ok=True, remote_listing=[{"Path": "A.mp4", "Size": 10}])
+        runner = UploadJobRunner(repo, rclone, FakeExecutor())
+
+        assert runner.run_next() == job_id
+
+        assert repo.get(job_id)["state"] == "cleanup_deferred"
+        assert rclone.copies == [("/tmp/Big/A.mp4", "gcrypt:/Big/A.mp4")]
+        assert rclone.dir_copies == []
+        batch = _rows(db, "select state,upload_job_id,local_pinned_bytes,cleanup_deferred_at from torrent_batches where id=1")[0]
+        assert batch == {"state": "cleanup_deferred", "upload_job_id": job_id, "local_pinned_bytes": 10, "cleanup_deferred_at": 100}
+        reservation = _rows(db, "select kind,bytes,state,reason from resource_reservations where batch_id=1 and kind='cleanup_pending'")[0]
+        assert reservation == {"kind": "cleanup_pending", "bytes": 10, "state": "active", "reason": "batch_cleanup_deferred"}
+        media_job = repo.claim_next("media_pipeline")
+        assert media_job is not None
+        assert media_job["batch_id"] == 1
 
 
 def test_command_processor_executes_safe_commands_and_requires_cleanup_approval():

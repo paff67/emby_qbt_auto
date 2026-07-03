@@ -320,6 +320,52 @@ def test_rclone_upload_worker_single_file_manifest_uses_copyto():
     assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
 
 
+def test_rclone_upload_worker_copy_files_copies_each_file_and_defers_cleanup_without_delete():
+    from qbt_orchestrator.upload import RcloneUploadWorker, UploadJob
+    from tests.fakes import FakeExecutor
+
+    class ManifestRclone:
+        def __init__(self, listing):
+            self.listing = listing
+            self.copytos = []
+            self.copies = []
+            self.lsjson_calls = []
+        def copy(self, local, remote):
+            self.copies.append((local, remote)); return True
+        def copyto(self, local, remote):
+            self.copytos.append((local, remote)); return True
+        def lsjson(self, remote, recursive=False):
+            self.lsjson_calls.append((remote, recursive))
+            return self.listing
+
+    files = [
+        {"relative_path": "A.mp4", "local_path": "/tmp/Big/A.mp4", "remote_path": "gcrypt:/Big/A.mp4", "size": 10},
+        {"relative_path": "extras/B.nfo", "local_path": "/tmp/Big/extras/B.nfo", "remote_path": "gcrypt:/Big/extras/B.nfo", "size": 5},
+    ]
+    executor = FakeExecutor()
+    worker = RcloneUploadWorker(
+        ManifestRclone([{"Path": "A.mp4", "Size": 10}, {"Path": "extras/B.nfo", "Size": 5}]),
+        executor,
+    )
+
+    result = worker.run_once(UploadJob(hash="h1", batch_id=1, local="/tmp/Big", remote="gcrypt:/Big", size=15, full_torrent=False, files=files, copy_mode="copy_files"))
+
+    assert result.state == "cleanup_deferred"
+    assert result.remote_verified is True
+    assert result.cleanup_allowed is False
+    assert worker.rclone.copytos == [("/tmp/Big/A.mp4", "gcrypt:/Big/A.mp4"), ("/tmp/Big/extras/B.nfo", "gcrypt:/Big/extras/B.nfo")]
+    assert worker.rclone.copies == []
+    assert worker.rclone.lsjson_calls == [("gcrypt:/Big", True)]
+    assert executor.posts == []
+
+    bad_executor = FakeExecutor()
+    bad = RcloneUploadWorker(ManifestRclone([{"Path": "A.mp4", "Size": 9}, {"Path": "extras/B.nfo", "Size": 5}]), bad_executor)
+    bad_result = bad.run_once(UploadJob(hash="h2", batch_id=2, local="/tmp/Big", remote="gcrypt:/Big", size=15, full_torrent=False, files=files, copy_mode="copy_files"))
+
+    assert bad_result.state == "verify_pending"
+    assert bad_executor.posts == []
+
+
 def test_media_pipeline_groups_multi_cd_passthrough_and_emby_precise_refresh():
     from qbt_orchestrator.media import MediaPipeline, UploadedFile
     from tests.fakes import FakeBackfill, FakeEmby, FakeUploadQueue

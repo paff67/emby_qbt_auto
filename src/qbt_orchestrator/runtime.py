@@ -153,9 +153,59 @@ class UploadJobRunner:
         elif result.state == "retry_wait": self.repo.schedule_retry(row["id"], "retry requested", exit_code=1, delay_sec=self._delay_for_attempt(int(row.get("attempts") or 1)))
         elif row["job_type"] == "sidecar_upload" and result.remote_verified: self.repo.update_state(row["id"], "done", exit_code=0)
         else: self.repo.update_state(row["id"], result.state)
+        if row["job_type"] == "upload" and row.get("batch_id") is not None:
+            self._update_batch_upload_state(row, payload, result)
         if row["job_type"] == "upload" and result.remote_verified:
             self._enqueue_media_pipeline_if_present(row, payload)
         return int(row["id"])
+
+    def _update_batch_upload_state(self, row: dict[str, Any], payload: dict[str, Any], result) -> None:
+        batch_id = int(row["batch_id"])
+        job_id = int(row["id"])
+        now = int(self.repo.now())
+        size = int(payload.get("size") or 0)
+        if result.state == "cleanup_deferred" and result.remote_verified:
+            state = "cleanup_deferred"
+            cleanup_deferred_at = now
+            reservation_reason = "batch_cleanup_deferred"
+        elif result.state == "verify_pending":
+            state = "verify_pending"
+            cleanup_deferred_at = None
+            reservation_reason = None
+        elif result.state == "retry_wait":
+            state = "retry_wait"
+            cleanup_deferred_at = None
+            reservation_reason = None
+        else:
+            state = str(result.state)
+            cleanup_deferred_at = now if state == "cleanup_deferred" else None
+            reservation_reason = "batch_cleanup_deferred" if state == "cleanup_deferred" else None
+
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
+                "update torrent_batches set state=?, upload_job_id=?, local_pinned_bytes=case when ?>0 then ? else local_pinned_bytes end, "
+                "cleanup_deferred_at=coalesce(?, cleanup_deferred_at), updated_at=? where id=?",
+                (state, job_id, size, size, cleanup_deferred_at, now, batch_id),
+            )
+            if reservation_reason is None:
+                return
+            existing = con.execute(
+                "select id from resource_reservations where batch_id=? and kind='cleanup_pending' order by id limit 1",
+                (batch_id,),
+            ).fetchone()
+            h = row.get("hash")
+            if existing:
+                con.execute(
+                    "update resource_reservations set hash=?, bytes=?, state='active', released_at=null, reason=? where id=?",
+                    (h, size, reservation_reason, int(existing["id"])),
+                )
+            else:
+                con.execute(
+                    "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
+                    (h, batch_id, "cleanup_pending", size, "active", now, None, reservation_reason),
+                )
+
+        write_transaction(self.repo.state_db, txn)
 
     def _enqueue_media_pipeline_if_present(self, row: dict[str, Any], payload: dict[str, Any]) -> None:
         media_files = payload.get("media_files")

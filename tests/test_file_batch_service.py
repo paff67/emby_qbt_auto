@@ -283,6 +283,100 @@ def test_file_batch_service_pipeline_dry_run_and_qbt_failure_do_not_leave_active
         assert reservation == {"state": "released", "released_at": 1_000, "reason": "qbt_apply_failed"}
 
 
+def test_file_batch_service_queues_downloaded_pipeline_batch_without_delete():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "downloads"
+        torrent_dir = root / "active" / "Big"
+        (torrent_dir / "extras").mkdir(parents=True)
+        (torrent_dir / "A.mp4").write_bytes(b"a" * 10)
+        (torrent_dir / "extras" / "B.nfo").write_bytes(b"b" * 5)
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+            (1, "big", 1, "downloading", "pipeline", "[0,1]", 15, 100, 900, 900),
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
+            ("big", 1, "batch", 100, "active", 900, 4600, "batch_pipeline_reserved"),
+        )
+        con.commit(); con.close()
+        qbt = BatchQbt([
+            {"index": 0, "name": "A.mp4", "size": 10, "progress": 1.0, "priority": 1},
+            {"index": 1, "name": "extras/B.nfo", "size": 5, "progress": 1.0, "priority": 1},
+            {"index": 2, "name": "C.mp4", "size": gib, "progress": 0.0, "priority": 0},
+        ])
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            host_downloads=str(root),
+            container_downloads="/downloads",
+            remote="gcrypt:",
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            max_inflight_batches_per_torrent=1,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {
+                "big": {
+                    "hash": "big",
+                    "name": "Big",
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "downloading",
+                    "amount_left": gib,
+                    "size": gib + 15,
+                    "progress": 0.01,
+                    "content_path": "/downloads/active/Big",
+                }
+            },
+            free_bytes=6 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.enqueued == 1
+        assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "0|1", "priority": "0"}) in qbt.calls
+        assert not any(call[0] == "/api/v2/torrents/delete" for call in qbt.calls)
+
+        job = _rows(db, "select id,hash,batch_id,job_type,state,payload_json from torrent_jobs")[0]
+        assert job["hash"] == "big"
+        assert job["batch_id"] == 1
+        assert job["job_type"] == "upload"
+        assert job["state"] == "queued"
+        payload = json.loads(job["payload_json"])
+        assert payload["full_torrent"] is False
+        assert payload["copy_mode"] == "copy_files"
+        assert payload["source"] == "file_batch_pipeline_batch"
+        assert payload["local"] == str(torrent_dir)
+        assert payload["remote"] == "gcrypt:/Big-big"
+        assert payload["size"] == 15
+        assert [(f["relative_path"], f["size"]) for f in payload["files"]] == [("A.mp4", 10), ("extras/B.nfo", 5)]
+        assert payload["files"][0]["local_path"] == str(torrent_dir / "A.mp4")
+        assert payload["files"][0]["remote_path"] == "gcrypt:/Big-big/A.mp4"
+        assert payload["media_files"] == [{"remote_path": "gcrypt:/Big-big/A.mp4", "size": 10}]
+
+        batch = _rows(db, "select state,downloaded_bytes,upload_job_id,local_pinned_bytes,upload_queued_at from torrent_batches where id=1")[0]
+        assert batch == {
+            "state": "upload_queued",
+            "downloaded_bytes": 15,
+            "upload_job_id": job["id"],
+            "local_pinned_bytes": 15,
+            "upload_queued_at": 1_000,
+        }
+        reservations = _rows(db, "select kind,bytes,state,released_at,reason from resource_reservations order by id")
+        assert reservations == [
+            {"kind": "batch", "bytes": 100, "state": "released", "released_at": 1_000, "reason": "batch_downloaded_upload_queued"},
+            {"kind": "cleanup_pending", "bytes": 15, "state": "active", "released_at": None, "reason": "batch_upload_queued"},
+        ]
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):

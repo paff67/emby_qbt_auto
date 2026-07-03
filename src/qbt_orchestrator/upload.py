@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 
@@ -29,7 +30,9 @@ class RcloneUploadWorker:
 
     def run_once(self, job: UploadJob) -> UploadResult:
         if job.files:
-            if job.copy_mode == "copyto":
+            if job.copy_mode == "copy_files":
+                copied = self._copy_each_file(job)
+            elif job.copy_mode == "copyto":
                 copied = self.rclone.copyto(job.local, job.remote)
             else:
                 copied = self.rclone.copy(job.local, job.remote)
@@ -43,6 +46,21 @@ class RcloneUploadWorker:
         if job.full_torrent:
             self.executor.qbt_post("/api/v2/torrents/delete", {"hashes": job.hash, "deleteFiles": "true"}); return UploadResult("done", True, True)
         return UploadResult("cleanup_deferred", True, False)
+
+    def _copy_each_file(self, job: UploadJob) -> bool:
+        for item in job.files or []:
+            rel = _rel(str(item.get("relative_path") or item.get("path") or item.get("name") or ""))
+            local = str(item.get("local_path") or item.get("local") or "")
+            remote = str(item.get("remote_path") or item.get("remote") or "")
+            if not local and rel:
+                local = str(PurePosixPath(str(job.local).replace("\\", "/")) / rel)
+            if not remote and rel:
+                remote = f"{str(job.remote).rstrip('/')}/{rel}"
+            if not local or not remote:
+                return False
+            if not self.rclone.copyto(local, remote):
+                return False
+        return True
 
     def _verify_manifest(self, job: UploadJob) -> bool:
         rows = self.rclone.lsjson(job.remote, recursive=(job.copy_mode != "copyto"))
