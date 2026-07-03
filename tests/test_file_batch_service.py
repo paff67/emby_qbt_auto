@@ -68,6 +68,44 @@ def test_file_batch_service_enqueues_completed_managed_torrent_once_with_vps_pat
         assert events[-1] == {"component": "file_batch", "event_type": "upload_queued", "hash": "abcdef1234567890"}
 
 
+def test_file_batch_service_builds_local_manifest_and_media_files_for_completed_directory():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "downloads"
+        movie = root / "active" / "Movie One"
+        (movie / "extras").mkdir(parents=True)
+        (movie / "A.mp4").write_bytes(b"a" * 100)
+        (movie / "extras" / "B.nfo").write_bytes(b"b" * 10)
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        service = FileBatchService(state_db=db, dry_run=False, host_downloads=str(root), container_downloads="/downloads", remote="gcrypt:")
+
+        result = service.sync_completed({
+            "abcdef1234567890": {
+                "hash": "abcdef1234567890",
+                "name": "Movie:One",
+                "category": "auto",
+                "tags": "auto",
+                "state": "uploading",
+                "amount_left": 0,
+                "size": 110,
+                "progress": 1.0,
+                "content_path": "/downloads/active/Movie One",
+            }
+        })
+
+        assert result.enqueued == 1
+        payload = json.loads(_rows(db, "select payload_json from torrent_jobs")[0]["payload_json"])
+        assert payload["remote"] == "gcrypt:/Movie_One-abcdef123456"
+        assert payload["size"] == 110
+        assert [(f["relative_path"], f["size"]) for f in payload["files"]] == [("A.mp4", 100), ("extras/B.nfo", 10)]
+        assert payload["files"][0]["remote_path"] == "gcrypt:/Movie_One-abcdef123456/A.mp4"
+        assert payload["media_files"] == [{"remote_path": "gcrypt:/Movie_One-abcdef123456/A.mp4", "size": 100}]
+        assert payload["copy_mode"] == "copy"
+
+
 def test_file_batch_service_dry_run_records_without_inserting_job():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService

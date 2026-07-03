@@ -225,6 +225,88 @@ def test_rclone_upload_worker_verify_failure_does_not_cleanup_and_success_full_a
     assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
 
 
+def test_rclone_upload_worker_directory_manifest_verify_gates_cleanup():
+    from qbt_orchestrator.upload import RcloneUploadWorker, UploadJob
+    from tests.fakes import FakeExecutor
+
+    class ManifestRclone:
+        def __init__(self, listing):
+            self.listing = listing
+            self.copies = []
+            self.copytos = []
+        def copy(self, local, remote):
+            self.copies.append((local, remote))
+            return True
+        def copyto(self, local, remote):
+            self.copytos.append((local, remote))
+            return True
+        def lsjson(self, remote, recursive=False):
+            return self.listing
+
+    files = [
+        {"relative_path": "A.mp4", "size": 100},
+        {"relative_path": "extras/B.nfo", "size": 10},
+    ]
+    executor = FakeExecutor()
+    ok = RcloneUploadWorker(
+        ManifestRclone([{"Path": "A.mp4", "Size": 100}, {"Path": "extras/B.nfo", "Size": 10}]),
+        executor,
+    )
+
+    result = ok.run_once(UploadJob(hash="h1", batch_id=1, local="/tmp/ABC", remote="gcrypt:/ABC", size=110, full_torrent=True, files=files))
+
+    assert result.state == "done"
+    assert ok.rclone.copies == [("/tmp/ABC", "gcrypt:/ABC")]
+    assert ok.rclone.copytos == []
+    assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
+
+    bad_executor = FakeExecutor()
+    bad = RcloneUploadWorker(
+        ManifestRclone([{"Path": "A.mp4", "Size": 99}, {"Path": "extras/B.nfo", "Size": 10}]),
+        bad_executor,
+    )
+    bad_result = bad.run_once(UploadJob(hash="h2", batch_id=2, local="/tmp/ABC", remote="gcrypt:/ABC", size=110, full_torrent=True, files=files))
+
+    assert bad_result.state == "verify_pending"
+    assert bad_executor.posts == []
+
+
+def test_rclone_upload_worker_single_file_manifest_uses_copyto():
+    from qbt_orchestrator.upload import RcloneUploadWorker, UploadJob
+    from tests.fakes import FakeExecutor
+
+    class ManifestRclone:
+        def __init__(self):
+            self.copytos = []
+            self.copies = []
+        def copy(self, local, remote):
+            self.copies.append((local, remote)); return True
+        def copyto(self, local, remote):
+            self.copytos.append((local, remote)); return True
+        def lsjson(self, remote, recursive=False):
+            return [{"Name": "A.mp4", "Size": 100}]
+
+    executor = FakeExecutor()
+    worker = RcloneUploadWorker(ManifestRclone(), executor)
+    result = worker.run_once(
+        UploadJob(
+            hash="h1",
+            batch_id=1,
+            local="/tmp/A.mp4",
+            remote="gcrypt:/A/A.mp4",
+            size=100,
+            full_torrent=True,
+            files=[{"relative_path": "A.mp4", "size": 100}],
+            copy_mode="copyto",
+        )
+    )
+
+    assert result.state == "done"
+    assert worker.rclone.copytos == [("/tmp/A.mp4", "gcrypt:/A/A.mp4")]
+    assert worker.rclone.copies == []
+    assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
+
+
 def test_media_pipeline_groups_multi_cd_passthrough_and_emby_precise_refresh():
     from qbt_orchestrator.media import MediaPipeline, UploadedFile
     from tests.fakes import FakeBackfill, FakeEmby, FakeUploadQueue

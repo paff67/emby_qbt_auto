@@ -58,6 +58,12 @@ class RcloneClient:
             raise RuntimeError(f"rclone copyto failed rc={rc}: {err[-400:]}")
         return True
 
+    def copy(self, local: str, remote: str) -> bool:
+        rc, _out, err = self.runner(self._base() + ["copy", local, remote], None, self.timeout)
+        if rc != 0:
+            raise RuntimeError(f"rclone copy failed rc={rc}: {err[-400:]}")
+        return True
+
     def lsjson_size(self, remote: str) -> int | None:
         rc, out, err = self.runner(self._base() + ["lsjson", remote], None, 300)
         if rc != 0:
@@ -68,3 +74,18 @@ class RcloneClient:
         if isinstance(data, dict):
             return int(data.get("Size", 0))
         return None
+
+    def lsjson(self, remote: str, recursive: bool = False) -> list[dict]:
+        argv = self._base() + ["lsjson"]
+        if recursive:
+            argv.append("--recursive")
+        argv.append(remote)
+        rc, out, err = self.runner(argv, None, 300)
+        if rc != 0:
+            raise RuntimeError(f"rclone lsjson failed rc={rc}: {err[-400:]}")
+        data = json.loads(out or "[]")
+        if isinstance(data, list):
+            return [dict(x) for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            return [dict(data)]
+        return []

@@ -34,17 +34,26 @@ class FakeExecutor:
 
 
 class FakeRclone:
-    def __init__(self, copy_ok=True, remote_sizes=None):
+    def __init__(self, copy_ok=True, remote_sizes=None, remote_listing=None):
         self.copy_ok = copy_ok
         self.remote_sizes = remote_sizes or {}
+        self.remote_listing = remote_listing or []
         self.copies = []
+        self.dir_copies = []
 
     def copyto(self, local, remote):
         self.copies.append((local, remote))
         return self.copy_ok
 
+    def copy(self, local, remote):
+        self.dir_copies.append((local, remote))
+        return self.copy_ok
+
     def lsjson_size(self, remote):
         return self.remote_sizes.get(remote)
+
+    def lsjson(self, remote, recursive=False):
+        return self.remote_listing
 
 
 class FakeBackfill:

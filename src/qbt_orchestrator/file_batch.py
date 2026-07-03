@@ -5,7 +5,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .runtime import ObservabilityStore, TorrentJobRepository
@@ -42,6 +42,9 @@ def _is_managed(torrent: Mapping[str, Any]) -> bool:
 
 def _is_completed(torrent: Mapping[str, Any]) -> bool:
     return int(torrent.get("size") or 0) > 0 and (int(torrent.get("amount_left") or 0) == 0 or float(torrent.get("progress") or 0) >= 1.0)
+
+
+MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 
 
 class FileBatchService:
@@ -111,13 +114,18 @@ class FileBatchService:
         name = str(torrent.get("name") or torrent_hash)
         local = self._local_path(torrent)
         remote_dir = f"{self.remote}/{_safe_name(name)}-{torrent_hash[:12]}"
-        return {
+        payload = {
             "local": local,
             "remote": remote_dir,
             "size": int(torrent.get("size") or 0),
             "full_torrent": True,
             "source": "file_batch_completed_full_torrent",
         }
+        manifest = self._manifest_for(local, remote_dir)
+        if manifest:
+            files, media_files, total_size, remote, copy_mode = manifest
+            payload.update({"files": files, "media_files": media_files, "size": total_size, "remote": remote, "copy_mode": copy_mode})
+        return payload
 
     def _local_path(self, torrent: Mapping[str, Any]) -> str:
         raw = str(torrent.get("content_path") or "")
@@ -129,3 +137,38 @@ class FileBatchService:
         if raw.startswith(self.container_downloads + "/"):
             return self.host_downloads + raw[len(self.container_downloads):]
         return raw
+
+    def _manifest_for(self, local: str, remote_dir: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, str, str] | None:
+        path = Path(local)
+        if not path.exists():
+            return None
+        rows: list[tuple[Path, str]] = []
+        if path.is_file():
+            rows.append((path, path.name))
+        elif path.is_dir():
+            for child in sorted((p for p in path.rglob("*") if p.is_file()), key=lambda p: p.relative_to(path).as_posix()):
+                rows.append((child, child.relative_to(path).as_posix()))
+        else:
+            return None
+        files: list[dict[str, Any]] = []
+        media_files: list[dict[str, Any]] = []
+        total = 0
+        for file_path, rel in rows:
+            rel_posix = rel.replace("\\", "/")
+            size = int(file_path.stat().st_size)
+            total += size
+            remote_path = f"{remote_dir.rstrip('/')}/{rel_posix}"
+            item = {
+                "relative_path": rel_posix,
+                "local_path": str(file_path),
+                "remote_path": remote_path,
+                "size": size,
+            }
+            files.append(item)
+            if file_path.suffix.lower() in MEDIA_EXTENSIONS:
+                media_files.append({"remote_path": remote_path, "size": size})
+        if not files:
+            return None
+        if path.is_file():
+            return files, media_files, total, files[0]["remote_path"], "copyto"
+        return files, media_files, total, remote_dir, "copy"

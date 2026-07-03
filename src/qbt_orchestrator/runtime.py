@@ -124,7 +124,16 @@ class UploadJobRunner:
         row = self.repo.claim_next_any(self.job_types)
         if not row: return None
         payload = json.loads(row["payload_json"] or "{}")
-        job = UploadJob(hash=row["hash"], batch_id=row["batch_id"], local=payload["local"], remote=payload["remote"], size=int(payload["size"]), full_torrent=bool(payload.get("full_torrent")))
+        job = UploadJob(
+            hash=row["hash"],
+            batch_id=row["batch_id"],
+            local=payload["local"],
+            remote=payload["remote"],
+            size=int(payload["size"]),
+            full_torrent=bool(payload.get("full_torrent")),
+            files=payload.get("files"),
+            copy_mode=str(payload.get("copy_mode") or "copy"),
+        )
         try:
             result = self.worker.run_once(job)
         except Exception as exc:

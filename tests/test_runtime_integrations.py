@@ -60,6 +60,19 @@ def test_rclone_client_copyto_and_lsjson_size_use_root_config_without_logging_se
     assert "lsjson" in runner.calls[1][0]
 
 
+def test_rclone_client_copy_directory_and_recursive_lsjson_use_root_config():
+    from qbt_orchestrator.integrations.rclone import RcloneClient
+
+    runner = RecordingRunner(outputs=["", json.dumps([{"Path": "A.mp4", "Size": 100}])])
+    client = RcloneClient(config_path="/root/.config/rclone/rclone.conf", transfers=1, checkers=2, runner=runner)
+
+    assert client.copy("/tmp/ABC", "gcrypt:/ABC") is True
+    assert client.lsjson("gcrypt:/ABC", recursive=True) == [{"Path": "A.mp4", "Size": 100}]
+    assert "copy" in runner.calls[0][0]
+    assert "--recursive" in runner.calls[1][0]
+    assert runner.calls[1][0][-1] == "gcrypt:/ABC"
+
+
 def test_emby_client_posts_precise_media_updated_payload_and_blocks_root():
     from qbt_orchestrator.integrations.emby import EmbyClient
 
