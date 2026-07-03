@@ -78,6 +78,11 @@ def _bool_or_none(value: str | None) -> bool | None:
         return None
     return _truthy(value)
 
+def _csv_set(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip().lower() for item in value.replace(";", ",").split(",") if item.strip()}
+
 def _free_bytes_for(path: str):
     def sample() -> int:
         if hasattr(os, "statvfs"):
@@ -169,6 +174,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     file_batch_dry_run = True if dry_run else (file_batch_env if file_batch_env is not None else True)
     batch_pipeline_env = _truthy(os.environ.get("QBT_ORCH_BATCH_PIPELINE"))
     batch_pipeline_enabled = batch_pipeline_env if batch_pipeline_env is not None else False
+    batch_live_verify = _truthy(os.environ.get("QBT_ORCH_BATCH_LIVE_VERIFY"))
+    batch_live_verify = bool(batch_live_verify) if batch_live_verify is not None else False
+    batch_allow_hashes = _csv_set(os.environ.get("QBT_ORCH_BATCH_ALLOW_HASHES"))
+    batch_allow_tag = os.environ.get("QBT_ORCH_BATCH_ALLOW_TAG", "").strip()
+    batch_max_live_batch_bytes = int(float(os.environ.get("QBT_ORCH_BATCH_MAX_LIVE_BATCH_BYTES_GB", "0")) * 1024**3)
+    batch_max_new_per_tick = int(os.environ.get("QBT_ORCH_BATCH_MAX_NEW_PER_TICK", "1" if batch_live_verify else "1000000"))
     upload_backpressure_policy = UploadBackpressurePolicy(
         max_backlog_bytes=int(float(os.environ.get("QBT_ORCH_UPLOAD_BACKPRESSURE_MAX_BACKLOG_GB", "20")) * 1024**3),
         max_oldest_pending_sec=int(os.environ.get("QBT_ORCH_UPLOAD_BACKPRESSURE_MAX_OLDEST_PENDING_SEC", "3600")),
@@ -303,6 +314,11 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         path_reconciler=path_reconciler,
         preemption_service=preemption_service,
         batch_pipeline_enabled=batch_pipeline_enabled,
+        batch_live_verify=batch_live_verify,
+        batch_allow_hashes=batch_allow_hashes,
+        batch_allow_tag=batch_allow_tag,
+        batch_max_live_batch_bytes=batch_max_live_batch_bytes,
+        batch_max_new_per_tick=batch_max_new_per_tick,
     )
     return runtime, dry_run
 

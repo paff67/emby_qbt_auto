@@ -158,6 +158,11 @@ class DaemonRuntime:
         path_reconciler=None,
         preemption_service=None,
         batch_pipeline_enabled: bool = False,
+        batch_live_verify: bool = False,
+        batch_allow_hashes: set[str] | None = None,
+        batch_allow_tag: str = "",
+        batch_max_live_batch_bytes: int = 0,
+        batch_max_new_per_tick: int = 1_000_000,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -188,6 +193,11 @@ class DaemonRuntime:
         self.path_reconciler = path_reconciler
         self.preemption_service = preemption_service
         self.batch_pipeline_enabled = bool(batch_pipeline_enabled)
+        self.batch_live_verify = bool(batch_live_verify)
+        self.batch_allow_hashes = {str(item).strip().lower() for item in (batch_allow_hashes or set()) if str(item).strip()}
+        self.batch_allow_tag = str(batch_allow_tag or "").strip()
+        self.batch_max_live_batch_bytes = int(batch_max_live_batch_bytes or 0)
+        self.batch_max_new_per_tick = int(batch_max_new_per_tick)
         self.junk_file_refresh_limit = int(junk_file_refresh_limit)
         self.carousel_dry_run = carousel_dry_run or dry_run
         if carousel_service is not None:
@@ -268,6 +278,11 @@ class DaemonRuntime:
             qbt=self.qbt,
             executor=self.executor,
             batch_pipeline_enabled=self.batch_pipeline_enabled,
+            batch_live_verify=self.batch_live_verify,
+            batch_allow_hashes=self.batch_allow_hashes,
+            batch_allow_tag=self.batch_allow_tag,
+            batch_max_live_batch_bytes=self.batch_max_live_batch_bytes,
+            batch_max_new_per_tick=self.batch_max_new_per_tick,
         )
         result = service.sync_completed(
             snapshots,

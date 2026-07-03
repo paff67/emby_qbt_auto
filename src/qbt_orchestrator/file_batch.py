@@ -79,6 +79,11 @@ class FileBatchService:
         max_inflight_batches_per_torrent: int = 2,
         min_payload_efficiency: float = 0.65,
         reservation_ttl_sec: int = 3600,
+        batch_live_verify: bool = False,
+        batch_allow_hashes: set[str] | None = None,
+        batch_allow_tag: str | None = None,
+        batch_max_new_per_tick: int | None = None,
+        batch_max_live_batch_bytes: int | None = None,
         now=None,
     ):
         self.state_db = state_db
@@ -96,11 +101,20 @@ class FileBatchService:
         self.max_inflight_batches_per_torrent = int(max_inflight_batches_per_torrent)
         self.min_payload_efficiency = float(min_payload_efficiency)
         self.reservation_ttl_sec = int(reservation_ttl_sec)
+        self.batch_live_verify = bool(batch_live_verify)
+        self.batch_allow_hashes = {str(item).strip().lower() for item in (batch_allow_hashes or set()) if str(item).strip()}
+        self.batch_allow_tag = str(batch_allow_tag or "").strip()
+        if batch_max_new_per_tick is None:
+            batch_max_new_per_tick = 1 if self.batch_live_verify else 1_000_000
+        self.batch_max_new_per_tick = max(0, int(batch_max_new_per_tick))
+        self.batch_max_live_batch_bytes = None if batch_max_live_batch_bytes in (None, 0) else max(0, int(batch_max_live_batch_bytes))
+        self._new_batches_created_this_tick = 0
         self.now = now or (lambda: int(time.time()))
         self.jobs = TorrentJobRepository(state_db)
         self.obs = ObservabilityStore(state_db)
 
     def sync_completed(self, snapshots: Mapping[str, Mapping[str, Any]], free_bytes: int | None = None, sync_healthy: bool = True) -> FileBatchResult:
+        self._new_batches_created_this_tick = 0
         scanned = len(snapshots)
         eligible = 0
         enqueued = 0
@@ -154,12 +168,46 @@ class FileBatchService:
         if not sync_healthy:
             self._decision(h, "prefetch_blocked", "sync_unhealthy", {"free_bytes": free_bytes})
             return {"created": 0, "blocked": 1}
+        live_allowed = self._live_verify_canary_allowed(h, tags)
+        if not live_allowed and self._inflight_batch_count(h) == 0:
+            self._decision(
+                h,
+                "prefetch_blocked",
+                "live_verify_no_canary_match",
+                {"batch_live_verify": True, "allow_hashes": sorted(self.batch_allow_hashes), "allow_tag": self.batch_allow_tag},
+            )
+            return {"created": 0, "blocked": 1}
+        tick_cap_reached = self._new_batches_created_this_tick >= self.batch_max_new_per_tick
+        if tick_cap_reached and self._inflight_batch_count(h) == 0:
+            self._decision(
+                h,
+                "prefetch_blocked",
+                "live_verify_new_batch_tick_cap",
+                {"batch_live_verify": self.batch_live_verify, "max_new_per_tick": self.batch_max_new_per_tick},
+            )
+            return {"created": 0, "blocked": 1}
         try:
             files = self.qbt.torrent_files(h)
         except Exception as exc:
             self.obs.event("error", "file_batch", "batch_file_probe_failed", str(redact(str(exc))), {"hash": h}, hash=h)
             return {"created": 0, "blocked": 1}
         queued = self._queue_downloaded_pipeline_batches(torrent, files)
+        if tick_cap_reached:
+            self._decision(
+                h,
+                "prefetch_blocked",
+                "live_verify_new_batch_tick_cap",
+                {"batch_live_verify": self.batch_live_verify, "max_new_per_tick": self.batch_max_new_per_tick, "upload_queued": queued},
+            )
+            return {"created": 0, "blocked": 1, "upload_queued": queued}
+        if not live_allowed:
+            self._decision(
+                h,
+                "prefetch_blocked",
+                "live_verify_no_canary_match",
+                {"batch_live_verify": True, "allow_hashes": sorted(self.batch_allow_hashes), "allow_tag": self.batch_allow_tag, "upload_queued": queued},
+            )
+            return {"created": 0, "blocked": 1, "upload_queued": queued}
         if self._inflight_batch_count(h) >= self.max_inflight_batches_per_torrent:
             self._decision(h, "prefetch_blocked", "inflight_batch_cap", {"limit": self.max_inflight_batches_per_torrent})
             return {"created": 0, "blocked": 1, "upload_queued": queued}
@@ -170,11 +218,28 @@ class FileBatchService:
             return {"created": 0, "blocked": 1, "upload_queued": queued}
         selected, reservation = self._select_batch_files(files, piece_size, free_bytes)
         if not selected or reservation is None:
+            reason_code = "live_verify_batch_size_cap" if self._first_pending_file_exceeds_live_cap(files, piece_size, free_bytes) else "batch_budget_insufficient"
             self._decision(
                 h,
                 "prefetch_blocked",
-                "batch_budget_insufficient",
-                {"free_bytes": int(free_bytes), "safe_budget": self._safe_batch_budget(free_bytes), "piece_size": piece_size},
+                reason_code,
+                {
+                    "free_bytes": int(free_bytes),
+                    "safe_budget": self._safe_batch_budget(free_bytes),
+                    "piece_size": piece_size,
+                    "batch_max_live_batch_bytes": self.batch_max_live_batch_bytes,
+                },
+            )
+            return {"created": 0, "blocked": 1, "upload_queued": queued}
+        if self._live_batch_size_cap_exceeded(reservation.reserved_bytes):
+            self._decision(
+                h,
+                "prefetch_blocked",
+                "live_verify_batch_size_cap",
+                {
+                    "reserved_bytes": reservation.reserved_bytes,
+                    "batch_max_live_batch_bytes": self.batch_max_live_batch_bytes,
+                },
             )
             return {"created": 0, "blocked": 1, "upload_queued": queued}
         if reservation.payload_efficiency < self.min_payload_efficiency:
@@ -215,7 +280,17 @@ class FileBatchService:
         self._mark_batch_applied(batch_id)
         self._decision(h, "prefetch_allowed", "batch_pipeline_reserved", {"batch_id": batch_id, **payload})
         self.obs.event("info", "file_batch", "batch_applied", f"batch {batch_id} applied", {"batch_id": batch_id, **payload}, hash=h)
+        self._new_batches_created_this_tick += 1
         return {"created": 1, "blocked": 0, "upload_queued": queued}
+
+    def _live_verify_canary_allowed(self, h: str, tags: set[str]) -> bool:
+        if not self.batch_live_verify:
+            return True
+        if self.batch_allow_hashes and h.lower() in self.batch_allow_hashes:
+            return True
+        if self.batch_allow_tag and self.batch_allow_tag in tags:
+            return True
+        return False
 
     def _queue_downloaded_pipeline_batches(self, torrent: Mapping[str, Any], files: list[Mapping[str, Any]]) -> int:
         h = str(torrent.get("hash") or "")
@@ -369,12 +444,31 @@ class FileBatchService:
             reservation = compute_batch_reservation(candidate, piece_size=piece_size, filesystem_slack=self.filesystem_slack_bytes)
             if reservation.payload_bytes > self.max_batch_bytes:
                 break
+            if self._live_batch_size_cap_exceeded(reservation.reserved_bytes):
+                break
             if reservation.reserved_bytes > budget:
                 break
             selected = candidate
         if not selected:
             return [], None
         return selected, compute_batch_reservation(selected, piece_size=piece_size, filesystem_slack=self.filesystem_slack_bytes)
+
+    def _live_batch_size_cap_exceeded(self, reserved_bytes: int) -> bool:
+        return self.batch_live_verify and self.batch_max_live_batch_bytes is not None and int(reserved_bytes) > int(self.batch_max_live_batch_bytes)
+
+    def _first_pending_file_exceeds_live_cap(self, files: list[Mapping[str, Any]], piece_size: int, free_bytes: int) -> bool:
+        if not (self.batch_live_verify and self.batch_max_live_batch_bytes is not None):
+            return False
+        budget = self._safe_batch_budget(free_bytes)
+        for row in sorted(files, key=lambda f: int(f.get("index") or 0)):
+            if float(row.get("progress") or 0) >= 1.0:
+                continue
+            size = int(row.get("size") or 0)
+            if size <= 0:
+                continue
+            reservation = compute_batch_reservation([row], piece_size=piece_size, filesystem_slack=self.filesystem_slack_bytes)
+            return reservation.reserved_bytes > int(self.batch_max_live_batch_bytes) and reservation.reserved_bytes <= budget
+        return False
 
     def _safe_batch_budget(self, free_bytes: int) -> int:
         return max(0, int(free_bytes) - self.disk_floor_bytes - self._active_reservation_bytes())

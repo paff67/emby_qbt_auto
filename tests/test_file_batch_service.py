@@ -249,6 +249,111 @@ def test_file_batch_service_blocks_pipeline_batch_when_reservation_budget_is_ins
         assert decision["reason_code"] == "batch_budget_insufficient"
 
 
+def test_file_batch_service_live_verify_blocks_new_batch_without_canary_before_file_probe():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0}])
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            batch_live_verify=True,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"big": {"hash": "big", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0}},
+            free_bytes=5 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 0
+        assert result.batches_blocked == 1
+        assert qbt.calls == []
+        decision = _rows(db, "select component,hash,decision,reason_code from decision_log order by id desc limit 1")[0]
+        assert decision == {"component": "file_batch", "hash": "big", "decision": "prefetch_blocked", "reason_code": "live_verify_no_canary_match"}
+
+
+def test_file_batch_service_live_verify_canary_limits_new_batches_per_tick_before_second_probe():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0}])
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            batch_live_verify=True,
+            batch_allow_tag="batch-canary",
+            batch_max_new_per_tick=1,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {
+                "h1": {"hash": "h1", "category": "auto", "tags": "auto,batch-canary", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0},
+                "h2": {"hash": "h2", "category": "auto", "tags": "auto,batch-canary", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0},
+            },
+            free_bytes=8 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        assert result.batches_blocked == 1
+        assert ("torrent_files", "h1") in qbt.calls
+        assert ("torrent_files", "h2") not in qbt.calls
+        batches = _rows(db, "select hash,state from torrent_batches order by id")
+        assert batches == [{"hash": "h1", "state": "downloading"}]
+        decision = _rows(db, "select hash,decision,reason_code from decision_log order by id desc limit 1")[0]
+        assert decision == {"hash": "h2", "decision": "prefetch_blocked", "reason_code": "live_verify_new_batch_tick_cap"}
+
+
+def test_file_batch_service_live_verify_blocks_batch_above_reserved_size_cap():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": 2 * gib, "progress": 0, "priority": 0}], piece_size=16 * 1024**2)
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+            batch_live_verify=True,
+            batch_allow_hashes={"big"},
+            batch_max_live_batch_bytes=gib,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"big": {"hash": "big", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 2 * gib, "size": 2 * gib, "progress": 0.0}},
+            free_bytes=8 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 0
+        assert result.batches_blocked == 1
+        assert ("torrent_files", "big") in qbt.calls
+        assert not any(call[0] == "/api/v2/torrents/filePrio" for call in qbt.calls)
+        decision = _rows(db, "select hash,decision,reason_code from decision_log order by id desc limit 1")[0]
+        assert decision == {"hash": "big", "decision": "prefetch_blocked", "reason_code": "live_verify_batch_size_cap"}
+
+
 def test_file_batch_service_pipeline_dry_run_and_qbt_failure_do_not_leave_active_reservation():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService

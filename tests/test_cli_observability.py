@@ -398,6 +398,37 @@ def test_cli_runtime_disables_batch_pipeline_by_default_and_enables_with_env(mon
         assert runtime.batch_pipeline_enabled is True
 
 
+def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
+    from qbt_orchestrator.cli import _build_runtime
+    from qbt_orchestrator.db import migrate
+
+    class Ns:
+        config = None
+        dry_run = False
+        safety_interval = 0
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+        monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+        monkeypatch.setenv("QBT_ORCH_BATCH_PIPELINE", "1")
+        monkeypatch.setenv("QBT_ORCH_BATCH_LIVE_VERIFY", "1")
+        monkeypatch.setenv("QBT_ORCH_BATCH_ALLOW_HASHES", "ABCDEF, 123456")
+        monkeypatch.setenv("QBT_ORCH_BATCH_ALLOW_TAG", "batch-canary")
+        monkeypatch.setenv("QBT_ORCH_BATCH_MAX_LIVE_BATCH_BYTES_GB", "1.5")
+        monkeypatch.setenv("QBT_ORCH_BATCH_MAX_NEW_PER_TICK", "1")
+
+        runtime, _ = _build_runtime(Ns(), db)
+
+        assert runtime.batch_pipeline_enabled is True
+        assert runtime.batch_live_verify is True
+        assert runtime.batch_allow_hashes == {"abcdef", "123456"}
+        assert runtime.batch_allow_tag == "batch-canary"
+        assert runtime.batch_max_live_batch_bytes == int(1.5 * 1024**3)
+        assert runtime.batch_max_new_per_tick == 1
+
+
 def test_cli_once_wires_media_pipeline_and_emby_refresh_dry_run_by_default():
     from qbt_orchestrator import cli
     from qbt_orchestrator.db import migrate
