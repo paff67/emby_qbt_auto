@@ -15,6 +15,7 @@ from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
 from .orphan_janitor import OrphanJanitorService
+from .path_reconcile import QbtPathReconciler
 from .preferences import QbtPreferencesGuard
 from .runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
@@ -163,6 +164,16 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         journal_size_limit_bytes=int(os.environ.get("QBT_ORCH_SQLITE_JOURNAL_SIZE_LIMIT_BYTES", str(64 * 1024 * 1024))),
         preferences_guard=preferences_guard,
     )
+    path_reconciler = None
+    path_reconcile_enabled = _truthy(os.environ.get("QBT_ORCH_PATH_RECONCILE"))
+    if path_reconcile_enabled is None:
+        path_reconcile_enabled = True
+    if path_reconcile_enabled:
+        path_reconciler = QbtPathReconciler(
+            state_db,
+            expected_save_path=qbt_cfg.save_path if qbt_cfg else "/downloads/active",
+            allowed_temp_path=qbt_cfg.temp_path if qbt_cfg else "/downloads/incomplete",
+        )
     orphan_janitor = None
     orphan_enabled = _truthy(os.environ.get("QBT_ORCH_ORPHAN_JANITOR"))
     if orphan_enabled is None:
@@ -241,6 +252,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         carousel_service=carousel_service,
         carousel_enabled=carousel_enabled,
         carousel_dry_run=carousel_dry_run,
+        path_reconciler=path_reconciler,
     )
     return runtime, dry_run
 

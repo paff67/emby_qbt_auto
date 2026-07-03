@@ -154,6 +154,7 @@ class DaemonRuntime:
         carousel_service=None,
         carousel_enabled: bool = True,
         carousel_dry_run: bool = True,
+        path_reconciler=None,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -181,6 +182,7 @@ class DaemonRuntime:
         self.maintenance_service = maintenance_service or SQLiteMaintenanceService(self.state_db)
         self.orphan_janitor = orphan_janitor
         self.junk_janitor = junk_janitor
+        self.path_reconciler = path_reconciler
         self.junk_file_refresh_limit = int(junk_file_refresh_limit)
         self.carousel_dry_run = carousel_dry_run or dry_run
         if carousel_service is not None:
@@ -213,8 +215,10 @@ class DaemonRuntime:
 
     def maintenance_tick(self) -> dict:
         result = self.maintenance_service.run_once()
+        snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        if self.path_reconciler is not None:
+            result["path_reconcile"] = self.path_reconciler.reconcile(snapshots)
         if self.orphan_janitor is not None:
-            snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
             result["orphan_janitor"] = self.orphan_janitor.reconcile(
                 snapshots,
                 sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),

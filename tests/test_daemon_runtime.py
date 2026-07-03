@@ -334,6 +334,56 @@ def test_daemon_runtime_runs_design_multirate_loops_and_records_events():
         assert ("loop_tick", 8) in events
 
 
+def test_daemon_maintenance_records_qbt_path_drift_from_sync_cache():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.path_reconcile import QbtPathReconciler
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class DriftQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "h1": {
+                        "name": "BBAN-582",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 1,
+                        "size": 2,
+                        "progress": 0.06,
+                        "save_path": "/downloads/active",
+                        "content_path": "/downloads/BBAN-582",
+                    }
+                },
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=DriftQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0,
+            path_reconciler=QbtPathReconciler(db),
+        )
+
+        daemon.run(max_safety_ticks=1)
+
+        con = sqlite3.connect(db)
+        event = con.execute("select component,event_type,hash from events_v2 where component='qbt_reconcile'").fetchone()
+        loop = con.execute("select data_json from events_v2 where component='maintenance' and event_type='loop_tick' order by id desc limit 1").fetchone()[0]
+        con.close()
+        assert event == ("qbt_reconcile", "path_drift", "h1")
+        assert "path_reconcile" in loop
+
+
 def test_daemon_default_planner_loop_uses_sync_cache_and_records_allocations():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime
