@@ -72,14 +72,15 @@ class DownloadPlanner:
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
         previous_allocations = self._allocation_rows()
         dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
-        budget = max(0, int(free_bytes) - self.disk_floor_bytes)
+        now = int(self.now())
+        active_reservations = self._active_reservation_bytes(now)
+        budget = max(0, int(free_bytes) - self.disk_floor_bytes - sum(active_reservations.values()))
         if not sync_healthy:
             for torrent in managed:
                 self._decision(str(torrent["hash"]), "hold", "sync_unhealthy", {"free_bytes": free_bytes})
             return PlannerResult([], [], conservative=True, budget_bytes=budget)
 
         health_rows = self._health_rows()
-        now = int(self.now())
         auto_dead = {
             str(t["hash"])
             for t in managed
@@ -103,10 +104,11 @@ class DownloadPlanner:
             if str(torrent.get("hash")) in active_slow:
                 continue
             amount_left = int(torrent.get("amount_left") or 0)
-            if len(selected) >= self.active_slots or used + amount_left > budget:
+            incremental_reserved_bytes = max(0, amount_left - int(active_reservations.get(str(torrent.get("hash")), 0)))
+            if len(selected) >= self.active_slots or used + incremental_reserved_bytes > budget:
                 continue
             selected.append(torrent)
-            used += amount_left
+            used += incremental_reserved_bytes
 
         selected_hashes = [str(t["hash"]) for t in selected]
         selected_set = set(selected_hashes)
@@ -147,6 +149,8 @@ class DownloadPlanner:
                     seq_false_hashes.append(h)
 
         self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead, previous_allocations=previous_allocations)
+        if not self.dry_run:
+            self._sync_active_download_reservations(selected, {str(t["hash"]) for t in managed}, now)
         self._force_seq_false(seq_false_hashes)
         self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
@@ -169,6 +173,22 @@ class DownloadPlanner:
         try:
             rows = con.execute("select * from torrent_health").fetchall()
             return {str(r["hash"]): dict(r) for r in rows}
+        finally:
+            con.close()
+
+    def _active_reservation_bytes(self, now: int) -> dict[str, int]:
+        con = _connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select hash,kind,bytes from resource_reservations "
+                "where state='active' and (expires_at is null or expires_at>?)",
+                (int(now),),
+            ).fetchall()
+            out: dict[str, int] = {}
+            for row in rows:
+                key = str(row["hash"] or f"{row['kind']}:{id(row)}")
+                out[key] = out.get(key, 0) + int(row["bytes"] or 0)
+            return out
         finally:
             con.close()
 
@@ -326,6 +346,51 @@ class DownloadPlanner:
                 (hash, desired_state, desired_state, slot_kind, 0, reserved_bytes, 1 if seq_dl else 0, ts, reason),
             ),
         )
+
+    def _sync_active_download_reservations(self, selected: list[Mapping[str, Any]], managed_hashes: set[str], now: int) -> None:
+        selected_by_hash = {str(t.get("hash")): int(t.get("amount_left") or 0) for t in selected if str(t.get("hash") or "")}
+        selected_hashes = set(selected_by_hash)
+
+        def txn(con: sqlite3.Connection) -> None:
+            active_rows = [
+                dict(r)
+                for r in con.execute(
+                    "select id,hash from resource_reservations where kind='active_download' and state='active'"
+                ).fetchall()
+            ]
+            active_by_hash: dict[str, list[int]] = {}
+            for row in active_rows:
+                active_by_hash.setdefault(str(row["hash"] or ""), []).append(int(row["id"]))
+
+            for h in sorted(managed_hashes - selected_hashes):
+                con.execute(
+                    "update resource_reservations set state='released', released_at=?, reason=? "
+                    "where kind='active_download' and state='active' and hash=?",
+                    (now, "planner_reallocated", h),
+                )
+
+            for h, bytes_reserved in selected_by_hash.items():
+                existing_ids = active_by_hash.get(h) or []
+                keep_id = existing_ids[0] if existing_ids else None
+                expires_at = now + 120
+                if keep_id is None:
+                    con.execute(
+                        "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
+                        (h, "active_download", bytes_reserved, "active", now, expires_at, "planner_active_download"),
+                    )
+                else:
+                    con.execute(
+                        "update resource_reservations set bytes=?, expires_at=?, released_at=null, reason=? where id=?",
+                        (bytes_reserved, expires_at, "planner_active_download", keep_id),
+                    )
+                    if len(existing_ids) > 1:
+                        placeholders = ",".join("?" for _ in existing_ids[1:])
+                        con.execute(
+                            f"update resource_reservations set state='released', released_at=?, reason=? where id in ({placeholders})",
+                            (now, "planner_duplicate_released", *existing_ids[1:]),
+                        )
+
+        write_transaction(self.state_db, txn)
 
     def _decision(self, hash: str, decision: str, reason_code: str, data: dict[str, Any]) -> None:
         write_transaction(

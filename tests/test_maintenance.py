@@ -68,6 +68,42 @@ def test_sqlite_maintenance_retention_deletes_old_rows_and_checkpoints_wal():
         assert result["journal_size_limit_bytes"] == 123456
 
 
+def test_sqlite_maintenance_expires_resource_reservations_without_deleting_audit_rows():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.maintenance import SQLiteMaintenanceService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
+            ("expired", "active_download", 100, "active", 1000, 1099, "test"),
+        )
+        con.execute(
+            "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
+            ("live", "active_download", 200, "active", 1000, 1200, "test"),
+        )
+        con.commit(); con.close()
+
+        result = SQLiteMaintenanceService(db, now=lambda: 1100).run_once()
+
+        assert result["reservations_expired"] == 1
+        rows = []
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = [dict(r) for r in con.execute("select hash,state,released_at,reason from resource_reservations order by hash")]
+            event = con.execute("select component,event_type,message from events_v2 where component='reservation'").fetchone()
+        finally:
+            con.close()
+        assert rows == [
+            {"hash": "expired", "state": "expired", "released_at": 1100, "reason": "reservation_expired"},
+            {"hash": "live", "state": "active", "released_at": None, "reason": "test"},
+        ]
+        assert tuple(event) == ("reservation", "reservation_expired", "expired 1 resource reservations")
+
+
 def test_daemon_default_maintenance_loop_runs_retention_not_not_configured():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.maintenance import SQLiteMaintenanceService

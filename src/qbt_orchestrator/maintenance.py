@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import json
 from pathlib import Path
 from typing import Callable
 
 from .db import write_transaction
+from .observability import redact
 
 RETENTION_TABLES = ("events_v2", "action_log", "decision_log", "metrics_snapshots")
 
@@ -43,9 +45,11 @@ class SQLiteMaintenanceService:
             con.execute(f"pragma journal_size_limit={self.journal_size_limit_bytes}")
             for table in RETENTION_TABLES:
                 deleted[table] = self._delete_old_rows(con, table, cutoff)
+            reservations_expired[0] = self._expire_resource_reservations(con, int(self.now()))
             journal_size_limit = int(con.execute("pragma journal_size_limit").fetchone()[0])
             return journal_size_limit
 
+        reservations_expired = [0]
         journal_size_limit = int(write_transaction(self.state_db, txn))
         con = sqlite3.connect(self.state_db)
         try:
@@ -59,6 +63,7 @@ class SQLiteMaintenanceService:
             "retention_delete_batch_size": self.retention_delete_batch_size,
             "wal_checkpoint": checkpoint,
             "journal_size_limit_bytes": journal_size_limit,
+            "reservations_expired": reservations_expired[0],
         }
         if self.preferences_guard is not None:
             result["qbt_preferences"] = self.preferences_guard.reconcile()
@@ -74,3 +79,34 @@ class SQLiteMaintenanceService:
             total += int(cur.rowcount or 0)
             if int(cur.rowcount or 0) < self.retention_delete_batch_size:
                 return total
+
+    def _expire_resource_reservations(self, con: sqlite3.Connection, now: int) -> int:
+        rows = [
+            dict(r)
+            for r in con.execute(
+                "select id,hash,kind,bytes,expires_at from resource_reservations "
+                "where state='active' and expires_at is not null and expires_at<=?",
+                (now,),
+            ).fetchall()
+        ]
+        if not rows:
+            return 0
+        ids = [int(r["id"]) for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        con.execute(
+            f"update resource_reservations set state='expired', released_at=?, reason='reservation_expired' where id in ({placeholders})",
+            (now, *ids),
+        )
+        data = {"expired_count": len(ids), "reservations": rows[:20]}
+        con.execute(
+            "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
+            (
+                now,
+                "info",
+                "reservation",
+                "reservation_expired",
+                f"expired {len(ids)} resource reservations",
+                json.dumps(redact(data), ensure_ascii=False),
+            ),
+        )
+        return len(ids)

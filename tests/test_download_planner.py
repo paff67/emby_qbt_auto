@@ -312,6 +312,109 @@ def test_planner_preserves_existing_dead_allocations_for_carousel():
         }
 
 
+def test_planner_subtracts_active_resource_reservations_from_budget():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
+            ("other", "active_download", 3 * gib, "active", 900, 2000, "existing_download_budget"),
+        )
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=2 * gib, now=lambda: 1000)
+        snapshots = {
+            "newbig": {
+                "hash": "newbig",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": 4 * gib,
+                "size": 8 * gib,
+                "progress": 0.5,
+            }
+        }
+
+        result = planner.plan_and_apply(snapshots, free_bytes=8 * gib, sync_healthy=True)
+
+        assert result.budget_bytes == 3 * gib
+        assert result.selected_hashes == []
+        assert executor.posts == []
+        decision = _rows(db, "select hash,decision,reason_code,data_json from decision_log where component='planner' order by id desc limit 1")[0]
+        assert decision["hash"] == "newbig"
+        assert decision["decision"] == "soak"
+        assert decision["reason_code"] == "budget_or_slot_exhausted"
+
+
+def test_planner_creates_refreshes_and_releases_active_download_reservations():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        snapshots = {
+            "h1": {
+                "hash": "h1",
+                "category": "auto",
+                "tags": "auto",
+                "state": "pausedDL",
+                "amount_left": gib,
+                "size": 2 * gib,
+                "progress": 0.5,
+            }
+        }
+
+        first = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=2 * gib, now=lambda: 1000)
+        assert first.plan_and_apply(snapshots, free_bytes=5 * gib, sync_healthy=True).selected_hashes == ["h1"]
+        rows = _rows(db, "select hash,kind,bytes,state,expires_at,released_at,reason from resource_reservations")
+        assert rows == [{
+            "hash": "h1",
+            "kind": "active_download",
+            "bytes": gib,
+            "state": "active",
+            "expires_at": 1120,
+            "released_at": None,
+            "reason": "planner_active_download",
+        }]
+
+        snapshots["h1"]["amount_left"] = gib // 2
+        snapshots["h1"]["state"] = "downloading"
+        second = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=2 * gib, now=lambda: 1010)
+        assert second.plan_and_apply(snapshots, free_bytes=5 * gib, sync_healthy=True).selected_hashes == ["h1"]
+        rows = _rows(db, "select hash,kind,bytes,state,expires_at,released_at,reason from resource_reservations")
+        assert rows == [{
+            "hash": "h1",
+            "kind": "active_download",
+            "bytes": gib // 2,
+            "state": "active",
+            "expires_at": 1130,
+            "released_at": None,
+            "reason": "planner_active_download",
+        }]
+
+        third = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=0, disk_floor_bytes=2 * gib, now=lambda: 1020)
+        assert third.plan_and_apply(snapshots, free_bytes=5 * gib, sync_healthy=True).selected_hashes == []
+        rows = _rows(db, "select hash,kind,bytes,state,released_at,reason from resource_reservations")
+        assert rows == [{
+            "hash": "h1",
+            "kind": "active_download",
+            "bytes": gib // 2,
+            "state": "released",
+            "released_at": 1020,
+            "reason": "planner_reallocated",
+        }]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
