@@ -78,8 +78,16 @@ class QbtDockerClient:
         self.rate_limiter.acquire()
         curl_max_time = max(1, int(self.timeout))
         curl_connect_timeout = min(5, curl_max_time)
-        argv = ["docker", "exec", self.container, "curl", "-fsS", "--connect-timeout", str(curl_connect_timeout), "--max-time", str(curl_max_time)]
+        argv = ["docker", "exec"]
         input_text = None
+        if data is not None:
+            # qBT write APIs expect application/x-www-form-urlencoded POST
+            # bodies.  Because curl is executed *inside* the qbittorrent
+            # container, docker exec must keep stdin attached; otherwise curl's
+            # --data-binary @- reads an empty body and qBT v5 returns HTTP 400
+            # for missing required fields such as "hashes".
+            argv.append("-i")
+        argv += [self.container, "curl", "-fsS", "--connect-timeout", str(curl_connect_timeout), "--max-time", str(curl_max_time)]
         if data is not None:
             argv += ["-X", "POST", "-H", "Content-Type: application/x-www-form-urlencoded", "--data-binary", "@-"]
             input_text = urlencode(data)

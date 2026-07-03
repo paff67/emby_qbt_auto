@@ -233,6 +233,19 @@ def test_telegram_notification_sender_sends_queued_messages_and_retries_failures
         assert "secret-token" not in failed["last_error"]
 
 
+def test_qbt_docker_client_attaches_stdin_for_form_post_inside_container():
+    from qbt_orchestrator.integrations.qbt import QbtDockerClient
+
+    runner = RecordingRunner(outputs=["Ok."])
+    client = QbtDockerClient(container="qbittorrent", runner=runner)
+
+    assert client.post("/api/v2/torrents/start", {"hashes": "h1|h2"}) == "Ok."
+
+    argv, input_text, _timeout = runner.calls[0]
+    assert argv[:4] == ["docker", "exec", "-i", "qbittorrent"]
+    assert input_text == "hashes=h1%7Ch2"
+
+
 def test_qbt_docker_client_rate_limits_api_calls_with_token_bucket():
     from qbt_orchestrator.integrations.qbt import QbtDockerClient
 
