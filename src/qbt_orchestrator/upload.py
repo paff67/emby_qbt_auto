@@ -45,7 +45,7 @@ class RcloneUploadWorker:
         return UploadResult("cleanup_deferred", True, False)
 
     def _verify_manifest(self, job: UploadJob) -> bool:
-        rows = self.rclone.lsjson(job.remote, recursive=True)
+        rows = self.rclone.lsjson(job.remote, recursive=(job.copy_mode != "copyto"))
         actual: dict[str, int] = {}
         for row in rows or []:
             if row.get("IsDir"):

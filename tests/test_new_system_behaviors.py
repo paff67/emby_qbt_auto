@@ -279,11 +279,13 @@ def test_rclone_upload_worker_single_file_manifest_uses_copyto():
         def __init__(self):
             self.copytos = []
             self.copies = []
+            self.lsjson_calls = []
         def copy(self, local, remote):
             self.copies.append((local, remote)); return True
         def copyto(self, local, remote):
             self.copytos.append((local, remote)); return True
         def lsjson(self, remote, recursive=False):
+            self.lsjson_calls.append((remote, recursive))
             return [{"Name": "A.mp4", "Size": 100}]
 
     executor = FakeExecutor()
@@ -304,6 +306,7 @@ def test_rclone_upload_worker_single_file_manifest_uses_copyto():
     assert result.state == "done"
     assert worker.rclone.copytos == [("/tmp/A.mp4", "gcrypt:/A/A.mp4")]
     assert worker.rclone.copies == []
+    assert worker.rclone.lsjson_calls == [("gcrypt:/A/A.mp4", False)]
     assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
 
 
