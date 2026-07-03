@@ -137,6 +137,8 @@ class DaemonRuntime:
         planner_dry_run: bool = True,
         upload_runner=None,
         upload_dry_run: bool = True,
+        cleanup_runner=None,
+        cleanup_dry_run: bool = True,
         file_batch_dry_run: bool = True,
         upload_backpressure_policy=None,
         host_downloads: str = "/data/downloads",
@@ -176,6 +178,8 @@ class DaemonRuntime:
         self.planner_dry_run = planner_dry_run or dry_run
         self.upload_runner = upload_runner
         self.upload_dry_run = upload_dry_run or dry_run
+        self.cleanup_runner = cleanup_runner
+        self.cleanup_dry_run = cleanup_dry_run or dry_run
         self.file_batch_dry_run = file_batch_dry_run or dry_run
         self.upload_backpressure_policy = upload_backpressure_policy
         self.host_downloads = host_downloads
@@ -413,6 +417,33 @@ class DaemonRuntime:
             self.obs.event("info", "upload", "upload_job_processed", f"upload job {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
         return processed
 
+    def process_cleanup_requests(self, max_jobs: int = 1) -> int:
+        if self.cleanup_runner is None:
+            return 0
+        processed = 0
+        if self.cleanup_dry_run:
+            row = self.cleanup_runner.repo.peek_next("cleanup_request")
+            if not row:
+                return 0
+            self.obs.action(
+                hash=row.get("hash"),
+                job_id=int(row["id"]),
+                action_type="cleanup_request",
+                path="torrent_jobs/cleanup_request",
+                payload={"job_id": row["id"], "state": row.get("state"), "job_type": row.get("job_type")},
+                status="dry_run",
+                dry_run=True,
+            )
+            self.obs.event("info", "cleanup", "cleanup_request_dry_run", f"cleanup request {row['id']} pending", {"job_id": row["id"]}, hash=row.get("hash"), job_id=int(row["id"]))
+            return 1
+        for _ in range(max_jobs):
+            job_id = self.cleanup_runner.run_next()
+            if job_id is None:
+                break
+            processed += 1
+            self.obs.event("info", "cleanup", "cleanup_request_processed", f"cleanup request {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
+        return processed
+
     def process_media_pipeline_jobs(self, max_jobs: int = 1) -> int:
         if self.media_pipeline_runner is None:
             return 0
@@ -525,6 +556,10 @@ class DaemonRuntime:
                     self.process_upload_jobs()
                 except Exception as exc:
                     self.obs.event("error", "upload", "upload_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                try:
+                    self.process_cleanup_requests()
+                except Exception as exc:
+                    self.obs.event("error", "cleanup", "cleanup_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                 try:
                     self.process_media_pipeline_jobs()
                 except Exception as exc:

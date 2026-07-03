@@ -19,7 +19,7 @@ from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineServi
 from .orphan_janitor import OrphanJanitorService
 from .path_reconcile import QbtPathReconciler
 from .preferences import QbtPreferencesGuard
-from .runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
+from .runtime import BotCommandRepository, BotNotificationRepository, CleanupRequestRunner, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
 from .seeding_preemption import PreemptionConfig, SeedingPreemptionService
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
@@ -179,7 +179,11 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     )
     upload_env = _truthy(os.environ.get("QBT_ORCH_UPLOAD_DRY_RUN"))
     upload_dry_run = True if dry_run else (upload_env if upload_env is not None else True)
+    cleanup_env = _truthy(os.environ.get("QBT_ORCH_CLEANUP_DRY_RUN"))
+    cleanup_dry_run = True if dry_run else (cleanup_env if cleanup_env is not None else False)
+    cleanup_repo = TorrentJobRepository(state_db)
     upload_runner = UploadJobRunner(TorrentJobRepository(state_db), rclone, executor)
+    cleanup_runner = CleanupRequestRunner(cleanup_repo, executor)
     file_batch_env = _truthy(os.environ.get("QBT_ORCH_FILE_BATCH_DRY_RUN"))
     file_batch_dry_run = True if dry_run else (file_batch_env if file_batch_env is not None else True)
     batch_pipeline_env = _truthy(os.environ.get("QBT_ORCH_BATCH_PIPELINE"))
@@ -310,6 +314,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         planner_dry_run=planner_dry_run,
         upload_runner=upload_runner,
         upload_dry_run=upload_dry_run,
+        cleanup_runner=cleanup_runner,
+        cleanup_dry_run=cleanup_dry_run,
         file_batch_dry_run=file_batch_dry_run,
         upload_backpressure_policy=upload_backpressure_policy,
         host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),

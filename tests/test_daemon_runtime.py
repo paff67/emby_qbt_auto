@@ -608,6 +608,80 @@ def test_daemon_upload_worker_live_processes_job_and_verify_pending():
         assert event == "upload_job_processed"
 
 
+def test_daemon_cleanup_request_dry_run_does_not_claim_or_mutate_batch():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import CleanupRequestRunner, TorrentJobRepository
+    from qbt_orchestrator.service import DaemonRuntime
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,downloaded_bytes,reserved_bytes,local_pinned_bytes,cleanup_deferred_at,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (1, "h1", 1, "cleanup_deferred", "pipeline", "[0]", 10, 10, 12, 10, 100, 100, 100),
+        )
+        con.commit(); con.close()
+        repo = TorrentJobRepository(db, now=lambda: 100)
+        job_id = repo.enqueue("h1", 1, "cleanup_request", {"target": "h1"}, priority=10)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            cleanup_runner=CleanupRequestRunner(repo, FakeExecutor()),
+            cleanup_dry_run=True,
+        )
+
+        assert daemon.process_cleanup_requests() == 1
+
+        assert repo.get(job_id)["state"] == "queued"
+        con = sqlite3.connect(db)
+        batch_state = con.execute("select state from torrent_batches where id=1").fetchone()[0]
+        action = con.execute("select action_type,path,status,dry_run from action_log where action_type='cleanup_request'").fetchone()
+        con.close()
+        assert batch_state == "cleanup_deferred"
+        assert action == ("cleanup_request", "torrent_jobs/cleanup_request", "dry_run", 1)
+
+
+def test_daemon_cleanup_request_live_processes_logical_cleanup():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import CleanupRequestRunner, TorrentJobRepository
+    from qbt_orchestrator.service import DaemonRuntime
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,downloaded_bytes,reserved_bytes,local_pinned_bytes,cleanup_deferred_at,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (2, "h2", 1, "cleanup_deferred", "pipeline", "[0]", 10, 10, 12, 10, 100, 100, 100),
+        )
+        con.commit(); con.close()
+        repo = TorrentJobRepository(db, now=lambda: 200)
+        job_id = repo.enqueue("h2", 2, "cleanup_request", {"target": "h2"}, priority=10)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            cleanup_runner=CleanupRequestRunner(repo, FakeExecutor()),
+            cleanup_dry_run=False,
+        )
+
+        assert daemon.process_cleanup_requests() == 1
+
+        assert repo.get(job_id)["state"] == "done"
+        con = sqlite3.connect(db)
+        batch_state = con.execute("select state from torrent_batches where id=2").fetchone()[0]
+        con.close()
+        assert batch_state == "cleanup_requested"
+
+
 class RecordingBackfill:
     def __init__(self, result=None):
         self.result = result or {"status": "not_found", "artifacts": []}

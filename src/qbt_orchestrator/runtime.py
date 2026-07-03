@@ -431,6 +431,122 @@ class UploadJobRunner:
         return self.backoff_schedule[idx]
 
 
+class CleanupRequestRunner:
+    """Handle approved cleanup requests conservatively.
+
+    Pipeline middle batches are still qBT-managed and may share piece boundary
+    data with neighboring/future batches, so this runner only records a logical
+    cleanup request and keeps cleanup_pending reservations active.  It never
+    calls qBT deleteFiles or removes files directly.
+    """
+
+    def __init__(self, repo: TorrentJobRepository, executor=None):
+        self.repo = repo
+        self.executor = executor
+
+    def run_next(self) -> int | None:
+        row = self.repo.claim_next("cleanup_request")
+        if not row:
+            return None
+        payload = json.loads(row["payload_json"] or "{}")
+        now = int(self.repo.now())
+        batch_ids = self._requested_batch_ids(row, payload)
+        target = str(payload.get("target") or row.get("hash") or "").strip()
+        args = payload.get("args") if isinstance(payload.get("args"), list) else []
+        if not target and args:
+            target = str(args[0])
+
+        def txn(con: sqlite3.Connection) -> tuple[list[int], str]:
+            if batch_ids:
+                placeholders = ",".join("?" for _ in batch_ids)
+                rows = [
+                    dict(r)
+                    for r in con.execute(
+                        f"select * from torrent_batches where id in ({placeholders}) and state='cleanup_deferred'",
+                        tuple(batch_ids),
+                    ).fetchall()
+                ]
+            elif target:
+                rows = [
+                    dict(r)
+                    for r in con.execute(
+                        "select * from torrent_batches where hash=? and state='cleanup_deferred' order by id",
+                        (target,),
+                    ).fetchall()
+                ]
+            else:
+                rows = []
+            if not rows:
+                con.execute(
+                    "update torrent_jobs set state='blocked', last_stderr_tail=?, last_exit_code=1, lease_owner=null, lease_until=null, updated_at=? where id=?",
+                    ("no cleanup_deferred batch matched request", now, int(row["id"])),
+                )
+                con.execute(
+                    "insert into action_log(ts,hash,job_id,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?,?,?)",
+                    (
+                        now,
+                        row.get("hash"),
+                        int(row["id"]),
+                        "cleanup_request",
+                        "cleanup_request",
+                        json.dumps(redact({"target": target, "batch_ids": batch_ids, "physical_delete": False}), ensure_ascii=False),
+                        "blocked",
+                        0,
+                        "no cleanup_deferred batch matched request",
+                    ),
+                )
+                return [], "blocked"
+
+            ids = [int(r["id"]) for r in rows]
+            placeholders = ",".join("?" for _ in ids)
+            con.execute(f"update torrent_batches set state='cleanup_requested', updated_at=? where id in ({placeholders})", (now, *ids))
+            con.execute(
+                f"update resource_reservations set state='active', reason=? where kind='cleanup_pending' and batch_id in ({placeholders})",
+                ("cleanup_requested_logical_only", *ids),
+            )
+            con.execute(
+                "update torrent_jobs set state='done', last_exit_code=0, lease_owner=null, lease_until=null, updated_at=? where id=?",
+                (now, int(row["id"])),
+            )
+            con.execute(
+                "insert into action_log(ts,hash,job_id,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?,?,?)",
+                (
+                    now,
+                    row.get("hash"),
+                    int(row["id"]),
+                    "cleanup_request",
+                    "torrent_batches/" + "|".join(str(i) for i in ids),
+                    json.dumps(redact({"target": target, "batch_ids": ids, "physical_delete": False}), ensure_ascii=False),
+                    "logical_only",
+                    0,
+                    None,
+                ),
+            )
+            return ids, "logical_only"
+
+        write_transaction(self.repo.state_db, txn)
+        return int(row["id"])
+
+    @staticmethod
+    def _requested_batch_ids(row: dict[str, Any], payload: dict[str, Any]) -> list[int]:
+        raw_values: list[Any] = []
+        if row.get("batch_id") is not None:
+            raw_values.append(row.get("batch_id"))
+        if payload.get("batch_id") is not None:
+            raw_values.append(payload.get("batch_id"))
+        if isinstance(payload.get("batch_ids"), list):
+            raw_values.extend(payload.get("batch_ids") or [])
+        out: list[int] = []
+        for value in raw_values:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed not in out:
+                out.append(parsed)
+        return out
+
+
 def reconcile_jobs(state_db: str | Path, now: int | None = None, dry_run: bool = True, retry_delay_sec: int = 60) -> dict[str, int]:
     now = int(now if now is not None else time.time())
     con = _connect(state_db)

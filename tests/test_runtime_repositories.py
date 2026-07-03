@@ -457,6 +457,66 @@ def test_approved_cleanup_enqueues_request_without_deleting_files_and_config_is_
         assert commands.get("config-1")["state"] == "done"
 
 
+def test_cleanup_request_runner_logically_marks_pipeline_batch_without_physical_delete():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import CleanupRequestRunner, TorrentJobRepository
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,downloaded_bytes,reserved_bytes,local_pinned_bytes,cleanup_deferred_at,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (9, "h-clean", 1, "cleanup_deferred", "pipeline", "[0]", 10, 10, 12, 10, 100, 100, 100),
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
+            ("h-clean", 9, "cleanup_pending", 10, "active", 100, None, "batch_cleanup_deferred"),
+        )
+        con.commit()
+        con.close()
+        repo = TorrentJobRepository(db, now=lambda: 500)
+        job_id = repo.enqueue("h-clean", 9, "cleanup_request", {"target": "h-clean", "source": "telegram"}, priority=10)
+        executor = FakeExecutor()
+        runner = CleanupRequestRunner(repo, executor)
+
+        assert runner.run_next() == job_id
+
+        assert executor.posts == []
+        assert repo.get(job_id)["state"] == "done"
+        batch = _rows(db, "select state,cleanup_deferred_at,updated_at from torrent_batches where id=9")[0]
+        assert batch == {"state": "cleanup_requested", "cleanup_deferred_at": 100, "updated_at": 500}
+        reservation = _rows(db, "select state,reason from resource_reservations where batch_id=9 and kind='cleanup_pending'")[0]
+        assert reservation == {"state": "active", "reason": "cleanup_requested_logical_only"}
+        action = _rows(db, "select action_type,path,status,dry_run,payload_json from action_log where action_type='cleanup_request'")[0]
+        assert action["path"] == "torrent_batches/9"
+        assert action["status"] == "logical_only"
+        assert action["dry_run"] == 0
+        assert json.loads(action["payload_json"])["physical_delete"] is False
+
+
+def test_cleanup_request_runner_blocks_when_no_piece_safe_target_exists():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import CleanupRequestRunner, TorrentJobRepository
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 600)
+        job_id = repo.enqueue("missing", None, "cleanup_request", {"target": "missing", "source": "telegram"}, priority=10)
+        runner = CleanupRequestRunner(repo, FakeExecutor())
+
+        assert runner.run_next() == job_id
+
+        row = repo.get(job_id)
+        assert row["state"] == "blocked"
+        assert row["last_stderr_tail"] == "no cleanup_deferred batch matched request"
+        action = _rows(db, "select action_type,path,status,dry_run from action_log where action_type='cleanup_request'")[0]
+        assert action == {"action_type": "cleanup_request", "path": "cleanup_request", "status": "blocked", "dry_run": 0}
+
+
 def test_bot_notification_repository_redacts_dedupes_and_retries():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import BotNotificationRepository
