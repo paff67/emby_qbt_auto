@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Iterable
 
+from .db import write_transaction
 from .runtime import TorrentJobRepository
 from .observability import redact
 @dataclass(frozen=True)
@@ -128,37 +129,37 @@ class MediaPipelineService:
 
     def _ensure_media_group(self, key: str, emby_dir: str) -> int:
         now = int(self.now())
-        con = _connect(self.state_db)
-        con.execute(
-            "insert or ignore into media_groups(media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?)",
-            (key, key, emby_dir, now, now),
-        )
-        con.execute("update media_groups set emby_media_dir=?, updated_at=? where media_group_key=?", (emby_dir, now, key))
-        row = con.execute("select id from media_groups where media_group_key=?", (key,)).fetchone()
-        con.commit()
-        con.close()
-        return int(row["id"])
+        def txn(con: sqlite3.Connection) -> int:
+            con.execute(
+                "insert or ignore into media_groups(media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?)",
+                (key, key, emby_dir, now, now),
+            )
+            con.execute("update media_groups set emby_media_dir=?, updated_at=? where media_group_key=?", (emby_dir, now, key))
+            row = con.execute("select id from media_groups where media_group_key=?", (key,)).fetchone()
+            return int(row["id"])
+
+        return int(write_transaction(self.state_db, txn))
 
     def _ensure_pipeline_run(self, manifest_id: str, group_id: int) -> int:
         now = int(self.now())
-        con = _connect(self.state_db)
-        con.execute(
-            "insert or ignore into media_pipeline_runs(upload_manifest_id,media_group_id,state,created_at,updated_at) values(?,?,?,?,?)",
-            (manifest_id, group_id, "created", now, now),
-        )
-        row = con.execute(
-            "select id from media_pipeline_runs where upload_manifest_id=? and media_group_id=?",
-            (manifest_id, group_id),
-        ).fetchone()
-        con.commit()
-        con.close()
-        return int(row["id"])
+        def txn(con: sqlite3.Connection) -> int:
+            con.execute(
+                "insert or ignore into media_pipeline_runs(upload_manifest_id,media_group_id,state,created_at,updated_at) values(?,?,?,?,?)",
+                (manifest_id, group_id, "created", now, now),
+            )
+            row = con.execute(
+                "select id from media_pipeline_runs where upload_manifest_id=? and media_group_id=?",
+                (manifest_id, group_id),
+            ).fetchone()
+            return int(row["id"])
+
+        return int(write_transaction(self.state_db, txn))
 
     def _set_pipeline_state(self, run_id: int, state: str) -> None:
-        con = _connect(self.state_db)
-        con.execute("update media_pipeline_runs set state=?, updated_at=? where id=?", (state, int(self.now()), run_id))
-        con.commit()
-        con.close()
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute("update media_pipeline_runs set state=?, updated_at=? where id=?", (state, int(self.now()), run_id)),
+        )
 
     def _sidecar_already_verified(self, group_id: int) -> bool:
         con = _connect(self.state_db)
@@ -171,14 +172,14 @@ class MediaPipelineService:
 
     def _record_sidecar_manifest(self, group_id: int, scrape: dict) -> int:
         now = int(self.now())
-        con = _connect(self.state_db)
-        cur = con.execute(
-            "insert into sidecar_manifests(media_group_id,staging_dir,artifacts_json,state,created_at,updated_at) values(?,?,?,?,?,?)",
-            (group_id, str(scrape.get("staging_dir") or ""), json.dumps(scrape.get("artifacts") or [], ensure_ascii=False), "sidecar_verified", now, now),
-        )
-        con.commit()
-        con.close()
-        return int(cur.lastrowid)
+        def txn(con: sqlite3.Connection) -> int:
+            cur = con.execute(
+                "insert into sidecar_manifests(media_group_id,staging_dir,artifacts_json,state,created_at,updated_at) values(?,?,?,?,?,?)",
+                (group_id, str(scrape.get("staging_dir") or ""), json.dumps(scrape.get("artifacts") or [], ensure_ascii=False), "sidecar_verified", now, now),
+            )
+            return int(cur.lastrowid)
+
+        return int(write_transaction(self.state_db, txn))
 
     def _valid_artifacts(self, artifacts: list) -> bool:
         if not artifacts:
@@ -213,23 +214,23 @@ class MediaPipelineService:
         earliest = now + self.debounce_sec
         max_run = now + self.max_debounce_wait_sec
         payload = {"media_group_key": key, "upload_manifest_id": str(manifest_id), "trigger_state": state}
-        con = _connect(self.state_db)
-        row = con.execute(
-            "select * from emby_refresh_tasks where emby_media_dir=? and state='queued' order by id limit 1",
-            (emby_dir,),
-        ).fetchone()
-        if row:
-            con.execute(
-                "update emby_refresh_tasks set earliest_run_at=?, max_run_at=?, payload_json=?, updated_at=? where id=?",
-                (min(int(row["max_run_at"]), earliest), int(row["max_run_at"]), json.dumps(payload, ensure_ascii=False), now, row["id"]),
-            )
-        else:
-            con.execute(
-                "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
-                (emby_dir, "queued", earliest, max_run, json.dumps(payload, ensure_ascii=False), now, now),
-            )
-        con.commit()
-        con.close()
+        def txn(con: sqlite3.Connection) -> None:
+            row = con.execute(
+                "select * from emby_refresh_tasks where emby_media_dir=? and state='queued' order by id limit 1",
+                (emby_dir,),
+            ).fetchone()
+            if row:
+                con.execute(
+                    "update emby_refresh_tasks set earliest_run_at=?, max_run_at=?, payload_json=?, updated_at=? where id=?",
+                    (min(int(row["max_run_at"]), earliest), int(row["max_run_at"]), json.dumps(payload, ensure_ascii=False), now, row["id"]),
+                )
+            else:
+                con.execute(
+                    "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+                    (emby_dir, "queued", earliest, max_run, json.dumps(payload, ensure_ascii=False), now, now),
+                )
+
+        write_transaction(self.state_db, txn)
 
 
 class MediaPipelineJobRunner:
@@ -282,21 +283,19 @@ class EmbyRefreshWorker:
 
     def _claim_next(self) -> dict | None:
         now = int(self.now())
-        con = _connect(self.state_db)
-        row = con.execute(
-            "select * from emby_refresh_tasks where state='queued' and "
-            "((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)) "
-            "order by coalesce(max_run_at, earliest_run_at, created_at), id limit 1",
-            (now, now),
-        ).fetchone()
-        if not row:
-            con.close()
-            return None
-        con.execute("update emby_refresh_tasks set state='running', updated_at=? where id=? and state='queued'", (now, row["id"]))
-        con.commit()
-        out = dict(con.execute("select * from emby_refresh_tasks where id=?", (row["id"],)).fetchone())
-        con.close()
-        return out
+        def txn(con: sqlite3.Connection) -> dict | None:
+            row = con.execute(
+                "select * from emby_refresh_tasks where state='queued' and "
+                "((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)) "
+                "order by coalesce(max_run_at, earliest_run_at, created_at), id limit 1",
+                (now, now),
+            ).fetchone()
+            if not row:
+                return None
+            con.execute("update emby_refresh_tasks set state='running', updated_at=? where id=? and state='queued'", (now, row["id"]))
+            return dict(con.execute("select * from emby_refresh_tasks where id=?", (row["id"],)).fetchone())
+
+        return write_transaction(self.state_db, txn)
 
     def peek_next(self) -> dict | None:
         now = int(self.now())
@@ -312,13 +311,13 @@ class EmbyRefreshWorker:
         return out
 
     def _finish(self, task_id: int, state: str, error: str | None) -> None:
-        con = _connect(self.state_db)
-        con.execute(
-            "update emby_refresh_tasks set state=?, last_error=?, updated_at=? where id=?",
-            (state, error, int(self.now()), task_id),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update emby_refresh_tasks set state=?, last_error=?, updated_at=? where id=?",
+                (state, error, int(self.now()), task_id),
+            ),
         )
-        con.commit()
-        con.close()
 
     def _validate_path(self, path: str) -> None:
         if path == self.media_prefix or not path.startswith(self.media_prefix + "/"):

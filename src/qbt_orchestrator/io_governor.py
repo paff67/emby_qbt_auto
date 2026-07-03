@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .db import write_transaction
 from .observability import redact
 
 
@@ -153,23 +154,23 @@ class UploadBackpressurePolicy:
             "candidate_bytes": decision.candidate_bytes,
             "projected_bytes": decision.projected_bytes,
         }
-        con = _connect(state_db)
-        con.execute(
-            "insert into metrics_snapshots(ts,component,metrics_json) values(?,?,?)",
-            (now, "upload_backpressure", json.dumps(redact(data), ensure_ascii=False)),
-        )
-        if not decision.allow_new_upload_jobs:
+        def txn(con: sqlite3.Connection) -> None:
             con.execute(
-                "insert into events_v2(ts,level,component,event_type,hash,message,data_json) values(?,?,?,?,?,?,?)",
-                (
-                    now,
-                    "warning",
-                    "upload_backpressure",
-                    "new_upload_blocked",
-                    torrent_hash,
-                    f"new upload blocked: {decision.reason}",
-                    json.dumps(redact(data), ensure_ascii=False),
-                ),
+                "insert into metrics_snapshots(ts,component,metrics_json) values(?,?,?)",
+                (now, "upload_backpressure", json.dumps(redact(data), ensure_ascii=False)),
             )
-        con.commit()
-        con.close()
+            if not decision.allow_new_upload_jobs:
+                con.execute(
+                    "insert into events_v2(ts,level,component,event_type,hash,message,data_json) values(?,?,?,?,?,?,?)",
+                    (
+                        now,
+                        "warning",
+                        "upload_backpressure",
+                        "new_upload_blocked",
+                        torrent_hash,
+                        f"new upload blocked: {decision.reason}",
+                        json.dumps(redact(data), ensure_ascii=False),
+                    ),
+                )
+
+        write_transaction(state_db, txn)

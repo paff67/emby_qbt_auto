@@ -10,7 +10,7 @@ from typing import Callable, Mapping
 
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
-from .db import migrate
+from .db import migrate, write_transaction
 from .file_batch import FileBatchService
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .junk_janitor import JunkJanitorService
@@ -291,6 +291,7 @@ class DaemonRuntime:
         return self.carousel_service.run_once(
             snapshots,
             sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+            free_bytes=int(self.free_bytes_provider()),
         )
 
     def tick_safety(self) -> None:
@@ -445,20 +446,20 @@ class DaemonRuntime:
 
     def _persist_disk_state(self, free_bytes: int, state: str) -> None:
         now = int(time.time())
-        con = sqlite3.connect(self.state_db)
-        prev = con.execute("select pressure_state, state_since from disk_state where id=1").fetchone()
-        previous_state = prev[0] if prev else None
-        state_since = prev[1] if prev and prev[0] == state else now
-        con.execute(
-            "insert into disk_state(id,sampled_at,free_bytes,pressure_state,previous_state,state_since,resume_allowed) "
-            "values(1,?,?,?,?,?,?) "
-            "on conflict(id) do update set sampled_at=excluded.sampled_at, free_bytes=excluded.free_bytes, "
-            "pressure_state=excluded.pressure_state, previous_state=excluded.previous_state, "
-            "state_since=excluded.state_since, resume_allowed=excluded.resume_allowed",
-            (now, free_bytes, state, previous_state, state_since, 0 if state == "emergency" else 1),
-        )
-        con.commit()
-        con.close()
+        def txn(con: sqlite3.Connection) -> None:
+            prev = con.execute("select pressure_state, state_since from disk_state where id=1").fetchone()
+            previous_state = prev[0] if prev else None
+            state_since = prev[1] if prev and prev[0] == state else now
+            con.execute(
+                "insert into disk_state(id,sampled_at,free_bytes,pressure_state,previous_state,state_since,resume_allowed) "
+                "values(1,?,?,?,?,?,?) "
+                "on conflict(id) do update set sampled_at=excluded.sampled_at, free_bytes=excluded.free_bytes, "
+                "pressure_state=excluded.pressure_state, previous_state=excluded.previous_state, "
+                "state_since=excluded.state_since, resume_allowed=excluded.resume_allowed",
+                (now, free_bytes, state, previous_state, state_since, 0 if state == "emergency" else 1),
+            )
+
+        write_transaction(self.state_db, txn)
 
     def run(self, max_safety_ticks: int | None = None) -> int:
         self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})

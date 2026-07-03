@@ -151,6 +151,31 @@ def test_carousel_service_suspends_when_sync_unhealthy_without_qbt_writes():
         assert event == {"component": "carousel", "event_type": "suspended_unhealthy_sync"}
 
 
+def test_carousel_live_probe_suspends_below_min_free_bytes_without_qbt_writes():
+    from qbt_orchestrator.carousel import CarouselService
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        _seed_dead_allocations(db, ["h1"])
+        executor = RecordingExecutor()
+        svc = CarouselService(db, executor, dry_run=False, concurrency=1, min_free_bytes=5 * 1024**3, now=lambda: 1000)
+
+        result = svc.run_once(
+            {"h1": {"hash": "h1", "category": "auto", "amount_left": 10, "num_seeds": 0, "num_peers": 0}},
+            sync_healthy=True,
+            free_bytes=4 * 1024**3,
+        )
+
+        assert result["suspended"] is True
+        assert result["reason"] == "disk_guard"
+        assert result["started"] == []
+        assert executor.posts == []
+        assert executor.seq == []
+        assert _rows(db, "select * from carousel_state") == []
+
+
 def test_daemon_default_carousel_loop_uses_sync_cache_not_not_configured():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime

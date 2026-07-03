@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .db import write_transaction
 from .observability import redact
 from .upload import RcloneUploadWorker, UploadJob
 
@@ -24,20 +25,24 @@ class ObservabilityStore:
     def event(self, level: str, component: str, event_type: str, message: str, data: dict[str, Any] | None = None, hash: str | None = None, job_id: int | None = None, correlation_id: str | None = None) -> int:
         safe_message = redact(message)
         safe_data = redact(data or {})
-        con = _connect(self.state_db)
-        cur = con.execute(
-            "insert into events_v2(ts,level,component,event_type,hash,job_id,correlation_id,message,data_json) values(?,?,?,?,?,?,?,?,?)",
-            (int(self.now()), level, component, event_type, hash, job_id, correlation_id, safe_message, json.dumps(safe_data, ensure_ascii=False)),
-        )
-        con.commit(); con.close(); return int(cur.lastrowid)
+        def txn(con: sqlite3.Connection) -> int:
+            cur = con.execute(
+                "insert into events_v2(ts,level,component,event_type,hash,job_id,correlation_id,message,data_json) values(?,?,?,?,?,?,?,?,?)",
+                (int(self.now()), level, component, event_type, hash, job_id, correlation_id, safe_message, json.dumps(safe_data, ensure_ascii=False)),
+            )
+            return int(cur.lastrowid)
+
+        return int(write_transaction(self.state_db, txn))
 
     def action(self, hash: str | None, job_id: int | None, action_type: str, path: str, payload: dict[str, Any], status: str, dry_run: bool = False, correlation_id: str | None = None, error: str | None = None) -> int:
-        con = _connect(self.state_db)
-        cur = con.execute(
-            "insert into action_log(ts,correlation_id,hash,job_id,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?,?,?,?)",
-            (int(self.now()), correlation_id, hash, job_id, action_type, path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
-        )
-        con.commit(); con.close(); return int(cur.lastrowid)
+        def txn(con: sqlite3.Connection) -> int:
+            cur = con.execute(
+                "insert into action_log(ts,correlation_id,hash,job_id,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?,?,?,?)",
+                (int(self.now()), correlation_id, hash, job_id, action_type, path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
+            )
+            return int(cur.lastrowid)
+
+        return int(write_transaction(self.state_db, txn))
 
     def trace(self, target: str) -> dict[str, list[dict[str, Any]]]:
         con = _connect(self.state_db)
@@ -54,42 +59,45 @@ class TorrentJobRepository:
         self.now = now or (lambda: int(time.time()))
 
     def enqueue(self, hash: str | None, batch_id: int | None, job_type: str, payload: dict[str, Any], priority: int = 100) -> int:
-        now = int(self.now()); con = _connect(self.state_db)
-        cur = con.execute("insert into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?)", (hash, batch_id, job_type, "queued", priority, json.dumps(payload, ensure_ascii=False), now, now))
-        con.commit(); con.close(); return int(cur.lastrowid)
+        now = int(self.now())
+        def txn(con: sqlite3.Connection) -> int:
+            cur = con.execute("insert into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?)", (hash, batch_id, job_type, "queued", priority, json.dumps(payload, ensure_ascii=False), now, now))
+            return int(cur.lastrowid)
+
+        return int(write_transaction(self.state_db, txn))
 
     def claim_next(self, job_type: str) -> dict[str, Any] | None:
-        con = _connect(self.state_db)
         now = int(self.now())
-        row = con.execute(
-            "select * from torrent_jobs where job_type=? and state in ('queued','verify_pending','retry_wait') "
-            "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by priority,id limit 1",
-            (job_type, now),
-        ).fetchone()
-        if not row:
-            con.close(); return None
-        con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
-        con.commit(); out = dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone()); con.close(); return out
+        def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
+            row = con.execute(
+                "select * from torrent_jobs where job_type=? and state in ('queued','verify_pending','retry_wait') "
+                "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by priority,id limit 1",
+                (job_type, now),
+            ).fetchone()
+            if not row:
+                return None
+            con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
+            return dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone())
+
+        return write_transaction(self.state_db, txn)
 
     def claim_next_any(self, job_types: tuple[str, ...] | list[str]) -> dict[str, Any] | None:
         if not job_types:
             return None
-        con = _connect(self.state_db)
         now = int(self.now())
         placeholders = ",".join("?" for _ in job_types)
-        row = con.execute(
-            f"select * from torrent_jobs where job_type in ({placeholders}) and state in ('queued','verify_pending','retry_wait') "
-            "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by priority,id limit 1",
-            (*tuple(job_types), now),
-        ).fetchone()
-        if not row:
-            con.close()
-            return None
-        con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
-        con.commit()
-        out = dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone())
-        con.close()
-        return out
+        def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
+            row = con.execute(
+                f"select * from torrent_jobs where job_type in ({placeholders}) and state in ('queued','verify_pending','retry_wait') "
+                "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by priority,id limit 1",
+                (*tuple(job_types), now),
+            ).fetchone()
+            if not row:
+                return None
+            con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
+            return dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone())
+
+        return write_transaction(self.state_db, txn)
 
     def peek_next(self, job_type: str) -> dict[str, Any] | None:
         con = _connect(self.state_db)
@@ -99,18 +107,20 @@ class TorrentJobRepository:
         return out
 
     def update_state(self, job_id: int, state: str, stderr_tail: str | None = None, exit_code: int | None = None) -> None:
-        con = _connect(self.state_db)
-        con.execute("update torrent_jobs set state=?, last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?", (state, stderr_tail, exit_code, int(self.now()), job_id))
-        con.commit(); con.close()
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute("update torrent_jobs set state=?, last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?", (state, stderr_tail, exit_code, int(self.now()), job_id)),
+        )
 
     def schedule_retry(self, job_id: int, stderr_tail: str | None = None, exit_code: int | None = None, delay_sec: int = 60) -> None:
-        con = _connect(self.state_db)
-        con.execute(
-            "update torrent_jobs set state='retry_wait', lease_owner=null, lease_until=null, next_run_at=?, "
-            "last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?",
-            (int(self.now()) + int(delay_sec), stderr_tail, exit_code, int(self.now()), job_id),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update torrent_jobs set state='retry_wait', lease_owner=null, lease_until=null, next_run_at=?, "
+                "last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?",
+                (int(self.now()) + int(delay_sec), stderr_tail, exit_code, int(self.now()), job_id),
+            ),
         )
-        con.commit(); con.close()
 
     def get(self, job_id: int) -> dict[str, Any]:
         con = _connect(self.state_db); row = dict(con.execute("select * from torrent_jobs where id=?", (job_id,)).fetchone()); con.close(); return row
@@ -172,15 +182,17 @@ def reconcile_jobs(state_db: str | Path, now: int | None = None, dry_run: bool =
     now = int(now if now is not None else time.time())
     con = _connect(state_db)
     rows = [dict(r) for r in con.execute("select * from torrent_jobs where state='running' and lease_until is not null and lease_until<?", (now,))]
-    if not dry_run:
-        for row in rows:
-            con.execute(
-                "update torrent_jobs set state='retry_wait', lease_owner=null, lease_until=null, next_run_at=?, "
-                "last_stderr_tail=?, last_exit_code=coalesce(last_exit_code,1), updated_at=? where id=?",
-                (now + retry_delay_sec, "lease expired during reconcile", now, row["id"]),
-            )
-        con.commit()
     con.close()
+    if rows and not dry_run:
+        def txn(wcon: sqlite3.Connection) -> None:
+            for row in rows:
+                wcon.execute(
+                    "update torrent_jobs set state='retry_wait', lease_owner=null, lease_until=null, next_run_at=?, "
+                    "last_stderr_tail=?, last_exit_code=coalesce(last_exit_code,1), updated_at=? where id=?",
+                    (now + retry_delay_sec, "lease expired during reconcile", now, row["id"]),
+                )
+
+        write_transaction(state_db, txn)
     return {"expired_running": len(rows), "dry_run": 1 if dry_run else 0}
 
 
@@ -191,45 +203,44 @@ class BotCommandRepository:
 
     def insert_command(self, command_id, chat_id, user_id, command, payload):
         now = int(self.now())
-        con = _connect(self.state_db)
-        con.execute(
-            "insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
-            (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
+                (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now),
+            ),
         )
-        con.commit()
-        con.close()
 
     def claim_next(self) -> dict[str, Any] | None:
-        con = _connect(self.state_db)
-        row = con.execute(
-            "select * from bot_commands where state in ('queued','approved') order by id limit 1"
-        ).fetchone()
-        if not row:
-            con.close()
-            return None
-        con.execute("update bot_commands set state='running', updated_at=? where id=?", (int(self.now()), row["id"]))
-        con.commit()
-        out = dict(con.execute("select * from bot_commands where id=?", (row["id"],)).fetchone())
-        con.close()
-        out["_claimed_from_state"] = row["state"]
-        return out
+        def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
+            row = con.execute(
+                "select * from bot_commands where state in ('queued','approved') order by id limit 1"
+            ).fetchone()
+            if not row:
+                return None
+            con.execute("update bot_commands set state='running', updated_at=? where id=?", (int(self.now()), row["id"]))
+            out = dict(con.execute("select * from bot_commands where id=?", (row["id"],)).fetchone())
+            out["_claimed_from_state"] = row["state"]
+            return out
+
+        return write_transaction(self.state_db, txn)
 
     def set_state(self, command_id: str, state: str) -> None:
-        con = _connect(self.state_db)
-        con.execute("update bot_commands set state=?, updated_at=? where command_id=?", (state, int(self.now()), command_id))
-        con.commit()
-        con.close()
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute("update bot_commands set state=?, updated_at=? where command_id=?", (state, int(self.now()), command_id)),
+        )
 
     def create_approval(self, command_id: str, action: str, payload: dict[str, Any], ttl: int = 300) -> str:
         aid = f"approval-{command_id}"
         now = int(self.now())
-        con = _connect(self.state_db)
-        con.execute(
-            "insert or ignore into bot_approvals(approval_id,command_id,action,payload_json,state,expires_at,created_at) values(?,?,?,?,?,?,?)",
-            (aid, command_id, action, json.dumps(payload, ensure_ascii=False), "pending", now + ttl, now),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert or ignore into bot_approvals(approval_id,command_id,action,payload_json,state,expires_at,created_at) values(?,?,?,?,?,?,?)",
+                (aid, command_id, action, json.dumps(payload, ensure_ascii=False), "pending", now + ttl, now),
+            ),
         )
-        con.commit()
-        con.close()
         return aid
 
     def approve_once(self, approval_id: str, user_id: int | str) -> bool:
@@ -240,8 +251,7 @@ class BotCommandRepository:
 
     def _decide_once(self, approval_id: str, user_id: int | str, decision: str) -> bool:
         now = int(self.now())
-        con = _connect(self.state_db)
-        try:
+        def txn(con: sqlite3.Connection) -> bool:
             row = con.execute(
                 "select * from bot_approvals where approval_id=? and state='pending'",
                 (str(approval_id),),
@@ -257,14 +267,12 @@ class BotCommandRepository:
                     "update bot_commands set state='expired', updated_at=? where command_id=? and state='approval_required'",
                     (now, row["command_id"]),
                 )
-                con.commit()
                 return False
             cur = con.execute(
                 "update bot_approvals set state=?, approved_by=?, approved_at=? where approval_id=? and state='pending'",
                 (decision, str(user_id), now, str(approval_id)),
             )
             if cur.rowcount != 1:
-                con.rollback()
                 return False
             if decision == "approved":
                 con.execute(
@@ -276,10 +284,9 @@ class BotCommandRepository:
                     "update bot_commands set state='denied', updated_at=? where command_id=? and state='approval_required'",
                     (now, row["command_id"]),
                 )
-            con.commit()
             return True
-        finally:
-            con.close()
+
+        return bool(write_transaction(self.state_db, txn))
 
     def get(self, command_id: str) -> dict[str, Any]:
         con = _connect(self.state_db)
@@ -311,24 +318,22 @@ class BotNotificationRepository:
         now = int(self.now())
         safe_message = str(redact(message))
         safe_payload = json.dumps(redact(payload or {}), ensure_ascii=False)
-        con = _connect(self.state_db)
-        if dedupe_key:
-            con.execute(
-                "insert or ignore into bot_notifications(dedupe_key,chat_id,level,topic,message,payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
-                (str(dedupe_key), str(chat_id), level, topic, safe_message, safe_payload, "queued", 0, now, now),
-            )
-            row = con.execute("select id from bot_notifications where dedupe_key=?", (str(dedupe_key),)).fetchone()
-            assert row is not None
-            note_id = int(row["id"])
-        else:
+        def txn(con: sqlite3.Connection) -> int:
+            if dedupe_key:
+                con.execute(
+                    "insert or ignore into bot_notifications(dedupe_key,chat_id,level,topic,message,payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+                    (str(dedupe_key), str(chat_id), level, topic, safe_message, safe_payload, "queued", 0, now, now),
+                )
+                row = con.execute("select id from bot_notifications where dedupe_key=?", (str(dedupe_key),)).fetchone()
+                assert row is not None
+                return int(row["id"])
             cur = con.execute(
                 "insert into bot_notifications(chat_id,level,topic,message,payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
                 (str(chat_id), level, topic, safe_message, safe_payload, "queued", 0, now, now),
             )
-            note_id = int(cur.lastrowid)
-        con.commit()
-        con.close()
-        return note_id
+            return int(cur.lastrowid)
+
+        return int(write_transaction(self.state_db, txn))
 
     def peek_next(self) -> dict[str, Any] | None:
         con = _connect(self.state_db)
@@ -343,44 +348,42 @@ class BotNotificationRepository:
         return out
 
     def claim_next(self) -> dict[str, Any] | None:
-        con = _connect(self.state_db)
         now = int(self.now())
-        row = con.execute(
-            "select * from bot_notifications where state in ('queued','retry_wait') "
-            "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by id limit 1",
-            (now,),
-        ).fetchone()
-        if not row:
-            con.close()
-            return None
-        con.execute(
-            "update bot_notifications set state='running', attempts=attempts+1, updated_at=? where id=?",
-            (now, row["id"]),
-        )
-        con.commit()
-        out = dict(con.execute("select * from bot_notifications where id=?", (row["id"],)).fetchone())
-        con.close()
-        return out
+        def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
+            row = con.execute(
+                "select * from bot_notifications where state in ('queued','retry_wait') "
+                "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by id limit 1",
+                (now,),
+            ).fetchone()
+            if not row:
+                return None
+            con.execute(
+                "update bot_notifications set state='running', attempts=attempts+1, updated_at=? where id=?",
+                (now, row["id"]),
+            )
+            return dict(con.execute("select * from bot_notifications where id=?", (row["id"],)).fetchone())
+
+        return write_transaction(self.state_db, txn)
 
     def mark_sent(self, notification_id: int) -> None:
         now = int(self.now())
-        con = _connect(self.state_db)
-        con.execute(
-            "update bot_notifications set state='sent', sent_at=?, updated_at=? where id=?",
-            (now, now, int(notification_id)),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update bot_notifications set state='sent', sent_at=?, updated_at=? where id=?",
+                (now, now, int(notification_id)),
+            ),
         )
-        con.commit()
-        con.close()
 
     def schedule_retry(self, notification_id: int, error: str, delay_sec: int = 60) -> None:
         now = int(self.now())
-        con = _connect(self.state_db)
-        con.execute(
-            "update bot_notifications set state='retry_wait', next_run_at=?, last_error=?, updated_at=? where id=?",
-            (now + int(delay_sec), str(redact(error))[:1000], now, int(notification_id)),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update bot_notifications set state='retry_wait', next_run_at=?, last_error=?, updated_at=? where id=?",
+                (now + int(delay_sec), str(redact(error))[:1000], now, int(notification_id)),
+            ),
         )
-        con.commit()
-        con.close()
 
     def get(self, notification_id: int) -> dict[str, Any]:
         con = _connect(self.state_db)

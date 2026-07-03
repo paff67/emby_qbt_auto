@@ -5,6 +5,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Set
+
+from .db import write_transaction
+
 VIEWER = {"status", "trace", "perf"}
 OPERATOR = VIEWER | {"pause", "resume", "queue"}
 ADMIN = OPERATOR | {"force_upload", "cleanup", "preempt", "config", "approve", "deny"}
@@ -33,6 +36,10 @@ class SQLiteBotCommandStore:
     def __init__(self, state_db: str | Path): self.state_db = Path(state_db)
     def insert_command(self, command_id, chat_id, user_id, command, payload):
         now = int(time.time())
-        con = sqlite3.connect(self.state_db)
-        con.execute("insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)", (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now))
-        con.commit(); con.close()
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
+                (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now),
+            ),
+        )

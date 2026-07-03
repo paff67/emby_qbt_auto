@@ -1,10 +1,124 @@
 from __future__ import annotations
-import asyncio, json, sqlite3, time
+import asyncio, atexit, json, queue, sqlite3, threading, time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 def _connect(path: str | Path) -> sqlite3.Connection:
     con = sqlite3.connect(path); con.row_factory = sqlite3.Row; return con
+
+def readonly_connect(path: str | Path) -> sqlite3.Connection:
+    con = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+@dataclass(frozen=True)
+class WriteResult:
+    lastrowid: int
+    rowcount: int
+
+class _SyncWriteActor:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._queue: "queue.Queue[tuple[str, Any, queue.Queue]]" = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._thread_id: int | None = None
+        self._lock = threading.Lock()
+        self._stopped = False
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._stopped = False
+            self._thread = threading.Thread(target=self._run, name=f"qbt-db-writer:{self.path}", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+
+    def transaction(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        # Synchronous daemon code cannot await an asyncio actor.  This helper
+        # gives those paths the same single-writer guarantee with a per-DB
+        # actor lock, while opening and closing the SQLite handle per
+        # transaction so test/prod maintenance can move or back up DB files.
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            con = _connect(self.path)
+            con.execute("pragma journal_mode=WAL")
+            con.execute("pragma busy_timeout=5000")
+            try:
+                out = fn(con)
+                con.commit()
+                return out
+            except Exception:
+                con.rollback()
+                raise
+            finally:
+                con.close()
+
+    def _run(self) -> None:
+        self._thread_id = threading.get_ident()
+        con = _connect(self.path)
+        con.execute("pragma journal_mode=WAL")
+        con.execute("pragma busy_timeout=5000")
+        try:
+            while True:
+                op, payload, reply = self._queue.get()
+                if op == "stop":
+                    con.commit()
+                    reply.put((True, None))
+                    self._queue.task_done()
+                    return
+                try:
+                    result = payload(con)
+                    con.commit()
+                    reply.put((True, result))
+                except Exception as exc:
+                    con.rollback()
+                    reply.put((False, exc))
+                finally:
+                    self._queue.task_done()
+        finally:
+            con.close()
+
+_WRITE_ACTORS: dict[str, _SyncWriteActor] = {}
+_WRITE_ACTORS_LOCK = threading.Lock()
+
+def _actor_for(path: str | Path) -> _SyncWriteActor:
+    key = str(Path(path).resolve())
+    with _WRITE_ACTORS_LOCK:
+        actor = _WRITE_ACTORS.get(key)
+        if actor is None:
+            actor = _SyncWriteActor(Path(key))
+            _WRITE_ACTORS[key] = actor
+        return actor
+
+def write_transaction(path: str | Path, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+    return _actor_for(path).transaction(fn)
+
+def write_execute(path: str | Path, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> WriteResult:
+    def txn(con: sqlite3.Connection) -> WriteResult:
+        cur = con.execute(sql, tuple(params))
+        return WriteResult(int(cur.lastrowid or 0), int(cur.rowcount if cur.rowcount is not None else -1))
+    return write_transaction(path, txn)
+
+def write_executemany(path: str | Path, sql: str, params: list[tuple[Any, ...]]) -> WriteResult:
+    def txn(con: sqlite3.Connection) -> WriteResult:
+        cur = con.executemany(sql, params)
+        return WriteResult(int(cur.lastrowid or 0), int(cur.rowcount if cur.rowcount is not None else -1))
+    return write_transaction(path, txn)
+
+def stop_write_actors() -> None:
+    with _WRITE_ACTORS_LOCK:
+        actors = list(_WRITE_ACTORS.values())
+        _WRITE_ACTORS.clear()
+    for actor in actors:
+        actor.stop()
+
+atexit.register(stop_write_actors)
 
 def migration_sql() -> list[str]:
     return [

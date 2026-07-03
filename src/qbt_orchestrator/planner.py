@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .db import write_transaction
 from .models import LifecycleState
 from .observability import redact
 from .policies.download_mode import desired_seq_dl
@@ -216,8 +217,7 @@ class DownloadPlanner:
     ) -> None:
         dead_set = dead_set or set()
         previous_allocations = previous_allocations or {}
-        con = _connect(self.state_db)
-        try:
+        def txn(con: sqlite3.Connection) -> None:
             for torrent in torrents:
                 h = str(torrent.get("hash") or "")
                 if not h:
@@ -280,9 +280,8 @@ class DownloadPlanner:
                         now,
                     ),
                 )
-            con.commit()
-        finally:
-            con.close()
+
+        write_transaction(self.state_db, txn)
 
     def _qbt_post(self, path: str, hashes: list[str]) -> None:
         if not hashes:
@@ -316,32 +315,32 @@ class DownloadPlanner:
                 raise
 
     def _allocation(self, hash: str, desired_state: str, slot_kind: str, reserved_bytes: int, seq_dl: bool, ts: int, reason: str) -> None:
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason) "
-            "values(?,?,?,?,?,?,?,?,?) "
-            "on conflict(hash) do update set desired_state=excluded.desired_state, applied_state=excluded.applied_state, "
-            "slot_kind=excluded.slot_kind, priority_score=excluded.priority_score, reserved_bytes=excluded.reserved_bytes, "
-            "desired_seq_dl=excluded.desired_seq_dl, allocated_at=excluded.allocated_at, reason=excluded.reason",
-            (hash, desired_state, desired_state, slot_kind, 0, reserved_bytes, 1 if seq_dl else 0, ts, reason),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason) "
+                "values(?,?,?,?,?,?,?,?,?) "
+                "on conflict(hash) do update set desired_state=excluded.desired_state, applied_state=excluded.applied_state, "
+                "slot_kind=excluded.slot_kind, priority_score=excluded.priority_score, reserved_bytes=excluded.reserved_bytes, "
+                "desired_seq_dl=excluded.desired_seq_dl, allocated_at=excluded.allocated_at, reason=excluded.reason",
+                (hash, desired_state, desired_state, slot_kind, 0, reserved_bytes, 1 if seq_dl else 0, ts, reason),
+            ),
         )
-        con.commit()
-        con.close()
 
     def _decision(self, hash: str, decision: str, reason_code: str, data: dict[str, Any]) -> None:
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
-            (int(self.now()), "planner", hash, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
+                (int(self.now()), "planner", hash, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
+            ),
         )
-        con.commit()
-        con.close()
 
     def _action(self, path: str, payload: dict[str, Any], status: str, dry_run: bool, error: str | None = None) -> None:
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into action_log(ts,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?)",
-            (int(self.now()), "qbt_post", path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into action_log(ts,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?)",
+                (int(self.now()), "qbt_post", path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
+            ),
         )
-        con.commit()
-        con.close()

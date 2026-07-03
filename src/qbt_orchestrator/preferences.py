@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .db import write_transaction
 from .observability import redact
 
 
@@ -77,28 +78,28 @@ class QbtPreferencesGuard:
             return
         now = int(self.now())
         data = {"drift": drift, "would_set": to_set, "dry_run": self.dry_run}
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
-            (now, "warning", "qbt_preferences", "preferences_drift", "qBT preferences drift detected", json.dumps(redact(data), ensure_ascii=False)),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
+                (now, "warning", "qbt_preferences", "preferences_drift", "qBT preferences drift detected", json.dumps(redact(data), ensure_ascii=False)),
+            ),
         )
-        con.commit()
-        con.close()
 
     def _record_action(self, to_set: dict[str, Any], status: str, dry_run: bool, error: str | None = None) -> None:
         now = int(self.now())
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into action_log(ts,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?)",
-            (
-                now,
-                "qbt_preferences",
-                "/api/v2/app/setPreferences",
-                json.dumps(redact({"set": to_set}), ensure_ascii=False),
-                status,
-                1 if dry_run else 0,
-                str(redact(error)) if error else None,
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into action_log(ts,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?)",
+                (
+                    now,
+                    "qbt_preferences",
+                    "/api/v2/app/setPreferences",
+                    json.dumps(redact({"set": to_set}), ensure_ascii=False),
+                    status,
+                    1 if dry_run else 0,
+                    str(redact(error)) if error else None,
+                ),
             ),
         )
-        con.commit()
-        con.close()

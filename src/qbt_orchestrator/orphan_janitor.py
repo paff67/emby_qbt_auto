@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .db import write_transaction
 from .observability import redact
 
 
@@ -139,38 +140,38 @@ class OrphanJanitorService:
         return path_s
 
     def _record_candidate(self, path: Path, now: int) -> int:
-        con = _connect(self.state_db)
-        row = con.execute("select confirmations from orphan_candidates where path=?", (str(path),)).fetchone()
-        if row is None:
-            confirmations = 1
-            con.execute(
-                "insert into orphan_candidates(path,first_seen_at,last_seen_at,confirmations,state) values(?,?,?,?,?)",
-                (str(path), now, now, confirmations, "seen"),
-            )
-        else:
-            confirmations = int(row["confirmations"] or 0) + 1
-            con.execute(
-                "update orphan_candidates set last_seen_at=?, confirmations=?, state=? where path=?",
-                (now, confirmations, "confirmed" if confirmations >= self.min_confirmations else "seen", str(path)),
-            )
-        con.commit()
-        con.close()
-        return confirmations
+        def txn(con: sqlite3.Connection) -> int:
+            row = con.execute("select confirmations from orphan_candidates where path=?", (str(path),)).fetchone()
+            if row is None:
+                confirmations = 1
+                con.execute(
+                    "insert into orphan_candidates(path,first_seen_at,last_seen_at,confirmations,state) values(?,?,?,?,?)",
+                    (str(path), now, now, confirmations, "seen"),
+                )
+            else:
+                confirmations = int(row["confirmations"] or 0) + 1
+                con.execute(
+                    "update orphan_candidates set last_seen_at=?, confirmations=?, state=? where path=?",
+                    (now, confirmations, "confirmed" if confirmations >= self.min_confirmations else "seen", str(path)),
+                )
+            return confirmations
+
+        return int(write_transaction(self.state_db, txn))
 
     def _mark_confirmed(self, path: Path, now: int) -> None:
-        con = _connect(self.state_db)
-        con.execute("update orphan_candidates set state='confirmed', last_seen_at=? where path=?", (now, str(path)))
-        con.commit()
-        con.close()
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute("update orphan_candidates set state='confirmed', last_seen_at=? where path=?", (now, str(path))),
+        )
 
     def _mark_quarantined(self, path: Path, dest: Path, now: int) -> None:
-        con = _connect(self.state_db)
-        con.execute(
-            "update orphan_candidates set state='quarantined', quarantined_at=?, trash_path=? where path=?",
-            (now, str(dest), str(path)),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update orphan_candidates set state='quarantined', quarantined_at=?, trash_path=? where path=?",
+                (now, str(dest), str(path)),
+            ),
         )
-        con.commit()
-        con.close()
 
     def _trash_destination(self, path: Path) -> Path:
         dest = self.trash_dir / path.name
@@ -182,27 +183,27 @@ class OrphanJanitorService:
     def _action(self, src: Path, dest: Path, status: str, dry_run: bool) -> None:
         now = int(self.now())
         payload = {"from": str(src), "to": str(dest)}
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into action_log(ts,action_type,path,payload_json,status,dry_run) values(?,?,?,?,?,?)",
-            (now, "orphan_quarantine", str(src), json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0),
-        )
-        con.execute(
-            "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
-            (now, "warning", "orphan_janitor", "orphan_quarantine", f"orphan quarantine {status}", json.dumps(redact(payload), ensure_ascii=False)),
-        )
-        con.commit()
-        con.close()
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
+                "insert into action_log(ts,action_type,path,payload_json,status,dry_run) values(?,?,?,?,?,?)",
+                (now, "orphan_quarantine", str(src), json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0),
+            )
+            con.execute(
+                "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
+                (now, "warning", "orphan_janitor", "orphan_quarantine", f"orphan quarantine {status}", json.dumps(redact(payload), ensure_ascii=False)),
+            )
+
+        write_transaction(self.state_db, txn)
 
     def _event(self, level: str, event_type: str, message: str, data: dict[str, Any]) -> None:
         now = int(self.now())
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
-            (now, level, "orphan_janitor", event_type, message, json.dumps(redact(data), ensure_ascii=False)),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
+                (now, level, "orphan_janitor", event_type, message, json.dumps(redact(data), ensure_ascii=False)),
+            ),
         )
-        con.commit()
-        con.close()
 
     @staticmethod
     def _is_relative_to(path: Path, parent: Path) -> bool:

@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .db import write_transaction
 
 RETENTION_TABLES = ("events_v2", "action_log", "decision_log", "metrics_snapshots")
 
@@ -36,17 +37,19 @@ class SQLiteMaintenanceService:
 
     def run_once(self) -> dict:
         cutoff = int(self.now()) - self.retention_days * 86400
-        con = sqlite3.connect(self.state_db)
-        con.row_factory = sqlite3.Row
-        con.execute("pragma busy_timeout=5000")
-        con.execute(f"pragma journal_size_limit={self.journal_size_limit_bytes}")
         deleted: dict[str, int] = {}
-        try:
+        def txn(con: sqlite3.Connection) -> int:
+            con.execute("pragma busy_timeout=5000")
+            con.execute(f"pragma journal_size_limit={self.journal_size_limit_bytes}")
             for table in RETENTION_TABLES:
                 deleted[table] = self._delete_old_rows(con, table, cutoff)
-            con.commit()
-            checkpoint = tuple(con.execute("pragma wal_checkpoint(passive)").fetchone())
             journal_size_limit = int(con.execute("pragma journal_size_limit").fetchone()[0])
+            return journal_size_limit
+
+        journal_size_limit = int(write_transaction(self.state_db, txn))
+        con = sqlite3.connect(self.state_db)
+        try:
+            checkpoint = tuple(con.execute("pragma wal_checkpoint(passive)").fetchone())
         finally:
             con.close()
         result = {

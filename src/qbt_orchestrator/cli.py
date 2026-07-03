@@ -10,6 +10,7 @@ from .integrations.qbt import QbtDockerClient
 from .integrations.rclone import RcloneClient
 from .integrations.emby import EmbyClient
 from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
+from .integrations.gdrive_backfill import GDriveBackfillScraper
 from .io_governor import IoGovernor, UploadBackpressurePolicy
 from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
@@ -25,6 +26,17 @@ from .service import DaemonRuntime, build_telegram_supervisor_from_env
 class PassthroughBackfill:
     def scrape_one(self, media_group_key, manifest_id):
         return {"status": "not_found", "artifacts": [], "media_group_key": media_group_key, "manifest_id": manifest_id}
+
+
+def _build_backfill_from_env(env=os.environ):
+    enabled = _truthy(env.get("QBT_ORCH_BACKFILL_SCRAPER"))
+    if not enabled:
+        return PassthroughBackfill()
+    script = env.get("QBT_ORCH_BACKFILL_SCRIPT", "/opt/qbt/gdrive-backfill/bin/javinizer_scrape_one.sh")
+    staging = env.get("QBT_ORCH_SIDECAR_STAGING_ROOT", "/var/lib/qbt-orchestrator/sidecar-staging")
+    timeout = int(env.get("QBT_ORCH_BACKFILL_TIMEOUT_SEC", "1020"))
+    remote = env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:")
+    return GDriveBackfillScraper(script_path=script, staging_root=staging, remote=remote, timeout_sec=timeout)
 
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
 
@@ -134,7 +146,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     media_pipeline_dry_run = True if dry_run else (media_env if media_env is not None else True)
     media_runner = MediaPipelineJobRunner(
         TorrentJobRepository(state_db),
-        MediaPipelineService(state_db, PassthroughBackfill(), emby_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt"),
+        MediaPipelineService(state_db, _build_backfill_from_env(os.environ), emby_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt"),
     )
     emby_env = _truthy(os.environ.get("QBT_ORCH_EMBY_REFRESH_DRY_RUN"))
     emby_refresh_dry_run = True if dry_run else (emby_env if emby_env is not None else True)
@@ -221,6 +233,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             dry_run=carousel_dry_run,
             concurrency=int(os.environ.get("QBT_ORCH_CAROUSEL_CONCURRENCY", "3")),
             probe_duration_sec=int(os.environ.get("QBT_ORCH_CAROUSEL_PROBE_DURATION_SEC", "1800")),
+            min_free_bytes=int(float(os.environ.get("QBT_ORCH_CAROUSEL_MIN_FREE_GB", "5")) * 1024**3),
         )
     runtime = DaemonRuntime(
         state_db=state_db,

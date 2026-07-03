@@ -8,6 +8,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
+from .db import write_transaction
 from .observability import redact
 
 
@@ -203,23 +204,23 @@ class JunkJanitorService:
         return any(pattern.search(name) for pattern in self.hard_patterns)
 
     def _learn_rule(self, pattern: str, now: int) -> int:
-        con = _connect(self.state_db)
-        row = con.execute(
-            "select id,hits from dynamic_junk_rules where pattern=? and pattern_type='literal' and source='janitor'",
-            (pattern,),
-        ).fetchone()
-        if row:
-            rule_id = int(row["id"])
-            con.execute("update dynamic_junk_rules set hits=hits+1, updated_at=? where id=?", (now, rule_id))
-        else:
-            cur = con.execute(
-                "insert into dynamic_junk_rules(pattern,pattern_type,confidence,source,hits,created_at,updated_at,enabled) values(?,?,?,?,?,?,?,?)",
-                (pattern, "literal", "hard", "janitor", 1, now, now, 1),
-            )
-            rule_id = int(cur.lastrowid)
-        con.commit()
-        con.close()
-        return rule_id
+        def txn(con: sqlite3.Connection) -> int:
+            row = con.execute(
+                "select id,hits from dynamic_junk_rules where pattern=? and pattern_type='literal' and source='janitor'",
+                (pattern,),
+            ).fetchone()
+            if row:
+                rule_id = int(row["id"])
+                con.execute("update dynamic_junk_rules set hits=hits+1, updated_at=? where id=?", (now, rule_id))
+            else:
+                cur = con.execute(
+                    "insert into dynamic_junk_rules(pattern,pattern_type,confidence,source,hits,created_at,updated_at,enabled) values(?,?,?,?,?,?,?,?)",
+                    (pattern, "literal", "hard", "janitor", 1, now, now, 1),
+                )
+                rule_id = int(cur.lastrowid)
+            return rule_id
+
+        return int(write_transaction(self.state_db, txn))
 
     def _record_event(
         self,
@@ -234,17 +235,17 @@ class JunkJanitorService:
         data: dict[str, Any],
         rule_id: int | None = None,
     ) -> None:
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into junk_janitor_events(ts,hash,file_index,path,size,action,reason,rule_id,qbt_priority,mtime,data_json) values(?,?,?,?,?,?,?,?,?,?,?)",
-            (int(self.now()), h, index, str(path), size, action, reason, rule_id, priority, mtime, json.dumps(redact(data), ensure_ascii=False)),
-        )
-        con.execute(
-            "insert into events_v2(ts,level,component,event_type,hash,message,data_json) values(?,?,?,?,?,?,?)",
-            (int(self.now()), "warning" if action in {"quarantined", "quarantine_dry_run"} else "info", "junk_janitor", f"junk_{action}", h, f"junk {action}: {reason}", json.dumps(redact(data), ensure_ascii=False)),
-        )
-        con.commit()
-        con.close()
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
+                "insert into junk_janitor_events(ts,hash,file_index,path,size,action,reason,rule_id,qbt_priority,mtime,data_json) values(?,?,?,?,?,?,?,?,?,?,?)",
+                (int(self.now()), h, index, str(path), size, action, reason, rule_id, priority, mtime, json.dumps(redact(data), ensure_ascii=False)),
+            )
+            con.execute(
+                "insert into events_v2(ts,level,component,event_type,hash,message,data_json) values(?,?,?,?,?,?,?)",
+                (int(self.now()), "warning" if action in {"quarantined", "quarantine_dry_run"} else "info", "junk_janitor", f"junk_{action}", h, f"junk {action}: {reason}", json.dumps(redact(data), ensure_ascii=False)),
+            )
+
+        write_transaction(self.state_db, txn)
 
     def _action(
         self,
@@ -258,22 +259,22 @@ class JunkJanitorService:
         payload: dict[str, Any] | None = None,
     ) -> None:
         payload = payload or {"hash": h, "index": index, "from": str(src), "to": str(dest)}
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into action_log(ts,hash,action_type,path,payload_json,status,dry_run) values(?,?,?,?,?,?,?)",
-            (int(self.now()), h, action_type, str(src), json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into action_log(ts,hash,action_type,path,payload_json,status,dry_run) values(?,?,?,?,?,?,?)",
+                (int(self.now()), h, action_type, str(src), json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0),
+            ),
         )
-        con.commit()
-        con.close()
 
     def _event(self, level: str, event_type: str, message: str, data: dict[str, Any]) -> None:
-        con = _connect(self.state_db)
-        con.execute(
-            "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
-            (int(self.now()), level, "junk_janitor", event_type, message, json.dumps(redact(data), ensure_ascii=False)),
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
+                (int(self.now()), level, "junk_janitor", event_type, message, json.dumps(redact(data), ensure_ascii=False)),
+            ),
         )
-        con.commit()
-        con.close()
 
     @staticmethod
     def _snapshot(snapshots: Mapping[str, Any], h: str) -> dict[str, Any]:

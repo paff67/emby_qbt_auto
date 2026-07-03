@@ -6,6 +6,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
+from .db import write_transaction
 from .observability import redact
 
 
@@ -109,18 +110,20 @@ class QbtPathReconciler:
             ).fetchone()
             if row and (row[0] or "") == data_json:
                 return
-            con.execute(
-                "insert into events_v2(ts,level,component,event_type,hash,message,data_json) values(?,?,?,?,?,?,?)",
-                (
-                    int(time.time()),
-                    "warning",
-                    "qbt_reconcile",
-                    "path_drift",
-                    drift.get("hash"),
-                    f"qBT path drift: {drift.get('reason')}",
-                    data_json,
+            write_transaction(
+                self.state_db,
+                lambda wcon: wcon.execute(
+                    "insert into events_v2(ts,level,component,event_type,hash,message,data_json) values(?,?,?,?,?,?,?)",
+                    (
+                        int(time.time()),
+                        "warning",
+                        "qbt_reconcile",
+                        "path_drift",
+                        drift.get("hash"),
+                        f"qBT path drift: {drift.get('reason')}",
+                        data_json,
+                    ),
                 ),
             )
-            con.commit()
         finally:
             con.close()
