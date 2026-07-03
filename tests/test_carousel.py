@@ -219,8 +219,35 @@ def test_daemon_default_carousel_loop_uses_sync_cache_not_not_configured():
         assert result["dry_run"] is True
 
 
+
+def test_carousel_live_verify_caps_probe_to_one_and_records_metrics():
+    from qbt_orchestrator.carousel import CarouselService
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        _seed_dead_allocations(db, ["h1", "h2", "h3"])
+        executor = RecordingExecutor()
+        svc = CarouselService(db, executor, dry_run=False, concurrency=3, live_verify=True, now=lambda: 1000)
+        snapshots = {h: {"hash": h, "category": "auto", "tags": "auto", "amount_left": 1, "num_seeds": 0, "num_peers": 0} for h in ["h1", "h2", "h3"]}
+
+        result = svc.run_once(snapshots, sync_healthy=True, free_bytes=8 * 1024**3)
+
+        assert result["started"] == ["h1"]
+        assert result["live_verify"] is True
+        assert result["effective_concurrency"] == 1
+        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "h1"})]
+        metric = _rows(db, "select component,metrics_json from metrics_snapshots where component='carousel' order by id desc limit 1")[0]
+        metrics = json.loads(metric["metrics_json"])
+        assert metrics["live_verify"] is True
+        assert metrics["started_count"] == 1
+        assert metrics["effective_concurrency"] == 1
+
+
 if __name__ == "__main__":
+    inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
+        if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")

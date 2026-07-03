@@ -4,27 +4,94 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
+
 def _connect(path: str | Path) -> sqlite3.Connection:
-    con = sqlite3.connect(path); con.row_factory = sqlite3.Row; return con
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    return con
+
 
 def readonly_connect(path: str | Path) -> sqlite3.Connection:
     con = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
+    con.execute("pragma query_only=ON")
+    con.execute("pragma busy_timeout=2000")
     return con
+
+
+class ReadonlyConnectionPool:
+    """Bounded readonly pool for Telegram/CLI/status reads.
+
+    Reads must not enter the single-writer queue.  Every connection is opened
+    `mode=ro` plus `query_only=ON`, so an accidental write from a status path is
+    rejected by SQLite instead of contending with the DbActor writer.
+    """
+
+    def __init__(self, path: str | Path, max_size: int = 4):
+        self.path = Path(path)
+        self.max_size = max(1, int(max_size))
+        self._pool: "queue.LifoQueue[sqlite3.Connection]" = queue.LifoQueue(maxsize=self.max_size)
+        self._created = 0
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def acquire(self) -> sqlite3.Connection:
+        if self._closed:
+            raise RuntimeError("readonly connection pool is closed")
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            with self._lock:
+                if self._created < self.max_size:
+                    self._created += 1
+                    return readonly_connect(self.path)
+            return self._pool.get()
+
+    def release(self, con: sqlite3.Connection) -> None:
+        if self._closed:
+            con.close()
+            return
+        try:
+            self._pool.put_nowait(con)
+        except queue.Full:
+            con.close()
+
+    def close(self) -> None:
+        self._closed = True
+        while True:
+            try:
+                self._pool.get_nowait().close()
+            except queue.Empty:
+                break
+
 
 @dataclass(frozen=True)
 class WriteResult:
     lastrowid: int
     rowcount: int
 
+
 class _SyncWriteActor:
+    """Per-DB single writer for synchronous daemon code.
+
+    This is the sync counterpart of `DbActor`: feature modules call
+    `write_transaction()` / `write_execute()`, which enqueue work onto one
+    writer thread per SQLite file.  The writer owns the only write connection,
+    uses WAL + busy_timeout, and never handles read-only status queries.
+    """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._queue: "queue.Queue[tuple[str, Any, queue.Queue]]" = queue.Queue()
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
+        self._connection: sqlite3.Connection | None = None
         self._lock = threading.Lock()
-        self._stopped = False
+        self._stopped = True
+        self._enqueued_total = 0
+        self._completed_total = 0
+        self._failed_total = 0
+        self._flushes_completed = 0
 
     def start(self) -> None:
         with self._lock:
@@ -37,55 +104,104 @@ class _SyncWriteActor:
 
     def stop(self) -> None:
         with self._lock:
+            thread = self._thread
+            if not thread or not thread.is_alive():
+                self._stopped = True
+                self._thread = None
+                self._thread_id = None
+                return
+            reply: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
+            self._queue.put(("stop", None, reply))
+        ok, value = reply.get()
+        thread.join(timeout=5)
+        with self._lock:
             self._stopped = True
+            self._thread = None
+            self._thread_id = None
+        if not ok:
+            raise value
 
     def transaction(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
-        # Synchronous daemon code cannot await an asyncio actor.  This helper
-        # gives those paths the same single-writer guarantee with a per-DB
-        # actor lock, while opening and closing the SQLite handle per
-        # transaction so test/prod maintenance can move or back up DB files.
+        self.start()
+        if self._thread_id == threading.get_ident() and self._connection is not None:
+            return fn(self._connection)
+        reply: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            con = _connect(self.path)
-            con.execute("pragma journal_mode=WAL")
-            con.execute("pragma busy_timeout=5000")
-            try:
-                out = fn(con)
-                con.commit()
-                return out
-            except Exception:
-                con.rollback()
-                raise
-            finally:
-                con.close()
+            self._enqueued_total += 1
+        self._queue.put(("transaction", fn, reply))
+        ok, value = reply.get()
+        if ok:
+            return value
+        raise value
+
+    def flush(self) -> None:
+        self.start()
+        reply: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
+        self._queue.put(("flush", None, reply))
+        ok, value = reply.get()
+        if not ok:
+            raise value
+
+    def metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "path": str(self.path),
+                "queue_depth": int(self._queue.qsize()),
+                "writes_enqueued": int(self._enqueued_total),
+                "writes_completed": int(self._completed_total),
+                "writes_failed": int(self._failed_total),
+                "flushes_completed": int(self._flushes_completed),
+                "running": bool(self._thread and self._thread.is_alive()),
+            }
 
     def _run(self) -> None:
         self._thread_id = threading.get_ident()
-        con = _connect(self.path)
-        con.execute("pragma journal_mode=WAL")
-        con.execute("pragma busy_timeout=5000")
         try:
             while True:
                 op, payload, reply = self._queue.get()
                 if op == "stop":
-                    con.commit()
-                    reply.put((True, None))
-                    self._queue.task_done()
+                    try:
+                        reply.put((True, None))
+                    except Exception as exc:  # pragma: no cover - defensive
+                        reply.put((False, exc))
+                    finally:
+                        self._queue.task_done()
                     return
                 try:
-                    result = payload(con)
-                    con.commit()
-                    reply.put((True, result))
+                    if op == "flush":
+                        with self._lock:
+                            self._flushes_completed += 1
+                        reply.put((True, True))
+                    else:
+                        con = _connect(self.path)
+                        self._connection = con
+                        con.execute("pragma journal_mode=WAL")
+                        con.execute("pragma busy_timeout=5000")
+                        try:
+                            result = payload(con)
+                            con.commit()
+                        except Exception:
+                            con.rollback()
+                            raise
+                        finally:
+                            self._connection = None
+                            con.close()
+                        with self._lock:
+                            self._completed_total += 1
+                        reply.put((True, result))
                 except Exception as exc:
-                    con.rollback()
+                    with self._lock:
+                        self._failed_total += 1
                     reply.put((False, exc))
                 finally:
                     self._queue.task_done()
         finally:
-            con.close()
+            self._connection = None
+
 
 _WRITE_ACTORS: dict[str, _SyncWriteActor] = {}
 _WRITE_ACTORS_LOCK = threading.Lock()
+
 
 def _actor_for(path: str | Path) -> _SyncWriteActor:
     key = str(Path(path).resolve())
@@ -96,8 +212,18 @@ def _actor_for(path: str | Path) -> _SyncWriteActor:
             _WRITE_ACTORS[key] = actor
         return actor
 
+
 def write_transaction(path: str | Path, fn: Callable[[sqlite3.Connection], Any]) -> Any:
     return _actor_for(path).transaction(fn)
+
+
+def flush_write_actor(path: str | Path) -> None:
+    _actor_for(path).flush()
+
+
+def db_actor_metrics(path: str | Path) -> Dict[str, Any]:
+    return _actor_for(path).metrics()
+
 
 def write_execute(path: str | Path, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> WriteResult:
     def txn(con: sqlite3.Connection) -> WriteResult:
@@ -105,11 +231,13 @@ def write_execute(path: str | Path, sql: str, params: tuple[Any, ...] | list[Any
         return WriteResult(int(cur.lastrowid or 0), int(cur.rowcount if cur.rowcount is not None else -1))
     return write_transaction(path, txn)
 
+
 def write_executemany(path: str | Path, sql: str, params: list[tuple[Any, ...]]) -> WriteResult:
     def txn(con: sqlite3.Connection) -> WriteResult:
         cur = con.executemany(sql, params)
         return WriteResult(int(cur.lastrowid or 0), int(cur.rowcount if cur.rowcount is not None else -1))
     return write_transaction(path, txn)
+
 
 def stop_write_actors() -> None:
     with _WRITE_ACTORS_LOCK:
@@ -117,6 +245,7 @@ def stop_write_actors() -> None:
         _WRITE_ACTORS.clear()
     for actor in actors:
         actor.stop()
+
 
 atexit.register(stop_write_actors)
 
@@ -141,6 +270,12 @@ def migration_sql() -> list[str]:
         "create table if not exists media_groups(id integer primary key autoincrement, media_group_key text unique, normalized_id text, emby_media_dir text, created_at integer, updated_at integer)",
         "create table if not exists media_pipeline_runs(id integer primary key autoincrement, upload_manifest_id text, media_group_id integer, state text, created_at integer, updated_at integer, unique(upload_manifest_id, media_group_id))",
         "create table if not exists sidecar_manifests(id integer primary key autoincrement, media_group_id integer, staging_dir text, artifacts_json text, state text, created_at integer, updated_at integer)",
+        "alter table sidecar_manifests add column local_artifact_dir text",
+        "alter table sidecar_manifests add column artifact_manifest_json text",
+        "alter table sidecar_manifests add column artifact_total_bytes integer",
+        "alter table sidecar_manifests add column scraper_exit_code integer",
+        "alter table sidecar_manifests add column scraper_log_tail text",
+        "alter table sidecar_manifests add column media_group_key_snapshot text",
         "create table if not exists emby_refresh_tasks(id integer primary key autoincrement, emby_media_dir text, state text default 'queued', earliest_run_at integer, max_run_at integer, payload_json text, created_at integer, updated_at integer)",
         "alter table emby_refresh_tasks add column last_error text",
         "create table if not exists bot_commands(id integer primary key autoincrement, command_id text unique, chat_id text, user_id text, command text, payload_json text, state text default 'queued', created_at integer, updated_at integer)",
@@ -173,31 +308,120 @@ def migrate(path: str | Path, dry_run: bool = False) -> list[str]:
     con.commit(); con.close(); return sql
 
 def readonly_counts(path: str | Path) -> Dict[str, int]:
-    con = _connect(path); tables = [r[0] for r in con.execute("select name from sqlite_master where type='table'")]
+    con = readonly_connect(path); tables = [r[0] for r in con.execute("select name from sqlite_master where type='table'")]
     counts = {t: con.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0] for t in tables}; con.close(); return counts
 
 def recover_jobs(path: str | Path) -> List[Dict[str, Any]]:
-    con = _connect(path); rows = [dict(r) for r in con.execute("select * from torrent_jobs where state in ('queued','running','verify_pending','retry_wait') order by priority,id")]; con.close(); return rows
+    con = readonly_connect(path); rows = [dict(r) for r in con.execute("select * from torrent_jobs where state in ('queued','running','verify_pending','retry_wait') order by priority,id")]; con.close(); return rows
 
 class DbActor:
-    def __init__(self, path: str | Path): self.path = Path(path); self.queue: asyncio.Queue = asyncio.Queue(); self._task = None; self._stopping = False
-    async def start(self) -> None: migrate(self.path, False); self._task = asyncio.create_task(self._run())
+    """Async single-writer DbActor used by coroutine-based workers/tests."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self._task: asyncio.Task | None = None
+        self._started = False
+        self._writes_enqueued = 0
+        self._writes_completed = 0
+        self._writes_failed = 0
+        self._flushes_completed = 0
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        migrate(self.path, False)
+        self._started = True
+        self._task = asyncio.create_task(self._run())
+
     async def _run(self) -> None:
         con = _connect(self.path)
-        while not self._stopping or not self.queue.empty():
-            item = await self.queue.get(); op, payload, fut = item
-            if op == "stop": self.queue.task_done(); continue
-            try:
-                if op == "enqueue_job":
-                    now = int(time.time()); cur = con.execute("insert into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?)", (payload["hash"], payload["batch_id"], payload["job_type"], "queued", payload["priority"], json.dumps(payload["payload"]), now, now)); con.commit(); fut.set_result(cur.lastrowid)
-                elif op == "flush": con.commit(); fut.set_result(True)
-            except Exception as e: fut.set_exception(e)
-            finally: self.queue.task_done()
-        con.close()
+        con.execute("pragma journal_mode=WAL")
+        con.execute("pragma busy_timeout=5000")
+        try:
+            while True:
+                op, payload, fut = await self.queue.get()
+                if op == "stop":
+                    try:
+                        con.commit()
+                        fut.set_result(True)
+                    finally:
+                        self.queue.task_done()
+                    break
+                try:
+                    if op == "enqueue_job":
+                        now = int(time.time())
+                        cur = con.execute(
+                            "insert into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
+                            (payload["hash"], payload["batch_id"], payload["job_type"], "queued", payload["priority"], json.dumps(payload["payload"], ensure_ascii=False), now, now),
+                        )
+                        con.commit()
+                        self._writes_completed += 1
+                        fut.set_result(int(cur.lastrowid))
+                    elif op == "execute":
+                        cur = con.execute(payload["sql"], tuple(payload.get("params") or ()))
+                        con.commit()
+                        self._writes_completed += 1
+                        fut.set_result(int(cur.lastrowid or 0))
+                    elif op == "transaction":
+                        out = payload(con)
+                        con.commit()
+                        self._writes_completed += 1
+                        fut.set_result(out)
+                    elif op == "flush":
+                        con.commit()
+                        self._flushes_completed += 1
+                        fut.set_result(True)
+                except Exception as exc:
+                    con.rollback()
+                    self._writes_failed += 1
+                    fut.set_exception(exc)
+                finally:
+                    self.queue.task_done()
+        finally:
+            con.close()
+
+    async def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> int:
+        fut = asyncio.get_running_loop().create_future()
+        self._writes_enqueued += 1
+        await self.queue.put(("execute", {"sql": sql, "params": tuple(params)}, fut))
+        return int(await fut)
+
+    async def transaction(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        fut = asyncio.get_running_loop().create_future()
+        self._writes_enqueued += 1
+        await self.queue.put(("transaction", fn, fut))
+        return await fut
+
     async def enqueue_job(self, hash: str | None, batch_id: int | None, job_type: str, payload: Dict[str, Any], priority: int = 100) -> int:
-        fut = asyncio.get_running_loop().create_future(); await self.queue.put(("enqueue_job", {"hash": hash, "batch_id": batch_id, "job_type": job_type, "payload": payload, "priority": priority}, fut)); return await fut
+        fut = asyncio.get_running_loop().create_future()
+        self._writes_enqueued += 1
+        await self.queue.put(("enqueue_job", {"hash": hash, "batch_id": batch_id, "job_type": job_type, "payload": payload, "priority": priority}, fut))
+        return int(await fut)
+
     async def flush(self) -> None:
-        fut = asyncio.get_running_loop().create_future(); await self.queue.put(("flush", {}, fut)); await fut
+        fut = asyncio.get_running_loop().create_future()
+        await self.queue.put(("flush", {}, fut))
+        await fut
+
     async def stop(self) -> None:
-        self._stopping = True; fut = asyncio.get_running_loop().create_future(); fut.set_result(True); await self.queue.put(("stop", {}, fut)); await self.queue.join();
-        if self._task: await self._task
+        if not self._started:
+            return
+        fut = asyncio.get_running_loop().create_future()
+        await self.queue.put(("stop", {}, fut))
+        await fut
+        await self.queue.join()
+        if self._task:
+            await self._task
+        self._started = False
+
+    def metrics(self) -> Dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "queue_depth": int(self.queue.qsize()),
+            "writes_enqueued": int(self._writes_enqueued),
+            "writes_completed": int(self._writes_completed),
+            "writes_failed": int(self._writes_failed),
+            "flushes_completed": int(self._flushes_completed),
+            "running": bool(self._task and not self._task.done()),
+        }

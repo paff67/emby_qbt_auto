@@ -109,7 +109,8 @@ def test_io_governor_throttles_rclone_command_with_dynamic_limits():
 
 
 if __name__ == "__main__":
+    inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
+        if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")

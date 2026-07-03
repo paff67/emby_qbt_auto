@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import json
 import os
 import re
 import shutil
@@ -17,7 +18,7 @@ class ScrapeCommandGuard:
     def __init__(self, staging_dir: str): self.staging_dir = staging_dir
     def validate(self, command: Sequence[str]) -> GuardResult:
         joined = " ".join(command)
-        if "rclone" in command[0] or " gcrypt:" in joined or joined.endswith("gcrypt:"):
+        if any(Path(part).name == "rclone" or part == "rclone" for part in command) or " gcrypt:" in joined or joined.endswith("gcrypt:"):
             return GuardResult(False, "scraper_io_bypass_blocked")
         return GuardResult(True)
 
@@ -56,6 +57,8 @@ class GDriveBackfillScraper:
         remote: str = "gcrypt:",
         runner: Callable[[list[str], dict[str, str], int], Any] = _default_runner,
         timeout_sec: int = 1020,
+        lock_file: str | Path | None = "/tmp/gdrive-backfill.lock",
+        command_mode: str = "auto",
         env: dict[str, str] | None = None,
         keep_failed_staging: bool = True,
         now: Callable[[], int] | None = None,
@@ -65,6 +68,8 @@ class GDriveBackfillScraper:
         self.remote = remote.rstrip(":") + ":"
         self.runner = runner
         self.timeout_sec = int(timeout_sec)
+        self.lock_file = Path(lock_file) if lock_file else None
+        self.command_mode = command_mode
         self.env = dict(env or {})
         self.keep_failed_staging = bool(keep_failed_staging)
         self.now = now or (lambda: int(time.time()))
@@ -77,7 +82,8 @@ class GDriveBackfillScraper:
         if not self.script_path.exists():
             return self._result("not_found", key, manifest_id, work_dir, [], f"scraper script not found: {self.script_path}")
 
-        command = [str(self.script_path), str(work_dir), key]
+        manifest_path = self._write_manifest(work_dir, key, str(manifest_id))
+        command = self._build_command(work_dir, manifest_path, key)
         guard = ScrapeCommandGuard(str(work_dir)).validate(command)
         if not guard.allowed:
             return self._result("blocked", key, manifest_id, work_dir, [], guard.reason)
@@ -89,12 +95,62 @@ class GDriveBackfillScraper:
         (work_dir / "scraper.stdout.log").write_text(stdout, encoding="utf-8")
         artifacts = self._collect_artifacts(work_dir, key)
         if artifacts:
-            return self._result("sidecar_verified", key, manifest_id, work_dir, artifacts, None, returncode=int(getattr(proc, "returncode", 0) or 0))
+            artifact_manifest = self._write_artifact_manifest(work_dir, key, str(manifest_id), artifacts, command, int(getattr(proc, "returncode", 0) or 0), stdout)
+            return self._result("sidecar_verified", key, manifest_id, work_dir, artifacts, None, returncode=int(getattr(proc, "returncode", 0) or 0), artifact_manifest=artifact_manifest)
         if int(getattr(proc, "returncode", 1) or 0) == 0:
             return self._result("not_found", key, manifest_id, work_dir, [], "scraper produced no sidecar artifacts", returncode=0)
         if not self.keep_failed_staging:
             shutil.rmtree(work_dir, ignore_errors=True)
         return self._result("not_found", key, manifest_id, work_dir, [], stdout[-1000:] or f"scraper rc={getattr(proc, 'returncode', 'unknown')}", returncode=int(getattr(proc, "returncode", 1) or 1))
+
+    def _write_manifest(self, work_dir: Path, key: str, manifest_id: str) -> Path:
+        manifest = {
+            "schema_version": 1,
+            "media_group_key": key,
+            "manifest_id": manifest_id,
+            "output_dir": str(work_dir),
+            "remote_write_allowed": False,
+            "allow_internal_rclone": False,
+            "created_at": int(self.now()),
+        }
+        path = work_dir / "manifest.json"
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def _build_command(self, work_dir: Path, manifest_path: Path, key: str) -> list[str]:
+        mode = self.command_mode
+        if mode == "auto":
+            mode = "manifest" if self.script_path.name in {"scrape-one", "scrape-one.sh"} else "vps_legacy"
+        if mode == "manifest":
+            command = [str(self.script_path), "--manifest", str(manifest_path), "--output-dir", str(work_dir)]
+        elif mode == "vps_legacy":
+            # Current US1 reality: /opt/qbt/gdrive-backfill/bin/javinizer_scrape_one.sh
+            # accepts `/host/work/dir [movie-id]`.  We still create manifest.json
+            # and artifact_manifest.json around it so the daemon owns audit,
+            # UploadWorker handoff, and the remote-write prohibition.
+            command = [str(self.script_path), str(work_dir), key]
+        else:
+            raise ValueError(f"unknown scraper command_mode: {mode}")
+        if self.lock_file:
+            return ["flock", "-n", str(self.lock_file), *command]
+        return command
+
+    def _write_artifact_manifest(self, work_dir: Path, key: str, manifest_id: str, artifacts: list[dict[str, Any]], command: list[str], returncode: int, stdout: str) -> str:
+        path = work_dir / "artifact_manifest.json"
+        payload = {
+            "schema_version": 1,
+            "media_group_key": key,
+            "manifest_id": manifest_id,
+            "artifacts": artifacts,
+            "scraper_command": command,
+            "scraper_exit_code": int(returncode),
+            "scraper_log_tail": stdout[-1000:],
+            "remote_write_allowed": False,
+            "allow_internal_rclone": False,
+            "created_at": int(self.now()),
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(path)
 
     def _collect_artifacts(self, work_dir: Path, key: str) -> list[dict[str, Any]]:
         artifacts: list[dict[str, Any]] = []
@@ -117,7 +173,7 @@ class GDriveBackfillScraper:
         return artifacts
 
     @staticmethod
-    def _result(status: str, key: str, manifest_id: str, work_dir: Path, artifacts: list[dict[str, Any]], error: str | None, returncode: int | None = None) -> dict[str, Any]:
+    def _result(status: str, key: str, manifest_id: str, work_dir: Path, artifacts: list[dict[str, Any]], error: str | None, returncode: int | None = None, artifact_manifest: str | None = None) -> dict[str, Any]:
         out: dict[str, Any] = {
             "status": status,
             "artifacts": artifacts,
@@ -125,6 +181,8 @@ class GDriveBackfillScraper:
             "manifest_id": manifest_id,
             "staging_dir": str(work_dir),
         }
+        if artifact_manifest:
+            out["artifact_manifest"] = artifact_manifest
         if error:
             out["error"] = error
         if returncode is not None:

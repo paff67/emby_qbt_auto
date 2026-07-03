@@ -6,14 +6,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .db import write_transaction
+from .db import readonly_connect, write_transaction
 from .observability import redact
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    return con
+    return readonly_connect(path)
 
 
 def _tags(torrent: Mapping[str, Any]) -> set[str]:
@@ -43,12 +41,14 @@ class CarouselService:
         probe_duration_sec: int = 30 * 60,
         backoff_schedule_sec: tuple[int, ...] = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600),
         min_free_bytes: int = 5 * 1024**3,
+        live_verify: bool = False,
         now: Callable[[], int] | None = None,
     ):
         self.state_db = Path(state_db)
         self.executor = executor
         self.dry_run = bool(dry_run)
         self.concurrency = max(0, int(concurrency))
+        self.live_verify = bool(live_verify)
         self.probe_duration_sec = int(probe_duration_sec)
         self.backoff_schedule_sec = tuple(int(x) for x in backoff_schedule_sec) or (30 * 60,)
         self.min_free_bytes = int(min_free_bytes)
@@ -56,27 +56,41 @@ class CarouselService:
 
     def run_once(self, snapshots: Mapping[str, Any], sync_healthy: bool, free_bytes: int | None = None) -> dict[str, Any]:
         now = int(self.now())
+        effective_concurrency = self._effective_concurrency()
         if not sync_healthy:
             self._event("warning", "suspended_unhealthy_sync", "carousel suspended because qBT sync is unhealthy", {"dry_run": self.dry_run})
-            return {"suspended": True, "reason": "unhealthy_sync", "started": [], "promoted": [], "stopped": [], "dry_run": self.dry_run}
+            result = {"suspended": True, "reason": "unhealthy_sync", "started": [], "promoted": [], "stopped": [], "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency}
+            self._metrics(result)
+            return result
         if free_bytes is not None and int(free_bytes) < self.min_free_bytes:
             data = {"free_bytes": int(free_bytes), "min_free_bytes": self.min_free_bytes, "dry_run": self.dry_run}
             self._event("warning", "suspended_disk_guard", "carousel suspended because disk free space is below live guard", data)
-            return {"suspended": True, "reason": "disk_guard", "started": [], "promoted": [], "stopped": [], "active_probes": self._active_probe_count(), "dry_run": self.dry_run, **data}
+            result = {"suspended": True, "reason": "disk_guard", "started": [], "promoted": [], "stopped": [], "active_probes": self._active_probe_count(), "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency, **data}
+            self._metrics(result)
+            return result
 
         promoted, stopped = self._reconcile_active_probes(snapshots, now)
         active_count = self._active_probe_count()
-        capacity = max(0, self.concurrency - active_count)
+        capacity = max(0, effective_concurrency - active_count)
         started = self._start_new_probes(snapshots, now, capacity)
         active_after = self._active_probe_count()
-        return {
+        result = {
             "suspended": False,
             "started": started,
             "promoted": promoted,
             "stopped": stopped,
             "active_probes": active_after,
             "dry_run": self.dry_run,
+            "live_verify": self.live_verify,
+            "effective_concurrency": effective_concurrency,
         }
+        self._metrics(result)
+        return result
+
+    def _effective_concurrency(self) -> int:
+        if self.live_verify:
+            return min(self.concurrency, 1)
+        return self.concurrency
 
     def _reconcile_active_probes(self, snapshots: Mapping[str, Any], now: int) -> tuple[list[str], list[str]]:
         promoted: list[str] = []
@@ -241,6 +255,27 @@ class CarouselService:
             lambda con: con.execute(
                 "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
                 (int(self.now()), level, "carousel", event_type, message, json.dumps(redact(data), ensure_ascii=False)),
+            ),
+        )
+
+    def _metrics(self, result: dict[str, Any]) -> None:
+        metrics = {
+            "dry_run": self.dry_run,
+            "live_verify": self.live_verify,
+            "configured_concurrency": self.concurrency,
+            "effective_concurrency": result.get("effective_concurrency", self._effective_concurrency()),
+            "started_count": len(result.get("started") or []),
+            "promoted_count": len(result.get("promoted") or []),
+            "stopped_count": len(result.get("stopped") or []),
+            "active_probes": int(result.get("active_probes") or 0),
+            "suspended": bool(result.get("suspended")),
+            "reason": result.get("reason"),
+        }
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into metrics_snapshots(ts,component,metrics_json) values(?,?,?)",
+                (int(self.now()), "carousel", json.dumps(redact(metrics), ensure_ascii=False)),
             ),
         )
 

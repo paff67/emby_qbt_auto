@@ -76,3 +76,53 @@ def test_sync_db_actor_helpers_serialize_writes_and_readonly_connection_is_reado
                 ro.close()
         finally:
             stop_write_actors()
+
+
+
+def test_async_db_actor_supports_generic_transactions_metrics_and_readonly_pool():
+    from qbt_orchestrator.db import DbActor, ReadonlyConnectionPool, migrate, stop_write_actors
+
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            db = Path(td) / "state.sqlite"
+            migrate(db)
+
+            async def run_actor():
+                actor = DbActor(db)
+                await actor.start()
+                event_id = await actor.execute(
+                    "insert into events_v2(ts,level,component,event_type,message) values(?,?,?,?,?)",
+                    (1, "info", "db_actor_test", "generic_execute", "ok"),
+                )
+                count = await actor.transaction(
+                    lambda con: con.execute("select count(*) from events_v2 where component='db_actor_test'").fetchone()[0]
+                )
+                await actor.flush()
+                metrics = actor.metrics()
+                await actor.stop()
+                return event_id, count, metrics
+
+            event_id, count, metrics = __import__("asyncio").run(run_actor())
+            assert event_id == 1
+            assert count == 1
+            assert metrics["writes_completed"] >= 1
+            assert metrics["flushes_completed"] >= 1
+            assert metrics["queue_depth"] == 0
+
+            pool = ReadonlyConnectionPool(db, max_size=2)
+            con = pool.acquire()
+            try:
+                assert con.execute("pragma query_only").fetchone()[0] == 1
+                assert con.execute("pragma busy_timeout").fetchone()[0] == 2000
+                assert con.execute("select count(*) from events_v2").fetchone()[0] == 1
+                try:
+                    con.execute("delete from events_v2")
+                except sqlite3.OperationalError as exc:
+                    assert "readonly" in str(exc).lower() or "read-only" in str(exc).lower() or "attempt to write" in str(exc).lower()
+                else:  # pragma: no cover
+                    raise AssertionError("readonly pool connection accepted a write")
+            finally:
+                pool.release(con)
+                pool.close()
+        finally:
+            stop_write_actors()

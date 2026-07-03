@@ -124,7 +124,8 @@ def test_sqlite_maintenance_runs_qbt_preferences_guard_when_configured():
 
 
 if __name__ == "__main__":
+    inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
+        if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")

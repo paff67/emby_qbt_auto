@@ -23,7 +23,8 @@ def test_release_root_supports_python_m_qbt_orchestrator_cli_without_install():
 
 
 if __name__ == "__main__":
+    inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
+        if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")

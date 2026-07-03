@@ -69,7 +69,8 @@ def test_path_reconciler_records_save_path_mismatch_but_does_not_duplicate_uncha
 
 
 if __name__ == "__main__":
+    inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
+        if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")

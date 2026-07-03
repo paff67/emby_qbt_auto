@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Iterable
 
-from .db import write_transaction
+from .db import readonly_connect, write_transaction
 from .runtime import TorrentJobRepository
 from .observability import redact
 @dataclass(frozen=True)
@@ -41,9 +41,7 @@ _JUNK_NAME = re.compile(r"(?i)(最新地址|收藏不迷路|官方指定|博彩|
 
 
 def _connect(path) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    return con
+    return readonly_connect(path)
 
 
 def _remote_path_without_remote(remote_path: str) -> str:
@@ -172,10 +170,34 @@ class MediaPipelineService:
 
     def _record_sidecar_manifest(self, group_id: int, scrape: dict) -> int:
         now = int(self.now())
+        artifacts = scrape.get("artifacts") or []
+        artifact_manifest = {
+            "artifact_manifest": scrape.get("artifact_manifest"),
+            "artifacts": artifacts,
+            "returncode": scrape.get("returncode"),
+            "scraper_log_tail": scrape.get("scraper_log_tail"),
+        }
+        artifact_total_bytes = sum(int(a.get("size") or 0) for a in artifacts if isinstance(a, dict))
         def txn(con: sqlite3.Connection) -> int:
             cur = con.execute(
-                "insert into sidecar_manifests(media_group_id,staging_dir,artifacts_json,state,created_at,updated_at) values(?,?,?,?,?,?)",
-                (group_id, str(scrape.get("staging_dir") or ""), json.dumps(scrape.get("artifacts") or [], ensure_ascii=False), "sidecar_verified", now, now),
+                "insert into sidecar_manifests("
+                "media_group_id,staging_dir,artifacts_json,state,created_at,updated_at,"
+                "local_artifact_dir,artifact_manifest_json,artifact_total_bytes,scraper_exit_code,scraper_log_tail,media_group_key_snapshot"
+                ") values(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    group_id,
+                    str(scrape.get("staging_dir") or ""),
+                    json.dumps(artifacts, ensure_ascii=False),
+                    "sidecar_verified",
+                    now,
+                    now,
+                    str(scrape.get("staging_dir") or ""),
+                    json.dumps(artifact_manifest, ensure_ascii=False),
+                    int(artifact_total_bytes),
+                    scrape.get("returncode"),
+                    scrape.get("scraper_log_tail"),
+                    str(scrape.get("media_group_key") or ""),
+                ),
             )
             return int(cur.lastrowid)
 

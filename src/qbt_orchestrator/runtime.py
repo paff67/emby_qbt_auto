@@ -6,15 +6,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .db import write_transaction
+from .db import readonly_connect, write_transaction
 from .observability import redact
 from .upload import RcloneUploadWorker, UploadJob
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    return con
+    return readonly_connect(path)
 
 
 class ObservabilityStore:

@@ -284,7 +284,8 @@ def test_file_batch_service_pipeline_dry_run_and_qbt_failure_do_not_leave_active
 
 
 if __name__ == "__main__":
+    inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
+        if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")

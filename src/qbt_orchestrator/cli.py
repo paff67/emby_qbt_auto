@@ -37,7 +37,9 @@ def _build_backfill_from_env(env=os.environ):
     staging = env.get("QBT_ORCH_SIDECAR_STAGING_ROOT", "/var/lib/qbt-orchestrator/sidecar-staging")
     timeout = int(env.get("QBT_ORCH_BACKFILL_TIMEOUT_SEC", "1020"))
     remote = env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:")
-    return GDriveBackfillScraper(script_path=script, staging_root=staging, remote=remote, timeout_sec=timeout)
+    lock_file = env.get("QBT_ORCH_BACKFILL_LOCK_FILE", "/tmp/gdrive-backfill.lock")
+    command_mode = env.get("QBT_ORCH_BACKFILL_COMMAND_MODE", "auto")
+    return GDriveBackfillScraper(script_path=script, staging_root=staging, remote=remote, timeout_sec=timeout, lock_file=lock_file, command_mode=command_mode)
 
 
 def _build_preemption_from_env(state_db: Path, executor, env=os.environ, global_dry_run: bool = True):
@@ -256,6 +258,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     carousel_dry_run = True if dry_run else (carousel_dry_env if carousel_dry_env is not None else True)
     carousel_service = None
     if carousel_enabled:
+        carousel_live_verify = _truthy(os.environ.get("QBT_ORCH_CAROUSEL_LIVE_VERIFY"))
+        if carousel_live_verify is None:
+            carousel_live_verify = False
         carousel_service = CarouselService(
             state_db,
             executor,
@@ -263,6 +268,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             concurrency=int(os.environ.get("QBT_ORCH_CAROUSEL_CONCURRENCY", "3")),
             probe_duration_sec=int(os.environ.get("QBT_ORCH_CAROUSEL_PROBE_DURATION_SEC", "1800")),
             min_free_bytes=int(float(os.environ.get("QBT_ORCH_CAROUSEL_MIN_FREE_GB", "5")) * 1024**3),
+            live_verify=carousel_live_verify,
         )
     runtime = DaemonRuntime(
         state_db=state_db,

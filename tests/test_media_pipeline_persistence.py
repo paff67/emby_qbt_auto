@@ -47,6 +47,9 @@ def test_persistent_media_pipeline_dedupes_multi_cd_sidecar_and_emby_refresh():
                     {"local": f"{staging}/ABC-123.nfo", "remote": "gcrypt:/ABC-123/ABC-123.nfo", "size": 100},
                     {"local": f"{staging}/ABC-123-poster.jpg", "remote": "gcrypt:/ABC-123/ABC-123-poster.jpg", "size": 200},
                 ],
+                "artifact_manifest": f"{staging}/artifact_manifest.json",
+                "returncode": 0,
+                "scraper_log_tail": "[javinizer] ok",
             }
         )
         service = MediaPipelineService(db, backfill=backfill, now=lambda: clock["now"])
@@ -73,6 +76,10 @@ def test_persistent_media_pipeline_dedupes_multi_cd_sidecar_and_emby_refresh():
         sidecars = rows(db, "select * from sidecar_manifests")
         assert len(sidecars) == 1
         assert sidecars[0]["state"] == "sidecar_verified"
+        assert sidecars[0]["local_artifact_dir"] == staging
+        assert sidecars[0]["artifact_total_bytes"] == 300
+        assert json.loads(sidecars[0]["artifact_manifest_json"])["artifact_manifest"] == f"{staging}/artifact_manifest.json"
+        assert sidecars[0]["scraper_exit_code"] == 0
 
         jobs = rows(db, "select * from torrent_jobs order by id")
         assert [j["job_type"] for j in jobs] == ["sidecar_upload", "sidecar_upload"]
@@ -177,7 +184,8 @@ def test_emby_refresh_worker_calls_precise_media_updated_and_rejects_root_path()
 
 
 if __name__ == "__main__":
+    inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
+        if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
