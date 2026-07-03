@@ -58,12 +58,14 @@ class DownloadPlanner:
         dry_run: bool = True,
         active_slots: int = 2,
         disk_floor_bytes: int = 2 * 1024**3,
+        now=None,
     ):
         self.state_db = Path(state_db)
         self.executor = executor
         self.dry_run = dry_run
         self.active_slots = active_slots
         self.disk_floor_bytes = disk_floor_bytes
+        self.now = now or (lambda: int(time.time()))
 
     def plan_and_apply(self, snapshots: Mapping[str, Mapping[str, Any]], free_bytes: int, sync_healthy: bool) -> PlannerResult:
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
@@ -74,6 +76,13 @@ class DownloadPlanner:
                 self._decision(str(torrent["hash"]), "hold", "sync_unhealthy", {"free_bytes": free_bytes})
             return PlannerResult([], [], conservative=True, budget_bytes=budget)
 
+        health_rows = self._health_rows()
+        now = int(self.now())
+        active_slow = {
+            str(t["hash"])
+            for t in managed
+            if self._should_demote_active(str(t["hash"]), t, health_rows.get(str(t["hash"])), now)
+        }
         candidates = sorted(
             [t for t in managed if int(t.get("amount_left") or 0) > 0 and str(t.get("hash")) not in dead_hashes],
             key=lambda t: (int(t.get("amount_left") or 0), -int(t.get("num_seeds") or 0), -int(t.get("num_peers") or 0), str(t.get("hash"))),
@@ -81,6 +90,8 @@ class DownloadPlanner:
         selected: list[dict[str, Any]] = []
         used = 0
         for torrent in candidates:
+            if str(torrent.get("hash")) in active_slow:
+                continue
             amount_left = int(torrent.get("amount_left") or 0)
             if len(selected) >= self.active_slots or used + amount_left > budget:
                 continue
@@ -92,7 +103,6 @@ class DownloadPlanner:
         start_hashes = [str(t["hash"]) for t in selected if _is_stopped_download(t)]
         paused_hashes = [str(t["hash"]) for t in managed if str(t["hash"]) not in selected_set and _is_running_download(t)]
 
-        now = int(time.time())
         for torrent in candidates:
             h = str(torrent["hash"])
             if h in selected_set:
@@ -104,10 +114,14 @@ class DownloadPlanner:
                 )
                 self._allocation(h, "active", "stable", int(torrent.get("amount_left") or 0), seq, now, "budget_fit")
                 self._decision(h, "active", "budget_fit", {"reserved_bytes": int(torrent.get("amount_left") or 0), "budget_bytes": budget})
+            elif h in active_slow:
+                self._allocation(h, "soak", "soak", 0, False, now, "active_slow_5min")
+                self._decision(h, "soak", "active_slow_5min", {"budget_bytes": budget})
             else:
                 self._allocation(h, "soak", "soak", 0, False, now, "budget_or_slot_exhausted")
                 self._decision(h, "soak", "budget_or_slot_exhausted", {"budget_bytes": budget})
 
+        self._update_health(candidates, selected_set, now, health_rows)
         self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
         return PlannerResult(selected_hashes, paused_hashes, conservative=False, budget_bytes=budget)
@@ -117,6 +131,85 @@ class DownloadPlanner:
         try:
             rows = con.execute("select hash from scheduler_allocations where desired_state='dead'").fetchall()
             return {str(r["hash"]) for r in rows}
+        finally:
+            con.close()
+
+    def _health_rows(self) -> dict[str, dict[str, Any]]:
+        con = _connect(self.state_db)
+        try:
+            rows = con.execute("select * from torrent_health").fetchall()
+            return {str(r["hash"]): dict(r) for r in rows}
+        finally:
+            con.close()
+
+    def _should_demote_active(self, hash: str, torrent: Mapping[str, Any], health: dict[str, Any] | None, now: int) -> bool:
+        if not health:
+            return False
+        active_since = health.get("active_since")
+        low_speed_since = health.get("low_speed_since")
+        if active_since is None or low_speed_since is None:
+            return False
+        dlspeed = int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or health.get("dlspeed_bps") or 0)
+        return int(now) - int(active_since) >= 90 and int(now) - int(low_speed_since) >= 300 and dlspeed < 100 * 1024
+
+    def _update_health(
+        self,
+        torrents: list[Mapping[str, Any]],
+        selected_set: set[str],
+        now: int,
+        previous: dict[str, dict[str, Any]],
+    ) -> None:
+        con = _connect(self.state_db)
+        try:
+            for torrent in torrents:
+                h = str(torrent.get("hash") or "")
+                if not h:
+                    continue
+                old = previous.get(h) or {}
+                dlspeed = int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or 0)
+                upspeed = int(torrent.get("upspeed_bps") or torrent.get("upspeed") or 0)
+                completed = int(torrent.get("completed_bytes") or torrent.get("completed") or torrent.get("downloaded") or 0)
+                progress = float(torrent.get("progress") or 0)
+                seeds = int(torrent.get("num_seeds") or torrent.get("num_complete") or 0)
+                peers = int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0)
+                low_speed_since = old.get("low_speed_since") if dlspeed < 100 * 1024 else None
+                if dlspeed < 100 * 1024 and low_speed_since is None:
+                    low_speed_since = now
+                old_completed = int(old.get("completed_bytes") or 0)
+                old_progress = float(old.get("progress") or 0)
+                no_progress_since = old.get("no_progress_since") if (completed <= old_completed and progress <= old_progress and old) else None
+                if old and completed <= old_completed and progress <= old_progress and no_progress_since is None:
+                    no_progress_since = now
+                last_swarm_seen_at = now if (seeds > 0 or peers > 0) else old.get("last_swarm_seen_at")
+                if h in selected_set:
+                    active_since = old.get("active_since") or now
+                    soak_since = None
+                else:
+                    active_since = None
+                    soak_since = old.get("soak_since") or now
+                con.execute(
+                    "insert into torrent_health(hash,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,low_speed_since,no_progress_since,active_since,soak_since,updated_at) "
+                    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,updated_at=excluded.updated_at",
+                    (
+                        h,
+                        now,
+                        dlspeed,
+                        upspeed,
+                        completed,
+                        old_completed,
+                        progress,
+                        seeds,
+                        peers,
+                        last_swarm_seen_at,
+                        low_speed_since,
+                        no_progress_since,
+                        active_since,
+                        soak_since,
+                        now,
+                    ),
+                )
+            con.commit()
         finally:
             con.close()
 
@@ -151,7 +244,7 @@ class DownloadPlanner:
         con = _connect(self.state_db)
         con.execute(
             "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
-            (int(time.time()), "planner", hash, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
+            (int(self.now()), "planner", hash, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
         )
         con.commit()
         con.close()
@@ -160,7 +253,7 @@ class DownloadPlanner:
         con = _connect(self.state_db)
         con.execute(
             "insert into action_log(ts,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?)",
-            (int(time.time()), "qbt_post", path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
+            (int(self.now()), "qbt_post", path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
         )
         con.commit()
         con.close()

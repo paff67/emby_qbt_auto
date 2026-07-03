@@ -91,6 +91,16 @@ def test_qbt_sync_full_update_rebuilds_and_unhealthy_preserves_cache():
     assert cache.high_risk_actions_allowed is False
 
 
+def test_torrent_snapshot_preserves_speed_and_completed_for_health_planner():
+    from qbt_orchestrator.models import TorrentSnapshot
+
+    snap = TorrentSnapshot.from_qbt({"hash": "h1", "dlspeed": 123, "upspeed": 45, "completed": 678, "progress": 0.5})
+
+    assert snap.dlspeed_bps == 123
+    assert snap.upspeed_bps == 45
+    assert snap.completed_bytes == 678
+
+
 def test_disk_pressure_and_emergency_action_do_not_need_db():
     from qbt_orchestrator.models import DiskPressureState
     from qbt_orchestrator.policies.disk import classify_disk, emergency_pause_action

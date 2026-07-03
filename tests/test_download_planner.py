@@ -50,6 +50,63 @@ def test_planner_selects_budget_fit_active_and_pauses_unplanned_managed_download
         assert ("h3", "soak", "budget_or_slot_exhausted") in [(r["hash"], r["decision"], r["reason_code"]) for r in decisions]
 
 
+def test_planner_updates_health_samples_so_slow_active_demotes_on_later_tick():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        snapshots = {
+            "slow": {"hash": "slow", "name": "slow", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 1, "size": 2, "progress": 0.2, "dlspeed": 1024, "completed": 100, "num_seeds": 1, "num_peers": 1},
+        }
+        first = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=0, now=lambda: 1000)
+        assert first.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True).selected_hashes == ["slow"]
+        health1 = _rows(db, "select hash,low_speed_since,active_since from torrent_health")
+        assert health1 == [{"hash": "slow", "low_speed_since": 1000, "active_since": 1000}]
+
+        second = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=0, now=lambda: 1301)
+        snapshots["fresh"] = {"hash": "fresh", "name": "fresh", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 2, "size": 3, "progress": 0.1, "dlspeed": 0, "completed": 0, "num_seeds": 5, "num_peers": 5}
+        result = second.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True)
+
+        assert result.selected_hashes == ["fresh"]
+        alloc = _rows(db, "select hash,desired_state,reason from scheduler_allocations order by hash")
+        assert {r["hash"]: (r["desired_state"], r["reason"]) for r in alloc}["slow"] == ("soak", "active_slow_5min")
+
+
+def test_planner_demotes_slow_active_after_five_minutes_and_selects_replacement():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute("insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) values('slow','active','active','stable',900,'budget_fit')")
+        con.execute("insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,low_speed_since,active_since,updated_at) values('slow',1190,1024,100,100,0.2,1,1,890,800,1190)")
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=0, now=lambda: 1200)
+        snapshots = {
+            "slow": {"hash": "slow", "name": "slow", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 1, "size": 2, "progress": 0.2, "dlspeed": 1024, "num_seeds": 1, "num_peers": 1},
+            "fresh": {"hash": "fresh", "name": "fresh", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 2, "size": 3, "progress": 0.1, "dlspeed": 0, "num_seeds": 5, "num_peers": 5},
+        }
+
+        result = planner.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True)
+
+        assert result.selected_hashes == ["fresh"]
+        assert ("/api/v2/torrents/stop", {"hashes": "slow"}) in executor.posts
+        assert ("/api/v2/torrents/start", {"hashes": "fresh"}) in executor.posts
+        alloc = _rows(db, "select hash,desired_state,reason from scheduler_allocations order by hash")
+        assert {r["hash"]: (r["desired_state"], r["reason"]) for r in alloc} == {
+            "fresh": ("active", "budget_fit"),
+            "slow": ("soak", "active_slow_5min"),
+        }
+
+
 def test_planner_only_starts_selected_torrents_that_are_stopped_or_paused():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner
