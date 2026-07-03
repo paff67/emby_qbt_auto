@@ -50,6 +50,28 @@ def test_planner_selects_budget_fit_active_and_pauses_unplanned_managed_download
         assert ("h3", "soak", "budget_or_slot_exhausted") in [(r["hash"], r["decision"], r["reason_code"]) for r in decisions]
 
 
+def test_planner_only_starts_selected_torrents_that_are_stopped_or_paused():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=3, disk_floor_bytes=0)
+        snapshots = {
+            "running": {"hash": "running", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 1, "size": 2, "progress": 0.5},
+            "stalled": {"hash": "stalled", "category": "auto", "tags": "auto", "state": "stalledDL", "amount_left": 2, "size": 3, "progress": 0.5},
+            "paused": {"hash": "paused", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 3, "size": 4, "progress": 0.5},
+        }
+
+        result = planner.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True)
+
+        assert result.selected_hashes == ["running", "stalled", "paused"]
+        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "paused"})]
+
+
 def test_planner_conservative_mode_does_not_start_or_cleanup_when_sync_unhealthy():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner

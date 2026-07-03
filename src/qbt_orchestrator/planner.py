@@ -44,6 +44,10 @@ def _is_running_download(torrent: Mapping[str, Any]) -> bool:
     return state not in STOPPED_STATES and float(torrent.get("progress") or 0) < 1.0 and int(torrent.get("amount_left") or 0) > 0
 
 
+def _is_stopped_download(torrent: Mapping[str, Any]) -> bool:
+    return str(torrent.get("state") or "").lower() in STOPPED_STATES
+
+
 class DownloadPlanner:
     """15s planner loop: desired download state + safe qBT action coalescing."""
 
@@ -85,6 +89,7 @@ class DownloadPlanner:
 
         selected_hashes = [str(t["hash"]) for t in selected]
         selected_set = set(selected_hashes)
+        start_hashes = [str(t["hash"]) for t in selected if _is_stopped_download(t)]
         paused_hashes = [str(t["hash"]) for t in managed if str(t["hash"]) not in selected_set and _is_running_download(t)]
 
         now = int(time.time())
@@ -103,7 +108,7 @@ class DownloadPlanner:
                 self._allocation(h, "soak", "soak", 0, False, now, "budget_or_slot_exhausted")
                 self._decision(h, "soak", "budget_or_slot_exhausted", {"budget_bytes": budget})
 
-        self._qbt_post("/api/v2/torrents/start", selected_hashes)
+        self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
         return PlannerResult(selected_hashes, paused_hashes, conservative=False, budget_bytes=budget)
 
