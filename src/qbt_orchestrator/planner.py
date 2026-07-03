@@ -69,7 +69,8 @@ class DownloadPlanner:
 
     def plan_and_apply(self, snapshots: Mapping[str, Mapping[str, Any]], free_bytes: int, sync_healthy: bool) -> PlannerResult:
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
-        dead_hashes = self._dead_allocations()
+        previous_allocations = self._allocation_rows()
+        dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
         budget = max(0, int(free_bytes) - self.disk_floor_bytes)
         if not sync_healthy:
             for torrent in managed:
@@ -103,6 +104,7 @@ class DownloadPlanner:
         start_hashes = [str(t["hash"]) for t in selected if _is_stopped_download(t)]
         paused_hashes = [str(t["hash"]) for t in managed if str(t["hash"]) not in selected_set and _is_running_download(t)]
 
+        seq_false_hashes: list[str] = []
         for torrent in candidates:
             h = str(torrent["hash"])
             if h in selected_set:
@@ -117,22 +119,31 @@ class DownloadPlanner:
             elif h in active_slow:
                 self._allocation(h, "soak", "soak", 0, False, now, "active_slow_5min")
                 self._decision(h, "soak", "active_slow_5min", {"budget_bytes": budget})
+                if self._needs_seq_false(h, previous_allocations):
+                    seq_false_hashes.append(h)
             else:
                 self._allocation(h, "soak", "soak", 0, False, now, "budget_or_slot_exhausted")
                 self._decision(h, "soak", "budget_or_slot_exhausted", {"budget_bytes": budget})
+                if self._needs_seq_false(h, previous_allocations):
+                    seq_false_hashes.append(h)
 
         self._update_health(candidates, selected_set, now, health_rows)
+        self._force_seq_false(seq_false_hashes)
         self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
         return PlannerResult(selected_hashes, paused_hashes, conservative=False, budget_bytes=budget)
 
-    def _dead_allocations(self) -> set[str]:
+    def _allocation_rows(self) -> dict[str, dict[str, Any]]:
         con = _connect(self.state_db)
         try:
-            rows = con.execute("select hash from scheduler_allocations where desired_state='dead'").fetchall()
-            return {str(r["hash"]) for r in rows}
+            rows = con.execute("select * from scheduler_allocations").fetchall()
+            return {str(r["hash"]): dict(r) for r in rows}
         finally:
             con.close()
+
+    def _needs_seq_false(self, hash: str, previous_allocations: dict[str, dict[str, Any]]) -> bool:
+        row = previous_allocations.get(hash)
+        return row is None or row.get("desired_seq_dl") is None or int(row.get("desired_seq_dl") or 0) != 0
 
     def _health_rows(self) -> dict[str, dict[str, Any]]:
         con = _connect(self.state_db)
@@ -226,6 +237,23 @@ class DownloadPlanner:
         except Exception as exc:
             self._action(path, payload, "failed", False, str(exc))
             raise
+
+    def _force_seq_false(self, hashes: list[str]) -> None:
+        if not hashes or not hasattr(self.executor, "set_seq_dl"):
+            return
+        path = "/api/v2/torrents/toggleSequentialDownload"
+        for h in hashes:
+            payload = {"hashes": h, "desired": False}
+            if self.dry_run:
+                self._action(path, payload, "dry_run", True)
+                continue
+            try:
+                changed = bool(self.executor.set_seq_dl(h, False))
+                if changed:
+                    self._action(path, payload, "succeeded", False)
+            except Exception as exc:
+                self._action(path, payload, "failed", False, str(exc))
+                raise
 
     def _allocation(self, hash: str, desired_state: str, slot_kind: str, reserved_bytes: int, seq_dl: bool, ts: int, reason: str) -> None:
         con = _connect(self.state_db)

@@ -129,6 +129,58 @@ def test_planner_only_starts_selected_torrents_that_are_stopped_or_paused():
         assert executor.posts == [("/api/v2/torrents/start", {"hashes": "paused"})]
 
 
+def test_planner_forces_sequential_download_off_for_soak_torrents():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+
+    class SeqExecutor:
+        def __init__(self):
+            self.posts = []
+            self.seq = []
+        def qbt_post(self, path, payload):
+            self.posts.append((path, payload))
+        def set_seq_dl(self, hash, desired):
+            self.seq.append((hash, desired))
+            return True
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = SeqExecutor()
+        planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=0)
+        snapshots = {
+            "active": {"hash": "active", "category": "auto", "state": "pausedDL", "amount_left": 1, "size": 2, "progress": 0.1},
+            "soak": {"hash": "soak", "category": "auto", "state": "downloading", "amount_left": 2, "size": 3, "progress": 0.1},
+        }
+
+        planner.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True)
+
+        assert executor.seq == [("soak", False)]
+
+
+def test_planner_does_not_repeat_seq_false_when_allocation_already_records_false():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+
+    class SeqExecutor:
+        def __init__(self): self.seq = []
+        def qbt_post(self, path, payload): pass
+        def set_seq_dl(self, hash, desired): self.seq.append((hash, desired)); return True
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute("insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,desired_seq_dl,allocated_at,reason) values('soak','soak','soak','soak',0,1,'budget_or_slot_exhausted')")
+        con.commit(); con.close()
+        executor = SeqExecutor()
+        planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=0, disk_floor_bytes=0)
+
+        planner.plan_and_apply({"soak": {"hash": "soak", "category": "auto", "state": "downloading", "amount_left": 1, "size": 2, "progress": 0.1}}, free_bytes=10, sync_healthy=True)
+
+        assert executor.seq == []
+
+
 def test_planner_conservative_mode_does_not_start_or_cleanup_when_sync_unhealthy():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner
