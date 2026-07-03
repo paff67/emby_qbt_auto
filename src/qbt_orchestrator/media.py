@@ -378,6 +378,7 @@ class MediaPipelineService:
                 "full_torrent": False,
                 "media_group_key": key,
                 "sidecar_manifest_id": sidecar_manifest_id,
+                "allow_unrecognized_passthrough": self.allow_unrecognized_passthrough,
             }
             self.jobs.enqueue(None, None, "sidecar_upload", payload, priority=20)
 

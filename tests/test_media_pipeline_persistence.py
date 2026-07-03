@@ -182,6 +182,38 @@ def test_persistent_media_pipeline_uses_filename_normalizer_for_grouping_and_scr
         assert rows(db, "select count(*) as n from emby_refresh_tasks")[0]["n"] == 0
 
 
+def test_media_pipeline_propagates_passthrough_policy_to_sidecar_upload_jobs():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        staging = "/var/lib/qbt-orchestrator/sidecar-staging/ABC-123"
+        backfill = RecordingBackfill(
+            {
+                "status": "sidecar_verified",
+                "staging_dir": staging,
+                "artifacts": [
+                    {"local": f"{staging}/movie.nfo", "remote": "gcrypt:/ABC-123/movie.nfo", "size": 100},
+                    {"local": f"{staging}/poster.jpg", "remote": "gcrypt:/ABC-123/poster.jpg", "size": 200},
+                    {"local": f"{staging}/fanart.jpg", "remote": "gcrypt:/ABC-123/fanart.jpg", "size": 300},
+                ],
+            }
+        )
+        service = MediaPipelineService(db, backfill=backfill, allow_unrecognized_passthrough=False, now=lambda: 4100)
+
+        result = service.handle_upload_verified(
+            "manifest-sidecar-policy",
+            [UploadedFile("gcrypt:/ABC-123/ABC-123.mp4", size=1024**3, duration_sec=120)],
+        )
+
+        assert result.state == "SidecarUploadQueued"
+        payloads = [json.loads(row["payload_json"]) for row in rows(db, "select payload_json from torrent_jobs order by id")]
+        assert payloads
+        assert {payload["allow_unrecognized_passthrough"] for payload in payloads} == {False}
+
+
 def test_persistent_media_pipeline_low_confidence_normalize_passthrough_skips_scrape():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.media import MediaPipelineService, UploadedFile
