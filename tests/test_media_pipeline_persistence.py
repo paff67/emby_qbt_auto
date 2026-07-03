@@ -22,6 +22,16 @@ class RecordingBackfill:
         return self.result
 
 
+class RecordingNormalizer:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def normalize(self, raw_filename):
+        self.calls.append(raw_filename)
+        return dict(self.result)
+
+
 def rows(db: Path, sql: str):
     con = sqlite3.connect(db)
     con.row_factory = sqlite3.Row
@@ -46,6 +56,7 @@ def test_persistent_media_pipeline_dedupes_multi_cd_sidecar_and_emby_refresh():
                 "artifacts": [
                     {"local": f"{staging}/ABC-123.nfo", "remote": "gcrypt:/ABC-123/ABC-123.nfo", "size": 100},
                     {"local": f"{staging}/ABC-123-poster.jpg", "remote": "gcrypt:/ABC-123/ABC-123-poster.jpg", "size": 200},
+                    {"local": f"{staging}/ABC-123-fanart.jpg", "remote": "gcrypt:/ABC-123/ABC-123-fanart.jpg", "size": 300},
                 ],
                 "artifact_manifest": f"{staging}/artifact_manifest.json",
                 "returncode": 0,
@@ -77,12 +88,12 @@ def test_persistent_media_pipeline_dedupes_multi_cd_sidecar_and_emby_refresh():
         assert len(sidecars) == 1
         assert sidecars[0]["state"] == "sidecar_verified"
         assert sidecars[0]["local_artifact_dir"] == staging
-        assert sidecars[0]["artifact_total_bytes"] == 300
+        assert sidecars[0]["artifact_total_bytes"] == 600
         assert json.loads(sidecars[0]["artifact_manifest_json"])["artifact_manifest"] == f"{staging}/artifact_manifest.json"
         assert sidecars[0]["scraper_exit_code"] == 0
 
         jobs = rows(db, "select * from torrent_jobs order by id")
-        assert [j["job_type"] for j in jobs] == ["sidecar_upload", "sidecar_upload"]
+        assert [j["job_type"] for j in jobs] == ["sidecar_upload", "sidecar_upload", "sidecar_upload"]
         payloads = [json.loads(j["payload_json"]) for j in jobs]
         assert payloads[0]["local"].startswith(staging)
         assert payloads[0]["remote"] == "gcrypt:/ABC-123/ABC-123.nfo"
@@ -120,6 +131,129 @@ def test_persistent_media_pipeline_allows_unknown_metadata_passthrough_but_block
         assert rows(db, "select count(*) as n from emby_refresh_tasks")[0]["n"] == 1
         assert rows(db, "select count(*) as n from torrent_jobs")[0]["n"] == 0
         assert backfill.calls == [("UNKNOWN-001", "manifest-ok")]
+
+
+def test_persistent_media_pipeline_uses_filename_normalizer_for_grouping_and_scrape_id():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        staging = "/var/lib/qbt-orchestrator/sidecar-staging/BBAN-582"
+        normalizer = RecordingNormalizer(
+            {
+                "normalized_id": "BBAN-582",
+                "confidence": 0.95,
+                "raw_basename": "489155.com@BBAN-582",
+                "reason": "domain_prefix_removed_and_standard_jav_id_matched",
+            }
+        )
+        backfill = RecordingBackfill(
+            {
+                "status": "sidecar_verified",
+                "staging_dir": staging,
+                "artifacts": [
+                    {"local": f"{staging}/movie.nfo", "remote": "gcrypt:/BBAN-582/movie.nfo", "size": 100},
+                    {"local": f"{staging}/poster.jpg", "remote": "gcrypt:/BBAN-582/poster.jpg", "size": 200},
+                    {"local": f"{staging}/fanart.jpg", "remote": "gcrypt:/BBAN-582/fanart.jpg", "size": 300},
+                ],
+                "artifact_manifest": f"{staging}/artifact_manifest.json",
+                "returncode": 0,
+            }
+        )
+        service = MediaPipelineService(db, backfill=backfill, normalizer=normalizer, now=lambda: 4000)
+
+        result = service.handle_upload_verified(
+            "manifest-normalized",
+            [UploadedFile("gcrypt:/raw-upload/489155.com@BBAN-582.mp4", size=1024**3, duration_sec=120)],
+        )
+
+        assert result.media_group_key == "BBAN-582"
+        assert result.state == "SidecarVerified"
+        assert normalizer.calls == ["489155.com@BBAN-582.mp4"]
+        assert backfill.calls == [("BBAN-582", "manifest-normalized")]
+
+        groups = rows(db, "select media_group_key,normalized_id,emby_media_dir from media_groups")
+        assert groups == [{"media_group_key": "BBAN-582", "normalized_id": "BBAN-582", "emby_media_dir": "/media/gcrypt/BBAN-582"}]
+        run = rows(db, "select state,metadata_policy,metadata_quality,passthrough_reason,normalize_result_json from media_pipeline_runs")[0]
+        assert run["state"] == "SidecarVerified"
+        assert run["metadata_policy"] == "sidecar"
+        assert run["metadata_quality"] == "normalized"
+        assert run["passthrough_reason"] is None
+        assert json.loads(run["normalize_result_json"])["reason"] == "domain_prefix_removed_and_standard_jav_id_matched"
+        assert rows(db, "select count(*) as n from torrent_jobs where job_type='sidecar_upload'")[0]["n"] == 3
+        assert rows(db, "select emby_media_dir from emby_refresh_tasks") == [{"emby_media_dir": "/media/gcrypt/BBAN-582"}]
+
+
+def test_persistent_media_pipeline_low_confidence_normalize_passthrough_skips_scrape():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        normalizer = RecordingNormalizer({"normalized_id": "UNKNOWN", "confidence": 0.2, "reason": "no_jav_id"})
+        backfill = RecordingBackfill({"status": "sidecar_verified", "artifacts": [{"local": "/tmp/a.nfo", "remote": "gcrypt:/UNKNOWN/a.nfo", "size": 1}]})
+        service = MediaPipelineService(db, backfill=backfill, normalizer=normalizer, min_normalize_confidence=0.8, now=lambda: 5000)
+
+        result = service.handle_upload_verified(
+            "manifest-low",
+            [UploadedFile("gcrypt:/raw-upload/random_home_video.mp4", size=1024**3, duration_sec=120)],
+        )
+
+        assert result.state == "PassthroughAllowed"
+        assert normalizer.calls == ["random_home_video.mp4"]
+        assert backfill.calls == []
+        run = rows(db, "select state,metadata_policy,metadata_quality,passthrough_reason,normalize_confidence from media_pipeline_runs")[0]
+        assert run == {
+            "state": "PassthroughAllowed",
+            "metadata_policy": "passthrough",
+            "metadata_quality": "raw",
+            "passthrough_reason": "normalize_low_confidence",
+            "normalize_confidence": 0.2,
+        }
+        assert rows(db, "select count(*) as n from torrent_jobs")[0]["n"] == 0
+        assert rows(db, "select emby_media_dir from emby_refresh_tasks") == [{"emby_media_dir": "/media/gcrypt/raw-upload"}]
+
+
+def test_persistent_media_pipeline_requires_core_sidecar_artifacts_before_upload_job():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        staging = "/var/lib/qbt-orchestrator/sidecar-staging/BBAN-582"
+        normalizer = RecordingNormalizer({"normalized_id": "BBAN-582", "confidence": 0.95, "reason": "standard_jav_id_matched"})
+        backfill = RecordingBackfill(
+            {
+                "status": "sidecar_verified",
+                "staging_dir": staging,
+                "artifacts": [
+                    {"local": f"{staging}/movie.nfo", "remote": "gcrypt:/BBAN-582/movie.nfo", "size": 100},
+                    {"local": f"{staging}/poster.jpg", "remote": "gcrypt:/BBAN-582/poster.jpg", "size": 200},
+                ],
+                "artifact_manifest": f"{staging}/artifact_manifest.json",
+                "returncode": 0,
+            }
+        )
+        service = MediaPipelineService(db, backfill=backfill, normalizer=normalizer, now=lambda: 6000)
+
+        result = service.handle_upload_verified(
+            "manifest-missing-fanart",
+            [UploadedFile("gcrypt:/BBAN-582/BBAN-582.mp4", size=1024**3, duration_sec=120)],
+        )
+
+        assert result.state == "PassthroughAllowed"
+        assert backfill.calls == [("BBAN-582", "manifest-missing-fanart")]
+        sidecars = rows(db, "select state,artifacts_json,artifact_manifest_json from sidecar_manifests")
+        assert len(sidecars) == 1
+        assert sidecars[0]["state"] == "sidecar_verify_failed"
+        assert "fanart" in json.loads(sidecars[0]["artifact_manifest_json"])["missing_outputs"]
+        assert rows(db, "select count(*) as n from torrent_jobs where job_type='sidecar_upload'")[0]["n"] == 0
+        run = rows(db, "select state,metadata_policy,passthrough_reason from media_pipeline_runs")[0]
+        assert run == {"state": "PassthroughAllowed", "metadata_policy": "passthrough", "passthrough_reason": "sidecar_verify_failed"}
 
 
 def test_media_pipeline_job_runner_processes_recoverable_jobs():

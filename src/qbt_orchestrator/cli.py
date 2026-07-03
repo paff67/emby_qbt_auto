@@ -11,6 +11,7 @@ from .integrations.rclone import RcloneClient
 from .integrations.emby import EmbyClient
 from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
 from .integrations.gdrive_backfill import GDriveBackfillScraper
+from .integrations.filename_normalize import FilenameNormalizeScript
 from .io_governor import IoGovernor, UploadBackpressurePolicy
 from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
@@ -27,6 +28,15 @@ from .service import DaemonRuntime, build_telegram_supervisor_from_env
 class PassthroughBackfill:
     def scrape_one(self, media_group_key, manifest_id):
         return {"status": "not_found", "artifacts": [], "media_group_key": media_group_key, "manifest_id": manifest_id}
+
+
+def _build_normalizer_from_env(env=os.environ):
+    enabled = _truthy(env.get("QBT_ORCH_FILENAME_NORMALIZE"))
+    if enabled is False:
+        return None
+    script = env.get("QBT_ORCH_FILENAME_NORMALIZE_SCRIPT", "/opt/qbt/gdrive-backfill/bin/jav_name_normalize.py")
+    timeout = int(env.get("QBT_ORCH_FILENAME_NORMALIZE_TIMEOUT_SEC", "30"))
+    return FilenameNormalizeScript(script_path=script, timeout_sec=timeout)
 
 
 def _build_backfill_from_env(env=os.environ):
@@ -188,7 +198,14 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     media_pipeline_dry_run = True if dry_run else (media_env if media_env is not None else True)
     media_runner = MediaPipelineJobRunner(
         TorrentJobRepository(state_db),
-        MediaPipelineService(state_db, _build_backfill_from_env(os.environ), emby_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt"),
+        MediaPipelineService(
+            state_db,
+            _build_backfill_from_env(os.environ),
+            emby_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt",
+            normalizer=_build_normalizer_from_env(os.environ),
+            min_normalize_confidence=float(os.environ.get("QBT_ORCH_FILENAME_NORMALIZE_MIN_CONFIDENCE", "0.8")),
+            allow_unrecognized_passthrough=(_truthy(os.environ.get("QBT_ORCH_MEDIA_ALLOW_UNRECOGNIZED_PASSTHROUGH")) is not False),
+        ),
     )
     emby_env = _truthy(os.environ.get("QBT_ORCH_EMBY_REFRESH_DRY_RUN"))
     emby_refresh_dry_run = True if dry_run else (emby_env if emby_env is not None else True)

@@ -5,7 +5,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Iterable
+from typing import Iterable, Protocol
 
 from .db import readonly_connect, write_transaction
 from .runtime import TorrentJobRepository
@@ -16,6 +16,28 @@ class UploadedFile:
 @dataclass(frozen=True)
 class PipelineRun:
     media_group_key: str; state: str
+
+
+class FilenameNormalizerProtocol(Protocol):
+    def normalize(self, raw_filename: str) -> dict: ...
+
+
+class FallbackFilenameNormalizer:
+    _JAV_ID = re.compile(r"(?i)([A-Z]{2,10})[-_ ]?(\d{2,6})")
+
+    def normalize(self, raw_filename: str) -> dict:
+        stem = PurePosixPath(raw_filename).stem
+        match = self._JAV_ID.search(stem)
+        if match:
+            return {
+                "normalized_id": f"{match.group(1).upper()}-{match.group(2)}",
+                "confidence": 0.85,
+                "raw_basename": stem,
+                "reason": "fallback_jav_id_matched",
+            }
+        return {"normalized_id": "", "confidence": 0.0, "raw_basename": stem, "reason": "normalizer_not_configured"}
+
+
 _MULTI_PART = re.compile(r"(?i)(?:[._ -]?(?:cd|disc|disk|part|pt)[._ -]?\d{1,2}|[上下]|前編|後編)$")
 def media_group_key_from_remote(remote_path: str) -> str:
     path = remote_path.split(":", 1)[1] if ":" in remote_path else remote_path
@@ -77,6 +99,10 @@ class MediaPipelineService:
         emby_prefix: str = "/media/gcrypt",
         debounce_sec: int = 300,
         max_debounce_wait_sec: int = 900,
+        normalizer: FilenameNormalizerProtocol | None = None,
+        min_normalize_confidence: float = 0.8,
+        allow_unrecognized_passthrough: bool = True,
+        required_sidecar_outputs: tuple[str, ...] = ("nfo", "poster", "fanart"),
         now=None,
     ):
         self.state_db = state_db
@@ -84,6 +110,10 @@ class MediaPipelineService:
         self.emby_prefix = emby_prefix.rstrip("/")
         self.debounce_sec = int(debounce_sec)
         self.max_debounce_wait_sec = int(max_debounce_wait_sec)
+        self.normalizer = normalizer or FallbackFilenameNormalizer()
+        self.min_normalize_confidence = float(min_normalize_confidence)
+        self.allow_unrecognized_passthrough = bool(allow_unrecognized_passthrough)
+        self.required_sidecar_outputs = tuple(required_sidecar_outputs)
         self.now = now or (lambda: int(time.time()))
         self.jobs = TorrentJobRepository(state_db, now=self.now)
 
@@ -92,25 +122,88 @@ class MediaPipelineService:
         if not valid:
             return PipelineRun("", "content_gate_failed")
 
-        key = media_group_key_from_remote(valid[0].remote_path)
-        emby_dir = _emby_dir_from_remote(valid[0].remote_path, self.emby_prefix)
-        group_id = self._ensure_media_group(key, emby_dir)
+        primary = valid[0]
+        raw_filename = PurePosixPath(_remote_path_without_remote(primary.remote_path)).name
+        normalize_result = self._normalize_filename(raw_filename)
+        normalize_confidence = self._normalize_confidence(normalize_result)
+        normalized_id = str(normalize_result.get("normalized_id") or "").strip()
+        normalize_high_confidence = bool(normalized_id) and normalize_confidence >= self.min_normalize_confidence
+        fallback_key = media_group_key_from_remote(primary.remote_path)
+        key = normalized_id if normalize_high_confidence else fallback_key
+        emby_dir = f"{self.emby_prefix}/{key}".rstrip("/") if normalize_high_confidence else _emby_dir_from_remote(primary.remote_path, self.emby_prefix)
+        group_id = self._ensure_media_group(key, emby_dir, normalized_id=normalized_id if normalize_high_confidence else fallback_key)
         run_id = self._ensure_pipeline_run(str(manifest_id), group_id)
 
         if self._sidecar_already_verified(group_id):
             state = "SidecarVerified"
-        else:
-            scrape = self.backfill.scrape_one(key, str(manifest_id))
-            if scrape.get("status") == "sidecar_verified" and self._valid_artifacts(scrape.get("artifacts") or []):
-                manifest_row_id = self._record_sidecar_manifest(group_id, scrape)
-                self._enqueue_sidecar_uploads(key, manifest_row_id, scrape.get("artifacts") or [])
-                state = "SidecarVerified"
+            metadata_policy = "sidecar"
+            metadata_quality = "normalized" if normalize_high_confidence else "cached"
+            passthrough_reason = None
+            missing_outputs: list[str] = []
+        elif not normalize_high_confidence:
+            if not self.allow_unrecognized_passthrough:
+                state = "ManualReview"
+                metadata_policy = "manual_review"
+                metadata_quality = "raw"
+                passthrough_reason = "normalize_low_confidence"
             else:
                 state = "PassthroughAllowed"
+                metadata_policy = "passthrough"
+                metadata_quality = "raw"
+                passthrough_reason = "normalize_low_confidence"
+            missing_outputs = []
+        else:
+            scrape = self.backfill.scrape_one(key, str(manifest_id))
+            valid_artifacts, missing_outputs = self._validate_sidecar_artifacts(scrape.get("artifacts") or [])
+            if scrape.get("status") == "sidecar_verified" and valid_artifacts:
+                manifest_row_id = self._record_sidecar_manifest(group_id, scrape, state="sidecar_verified", missing_outputs=[])
+                self._enqueue_sidecar_uploads(key, manifest_row_id, scrape.get("artifacts") or [])
+                state = "SidecarVerified"
+                metadata_policy = "sidecar"
+                metadata_quality = "normalized"
+                passthrough_reason = None
+            else:
+                self._record_sidecar_manifest(group_id, scrape, state="sidecar_verify_failed", missing_outputs=missing_outputs)
+                state = "PassthroughAllowed"
+                metadata_policy = "passthrough"
+                metadata_quality = "raw"
+                passthrough_reason = "sidecar_verify_failed"
 
-        self._set_pipeline_state(run_id, state)
+        self._set_pipeline_state(
+            run_id,
+            state,
+            metadata_policy=metadata_policy,
+            metadata_quality=metadata_quality,
+            passthrough_reason=passthrough_reason,
+            normalize_confidence=normalize_confidence,
+            normalize_result=normalize_result,
+            missing_outputs=missing_outputs,
+        )
         self._queue_emby_refresh(emby_dir, key, manifest_id, state)
         return PipelineRun(key, state)
+
+    def _normalize_filename(self, raw_filename: str) -> dict:
+        try:
+            result = self.normalizer.normalize(raw_filename)
+            return result if isinstance(result, dict) else {"normalized_id": "", "confidence": 0.0, "reason": "normalizer_invalid_result"}
+        except Exception as exc:
+            return {"normalized_id": "", "confidence": 0.0, "raw_filename": raw_filename, "reason": "normalizer_failed", "error": redact(str(exc))[:500]}
+
+    @staticmethod
+    def _normalize_confidence(result: dict) -> float:
+        raw = result.get("confidence", 0.0)
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"high", "trusted"}:
+                return 1.0
+            if lowered in {"medium", "med"}:
+                return 0.7
+            if lowered in {"low", "unknown"}:
+                return 0.2
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _content_gate_allows(self, file: UploadedFile) -> bool:
         path = PurePosixPath(_remote_path_without_remote(file.remote_path))
@@ -125,14 +218,14 @@ class MediaPipelineService:
             return False
         return True
 
-    def _ensure_media_group(self, key: str, emby_dir: str) -> int:
+    def _ensure_media_group(self, key: str, emby_dir: str, *, normalized_id: str | None = None) -> int:
         now = int(self.now())
         def txn(con: sqlite3.Connection) -> int:
             con.execute(
                 "insert or ignore into media_groups(media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?)",
-                (key, key, emby_dir, now, now),
+                (key, normalized_id or key, emby_dir, now, now),
             )
-            con.execute("update media_groups set emby_media_dir=?, updated_at=? where media_group_key=?", (emby_dir, now, key))
+            con.execute("update media_groups set normalized_id=?, emby_media_dir=?, updated_at=? where media_group_key=?", (normalized_id or key, emby_dir, now, key))
             row = con.execute("select id from media_groups where media_group_key=?", (key,)).fetchone()
             return int(row["id"])
 
@@ -153,10 +246,35 @@ class MediaPipelineService:
 
         return int(write_transaction(self.state_db, txn))
 
-    def _set_pipeline_state(self, run_id: int, state: str) -> None:
+    def _set_pipeline_state(
+        self,
+        run_id: int,
+        state: str,
+        *,
+        metadata_policy: str | None = None,
+        metadata_quality: str | None = None,
+        passthrough_reason: str | None = None,
+        normalize_confidence: float | None = None,
+        normalize_result: dict | None = None,
+        missing_outputs: list[str] | None = None,
+    ) -> None:
         write_transaction(
             self.state_db,
-            lambda con: con.execute("update media_pipeline_runs set state=?, updated_at=? where id=?", (state, int(self.now()), run_id)),
+            lambda con: con.execute(
+                "update media_pipeline_runs set state=?, metadata_policy=?, metadata_quality=?, passthrough_reason=?, "
+                "normalize_confidence=?, normalize_result_json=?, missing_outputs_json=?, updated_at=? where id=?",
+                (
+                    state,
+                    metadata_policy,
+                    metadata_quality,
+                    passthrough_reason,
+                    normalize_confidence,
+                    json.dumps(normalize_result or {}, ensure_ascii=False),
+                    json.dumps(missing_outputs or [], ensure_ascii=False),
+                    int(self.now()),
+                    run_id,
+                ),
+            ),
         )
 
     def _sidecar_already_verified(self, group_id: int) -> bool:
@@ -168,7 +286,7 @@ class MediaPipelineService:
         con.close()
         return row is not None
 
-    def _record_sidecar_manifest(self, group_id: int, scrape: dict) -> int:
+    def _record_sidecar_manifest(self, group_id: int, scrape: dict, *, state: str, missing_outputs: list[str]) -> int:
         now = int(self.now())
         artifacts = scrape.get("artifacts") or []
         artifact_manifest = {
@@ -176,6 +294,8 @@ class MediaPipelineService:
             "artifacts": artifacts,
             "returncode": scrape.get("returncode"),
             "scraper_log_tail": scrape.get("scraper_log_tail"),
+            "required_outputs": list(self.required_sidecar_outputs),
+            "missing_outputs": list(missing_outputs),
         }
         artifact_total_bytes = sum(int(a.get("size") or 0) for a in artifacts if isinstance(a, dict))
         def txn(con: sqlite3.Connection) -> int:
@@ -188,7 +308,7 @@ class MediaPipelineService:
                     group_id,
                     str(scrape.get("staging_dir") or ""),
                     json.dumps(artifacts, ensure_ascii=False),
-                    "sidecar_verified",
+                    state,
                     now,
                     now,
                     str(scrape.get("staging_dir") or ""),
@@ -203,19 +323,35 @@ class MediaPipelineService:
 
         return int(write_transaction(self.state_db, txn))
 
-    def _valid_artifacts(self, artifacts: list) -> bool:
+    def _validate_sidecar_artifacts(self, artifacts: list) -> tuple[bool, list[str]]:
         if not artifacts:
-            return False
+            return False, list(self.required_sidecar_outputs)
+        seen: set[str] = set()
         for artifact in artifacts:
             if not isinstance(artifact, dict):
-                return False
+                return False, list(self.required_sidecar_outputs)
             local = str(artifact.get("local") or "")
             remote = str(artifact.get("remote") or "")
             if not local or local.startswith("gcrypt:"):
-                return False
+                return False, list(self.required_sidecar_outputs)
             if not remote.startswith("gcrypt:/"):
-                return False
-        return True
+                return False, list(self.required_sidecar_outputs)
+            if int(artifact.get("size") or 0) <= 0:
+                return False, list(self.required_sidecar_outputs)
+            name = PurePosixPath(remote).name.lower()
+            suffix = PurePosixPath(name).suffix.lower()
+            stem = PurePosixPath(name).stem.lower()
+            if suffix == ".nfo":
+                seen.add("nfo")
+            if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+                if stem in {"poster", "folder"} or stem.endswith("-poster"):
+                    seen.add("poster")
+                if stem in {"fanart", "backdrop"} or stem.endswith("-fanart"):
+                    seen.add("fanart")
+                if stem in {"thumb", "thumbnail"} or stem.endswith("-thumb"):
+                    seen.add("thumb")
+        missing = [item for item in self.required_sidecar_outputs if item not in seen]
+        return not missing, missing
 
     def _enqueue_sidecar_uploads(self, key: str, sidecar_manifest_id: int, artifacts: list[dict]) -> None:
         for artifact in artifacts:
