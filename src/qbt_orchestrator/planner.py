@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .db import write_transaction
+from .db import readonly_connect, write_transaction
 from .models import LifecycleState
 from .observability import redact
 from .policies.download_mode import desired_seq_dl
@@ -25,9 +25,7 @@ class PlannerResult:
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    return con
+    return readonly_connect(path)
 
 
 def _tags(torrent: Mapping[str, Any]) -> set[str]:

@@ -51,11 +51,7 @@ class SQLiteMaintenanceService:
 
         reservations_expired = [0]
         journal_size_limit = int(write_transaction(self.state_db, txn))
-        con = sqlite3.connect(self.state_db)
-        try:
-            checkpoint = tuple(con.execute("pragma wal_checkpoint(passive)").fetchone())
-        finally:
-            con.close()
+        checkpoint = tuple(write_transaction(self.state_db, lambda con: con.execute("pragma wal_checkpoint(passive)").fetchone()))
         result = {
             "retention_cutoff": cutoff,
             "retention_deleted": deleted,

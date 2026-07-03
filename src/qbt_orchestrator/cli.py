@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Sequence
 from .config import load_config
 from .carousel import CarouselService
-from .db import migrate, readonly_counts, recover_jobs
+from .db import migrate, readonly_connect, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient
 from .integrations.rclone import RcloneClient
@@ -109,9 +109,7 @@ def _iowait_provider_from_env():
     return sample
 
 def _connect_readonly(db: Path) -> sqlite3.Connection:
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
-    return con
+    return readonly_connect(db)
 
 def _status_payload(db: Path, view: str | None) -> dict:
     if view in {None, "all"}:
@@ -361,7 +359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ns.cmd == "status":
         payload = _status_payload(db, ns.target); _print_json(payload) if ns.json else print(payload); return 0
     if ns.cmd == "events":
-        con = sqlite3.connect(db); rows = con.execute("select ts,level,component,event_type,message from events_v2 order by id desc limit 50").fetchall(); con.close(); _print_json([tuple(r) for r in rows]) if ns.json else print(rows); return 0
+        con = _connect_readonly(db); rows = con.execute("select ts,level,component,event_type,message from events_v2 order by id desc limit 50").fetchall(); con.close(); _print_json([tuple(r) for r in rows]) if ns.json else print(rows); return 0
     if ns.cmd == "trace":
         trace = ObservabilityStore(db).trace(str(ns.target or ""))
         payload = {"target": ns.target, **trace}

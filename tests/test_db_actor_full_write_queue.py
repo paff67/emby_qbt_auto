@@ -34,6 +34,34 @@ def test_runtime_modules_do_not_commit_sqlite_directly_outside_db_actor():
     assert offenders == []
 
 
+def test_runtime_modules_do_not_open_raw_sqlite_connections_outside_db_module():
+    """Feature/runtime modules must use DbActor helpers or readonly_connect.
+
+    Raw ``sqlite3.connect`` outside qbt_orchestrator.db silently bypasses the
+    single-writer/readonly split required by the v2 design.  Type annotations
+    using sqlite3.Connection are fine; only direct connect calls are forbidden.
+    """
+
+    src_root = ROOT / "src" / "qbt_orchestrator"
+    offenders: list[str] = []
+    for path in sorted(src_root.rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel == "src/qbt_orchestrator/db.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "sqlite3"
+            ):
+                offenders.append(f"{rel}:{node.lineno}")
+
+    assert offenders == []
+
+
 def test_sync_db_actor_helpers_serialize_writes_and_readonly_connection_is_readonly():
     from qbt_orchestrator.db import migrate, readonly_connect, stop_write_actors, write_execute, write_transaction
 

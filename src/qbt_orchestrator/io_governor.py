@@ -7,14 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .db import write_transaction
+from .db import readonly_connect, write_transaction
 from .observability import redact
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    return con
+    return readonly_connect(path)
 
 
 @dataclass(frozen=True)

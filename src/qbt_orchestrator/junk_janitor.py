@@ -8,7 +8,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
-from .db import write_transaction
+from .db import readonly_connect, write_transaction
 from .observability import redact
 
 
@@ -20,9 +20,7 @@ DEFAULT_HARD_PATTERNS = (
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    return con
+    return readonly_connect(path)
 
 
 def _tags(torrent: Mapping[str, Any]) -> set[str]:

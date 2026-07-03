@@ -6,7 +6,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
-from .db import write_transaction
+from .db import readonly_connect, write_transaction
 from .observability import redact
 
 
@@ -102,7 +102,7 @@ class QbtPathReconciler:
     def _record_once(self, drift: dict[str, Any]) -> None:
         data = redact(drift)
         data_json = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        con = sqlite3.connect(self.state_db)
+        con = readonly_connect(self.state_db)
         try:
             row = con.execute(
                 "select data_json from events_v2 where component='qbt_reconcile' and event_type='path_drift' and hash=? order by id desc limit 1",
