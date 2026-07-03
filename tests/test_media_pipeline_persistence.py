@@ -75,8 +75,8 @@ def test_persistent_media_pipeline_dedupes_multi_cd_sidecar_and_emby_refresh():
 
         assert first.media_group_key == "ABC-123"
         assert second.media_group_key == "ABC-123"
-        assert first.state == "SidecarVerified"
-        assert second.state == "SidecarVerified"
+        assert first.state == "SidecarUploadQueued"
+        assert second.state == "SidecarUploadQueued"
         assert backfill.calls == [("ABC-123", "manifest-1")]
 
         groups = rows(db, "select * from media_groups")
@@ -86,7 +86,7 @@ def test_persistent_media_pipeline_dedupes_multi_cd_sidecar_and_emby_refresh():
 
         sidecars = rows(db, "select * from sidecar_manifests")
         assert len(sidecars) == 1
-        assert sidecars[0]["state"] == "sidecar_verified"
+        assert sidecars[0]["state"] == "local_sidecar_validated"
         assert sidecars[0]["local_artifact_dir"] == staging
         assert sidecars[0]["artifact_total_bytes"] == 600
         assert json.loads(sidecars[0]["artifact_manifest_json"])["artifact_manifest"] == f"{staging}/artifact_manifest.json"
@@ -99,11 +99,7 @@ def test_persistent_media_pipeline_dedupes_multi_cd_sidecar_and_emby_refresh():
         assert payloads[0]["remote"] == "gcrypt:/ABC-123/ABC-123.nfo"
         assert payloads[0]["full_torrent"] is False
 
-        refresh = rows(db, "select * from emby_refresh_tasks")
-        assert len(refresh) == 1
-        assert refresh[0]["emby_media_dir"] == "/media/gcrypt/ABC-123"
-        assert refresh[0]["earliest_run_at"] == 1400
-        assert refresh[0]["max_run_at"] == 1900
+        assert rows(db, "select count(*) as n from emby_refresh_tasks")[0]["n"] == 0
 
 
 def test_persistent_media_pipeline_allows_unknown_metadata_passthrough_but_blocks_junk():
@@ -170,20 +166,20 @@ def test_persistent_media_pipeline_uses_filename_normalizer_for_grouping_and_scr
         )
 
         assert result.media_group_key == "BBAN-582"
-        assert result.state == "SidecarVerified"
+        assert result.state == "SidecarUploadQueued"
         assert normalizer.calls == ["489155.com@BBAN-582.mp4"]
         assert backfill.calls == [("BBAN-582", "manifest-normalized")]
 
         groups = rows(db, "select media_group_key,normalized_id,emby_media_dir from media_groups")
         assert groups == [{"media_group_key": "BBAN-582", "normalized_id": "BBAN-582", "emby_media_dir": "/media/gcrypt/BBAN-582"}]
         run = rows(db, "select state,metadata_policy,metadata_quality,passthrough_reason,normalize_result_json from media_pipeline_runs")[0]
-        assert run["state"] == "SidecarVerified"
+        assert run["state"] == "SidecarUploadQueued"
         assert run["metadata_policy"] == "sidecar"
         assert run["metadata_quality"] == "normalized"
         assert run["passthrough_reason"] is None
         assert json.loads(run["normalize_result_json"])["reason"] == "domain_prefix_removed_and_standard_jav_id_matched"
         assert rows(db, "select count(*) as n from torrent_jobs where job_type='sidecar_upload'")[0]["n"] == 3
-        assert rows(db, "select emby_media_dir from emby_refresh_tasks") == [{"emby_media_dir": "/media/gcrypt/BBAN-582"}]
+        assert rows(db, "select count(*) as n from emby_refresh_tasks")[0]["n"] == 0
 
 
 def test_persistent_media_pipeline_low_confidence_normalize_passthrough_skips_scrape():

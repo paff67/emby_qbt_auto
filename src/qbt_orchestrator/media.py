@@ -134,12 +134,21 @@ class MediaPipelineService:
         group_id = self._ensure_media_group(key, emby_dir, normalized_id=normalized_id if normalize_high_confidence else fallback_key)
         run_id = self._ensure_pipeline_run(str(manifest_id), group_id)
 
-        if self._sidecar_already_verified(group_id):
+        existing_sidecar_state = self._sidecar_manifest_state(group_id)
+        queue_refresh = False
+        if existing_sidecar_state == "sidecar_verified":
             state = "SidecarVerified"
             metadata_policy = "sidecar"
             metadata_quality = "normalized" if normalize_high_confidence else "cached"
             passthrough_reason = None
             missing_outputs: list[str] = []
+            queue_refresh = True
+        elif existing_sidecar_state in {"local_sidecar_validated", "sidecar_uploading"}:
+            state = "SidecarUploadQueued"
+            metadata_policy = "sidecar"
+            metadata_quality = "normalized" if normalize_high_confidence else "cached"
+            passthrough_reason = None
+            missing_outputs = []
         elif not normalize_high_confidence:
             if not self.allow_unrecognized_passthrough:
                 state = "ManualReview"
@@ -151,14 +160,15 @@ class MediaPipelineService:
                 metadata_policy = "passthrough"
                 metadata_quality = "raw"
                 passthrough_reason = "normalize_low_confidence"
+                queue_refresh = True
             missing_outputs = []
         else:
             scrape = self.backfill.scrape_one(key, str(manifest_id))
             valid_artifacts, missing_outputs = self._validate_sidecar_artifacts(scrape.get("artifacts") or [])
             if scrape.get("status") == "sidecar_verified" and valid_artifacts:
-                manifest_row_id = self._record_sidecar_manifest(group_id, scrape, state="sidecar_verified", missing_outputs=[])
+                manifest_row_id = self._record_sidecar_manifest(group_id, scrape, state="local_sidecar_validated", missing_outputs=[])
                 self._enqueue_sidecar_uploads(key, manifest_row_id, scrape.get("artifacts") or [])
-                state = "SidecarVerified"
+                state = "SidecarUploadQueued"
                 metadata_policy = "sidecar"
                 metadata_quality = "normalized"
                 passthrough_reason = None
@@ -168,6 +178,7 @@ class MediaPipelineService:
                 metadata_policy = "passthrough"
                 metadata_quality = "raw"
                 passthrough_reason = "sidecar_verify_failed"
+                queue_refresh = True
 
         self._set_pipeline_state(
             run_id,
@@ -179,7 +190,8 @@ class MediaPipelineService:
             normalize_result=normalize_result,
             missing_outputs=missing_outputs,
         )
-        self._queue_emby_refresh(emby_dir, key, manifest_id, state)
+        if queue_refresh:
+            self._queue_emby_refresh(emby_dir, key, manifest_id, state)
         return PipelineRun(key, state)
 
     def _normalize_filename(self, raw_filename: str) -> dict:
@@ -278,13 +290,17 @@ class MediaPipelineService:
         )
 
     def _sidecar_already_verified(self, group_id: int) -> bool:
+        return self._sidecar_manifest_state(group_id) == "sidecar_verified"
+
+    def _sidecar_manifest_state(self, group_id: int) -> str | None:
         con = _connect(self.state_db)
         row = con.execute(
-            "select id from sidecar_manifests where media_group_id=? and state='sidecar_verified' order by id limit 1",
+            "select state from sidecar_manifests where media_group_id=? and state in ('sidecar_verified','local_sidecar_validated','sidecar_uploading') "
+            "order by case state when 'sidecar_verified' then 0 when 'local_sidecar_validated' then 1 else 2 end, id limit 1",
             (group_id,),
         ).fetchone()
         con.close()
-        return row is not None
+        return str(row["state"]) if row else None
 
     def _record_sidecar_manifest(self, group_id: int, scrape: dict, *, state: str, missing_outputs: list[str]) -> int:
         now = int(self.now())

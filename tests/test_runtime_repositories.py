@@ -106,6 +106,66 @@ def test_upload_verified_enqueues_media_pipeline_and_sidecar_upload_uses_upload_
         assert repo.get(sidecar_id)["state"] == "done"
 
 
+def test_sidecar_upload_verified_marks_manifest_and_only_then_queues_emby_refresh():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor, FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into media_groups(id,media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?,?)",
+            (1, "ABC-123", "ABC-123", "/media/gcrypt/ABC-123", 100, 100),
+        )
+        con.execute(
+            "insert into media_pipeline_runs(id,upload_manifest_id,media_group_id,state,metadata_policy,metadata_quality,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
+            (1, "manifest-1", 1, "SidecarUploadQueued", "sidecar", "normalized", 100, 100),
+        )
+        con.execute(
+            "insert into sidecar_manifests(id,media_group_id,staging_dir,artifacts_json,state,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            (1, 1, "/staging/ABC-123", "[]", "local_sidecar_validated", 100, 100),
+        )
+        con.commit(); con.close()
+        repo = TorrentJobRepository(db, now=lambda: 1000)
+        nfo_job = repo.enqueue(
+            None,
+            None,
+            "sidecar_upload",
+            {"local": "/staging/ABC-123/movie.nfo", "remote": "gcrypt:/ABC-123/movie.nfo", "size": 10, "full_torrent": False, "sidecar_manifest_id": 1},
+            priority=1,
+        )
+        poster_job = repo.enqueue(
+            None,
+            None,
+            "sidecar_upload",
+            {"local": "/staging/ABC-123/poster.jpg", "remote": "gcrypt:/ABC-123/poster.jpg", "size": 20, "full_torrent": False, "sidecar_manifest_id": 1},
+            priority=2,
+        )
+        runner = UploadJobRunner(
+            repo,
+            FakeRclone(copy_ok=True, remote_sizes={"gcrypt:/ABC-123/movie.nfo": 10, "gcrypt:/ABC-123/poster.jpg": 20}),
+            FakeExecutor(),
+        )
+
+        assert runner.run_next() == nfo_job
+        assert _rows(db, "select state from sidecar_manifests where id=1") == [{"state": "sidecar_uploading"}]
+        assert _rows(db, "select state from media_pipeline_runs where id=1") == [{"state": "SidecarUploading"}]
+        assert _rows(db, "select count(*) as n from emby_refresh_tasks") == [{"n": 0}]
+
+        assert runner.run_next() == poster_job
+        assert _rows(db, "select state from sidecar_manifests where id=1") == [{"state": "sidecar_verified"}]
+        assert _rows(db, "select state from media_pipeline_runs where id=1") == [{"state": "SidecarVerified"}]
+        refresh = _rows(db, "select emby_media_dir,state,earliest_run_at,max_run_at,payload_json from emby_refresh_tasks")
+        assert len(refresh) == 1
+        assert refresh[0]["emby_media_dir"] == "/media/gcrypt/ABC-123"
+        assert refresh[0]["state"] == "queued"
+        assert refresh[0]["earliest_run_at"] == 1300
+        assert refresh[0]["max_run_at"] == 1900
+        assert json.loads(refresh[0]["payload_json"])["trigger_state"] == "SidecarVerified"
+
+
 def test_upload_job_runner_marks_pipeline_batch_cleanup_deferred_and_counts_pending_cleanup():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner

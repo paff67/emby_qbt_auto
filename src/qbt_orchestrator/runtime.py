@@ -151,7 +151,9 @@ class UploadJobRunner:
         if result.state == "done": self.repo.update_state(row["id"], "done", exit_code=0)
         elif result.state == "verify_pending": self.repo.update_state(row["id"], "verify_pending", "remote size mismatch")
         elif result.state == "retry_wait": self.repo.schedule_retry(row["id"], "retry requested", exit_code=1, delay_sec=self._delay_for_attempt(int(row.get("attempts") or 1)))
-        elif row["job_type"] == "sidecar_upload" and result.remote_verified: self.repo.update_state(row["id"], "done", exit_code=0)
+        elif row["job_type"] == "sidecar_upload" and result.remote_verified:
+            self.repo.update_state(row["id"], "done", exit_code=0)
+            self._update_sidecar_upload_state(row, payload)
         else: self.repo.update_state(row["id"], result.state)
         if row["job_type"] == "upload" and row.get("batch_id") is not None:
             self._update_batch_upload_state(row, payload, result)
@@ -218,6 +220,93 @@ class UploadJobRunner:
             "files": media_files,
         }
         self.repo.enqueue(row.get("hash"), row.get("batch_id"), "media_pipeline", media_payload, priority=30)
+
+    def _update_sidecar_upload_state(self, row: dict[str, Any], payload: dict[str, Any]) -> None:
+        raw_manifest_id = payload.get("sidecar_manifest_id")
+        if raw_manifest_id in (None, ""):
+            return
+        try:
+            sidecar_manifest_id = int(raw_manifest_id)
+        except (TypeError, ValueError):
+            return
+        now = int(self.repo.now())
+
+        def txn(con: sqlite3.Connection) -> None:
+            manifest = con.execute(
+                "select sm.*, mg.media_group_key, mg.emby_media_dir from sidecar_manifests sm "
+                "left join media_groups mg on mg.id=sm.media_group_id where sm.id=?",
+                (sidecar_manifest_id,),
+            ).fetchone()
+            if not manifest:
+                return
+
+            pending = False
+            for job_row in con.execute("select id,state,payload_json from torrent_jobs where job_type='sidecar_upload'"):
+                try:
+                    job_payload = json.loads(job_row["payload_json"] or "{}")
+                except Exception:
+                    continue
+                try:
+                    same_manifest = int(job_payload.get("sidecar_manifest_id") or 0) == sidecar_manifest_id
+                except (TypeError, ValueError):
+                    same_manifest = False
+                if not same_manifest:
+                    continue
+                if str(job_row["state"]) not in {"done", "cancelled", "failed"}:
+                    pending = True
+                    break
+
+            if pending:
+                con.execute("update sidecar_manifests set state='sidecar_uploading', updated_at=? where id=?", (now, sidecar_manifest_id))
+                con.execute(
+                    "update media_pipeline_runs set state='SidecarUploading', updated_at=? "
+                    "where media_group_id=? and state in ('SidecarUploadQueued','SidecarUploading')",
+                    (now, int(manifest["media_group_id"])),
+                )
+                return
+
+            con.execute("update sidecar_manifests set state='sidecar_verified', updated_at=? where id=?", (now, sidecar_manifest_id))
+            con.execute(
+                "update media_pipeline_runs set state='SidecarVerified', metadata_policy='sidecar', passthrough_reason=null, updated_at=? "
+                "where media_group_id=? and state in ('SidecarUploadQueued','SidecarUploading')",
+                (now, int(manifest["media_group_id"])),
+            )
+            emby_dir = str(manifest["emby_media_dir"] or "").rstrip("/")
+            media_group_key = str(manifest["media_group_key"] or "")
+            if not emby_dir or not media_group_key or emby_dir in {"/media", "/media/gcrypt"}:
+                return
+            run = con.execute(
+                "select upload_manifest_id from media_pipeline_runs where media_group_id=? order by updated_at desc,id desc limit 1",
+                (int(manifest["media_group_id"]),),
+            ).fetchone()
+            upload_manifest_id = str(run["upload_manifest_id"] if run else "")
+            payload_json = json.dumps(
+                {
+                    "media_group_key": media_group_key,
+                    "upload_manifest_id": upload_manifest_id,
+                    "sidecar_manifest_id": sidecar_manifest_id,
+                    "trigger_state": "SidecarVerified",
+                },
+                ensure_ascii=False,
+            )
+            earliest = now + 300
+            max_run = now + 900
+            existing = con.execute(
+                "select * from emby_refresh_tasks where emby_media_dir=? and state='queued' order by id limit 1",
+                (emby_dir,),
+            ).fetchone()
+            if existing:
+                con.execute(
+                    "update emby_refresh_tasks set earliest_run_at=?, max_run_at=?, payload_json=?, updated_at=? where id=?",
+                    (min(int(existing["max_run_at"]), earliest), int(existing["max_run_at"]), payload_json, now, int(existing["id"])),
+                )
+            else:
+                con.execute(
+                    "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+                    (emby_dir, "queued", earliest, max_run, payload_json, now, now),
+                )
+
+        write_transaction(self.repo.state_db, txn)
 
     def _delay_for_attempt(self, attempt: int) -> int:
         if not self.backoff_schedule:
