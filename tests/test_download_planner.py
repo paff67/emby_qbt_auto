@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -215,6 +216,51 @@ def test_planner_forces_sequential_download_off_for_soak_torrents():
         planner.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True)
 
         assert executor.seq == [("soak", False)]
+
+
+def test_planner_applies_sequential_download_true_for_eligible_active_torrents():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+
+    class SeqExecutor:
+        def __init__(self):
+            self.posts = []
+            self.seq = []
+
+        def qbt_post(self, path, payload):
+            self.posts.append((path, payload))
+
+        def set_seq_dl(self, hash, desired):
+            self.seq.append((hash, desired))
+            return True
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = SeqExecutor()
+        planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=0)
+        snapshots = {
+            "hot": {
+                "hash": "hot",
+                "category": "auto",
+                "state": "pausedDL",
+                "amount_left": 1,
+                "size": 2,
+                "progress": 0.1,
+                "num_seeds": 3,
+                "num_peers": 5,
+                "stalled_seconds": 0,
+            },
+        }
+
+        planner.plan_and_apply(snapshots, free_bytes=10, sync_healthy=True)
+
+        assert executor.seq == [("hot", True)]
+        actions = _rows(db, "select path,status,dry_run,payload_json from action_log where path='/api/v2/torrents/toggleSequentialDownload'")
+        assert len(actions) == 1
+        assert actions[0]["status"] == "succeeded"
+        assert actions[0]["dry_run"] == 0
+        assert json.loads(actions[0]["payload_json"]) == {"hashes": "hot", "desired": True}
 
 
 def test_planner_does_not_repeat_seq_false_when_allocation_already_records_false():

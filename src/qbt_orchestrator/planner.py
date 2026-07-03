@@ -115,7 +115,7 @@ class DownloadPlanner:
         start_hashes = [str(t["hash"]) for t in selected if _is_stopped_download(t)]
         paused_hashes = [str(t["hash"]) for t in managed if str(t["hash"]) not in selected_set and _is_running_download(t)]
 
-        seq_false_hashes: list[str] = []
+        seq_desired_actions: list[tuple[str, bool]] = []
         for torrent in managed:
             h = str(torrent["hash"])
             if h in auto_dead:
@@ -126,6 +126,8 @@ class DownloadPlanner:
                     "health_no_swarm_no_progress",
                     {"last_swarm_seen_at": (health_rows.get(h) or {}).get("last_swarm_seen_at"), "no_progress_since": (health_rows.get(h) or {}).get("no_progress_since")},
                 )
+                if self._needs_seq_desired(h, False, previous_allocations):
+                    seq_desired_actions.append((h, False))
         for torrent in candidates:
             h = str(torrent["hash"])
             if h in selected_set:
@@ -137,21 +139,23 @@ class DownloadPlanner:
                 )
                 self._allocation(h, "active", "stable", int(torrent.get("amount_left") or 0), seq, now, "budget_fit")
                 self._decision(h, "active", "budget_fit", {"reserved_bytes": int(torrent.get("amount_left") or 0), "budget_bytes": budget})
+                if seq and self._needs_seq_desired(h, True, previous_allocations):
+                    seq_desired_actions.append((h, True))
             elif h in active_slow:
                 self._allocation(h, "soak", "soak", 0, False, now, "active_slow_5min")
                 self._decision(h, "soak", "active_slow_5min", {"budget_bytes": budget})
-                if self._needs_seq_false(h, previous_allocations):
-                    seq_false_hashes.append(h)
+                if self._needs_seq_desired(h, False, previous_allocations):
+                    seq_desired_actions.append((h, False))
             else:
                 self._allocation(h, "soak", "soak", 0, False, now, "budget_or_slot_exhausted")
                 self._decision(h, "soak", "budget_or_slot_exhausted", {"budget_bytes": budget})
-                if self._needs_seq_false(h, previous_allocations):
-                    seq_false_hashes.append(h)
+                if self._needs_seq_desired(h, False, previous_allocations):
+                    seq_desired_actions.append((h, False))
 
         self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead, previous_allocations=previous_allocations)
         if not self.dry_run:
             self._sync_active_download_reservations(selected, {str(t["hash"]) for t in managed}, now)
-        self._force_seq_false(seq_false_hashes)
+        self._apply_seq_desired(seq_desired_actions)
         self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
         return PlannerResult(selected_hashes, paused_hashes, conservative=False, budget_bytes=budget)
@@ -165,8 +169,13 @@ class DownloadPlanner:
             con.close()
 
     def _needs_seq_false(self, hash: str, previous_allocations: dict[str, dict[str, Any]]) -> bool:
+        return self._needs_seq_desired(hash, False, previous_allocations)
+
+    def _needs_seq_desired(self, hash: str, desired: bool, previous_allocations: dict[str, dict[str, Any]]) -> bool:
         row = previous_allocations.get(hash)
-        return row is None or row.get("desired_seq_dl") is None or int(row.get("desired_seq_dl") or 0) != 0
+        if row is None or row.get("desired_seq_dl") is None:
+            return True
+        return int(row.get("desired_seq_dl") or 0) != (1 if desired else 0)
 
     def _health_rows(self) -> dict[str, dict[str, Any]]:
         con = _connect(self.state_db)
@@ -318,16 +327,28 @@ class DownloadPlanner:
             raise
 
     def _force_seq_false(self, hashes: list[str]) -> None:
-        if not hashes or not hasattr(self.executor, "set_seq_dl"):
+        self._apply_seq_desired([(h, False) for h in hashes])
+
+    def _apply_seq_desired(self, desired_actions: list[tuple[str, bool]]) -> None:
+        if not desired_actions or not hasattr(self.executor, "set_seq_dl"):
+            return
+        seen: set[tuple[str, bool]] = set()
+        deduped: list[tuple[str, bool]] = []
+        for h, desired in desired_actions:
+            item = (h, bool(desired))
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        if not deduped:
             return
         path = "/api/v2/torrents/toggleSequentialDownload"
-        for h in hashes:
-            payload = {"hashes": h, "desired": False}
+        for h, desired in deduped:
+            payload = {"hashes": h, "desired": bool(desired)}
             if self.dry_run:
                 self._action(path, payload, "dry_run", True)
                 continue
             try:
-                changed = bool(self.executor.set_seq_dl(h, False))
+                changed = bool(self.executor.set_seq_dl(h, bool(desired)))
                 if changed:
                     self._action(path, payload, "succeeded", False)
             except Exception as exc:
