@@ -165,6 +165,9 @@ class DaemonRuntime:
         batch_allow_tag: str = "",
         batch_max_live_batch_bytes: int = 0,
         batch_max_new_per_tick: int = 1_000_000,
+        background_event_workers: bool = False,
+        event_worker_interval: float = 1.0,
+        event_worker_join_timeout: float = 0.2,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -202,6 +205,11 @@ class DaemonRuntime:
         self.batch_allow_tag = str(batch_allow_tag or "").strip()
         self.batch_max_live_batch_bytes = int(batch_max_live_batch_bytes or 0)
         self.batch_max_new_per_tick = int(batch_max_new_per_tick)
+        self.background_event_workers = bool(background_event_workers)
+        self.event_worker_interval = max(0.01, float(event_worker_interval))
+        self.event_worker_join_timeout = max(0.0, float(event_worker_join_timeout))
+        self._event_worker_stop = threading.Event()
+        self._event_worker_threads: list[threading.Thread] = []
         self.junk_file_refresh_limit = int(junk_file_refresh_limit)
         self.carousel_dry_run = carousel_dry_run or dry_run
         if carousel_service is not None:
@@ -498,6 +506,59 @@ class DaemonRuntime:
             self.obs.event("info", "emby", "emby_refresh_processed", f"emby refresh task {task_id} processed", {"task_id": task_id})
         return processed
 
+    def _background_event_worker_specs(self) -> list[tuple[str, Callable[[], int]]]:
+        return [
+            ("telegram", self.process_bot_notifications),
+            ("upload", self.process_upload_jobs),
+            ("cleanup", self.process_cleanup_requests),
+            ("media_pipeline", self.process_media_pipeline_jobs),
+            ("emby", self.process_emby_refresh_tasks),
+        ]
+
+    def _start_background_event_workers(self) -> None:
+        if not self.background_event_workers:
+            return
+        if any(thread.is_alive() for thread in self._event_worker_threads):
+            return
+        self._event_worker_stop.clear()
+        self._event_worker_threads = []
+        worker_names: list[str] = []
+        for name, callback in self._background_event_worker_specs():
+            thread = threading.Thread(
+                target=self._run_background_event_worker,
+                name=f"qbt-event-{name}",
+                args=(name, callback),
+                daemon=True,
+            )
+            thread.start()
+            self._event_worker_threads.append(thread)
+            worker_names.append(name)
+        self.obs.event("info", "daemon", "event_workers_started", "background event workers started", {"workers": worker_names})
+
+    def _stop_background_event_workers(self) -> None:
+        if not self._event_worker_threads:
+            return
+        self._event_worker_stop.set()
+        for thread in list(self._event_worker_threads):
+            thread.join(timeout=self.event_worker_join_timeout)
+        alive = [thread.name for thread in self._event_worker_threads if thread.is_alive()]
+        self.obs.event("info", "daemon", "event_workers_stopped", "background event workers stop requested", {"alive": alive})
+        self._event_worker_threads = [thread for thread in self._event_worker_threads if thread.is_alive()]
+
+    def _run_background_event_worker(self, name: str, callback: Callable[[], int]) -> None:
+        while not self._event_worker_stop.is_set():
+            try:
+                callback()
+            except Exception as exc:
+                self.obs.event(
+                    "error",
+                    name,
+                    "event_worker_failed",
+                    str(redact(str(exc))),
+                    {"background_event_workers": True, "dry_run": self.dry_run},
+                )
+            self._event_worker_stop.wait(self.event_worker_interval)
+
     def run_due_loop_tasks(self) -> int:
         ran = 0
         now_monotonic = self.monotonic()
@@ -535,6 +596,7 @@ class DaemonRuntime:
         self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
         if self.telegram_supervisor is not None:
             self.telegram_supervisor.start()
+        self._start_background_event_workers()
         ticks = 0
         try:
             while not self._stopping:
@@ -548,26 +610,27 @@ class DaemonRuntime:
                     self.process_bot_commands()
                 except Exception as exc:
                     self.obs.event("error", "telegram", "command_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-                try:
-                    self.process_bot_notifications()
-                except Exception as exc:
-                    self.obs.event("error", "telegram", "notification_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-                try:
-                    self.process_upload_jobs()
-                except Exception as exc:
-                    self.obs.event("error", "upload", "upload_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-                try:
-                    self.process_cleanup_requests()
-                except Exception as exc:
-                    self.obs.event("error", "cleanup", "cleanup_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-                try:
-                    self.process_media_pipeline_jobs()
-                except Exception as exc:
-                    self.obs.event("error", "media_pipeline", "media_pipeline_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-                try:
-                    self.process_emby_refresh_tasks()
-                except Exception as exc:
-                    self.obs.event("error", "emby", "emby_refresh_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                if not self.background_event_workers:
+                    try:
+                        self.process_bot_notifications()
+                    except Exception as exc:
+                        self.obs.event("error", "telegram", "notification_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                    try:
+                        self.process_upload_jobs()
+                    except Exception as exc:
+                        self.obs.event("error", "upload", "upload_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                    try:
+                        self.process_cleanup_requests()
+                    except Exception as exc:
+                        self.obs.event("error", "cleanup", "cleanup_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                    try:
+                        self.process_media_pipeline_jobs()
+                    except Exception as exc:
+                        self.obs.event("error", "media_pipeline", "media_pipeline_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                    try:
+                        self.process_emby_refresh_tasks()
+                    except Exception as exc:
+                        self.obs.event("error", "emby", "emby_refresh_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                 ticks += 1
                 if max_safety_ticks is not None and ticks >= max_safety_ticks:
                     break
@@ -575,6 +638,7 @@ class DaemonRuntime:
                 if sleep_for > 0:
                     self.sleeper(sleep_for)
         finally:
+            self._stop_background_event_workers()
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.stop()
             self.obs.event("info", "daemon", "stopped", "qbt orchestrator daemon stopped", {"ticks": ticks})

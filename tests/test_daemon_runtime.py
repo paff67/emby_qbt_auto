@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 import sys
 
@@ -680,6 +681,47 @@ def test_daemon_cleanup_request_live_processes_logical_cleanup():
         batch_state = con.execute("select state from torrent_batches where id=2").fetchone()[0]
         con.close()
         assert batch_state == "cleanup_requested"
+
+
+def test_daemon_background_event_workers_do_not_block_safety_loop():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class SlowUploadRunner:
+        def __init__(self):
+            self.calls = 0
+
+        def run_next(self):
+            self.calls += 1
+            time.sleep(0.35)
+            return None
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        runner = SlowUploadRunner()
+        qbt = FakeQbt()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            upload_runner=runner,
+            upload_dry_run=False,
+            background_event_workers=True,
+            event_worker_interval=0.01,
+            event_worker_join_timeout=0.01,
+        )
+
+        started = time.monotonic()
+        daemon.run(max_safety_ticks=2)
+        elapsed = time.monotonic() - started
+
+        assert qbt.rids == [0, 1]
+        assert elapsed < 0.25
+        assert runner.calls >= 1
 
 
 class RecordingBackfill:

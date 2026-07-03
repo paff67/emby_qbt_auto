@@ -300,6 +300,13 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             min_free_bytes=int(float(os.environ.get("QBT_ORCH_CAROUSEL_MIN_FREE_GB", "5")) * 1024**3),
             live_verify=carousel_live_verify,
         )
+    background_event_env = _truthy(os.environ.get("QBT_ORCH_BACKGROUND_EVENT_WORKERS"))
+    default_background_event_workers = (
+        getattr(ns, "cmd", "") == "daemon"
+        and getattr(ns, "max_safety_ticks", None) is None
+        and not dry_run
+    )
+    background_event_workers = background_event_env if background_event_env is not None else default_background_event_workers
     runtime = DaemonRuntime(
         state_db=state_db,
         qbt=qbt,
@@ -340,6 +347,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         batch_allow_tag=batch_allow_tag,
         batch_max_live_batch_bytes=batch_max_live_batch_bytes,
         batch_max_new_per_tick=batch_max_new_per_tick,
+        background_event_workers=background_event_workers,
+        event_worker_interval=float(os.environ.get("QBT_ORCH_EVENT_WORKER_INTERVAL_SEC", "1")),
+        event_worker_join_timeout=float(os.environ.get("QBT_ORCH_EVENT_WORKER_JOIN_TIMEOUT_SEC", "0.2")),
     )
     return runtime, dry_run
 

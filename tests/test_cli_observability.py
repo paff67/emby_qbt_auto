@@ -429,6 +429,51 @@ def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
         assert runtime.batch_max_new_per_tick == 1
 
 
+def test_cli_runtime_enables_background_event_workers_only_for_live_daemon(monkeypatch):
+    from qbt_orchestrator.cli import _build_runtime
+    from qbt_orchestrator.db import migrate
+
+    class FakeQbt:
+        def get_maindata(self, rid):
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+        def post(self, path, payload):
+            raise AssertionError("test should not post to qBT")
+        def torrent_info(self, hash):
+            return {"hash": hash, "seq_dl": False}
+
+    class Ns:
+        config = None
+        dry_run = False
+        safety_interval = 0
+        max_safety_ticks = None
+        cmd = "daemon"
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        from qbt_orchestrator import cli
+        old_qbt = cli.QbtDockerClient
+        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
+        monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+        monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+        monkeypatch.setenv("QBT_ORCH_DISK_PATH", td)
+        monkeypatch.delenv("QBT_ORCH_BACKGROUND_EVENT_WORKERS", raising=False)
+        try:
+            runtime, _ = _build_runtime(Ns(), db)
+            assert runtime.background_event_workers is True
+
+            Ns.cmd = "once"
+            runtime, _ = _build_runtime(Ns(), db)
+            assert runtime.background_event_workers is False
+
+            Ns.cmd = "daemon"
+            monkeypatch.setenv("QBT_ORCH_BACKGROUND_EVENT_WORKERS", "0")
+            runtime, _ = _build_runtime(Ns(), db)
+            assert runtime.background_event_workers is False
+        finally:
+            cli.QbtDockerClient = old_qbt
+
+
 def test_cli_once_wires_media_pipeline_and_emby_refresh_dry_run_by_default():
     from qbt_orchestrator import cli
     from qbt_orchestrator.db import migrate
