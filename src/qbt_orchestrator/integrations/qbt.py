@@ -122,6 +122,9 @@ class QbtDockerClient:
     def get_preferences(self) -> dict[str, Any]:
         return json.loads(self._curl("/api/v2/app/preferences"))
 
+    def app_version(self) -> str:
+        return self._curl("/api/v2/app/version").strip()
+
     def set_preferences(self, preferences: dict[str, Any]) -> str:
         return self._curl("/api/v2/app/setPreferences", data={"json": json.dumps(preferences, ensure_ascii=False)})
 
@@ -156,16 +159,22 @@ class QbtHttpClient:
         transport: HttpTransport = default_http_transport,
         timeout: int = 10,
         api_max_requests_per_sec: float = 4.0,
+        auth_mode: str = "auto",
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ):
         self.api_base = api_base.rstrip("/")
         self.username = username
         self.password = password
+        self.auth_mode = str(auth_mode or "auto").strip().lower()
         self.transport = transport
         self.timeout = timeout
         self.cookie: str | None = None
         self.rate_limiter = TokenBucket(api_max_requests_per_sec, clock=clock, sleeper=sleeper)
+
+    @property
+    def auth_enabled(self) -> bool:
+        return self.auth_mode not in {"none", "noauth", "disabled", "off"}
 
     def _url(self, path: str, params: dict[str, Any] | None = None) -> str:
         url = f"{self.api_base}{path}"
@@ -204,7 +213,7 @@ class QbtHttpClient:
         retry_auth: bool = True,
     ) -> str:
         self.rate_limiter.acquire()
-        if self.cookie is None and (self.username or self.password):
+        if self.auth_enabled and self.cookie is None and (self.username or self.password):
             self._login()
         body = None if data is None else urlencode(data)
         headers: dict[str, str] = {}
@@ -213,10 +222,12 @@ class QbtHttpClient:
         if self.cookie:
             headers["Cookie"] = self.cookie
         status, text, _headers = self.transport(method, self._url(path, params), body, headers, self.timeout)
-        if status in {401, 403} and retry_auth:
+        if status in {401, 403} and retry_auth and self.auth_enabled:
             self.cookie = None
             self._login()
             return self._request(method, path, params=params, data=data, retry_auth=False)
+        if status in {401, 403} and not self.auth_enabled:
+            raise RuntimeError(f"qBT host API returned unauthorized while auth is disabled status={status}")
         if status >= 400:
             raise RuntimeError(f"qBT host API failed status={status}: {text[-400:]}")
         return text
@@ -242,6 +253,9 @@ class QbtHttpClient:
 
     def get_preferences(self) -> dict[str, Any]:
         return json.loads(self._request("GET", "/api/v2/app/preferences"))
+
+    def app_version(self) -> str:
+        return self._request("GET", "/api/v2/app/version").strip()
 
     def set_preferences(self, preferences: dict[str, Any]) -> str:
         return self._request("POST", "/api/v2/app/setPreferences", data={"json": json.dumps(preferences, ensure_ascii=False)})

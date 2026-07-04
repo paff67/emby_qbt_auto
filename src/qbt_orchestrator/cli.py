@@ -107,6 +107,15 @@ def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
     timeout = int(env.get("QBT_ORCH_QBT_API_TIMEOUT_SEC", "10"))
     max_rps = float(env.get("QBT_ORCH_QBT_API_MAX_RPS", "4"))
     mode = str(env.get("QBT_ORCH_QBT_API_MODE", "docker")).strip().lower()
+    if mode in {"host-proxy", "localhost-bridge", "bridge", "host-noauth"}:
+        return QbtHttpClient(
+            api_base=env.get("QBT_ORCH_QBT_API_BASE", "http://127.0.0.1:18081"),
+            username="",
+            password="",
+            timeout=timeout,
+            api_max_requests_per_sec=max_rps,
+            auth_mode="none",
+        )
     if mode in {"host", "http", "host-http"}:
         return QbtHttpClient(
             api_base=env.get("QBT_ORCH_QBT_API_BASE", "http://127.0.0.1:8081"),
@@ -114,6 +123,7 @@ def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
             password=env.get("QBT_ORCH_QBT_PASSWORD", ""),
             timeout=timeout,
             api_max_requests_per_sec=max_rps,
+            auth_mode="auto",
         )
     if mode in {"docker", "docker-exec", "container"}:
         return QbtDockerClient(
@@ -123,6 +133,25 @@ def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
             api_max_requests_per_sec=max_rps,
         )
     raise SystemExit(f"unknown QBT_ORCH_QBT_API_MODE: {mode}")
+
+
+def _qbt_api_check_payload(qbt_cfg=None, env=os.environ) -> dict:
+    qbt = _build_qbt_client_from_env(qbt_cfg, env)
+    mode = str(env.get("QBT_ORCH_QBT_API_MODE", "docker")).strip().lower()
+    payload = {
+        "mode": mode,
+        "client": type(qbt).__name__,
+        "api_base": getattr(qbt, "api_base", None),
+        "auth_mode": getattr(qbt, "auth_mode", None),
+        "auth_enabled": getattr(qbt, "auth_enabled", None),
+    }
+    version = qbt.app_version() if hasattr(qbt, "app_version") else None
+    payload["version"] = version
+    maindata = qbt.get_maindata(0)
+    payload["rid"] = maindata.get("rid")
+    payload["full_update"] = bool(maindata.get("full_update"))
+    payload["torrent_count"] = len(maindata.get("torrents") or {})
+    return payload
 
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
 
@@ -421,7 +450,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="qbt-orchestrator"); sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ["status", "events", "trace", "once", "daemon", "reconcile", "migrate"]:
+    for name in ["status", "events", "trace", "once", "daemon", "reconcile", "migrate", "qbt-api-check"]:
         p = sub.add_parser(name); p.add_argument("target", nargs="?"); p.add_argument("--state-db", default="/var/lib/qbt-orchestrator/state.sqlite"); p.add_argument("--config", default=None); p.add_argument("--json", action="store_true"); p.add_argument("--dry-run", action="store_true"); p.add_argument("--apply", action="store_true")
         if name == "daemon":
             p.add_argument("--max-safety-ticks", type=int, default=None)
@@ -434,6 +463,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not db.exists(): migrate(db, False)
     if ns.cmd == "status":
         payload = _status_payload(db, ns.target); _print_json(payload) if ns.json else print(payload); return 0
+    if ns.cmd == "qbt-api-check":
+        cfg = load_config(ns.config) if ns.config else None
+        payload = _qbt_api_check_payload(cfg.qbt if cfg else None, os.environ)
+        _print_json(payload) if ns.json else print(payload)
+        return 0
     if ns.cmd == "events":
         con = _connect_readonly(db); rows = con.execute("select ts,level,component,event_type,message from events_v2 order by id desc limit 50").fetchall(); con.close(); _print_json([tuple(r) for r in rows]) if ns.json else print(rows); return 0
     if ns.cmd == "trace":

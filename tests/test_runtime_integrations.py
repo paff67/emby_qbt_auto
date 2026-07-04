@@ -406,6 +406,34 @@ def test_qbt_http_client_uses_same_public_methods_as_docker_client():
     assert client.set_preferences({"preallocate_all": True}) == "Ok."
 
 
+def test_qbt_http_client_host_proxy_noauth_does_not_login_even_if_credentials_exist():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    calls = []
+
+    def transport(method, url, body, headers, timeout):
+        calls.append((method, url, body, dict(headers)))
+        assert not url.endswith("/api/v2/auth/login")
+        assert "Cookie" not in headers
+        if url == "http://127.0.0.1:18081/api/v2/app/version":
+            return 200, "v5.1.4", {}
+        if url == "http://127.0.0.1:18081/api/v2/sync/maindata?rid=0":
+            return 200, json.dumps({"rid": 7, "full_update": True, "torrents": {"h1": {"hash": "h1"}}}), {}
+        raise AssertionError(url)
+
+    client = QbtHttpClient(
+        api_base="http://127.0.0.1:18081",
+        username="admin",
+        password="secret",
+        transport=transport,
+        auth_mode="none",
+    )
+
+    assert client.app_version() == "v5.1.4"
+    assert client.get_maindata(0)["rid"] == 7
+    assert [c[0] for c in calls] == ["GET", "GET"]
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):

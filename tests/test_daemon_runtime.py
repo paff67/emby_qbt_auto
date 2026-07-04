@@ -1210,6 +1210,63 @@ def test_cli_builds_qbt_host_http_client_from_env():
                 os.environ[k] = v
 
 
+def test_cli_builds_qbt_host_proxy_client_without_auth_from_env():
+    import argparse
+    import os
+    from qbt_orchestrator.cli import _build_runtime
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    keys = [
+        "QBT_ORCH_STATE_DB", "QBT_ORCH_DRY_RUN", "QBT_ORCH_PLANNER_DRY_RUN",
+        "QBT_ORCH_QBT_API_MODE", "QBT_ORCH_QBT_API_BASE", "QBT_ORCH_QBT_USERNAME",
+        "QBT_ORCH_QBT_PASSWORD", "QBT_ORCH_QBT_API_TIMEOUT_SEC", "QBT_ORCH_QBT_API_MAX_RPS",
+        "QBT_ORCH_DISK_PATH", "QBT_ORCH_ORPHAN_JANITOR", "QBT_ORCH_JUNK_JANITOR", "QBT_ORCH_CAROUSEL",
+        "QBT_ORCH_QBT_PREFERENCES_GUARD", "QBT_ORCH_PATH_RECONCILE", "QBT_ORCH_SOAK_ENABLED",
+    ]
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "state.sqlite"
+            migrate(db, dry_run=False)
+            os.environ.update({
+                "QBT_ORCH_STATE_DB": str(db),
+                "QBT_ORCH_DRY_RUN": "0",
+                "QBT_ORCH_PLANNER_DRY_RUN": "1",
+                "QBT_ORCH_QBT_API_MODE": "host-proxy",
+                "QBT_ORCH_QBT_API_BASE": "http://127.0.0.1:18081",
+                "QBT_ORCH_QBT_USERNAME": "admin",
+                "QBT_ORCH_QBT_PASSWORD": "secret",
+                "QBT_ORCH_QBT_API_TIMEOUT_SEC": "7",
+                "QBT_ORCH_QBT_API_MAX_RPS": "2",
+                "QBT_ORCH_DISK_PATH": td,
+                "QBT_ORCH_ORPHAN_JANITOR": "0",
+                "QBT_ORCH_JUNK_JANITOR": "0",
+                "QBT_ORCH_CAROUSEL": "0",
+                "QBT_ORCH_QBT_PREFERENCES_GUARD": "0",
+                "QBT_ORCH_PATH_RECONCILE": "0",
+                "QBT_ORCH_SOAK_ENABLED": "0",
+            })
+
+            runtime, dry_run = _build_runtime(argparse.Namespace(cmd="daemon", dry_run=False, config=None, safety_interval=0, max_safety_ticks=1), db)
+
+            assert dry_run is False
+            assert isinstance(runtime.qbt, QbtHttpClient)
+            assert runtime.qbt.api_base == "http://127.0.0.1:18081"
+            assert runtime.qbt.auth_mode == "none"
+            assert runtime.qbt.auth_enabled is False
+            assert runtime.qbt.username == ""
+            assert runtime.qbt.password == ""
+            assert runtime.qbt.timeout == 7
+            assert runtime.qbt.rate_limiter.rate_per_sec == 2
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
