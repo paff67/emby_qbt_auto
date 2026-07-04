@@ -137,6 +137,8 @@ class FileBatchService:
             eligible += 1
             torrent_hash = str(torrent.get("hash") or h)
             payload = self._payload_for(torrent_hash, torrent)
+            if payload is None:
+                continue
             if self._existing_upload_job(torrent_hash):
                 skipped_existing += 1
                 continue
@@ -766,10 +768,11 @@ class FileBatchService:
         con.close()
         return row is not None
 
-    def _payload_for(self, torrent_hash: str, torrent: Mapping[str, Any]) -> dict[str, Any]:
+    def _payload_for(self, torrent_hash: str, torrent: Mapping[str, Any]) -> dict[str, Any] | None:
         name = str(torrent.get("name") or torrent_hash)
         local = self._local_path(torrent)
         remote_dir = f"{self.remote}/{_safe_name(name)}-{torrent_hash[:12]}"
+        qbt_selected_files = self._selected_qbt_files_for_completed_payload(torrent_hash)
         payload = {
             "local": local,
             "remote": remote_dir,
@@ -777,11 +780,31 @@ class FileBatchService:
             "full_torrent": True,
             "source": "file_batch_completed_full_torrent",
         }
-        manifest = self._manifest_for(local, remote_dir)
+        manifest = self._manifest_for(local, remote_dir, selected_qbt_files=qbt_selected_files)
+        if manifest is None and qbt_selected_files is not None:
+            self.obs.event(
+                "warning",
+                "file_batch",
+                "completed_manifest_empty_after_qbt_filter",
+                f"no qBT-selected local files for {torrent_hash[:8]}",
+                {"local": local, "selected_qbt_files": len(qbt_selected_files)},
+                hash=torrent_hash,
+            )
+            return None
         if manifest:
             files, media_files, total_size, remote, copy_mode = manifest
             payload.update({"files": files, "media_files": media_files, "size": total_size, "remote": remote, "copy_mode": copy_mode})
         return payload
+
+    def _selected_qbt_files_for_completed_payload(self, torrent_hash: str) -> list[Mapping[str, Any]] | None:
+        if self.qbt is None or not hasattr(self.qbt, "torrent_files"):
+            return None
+        try:
+            rows = [dict(row) for row in self.qbt.torrent_files(torrent_hash)]
+        except Exception as exc:
+            self.obs.event("warning", "file_batch", "completed_file_probe_failed", str(redact(str(exc))), {"hash": torrent_hash}, hash=torrent_hash)
+            return None
+        return [row for row in rows if int(row.get("priority", 1) or 0) != 0]
 
     def _local_path(self, torrent: Mapping[str, Any]) -> str:
         raw = str(torrent.get("content_path") or "")
@@ -802,10 +825,11 @@ class FileBatchService:
             return str(Path(self.host_downloads).joinpath(*PurePosixPath(rel).parts))
         return f"{self.host_downloads.rstrip('/')}/{rel}"
 
-    def _manifest_for(self, local: str, remote_dir: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, str, str] | None:
+    def _manifest_for(self, local: str, remote_dir: str, selected_qbt_files: list[Mapping[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, str, str] | None:
         path = Path(local)
         if not path.exists():
             return None
+        allowed_relatives = self._allowed_manifest_relatives(path, selected_qbt_files)
         rows: list[tuple[Path, str]] = []
         if path.is_file():
             rows.append((path, path.name))
@@ -819,6 +843,8 @@ class FileBatchService:
         total = 0
         for file_path, rel in rows:
             rel_posix = rel.replace("\\", "/")
+            if allowed_relatives is not None and rel_posix not in allowed_relatives:
+                continue
             size = int(file_path.stat().st_size)
             total += size
             remote_path = f"{remote_dir.rstrip('/')}/{rel_posix}"
@@ -836,3 +862,20 @@ class FileBatchService:
         if path.is_file():
             return files, media_files, total, files[0]["remote_path"], "copyto"
         return files, media_files, total, remote_dir, "copy"
+
+    @staticmethod
+    def _allowed_manifest_relatives(root: Path, selected_qbt_files: list[Mapping[str, Any]] | None) -> set[str] | None:
+        if selected_qbt_files is None:
+            return None
+        allowed: set[str] = set()
+        root_name = root.name
+        for row in selected_qbt_files:
+            rel = FileBatchService._file_relative_path(row)
+            if not rel:
+                continue
+            rel_path = PurePosixPath(rel)
+            allowed.add(rel_path.as_posix())
+            parts = rel_path.parts
+            if len(parts) > 1 and parts[0] == root_name:
+                allowed.add(PurePosixPath(*parts[1:]).as_posix())
+        return allowed

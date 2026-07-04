@@ -106,6 +106,56 @@ def test_file_batch_service_builds_local_manifest_and_media_files_for_completed_
         assert payload["copy_mode"] == "copy"
 
 
+def test_file_batch_service_completed_manifest_excludes_qbt_priority_zero_files():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    class CompletedQbt:
+        def __init__(self):
+            self.calls = []
+
+        def torrent_files(self, h):
+            self.calls.append(h)
+            return [
+                {"index": 0, "name": "dori-136/dori-136.mp4", "size": 100, "progress": 1.0, "priority": 1},
+                {"index": 1, "name": "dori-136/台 妹 子 線 上 現 場 直 播.mp4", "size": 20, "progress": 0.003, "priority": 0},
+                {"index": 2, "name": "dori-136/最 新 位 址 獲 取.txt", "size": 1, "progress": 0, "priority": 0},
+            ]
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "downloads"
+        movie = root / "active" / "dori-136"
+        movie.mkdir(parents=True)
+        (movie / "dori-136.mp4").write_bytes(b"a" * 100)
+        (movie / "台 妹 子 線 上 現 場 直 播.mp4").write_bytes(b"b" * 20)
+        (movie / "最 新 位 址 獲 取.txt").write_bytes(b"c")
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = CompletedQbt()
+        service = FileBatchService(state_db=db, dry_run=False, host_downloads=str(root), container_downloads="/downloads", remote="gcrypt:", qbt=qbt)
+
+        result = service.sync_completed({
+            "h1": {
+                "hash": "h1",
+                "name": "dori-136.torrent",
+                "category": "auto",
+                "tags": "auto,checked",
+                "state": "stoppedUP",
+                "amount_left": 0,
+                "size": 121,
+                "progress": 1.0,
+                "content_path": "/downloads/active/dori-136",
+            }
+        })
+
+        assert result.enqueued == 1
+        assert qbt.calls == ["h1"]
+        payload = json.loads(_rows(db, "select payload_json from torrent_jobs")[0]["payload_json"])
+        assert payload["size"] == 100
+        assert [(f["relative_path"], f["size"]) for f in payload["files"]] == [("dori-136.mp4", 100)]
+        assert payload["media_files"] == [{"remote_path": "gcrypt:/dori-136.torrent-h1/dori-136.mp4", "size": 100}]
+
+
 def test_file_batch_service_dry_run_records_without_inserting_job():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
