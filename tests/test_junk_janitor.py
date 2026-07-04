@@ -95,7 +95,7 @@ def test_junk_janitor_quarantines_only_priority_zero_stable_small_hard_junk():
         assert rules and rules[0]["confidence"] == "hard" and rules[0]["source"] == "janitor" and rules[0]["hits"] == 1
 
 
-def test_junk_janitor_ignores_txt_files_even_when_name_matches_hard_junk_pattern():
+def test_junk_janitor_sets_ad_txt_priority_zero_before_quarantine():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.junk_janitor import JunkJanitorService
 
@@ -112,6 +112,35 @@ def test_junk_janitor_ignores_txt_files_even_when_name_matches_hard_junk_pattern
         janitor = JunkJanitorService(db, executor, managed_root=root, trash_dir=Path(td) / ".trash", dry_run=False, stable_mtime_sec=60, now=lambda: 1000)
         snapshots = {"h1": {"hash": "h1", "name": "ABC-123", "category": "auto", "content_path": str(movie), "dlspeed_bps": 0}}
         files = {"h1": [{"index": 3, "name": "最新地址 收藏不迷路.txt", "size": 5, "priority": 1}]}
+
+        result = janitor.reconcile(snapshots, files, sync_healthy=True)
+
+        assert result["observed"] == 1
+        assert result["set_prio_zero"] == ["h1:3"]
+        assert result["quarantined"] == []
+        assert txt.exists()
+        assert executor.posts == [("/api/v2/torrents/filePrio", {"hash": "h1", "id": "3", "priority": "0"})]
+        event = _rows(db, "select hash,file_index,action,reason,qbt_priority from junk_janitor_events")[-1]
+        assert event == {"hash": "h1", "file_index": 3, "action": "set_prio_zero", "reason": "hard_junk_priority_not_zero", "qbt_priority": 1}
+
+
+def test_junk_janitor_keeps_informational_txt_files_downloadable():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.junk_janitor import JunkJanitorService
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "active"
+        movie = root / "ABC-123"
+        txt = movie / "解压密码.txt"
+        txt.parent.mkdir(parents=True)
+        txt.write_text("password: 1234", encoding="utf-8")
+        os.utime(txt, (900, 900))
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = RecordingExecutor()
+        janitor = JunkJanitorService(db, executor, managed_root=root, trash_dir=Path(td) / ".trash", dry_run=False, stable_mtime_sec=60, now=lambda: 1000)
+        snapshots = {"h1": {"hash": "h1", "name": "ABC-123", "category": "auto", "content_path": str(movie), "dlspeed_bps": 0}}
+        files = {"h1": [{"index": 4, "name": "解压密码.txt", "size": 14, "priority": 1}]}
 
         result = janitor.reconcile(snapshots, files, sync_healthy=True)
 

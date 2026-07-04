@@ -582,7 +582,7 @@ class FileBatchService:
     @staticmethod
     def _keeps_default_download_priority(row: Mapping[str, Any]) -> bool:
         path = PurePosixPath(str(row.get("name") or row.get("path") or row.get("relative_path") or ""))
-        return path.suffix.lower() in DEFAULT_DOWNLOAD_EXTENSIONS
+        return path.suffix.lower() in DEFAULT_DOWNLOAD_EXTENSIONS and not JUNK_BATCH_NAME.search(path.name)
 
     def _live_batch_size_cap_exceeded(self, reserved_bytes: int) -> bool:
         return self.batch_live_verify and self.batch_max_live_batch_bytes is not None and int(reserved_bytes) > int(self.batch_max_live_batch_bytes)

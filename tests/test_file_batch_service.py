@@ -393,7 +393,7 @@ def test_file_batch_service_pipeline_selects_real_media_and_skips_junk_candidate
         assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "0|1", "priority": "0"}) in qbt.calls
 
 
-def test_file_batch_service_pipeline_keeps_txt_files_at_default_priority():
+def test_file_batch_service_pipeline_blocks_ad_txt_but_keeps_informational_txt_downloadable():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
 
@@ -406,6 +406,7 @@ def test_file_batch_service_pipeline_keeps_txt_files_at_default_priority():
                 {"index": 0, "name": "Movie/Movie.mp4", "size": gib, "progress": 0, "priority": 0},
                 {"index": 1, "name": "Movie/最新地址 收藏不迷路.txt", "size": 1024, "progress": 0, "priority": 1},
                 {"index": 2, "name": "Movie/广告.url", "size": 1024, "progress": 0, "priority": 1},
+                {"index": 3, "name": "Movie/解压密码.txt", "size": 1024, "progress": 0, "priority": 1},
             ]
         )
         service = FileBatchService(
@@ -425,9 +426,9 @@ def test_file_batch_service_pipeline_keeps_txt_files_at_default_priority():
 
         assert result.batches_created == 1
         assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "0", "priority": "1"}) in qbt.calls
-        assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "2", "priority": "0"}) in qbt.calls
-        assert not any(call == ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "1", "priority": "0"}) for call in qbt.calls)
-        assert not any(call == ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "1|2", "priority": "0"}) for call in qbt.calls)
+        assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "1|2", "priority": "0"}) in qbt.calls
+        assert not any(call == ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "3", "priority": "0"}) for call in qbt.calls)
+        assert not any(call == ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "1|2|3", "priority": "0"}) for call in qbt.calls)
 
 
 def test_file_batch_service_pipeline_uses_dynamic_programming_to_skip_oversized_early_file():
