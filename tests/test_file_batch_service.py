@@ -249,7 +249,7 @@ def test_file_batch_service_blocks_pipeline_batch_when_reservation_budget_is_ins
         assert decision["reason_code"] == "batch_budget_insufficient"
 
 
-def test_file_batch_service_live_verify_blocks_new_batch_without_canary_before_file_probe():
+def test_file_batch_service_live_verify_with_explicit_canary_blocks_nonmatching_hash_before_file_probe():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
 
@@ -264,6 +264,7 @@ def test_file_batch_service_live_verify_blocks_new_batch_without_canary_before_f
             qbt=qbt,
             disk_floor_bytes=2 * gib,
             batch_live_verify=True,
+            batch_allow_hashes={"other"},
             now=lambda: 1_000,
         )
 
@@ -390,6 +391,169 @@ def test_file_batch_service_pipeline_selects_real_media_and_skips_junk_candidate
         assert batch["total_bytes"] == gib
         assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "2", "priority": "1"}) in qbt.calls
         assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "0|1", "priority": "0"}) in qbt.calls
+
+
+def test_file_batch_service_pipeline_keeps_txt_files_at_default_priority():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt(
+            [
+                {"index": 0, "name": "Movie/Movie.mp4", "size": gib, "progress": 0, "priority": 0},
+                {"index": 1, "name": "Movie/最新地址 收藏不迷路.txt", "size": 1024, "progress": 0, "priority": 1},
+                {"index": 2, "name": "Movie/广告.url", "size": 1024, "progress": 0, "priority": 1},
+            ]
+        )
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"movie": {"hash": "movie", "name": "Movie", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0}},
+            free_bytes=5 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "0", "priority": "1"}) in qbt.calls
+        assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "2", "priority": "0"}) in qbt.calls
+        assert not any(call == ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "1", "priority": "0"}) for call in qbt.calls)
+        assert not any(call == ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "1|2", "priority": "0"}) for call in qbt.calls)
+
+
+def test_file_batch_service_pipeline_uses_dynamic_programming_to_skip_oversized_early_file():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt(
+            [
+                {"index": 0, "name": "Big/Oversized.mp4", "size": 3 * gib, "progress": 0, "priority": 0},
+                {"index": 1, "name": "Big/Fit-A.mp4", "size": gib, "progress": 0, "priority": 0},
+                {"index": 2, "name": "Big/Fit-B.mp4", "size": gib, "progress": 0, "priority": 0},
+            ],
+            piece_size=16 * 1024**2,
+        )
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"big": {"hash": "big", "name": "Big", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 5 * gib, "size": 5 * gib, "progress": 0.0}},
+            free_bytes=5 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        batch = _rows(db, "select indices_json,total_bytes from torrent_batches")[0]
+        assert json.loads(batch["indices_json"]) == [1, 2]
+        assert batch["total_bytes"] == 2 * gib
+        assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "1|2", "priority": "1"}) in qbt.calls
+        assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "0", "priority": "0"}) in qbt.calls
+
+
+def test_file_batch_service_pipeline_prefers_nearly_complete_high_payload_file():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt(
+            [
+                {"index": 0, "name": "Big/Small.mp4", "size": gib, "progress": 0.0, "priority": 0},
+                {"index": 1, "name": "Big/NearlyDone.mp4", "size": 4 * gib, "progress": 0.75, "priority": 0},
+            ],
+            piece_size=16 * 1024**2,
+        )
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+            batch_live_verify=True,
+            batch_max_live_batch_bytes=1280 * 1024**2,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"big": {"hash": "big", "name": "Big", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 2 * gib, "size": 5 * gib, "progress": 0.6}},
+            free_bytes=5 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        batch = _rows(db, "select indices_json,total_bytes,reserved_bytes from torrent_batches")[0]
+        assert json.loads(batch["indices_json"]) == [1]
+        assert batch["total_bytes"] == 4 * gib
+        assert batch["reserved_bytes"] == gib + 32 * 1024**2 + 128 * 1024**2
+
+
+def test_file_batch_service_live_verify_without_allowlist_allows_multiple_hashes():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+
+        class MultiQbt(BatchQbt):
+            def __init__(self):
+                super().__init__([], piece_size=16 * 1024**2)
+                self.by_hash = {
+                    "h1": [{"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0}],
+                    "h2": [{"index": 0, "name": "B.mp4", "size": gib, "progress": 0, "priority": 0}],
+                }
+
+            def torrent_files(self, hash):
+                self.calls.append(("torrent_files", hash))
+                return list(self.by_hash[hash])
+
+        qbt = MultiQbt()
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            batch_live_verify=True,
+            batch_max_new_per_tick=10,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {
+                "h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0},
+                "h2": {"hash": "h2", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0},
+            },
+            free_bytes=8 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 2
+        assert ("torrent_files", "h1") in qbt.calls
+        assert ("torrent_files", "h2") in qbt.calls
+        batches = _rows(db, "select hash,state from torrent_batches order by id")
+        assert batches == [{"hash": "h1", "state": "downloading"}, {"hash": "h2", "state": "downloading"}]
 
 
 def test_file_batch_service_pipeline_allows_real_media_with_site_prefix():

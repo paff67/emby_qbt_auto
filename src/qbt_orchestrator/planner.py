@@ -55,15 +55,17 @@ class DownloadPlanner:
         state_db: str | Path,
         executor,
         dry_run: bool = True,
-        active_slots: int = 2,
+        active_slots: int = 5,
         disk_floor_bytes: int = 2 * 1024**3,
+        slow_active_demote_sec: int = 180,
         now=None,
     ):
         self.state_db = Path(state_db)
         self.executor = executor
         self.dry_run = dry_run
-        self.active_slots = active_slots
+        self.active_slots = int(active_slots)
         self.disk_floor_bytes = disk_floor_bytes
+        self.slow_active_demote_sec = int(slow_active_demote_sec)
         self.now = now or (lambda: int(time.time()))
 
     def plan_and_apply(self, snapshots: Mapping[str, Mapping[str, Any]], free_bytes: int, sync_healthy: bool) -> PlannerResult:
@@ -140,8 +142,8 @@ class DownloadPlanner:
                 if seq and self._needs_seq_desired(h, True, previous_allocations):
                     seq_desired_actions.append((h, True))
             elif h in active_slow:
-                self._allocation(h, "soak", "soak", 0, False, now, "active_slow_5min")
-                self._decision(h, "soak", "active_slow_5min", {"budget_bytes": budget})
+                self._allocation(h, "soak", "soak", 0, False, now, "active_slow_3min")
+                self._decision(h, "soak", "active_slow_3min", {"budget_bytes": budget})
                 if self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
             else:
@@ -187,14 +189,24 @@ class DownloadPlanner:
         con = _connect(self.state_db)
         try:
             rows = con.execute(
-                "select hash,kind,bytes from resource_reservations "
+                "select id,hash,kind,bytes from resource_reservations "
                 "where state='active' and (expires_at is null or expires_at>?)",
                 (int(now),),
             ).fetchall()
-            out: dict[str, int] = {}
+            grouped: dict[str, dict[str, int]] = {}
             for row in rows:
-                key = str(row["hash"] or f"{row['kind']}:{id(row)}")
-                out[key] = out.get(key, 0) + int(row["bytes"] or 0)
+                key = str(row["hash"] or f"{row['kind']}:{row['id']}")
+                bucket = grouped.setdefault(key, {"active_download": 0, "batch": 0, "other": 0})
+                kind = str(row["kind"] or "")
+                if kind == "active_download":
+                    bucket["active_download"] += int(row["bytes"] or 0)
+                elif kind == "batch":
+                    bucket["batch"] += int(row["bytes"] or 0)
+                else:
+                    bucket["other"] += int(row["bytes"] or 0)
+            out: dict[str, int] = {}
+            for key, bucket in grouped.items():
+                out[key] = max(bucket["active_download"], bucket["batch"]) + bucket["other"]
             return out
         finally:
             con.close()
@@ -207,7 +219,7 @@ class DownloadPlanner:
         if active_since is None or low_speed_since is None:
             return False
         dlspeed = int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or health.get("dlspeed_bps") or 0)
-        return int(now) - int(active_since) >= 90 and int(now) - int(low_speed_since) >= 300 and dlspeed < 100 * 1024
+        return int(now) - int(active_since) >= 90 and int(now) - int(low_speed_since) >= self.slow_active_demote_sec and dlspeed < 100 * 1024
 
     def _should_mark_dead(
         self,

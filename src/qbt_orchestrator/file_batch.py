@@ -53,6 +53,7 @@ def _is_stopped(torrent: Mapping[str, Any]) -> bool:
 
 
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ts", ".webm", ".flv", ".mpg", ".mpeg", ".iso"}
+DEFAULT_DOWNLOAD_EXTENSIONS = {".txt"}
 JUNK_BATCH_NAME = re.compile(r"(?i)(最新地址|最\s*新\s*位\s*址|收藏不迷路|官方指定|博彩|赌场|直播|telegram|996gg\.cc|x\s*u\s*u|uu美少女|社\s*區|社\s*区|福利|体育|电竞|楼风)")
 
 
@@ -107,7 +108,7 @@ class FileBatchService:
         self.batch_allow_hashes = {str(item).strip().lower() for item in (batch_allow_hashes or set()) if str(item).strip()}
         self.batch_allow_tag = str(batch_allow_tag or "").strip()
         if batch_max_new_per_tick is None:
-            batch_max_new_per_tick = 1 if self.batch_live_verify else 1_000_000
+            batch_max_new_per_tick = 1 if self.batch_live_verify and (self.batch_allow_hashes or self.batch_allow_tag) else 1_000_000
         self.batch_max_new_per_tick = max(0, int(batch_max_new_per_tick))
         self.batch_max_live_batch_bytes = None if batch_max_live_batch_bytes in (None, 0) else max(0, int(batch_max_live_batch_bytes))
         self._new_batches_created_this_tick = 0
@@ -276,7 +277,7 @@ class FileBatchService:
             return {"created": 0, "blocked": 0, "upload_queued": queued}
         batch_id = self._create_batch_and_reservation(h, indices, reservation, piece_size)
         try:
-            self._apply_batch_to_qbt(h, indices, [int(f.get("index")) for f in files], should_start=_is_stopped(torrent), protected_indices=already_selected_indices)
+            self._apply_batch_to_qbt(h, indices, files, should_start=_is_stopped(torrent), protected_indices=already_selected_indices)
         except Exception as exc:
             self._mark_batch_failed(batch_id, str(exc))
             return {"created": 0, "blocked": 1, "upload_queued": queued}
@@ -288,6 +289,8 @@ class FileBatchService:
 
     def _live_verify_canary_allowed(self, h: str, tags: set[str]) -> bool:
         if not self.batch_live_verify:
+            return True
+        if not self.batch_allow_hashes and not self.batch_allow_tag:
             return True
         if self.batch_allow_hashes and h.lower() in self.batch_allow_hashes:
             return True
@@ -436,8 +439,8 @@ class FileBatchService:
 
     def _select_batch_files(self, files: list[Mapping[str, Any]], piece_size: int, free_bytes: int, already_selected_indices: set[int] | None = None):
         budget = self._safe_batch_budget(free_bytes)
-        selected: list[Mapping[str, Any]] = []
         already_selected_indices = already_selected_indices or set()
+        candidates: list[Mapping[str, Any]] = []
         for row in sorted(files, key=lambda f: int(f.get("index") or 0)):
             if int(row.get("index") or 0) in already_selected_indices:
                 continue
@@ -448,18 +451,95 @@ class FileBatchService:
                 continue
             if not self._is_selectable_batch_media(row):
                 continue
-            candidate = [*selected, row]
-            reservation = self._batch_reservation(candidate, piece_size)
-            if sum(int(item.get("size") or 0) for item in candidate) > self.max_batch_bytes:
-                break
-            if self._live_batch_size_cap_exceeded(reservation.reserved_bytes):
-                break
-            if reservation.reserved_bytes > budget:
-                break
-            selected = candidate
+            candidates.append(row)
+        selected = self._best_batch_combination(candidates, piece_size, budget)
         if not selected:
             return [], None
         return selected, self._batch_reservation(selected, piece_size)
+
+    def _best_batch_combination(self, candidates: list[Mapping[str, Any]], piece_size: int, budget: int) -> list[Mapping[str, Any]]:
+        if budget <= 0 or not candidates:
+            return []
+        if len(candidates) <= 18:
+            return self._best_batch_combination_exact(candidates, piece_size, budget)
+        return self._best_batch_combination_dp(candidates, piece_size, budget)
+
+    def _best_batch_combination_exact(self, candidates: list[Mapping[str, Any]], piece_size: int, budget: int) -> list[Mapping[str, Any]]:
+        best: list[Mapping[str, Any]] = []
+        best_score: tuple[float, ...] | None = None
+        for mask in range(1, 1 << len(candidates)):
+            selected = [candidates[i] for i in range(len(candidates)) if mask & (1 << i)]
+            score = self._batch_score_if_valid(selected, piece_size, budget)
+            if score is None:
+                continue
+            if best_score is None or score > best_score:
+                best = selected
+                best_score = score
+        return sorted(best, key=lambda f: int(f.get("index") or 0))
+
+    def _best_batch_combination_dp(self, candidates: list[Mapping[str, Any]], piece_size: int, budget: int) -> list[Mapping[str, Any]]:
+        scale = max(1, min(64 * 1024**2, max(1024**2, int(piece_size))))
+        capacity_units = max(0, int(budget // scale))
+        if capacity_units <= 0:
+            return []
+        ranked = sorted(candidates, key=lambda row: self._single_candidate_rank(row, piece_size), reverse=True)[:48]
+        states: dict[int, tuple[tuple[float, ...], list[Mapping[str, Any]]]] = {0: ((0.0,), [])}
+        for row in ranked:
+            cost_units = max(1, (self._remaining_file_bytes(row) + scale - 1) // scale)
+            updates: dict[int, tuple[tuple[float, ...], list[Mapping[str, Any]]]] = {}
+            for used_units, (_score, selected) in list(states.items()):
+                new_units = used_units + cost_units
+                if new_units > capacity_units:
+                    continue
+                candidate_selected = [*selected, row]
+                score = self._batch_score_if_valid(candidate_selected, piece_size, budget)
+                if score is None:
+                    continue
+                current = states.get(new_units) or updates.get(new_units)
+                if current is None or score > current[0]:
+                    updates[new_units] = (score, candidate_selected)
+            states.update(updates)
+        best = max((value for units, value in states.items() if units > 0), key=lambda value: value[0], default=None)
+        if best is None:
+            return []
+        return sorted(best[1], key=lambda f: int(f.get("index") or 0))
+
+    def _batch_score_if_valid(self, selected: list[Mapping[str, Any]], piece_size: int, budget: int) -> tuple[float, ...] | None:
+        if not selected:
+            return None
+        payload = sum(int(row.get("size") or 0) for row in selected)
+        if payload <= 0 or payload > self.max_batch_bytes:
+            return None
+        reservation = self._batch_reservation(selected, piece_size)
+        if reservation.reserved_bytes > budget:
+            return None
+        if self._live_batch_size_cap_exceeded(reservation.reserved_bytes):
+            return None
+        completion_bonus = sum(
+            int(row.get("size") or 0) * max(0.0, min(1.0, float(row.get("progress") or 0.0)))
+            for row in selected
+        )
+        indices = [int(row.get("index") or 0) for row in selected]
+        return (
+            float(payload),
+            float(reservation.payload_efficiency),
+            float(completion_bonus),
+            -float(reservation.piece_spill_overhead_bytes),
+            -float(len(selected)),
+            -float(sum(indices)),
+        )
+
+    def _single_candidate_rank(self, row: Mapping[str, Any], piece_size: int) -> tuple[float, ...]:
+        reservation = self._batch_reservation([row], piece_size)
+        size = int(row.get("size") or 0)
+        progress = max(0.0, min(1.0, float(row.get("progress") or 0.0)))
+        return (
+            float(size),
+            float(reservation.payload_efficiency),
+            float(size) * progress,
+            -float(reservation.reserved_bytes),
+            -float(int(row.get("index") or 0)),
+        )
 
     def _batch_reservation(self, selected: list[Mapping[str, Any]], piece_size: int) -> BatchReservation:
         reservation_rows = []
@@ -499,6 +579,11 @@ class FileBatchService:
             return False
         return True
 
+    @staticmethod
+    def _keeps_default_download_priority(row: Mapping[str, Any]) -> bool:
+        path = PurePosixPath(str(row.get("name") or row.get("path") or row.get("relative_path") or ""))
+        return path.suffix.lower() in DEFAULT_DOWNLOAD_EXTENSIONS
+
     def _live_batch_size_cap_exceeded(self, reserved_bytes: int) -> bool:
         return self.batch_live_verify and self.batch_max_live_batch_bytes is not None and int(reserved_bytes) > int(self.batch_max_live_batch_bytes)
 
@@ -524,11 +609,22 @@ class FileBatchService:
     def _active_reservation_bytes(self) -> int:
         con = _connect(self.state_db)
         try:
-            row = con.execute(
-                "select coalesce(sum(bytes),0) from resource_reservations where state='active' and (expires_at is null or expires_at>?)",
+            rows = con.execute(
+                "select id,hash,kind,bytes from resource_reservations where state='active' and (expires_at is null or expires_at>?)",
                 (int(self.now()),),
-            ).fetchone()
-            return int(row[0] if row else 0)
+            ).fetchall()
+            grouped: dict[str, dict[str, int]] = {}
+            for row in rows:
+                key = str(row["hash"] or f"{row['kind']}:{row['id']}")
+                bucket = grouped.setdefault(key, {"active_download": 0, "batch": 0, "other": 0})
+                kind = str(row["kind"] or "")
+                if kind == "active_download":
+                    bucket["active_download"] += int(row["bytes"] or 0)
+                elif kind == "batch":
+                    bucket["batch"] += int(row["bytes"] or 0)
+                else:
+                    bucket["other"] += int(row["bytes"] or 0)
+            return sum(max(bucket["active_download"], bucket["batch"]) + bucket["other"] for bucket in grouped.values())
         finally:
             con.close()
 
@@ -632,9 +728,11 @@ class FileBatchService:
             )
         write_transaction(self.state_db, txn)
 
-    def _apply_batch_to_qbt(self, h: str, selected_indices: list[int], all_indices: list[int], *, should_start: bool, protected_indices: set[int] | None = None) -> None:
+    def _apply_batch_to_qbt(self, h: str, selected_indices: list[int], all_files: list[Mapping[str, Any]], *, should_start: bool, protected_indices: set[int] | None = None) -> None:
         protected_indices = protected_indices or set()
-        unselected = [i for i in all_indices if i not in set(selected_indices) and i not in protected_indices]
+        default_download_indices = {int(row.get("index") or 0) for row in all_files if self._keeps_default_download_priority(row)}
+        all_indices = [int(f.get("index")) for f in all_files]
+        unselected = [i for i in all_indices if i not in set(selected_indices) and i not in protected_indices and i not in default_download_indices]
         if selected_indices:
             self._qbt_post("/api/v2/torrents/filePrio", {"hash": h, "id": "|".join(str(i) for i in selected_indices), "priority": "1"}, h)
         if unselected:

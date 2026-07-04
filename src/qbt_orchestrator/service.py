@@ -135,6 +135,8 @@ class DaemonRuntime:
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         planner_dry_run: bool = True,
+        planner_active_slots: int = 5,
+        planner_slow_active_demote_sec: int = 180,
         upload_runner=None,
         upload_dry_run: bool = True,
         cleanup_runner=None,
@@ -179,6 +181,8 @@ class DaemonRuntime:
         self.telegram_supervisor = telegram_supervisor
         self.command_processor = command_processor
         self.planner_dry_run = planner_dry_run or dry_run
+        self.planner_active_slots = int(planner_active_slots)
+        self.planner_slow_active_demote_sec = int(planner_slow_active_demote_sec)
         self.upload_runner = upload_runner
         self.upload_dry_run = upload_dry_run or dry_run
         self.cleanup_runner = cleanup_runner
@@ -254,7 +258,13 @@ class DaemonRuntime:
 
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
-        planner = DownloadPlanner(self.state_db, self.executor, dry_run=self.planner_dry_run)
+        planner = DownloadPlanner(
+            self.state_db,
+            self.executor,
+            dry_run=self.planner_dry_run,
+            active_slots=self.planner_active_slots,
+            slow_active_demote_sec=self.planner_slow_active_demote_sec,
+        )
         free_bytes = int(self.free_bytes_provider())
         result = planner.plan_and_apply(
             snapshots,

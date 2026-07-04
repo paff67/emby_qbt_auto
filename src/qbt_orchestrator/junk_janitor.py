@@ -199,6 +199,8 @@ class JunkJanitorService:
         return dest.with_name(f"{dest.name}.{int(self.now())}")
 
     def _is_hard_junk(self, name: str) -> bool:
+        if PurePosixPath(str(name)).suffix.lower() == ".txt":
+            return False
         return any(pattern.search(name) for pattern in self.hard_patterns)
 
     def _learn_rule(self, pattern: str, now: int) -> int:
