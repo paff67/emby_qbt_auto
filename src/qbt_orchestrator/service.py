@@ -15,6 +15,7 @@ from .file_batch import FileBatchService
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
+from .observe_promotion import ObservePromotionService
 from .observability import redact
 from .planner import DownloadPlanner
 from .policies.disk import classify_disk
@@ -157,6 +158,7 @@ class DaemonRuntime:
         maintenance_service=None,
         orphan_janitor=None,
         junk_janitor=None,
+        observe_promotion_service: ObservePromotionService | None = None,
         junk_file_refresh_limit: int = 3,
         carousel_service=None,
         carousel_enabled: bool = True,
@@ -208,6 +210,7 @@ class DaemonRuntime:
         self.maintenance_service = maintenance_service or SQLiteMaintenanceService(self.state_db)
         self.orphan_janitor = orphan_janitor
         self.junk_janitor = junk_janitor
+        self.observe_promotion_service = observe_promotion_service
         self.path_reconciler = path_reconciler
         self.preemption_service = preemption_service
         self.soak_dry_run = soak_dry_run or dry_run
@@ -331,6 +334,21 @@ class DaemonRuntime:
 
     def file_batch_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        observe_result = None
+        if self.observe_promotion_service is not None:
+            observe_result = self.observe_promotion_service.promote_ready(
+                snapshots,
+                sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+            )
+            for promoted_hash in observe_result.get("promoted", []):
+                torrent = snapshots.get(str(promoted_hash))
+                if not torrent:
+                    continue
+                tags = {p.strip() for p in str(torrent.get("tags") or "").split(",") if p.strip()}
+                tags.difference_update({"metadata-timeout", "observe", "precheck"})
+                tags.update({"auto", "checked"})
+                torrent["tags"] = ",".join(sorted(tags))
+                torrent["category"] = "auto"
         service = FileBatchService(
             state_db=self.state_db,
             dry_run=self.file_batch_dry_run,
@@ -362,6 +380,8 @@ class DaemonRuntime:
             "batches_created": result.batches_created,
             "batches_blocked": result.batches_blocked,
         }
+        if observe_result is not None:
+            payload["observe_promotion"] = observe_result
         if self.junk_janitor is not None:
             payload["junk_janitor"] = self.junk_janitor.reconcile(
                 snapshots,

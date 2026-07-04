@@ -16,6 +16,7 @@ from .io_governor import IoGovernor, UploadBackpressurePolicy
 from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
+from .observe_promotion import ObservePromotionConfig, ObservePromotionService
 from .orphan_janitor import OrphanJanitorService
 from .path_reconcile import QbtPathReconciler
 from .preferences import QbtPreferencesGuard
@@ -380,6 +381,22 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
             container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
         )
+    observe_promotion_service = None
+    observe_enabled = _truthy(os.environ.get("QBT_ORCH_OBSERVE_PROMOTION"))
+    if observe_enabled is None:
+        observe_enabled = True
+    if observe_enabled:
+        observe_dry_env = _truthy(os.environ.get("QBT_ORCH_OBSERVE_PROMOTION_DRY_RUN"))
+        observe_promotion_service = ObservePromotionService(
+            state_db,
+            qbt,
+            executor,
+            dry_run=True if dry_run else (observe_dry_env if observe_dry_env is not None else False),
+            config=ObservePromotionConfig(
+                min_main_bytes=int(float(os.environ.get("QBT_ORCH_OBSERVE_MIN_MAIN_MB", "100")) * 1024**2),
+                max_per_tick=int(os.environ.get("QBT_ORCH_OBSERVE_PROMOTION_LIMIT", "50")),
+            ),
+        )
     carousel_enabled = _truthy(os.environ.get("QBT_ORCH_CAROUSEL"))
     if carousel_enabled is None:
         carousel_enabled = True
@@ -443,6 +460,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         maintenance_service=maintenance_service,
         orphan_janitor=orphan_janitor,
         junk_janitor=junk_janitor,
+        observe_promotion_service=observe_promotion_service,
         junk_file_refresh_limit=int(os.environ.get("QBT_ORCH_JUNK_FILE_REFRESH_LIMIT", "3")),
         carousel_service=carousel_service,
         carousel_enabled=carousel_enabled,

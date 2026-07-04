@@ -106,9 +106,11 @@ class TorrentSnapshot:
     dlspeed_bps: int = 0
     upspeed_bps: int = 0
     completed_bytes: int = 0
+    has_metadata: bool | None = None
 
     @classmethod
     def from_qbt(cls, payload: Dict[str, Any]) -> "TorrentSnapshot":
+        has_metadata = payload.get("has_metadata")
         return cls(
             hash=payload.get("hash", ""),
             name=payload.get("name", ""),
@@ -125,6 +127,7 @@ class TorrentSnapshot:
             dlspeed_bps=int(payload.get("dlspeed_bps") or payload.get("dlspeed") or 0),
             upspeed_bps=int(payload.get("upspeed_bps") or payload.get("upspeed") or 0),
             completed_bytes=int(payload.get("completed_bytes") or payload.get("completed") or payload.get("downloaded") or 0),
+            has_metadata=None if has_metadata is None else bool(has_metadata),
         )
 
 @dataclass(frozen=True)
