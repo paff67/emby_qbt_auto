@@ -1102,6 +1102,8 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
         "QBT_ORCH_STATE_DB", "QBT_ORCH_DRY_RUN", "QBT_ORCH_PLANNER_DRY_RUN", "QBT_ORCH_SOAK_ENABLED",
         "QBT_ORCH_SOAK_DRY_RUN", "QBT_ORCH_SOAK_RESIDENT_SLOTS", "QBT_ORCH_SOAK_MIN_FREE_GB",
         "QBT_ORCH_SOAK_MAX_EXPOSURE_GB", "QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB",
+        "QBT_ORCH_DISK_FLOOR_GB", "QBT_ORCH_SOAK_LOW_CAPACITY_THROTTLE_MARGIN_GB",
+        "QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS",
         "QBT_ORCH_DISK_PATH", "QBT_ORCH_ORPHAN_JANITOR", "QBT_ORCH_JUNK_JANITOR", "QBT_ORCH_CAROUSEL",
         "QBT_ORCH_QBT_PREFERENCES_GUARD", "QBT_ORCH_PATH_RECONCILE",
     ]
@@ -1118,8 +1120,11 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
                 "QBT_ORCH_SOAK_DRY_RUN": "0",
                 "QBT_ORCH_SOAK_RESIDENT_SLOTS": "8",
                 "QBT_ORCH_SOAK_MIN_FREE_GB": "8",
+                "QBT_ORCH_DISK_FLOOR_GB": "3",
                 "QBT_ORCH_SOAK_MAX_EXPOSURE_GB": "4",
                 "QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB": "512",
+                "QBT_ORCH_SOAK_LOW_CAPACITY_THROTTLE_MARGIN_GB": "1",
+                "QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS": "262144",
                 "QBT_ORCH_DISK_PATH": td,
                 "QBT_ORCH_ORPHAN_JANITOR": "0",
                 "QBT_ORCH_JUNK_JANITOR": "0",
@@ -1136,8 +1141,12 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
             assert runtime.soak_queue_service.dry_run is False
             assert runtime.soak_queue_service.config.resident_slots == 8
             assert runtime.soak_queue_service.config.min_free_bytes == 8 * 1024**3
+            assert runtime.soak_queue_service.config.disk_floor_bytes == 3 * 1024**3
+            assert runtime.soak_queue_service.config.low_capacity_throttle_margin_bytes == 1024**3
+            assert runtime.soak_queue_service.config.low_capacity_soak_limit_bps == 262144
             assert runtime.soak_queue_service.config.max_total_exposure_bytes == 4 * 1024**3
             assert runtime.soak_queue_service.config.max_per_torrent_exposure_bytes == 512 * 1024**2
+            assert runtime.disk_floor_bytes == 3 * 1024**3
     finally:
         for k, v in old.items():
             if v is None:

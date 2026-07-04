@@ -18,8 +18,10 @@ STOPPED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "s
 class SoakQueueConfig:
     enabled: bool = True
     resident_slots: int = 8
-    min_free_bytes: int = 8 * 1024**3
-    disk_floor_bytes: int = 2 * 1024**3
+    # Deprecated compatibility knob: retained for config traceability, but no
+    # longer acts as a hard gate. Disk-floor budget below decides starts.
+    min_free_bytes: int = 0
+    disk_floor_bytes: int = 3 * 1024**3
     max_total_exposure_bytes: int = 4 * 1024**3
     min_exposure_bytes: int = 128 * 1024**2
     max_per_torrent_exposure_bytes: int = 512 * 1024**2
@@ -29,6 +31,9 @@ class SoakQueueConfig:
     hot_confirm_sec: int = 60
     cooldown_sec: int = 1800
     max_qbt_active_downloads: int = 16
+    low_capacity_throttle_margin_bytes: int = 1024**3
+    low_capacity_soak_limit_bps: int = 256 * 1024
+    low_capacity_throttle_trigger_bps: int = 1024**2
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,8 @@ class SoakQueueResult:
     hot_hashes: list[str] = field(default_factory=list)
     cooldown_hashes: list[str] = field(default_factory=list)
     preempted_hashes: list[str] = field(default_factory=list)
+    throttled_hashes: list[str] = field(default_factory=list)
+    unthrottled_hashes: list[str] = field(default_factory=list)
     reserved_bytes: int = 0
     blocked_reason: str | None = None
     dry_run: bool = True
@@ -55,6 +62,8 @@ class SoakQueueResult:
             "hot_hashes": list(self.hot_hashes),
             "cooldown_hashes": list(self.cooldown_hashes),
             "preempted_hashes": list(self.preempted_hashes),
+            "throttled_hashes": list(self.throttled_hashes),
+            "unthrottled_hashes": list(self.unthrottled_hashes),
             "reserved_bytes": int(self.reserved_bytes),
             "blocked_reason": self.blocked_reason,
             "dry_run": bool(self.dry_run),
@@ -125,10 +134,6 @@ class SoakQueueService:
         if not sync_healthy:
             self._decision(None, "blocked", "sync_unhealthy", {"free_bytes": free_bytes})
             return SoakQueueResult(blocked_reason="sync_unhealthy", dry_run=self.dry_run)
-        if int(free_bytes) < int(self.config.min_free_bytes):
-            self._release_stale_reservations(set(), now, reason="soak_min_free_block")
-            self._decision(None, "blocked", "min_free_block", {"free_bytes": free_bytes, "min_free_bytes": self.config.min_free_bytes})
-            return SoakQueueResult(blocked_reason="min_free_block", dry_run=self.dry_run)
 
         active_hashes = set(active_hashes or set())
         active_like = {str(t["hash"]) for t in managed if _is_running_download(t)}
@@ -178,6 +183,13 @@ class SoakQueueService:
         self._sync_reservations(exposures, now)
         self._apply_seq_false(sorted(selected_hashes))
         self._qbt_post("/api/v2/torrents/start", started)
+        throttled_hashes, unthrottled_hashes = self._apply_low_capacity_download_limits(
+            selected_hashes,
+            rows=rows,
+            ema_by_hash=ema_by_hash,
+            free_bytes=free_bytes,
+            now=now,
+        )
         for h in started:
             self._decision(h, "resident_start", "budget_fit", {"exposure_bytes": exposures.get(h, 0)})
         for h in resident_hashes:
@@ -191,6 +203,8 @@ class SoakQueueService:
             hot_hashes=sorted(hot_hashes),
             cooldown_hashes=sorted(cooldown_hashes | set(preempted_hashes)),
             preempted_hashes=preempted_hashes,
+            throttled_hashes=throttled_hashes,
+            unthrottled_hashes=unthrottled_hashes,
             reserved_bytes=sum(int(v) for v in exposures.values()),
             dry_run=self.dry_run,
         )
@@ -459,6 +473,10 @@ class SoakQueueService:
             and _is_running_download(managed_by_hash[h])
         ]
         if stale:
+            for h in stale:
+                if str((rows.get(h) or {}).get("reason") or "") == "low_capacity_throttled":
+                    self._set_download_limit(h, 0)
+                    self._decision(h, "download_unlimited", "resident_reallocated", {"limit_bps": 0})
             self._qbt_post("/api/v2/torrents/stop", stale)
         if stale:
             def txn(con: sqlite3.Connection) -> None:
@@ -537,6 +555,83 @@ class SoakQueueService:
             except Exception as exc:
                 self._action("/api/v2/torrents/toggleSequentialDownload", payload, "failed", False, str(exc))
                 raise
+
+    def _apply_low_capacity_download_limits(
+        self,
+        selected_hashes: set[str],
+        rows: dict[str, dict[str, Any]],
+        ema_by_hash: dict[str, int],
+        free_bytes: int,
+        now: int,
+    ) -> tuple[list[str], list[str]]:
+        if not selected_hashes:
+            return [], []
+        floor = int(self.config.disk_floor_bytes)
+        margin = max(0, int(self.config.low_capacity_throttle_margin_bytes))
+        low_capacity = int(free_bytes) < floor + margin
+        trigger_bps = int(self.config.low_capacity_throttle_trigger_bps or self.config.hot_bps)
+        limit_bps = max(0, int(self.config.low_capacity_soak_limit_bps))
+        throttled: list[str] = []
+        unthrottled: list[str] = []
+        for h in sorted(selected_hashes):
+            previous_reason = str((rows.get(h) or {}).get("reason") or "")
+            ema = int(ema_by_hash.get(h, 0))
+            if low_capacity and limit_bps > 0 and ema >= trigger_bps:
+                self._set_download_limit(h, limit_bps)
+                self._mark_limit_state(h, now, "low_capacity_throttled")
+                self._decision(
+                    h,
+                    "download_limited",
+                    "low_capacity_soak_speed_spike",
+                    {
+                        "free_bytes": int(free_bytes),
+                        "disk_floor_bytes": floor,
+                        "throttle_margin_bytes": margin,
+                        "ema_dlspeed_bps": ema,
+                        "limit_bps": limit_bps,
+                    },
+                )
+                throttled.append(h)
+            elif previous_reason == "low_capacity_throttled":
+                self._set_download_limit(h, 0)
+                self._mark_limit_state(h, now, "low_capacity_unthrottled")
+                self._decision(
+                    h,
+                    "download_unlimited",
+                    "capacity_recovered",
+                    {
+                        "free_bytes": int(free_bytes),
+                        "disk_floor_bytes": floor,
+                        "throttle_margin_bytes": margin,
+                    },
+                )
+                unthrottled.append(h)
+        return throttled, unthrottled
+
+    def _set_download_limit(self, hash: str, limit_bps: int) -> None:
+        payload = {"hashes": hash, "limit": int(limit_bps)}
+        path = "/api/v2/torrents/setDownloadLimit"
+        if self.dry_run:
+            self._action(path, payload, "dry_run", True)
+            return
+        try:
+            if hasattr(self.executor, "set_download_limit"):
+                self.executor.set_download_limit(hash, int(limit_bps))
+            else:
+                self.executor.qbt_post(path, {"hashes": hash, "limit": str(int(limit_bps))})
+            self._action(path, payload, "succeeded", False)
+        except Exception as exc:
+            self._action(path, payload, "failed", False, str(exc))
+            raise
+
+    def _mark_limit_state(self, hash: str, now: int, reason: str) -> None:
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update soak_state set updated_at=?, reason=? where hash=?",
+                (int(now), str(reason), str(hash)),
+            ),
+        )
 
     def _qbt_post(self, path: str, hashes: list[str]) -> None:
         if not hashes:

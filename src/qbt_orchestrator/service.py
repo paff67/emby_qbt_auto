@@ -138,6 +138,7 @@ class DaemonRuntime:
         planner_dry_run: bool = True,
         planner_active_slots: int = 5,
         planner_slow_active_demote_sec: int = 180,
+        disk_floor_bytes: int = 3 * 1024**3,
         upload_runner=None,
         upload_dry_run: bool = True,
         cleanup_runner=None,
@@ -188,6 +189,7 @@ class DaemonRuntime:
         self.planner_dry_run = planner_dry_run or dry_run
         self.planner_active_slots = int(planner_active_slots)
         self.planner_slow_active_demote_sec = int(planner_slow_active_demote_sec)
+        self.disk_floor_bytes = int(disk_floor_bytes)
         self.upload_runner = upload_runner
         self.upload_dry_run = upload_dry_run or dry_run
         self.cleanup_runner = cleanup_runner
@@ -291,6 +293,7 @@ class DaemonRuntime:
             dry_run=self.planner_dry_run,
             active_slots=self.planner_active_slots,
             slow_active_demote_sec=self.planner_slow_active_demote_sec,
+            disk_floor_bytes=self.disk_floor_bytes,
         )
         result = planner.plan_and_apply(
             snapshots,
@@ -343,6 +346,7 @@ class DaemonRuntime:
             batch_allow_tag=self.batch_allow_tag,
             batch_max_live_batch_bytes=self.batch_max_live_batch_bytes,
             batch_max_new_per_tick=self.batch_max_new_per_tick,
+            disk_floor_bytes=self.disk_floor_bytes,
         )
         result = service.sync_completed(
             snapshots,

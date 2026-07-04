@@ -77,21 +77,29 @@ def _build_preemption_from_env(state_db: Path, executor, env=os.environ, global_
         remote=env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:"),
     )
 
+def _disk_floor_bytes_from_env(env=os.environ) -> int:
+    return int(float(env.get("QBT_ORCH_DISK_FLOOR_GB", "3")) * 1024**3)
+
+
 def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
+    hot_bps = int(env.get("QBT_ORCH_SOAK_HOT_BPS", str(1024**2)))
     return SoakQueueConfig(
         enabled=(_truthy(env.get("QBT_ORCH_SOAK_ENABLED")) is not False),
         resident_slots=int(env.get("QBT_ORCH_SOAK_RESIDENT_SLOTS", "8")),
-        min_free_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_FREE_GB", "8")) * 1024**3),
-        disk_floor_bytes=int(float(env.get("QBT_ORCH_DISK_FLOOR_GB", "2")) * 1024**3),
+        min_free_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_FREE_GB", "0")) * 1024**3),
+        disk_floor_bytes=_disk_floor_bytes_from_env(env),
         max_total_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MAX_EXPOSURE_GB", "4")) * 1024**3),
         min_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_EXPOSURE_MB", "128")) * 1024**2),
         max_per_torrent_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB", "512")) * 1024**2),
         exposure_horizon_sec=int(env.get("QBT_ORCH_SOAK_EXPOSURE_HORIZON_SEC", "900")),
-        hot_bps=int(env.get("QBT_ORCH_SOAK_HOT_BPS", str(1024**2))),
+        hot_bps=hot_bps,
         low_bps=int(env.get("QBT_ORCH_SOAK_LOW_BPS", str(100 * 1024))),
         hot_confirm_sec=int(env.get("QBT_ORCH_SOAK_HOT_CONFIRM_SEC", "60")),
         cooldown_sec=int(env.get("QBT_ORCH_SOAK_COOLDOWN_SEC", "1800")),
         max_qbt_active_downloads=int(env.get("QBT_ORCH_SOAK_MAX_QBT_ACTIVE_DOWNLOADS", "16")),
+        low_capacity_throttle_margin_bytes=int(float(env.get("QBT_ORCH_SOAK_LOW_CAPACITY_THROTTLE_MARGIN_GB", "1")) * 1024**3),
+        low_capacity_soak_limit_bps=int(env.get("QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS", str(256 * 1024))),
+        low_capacity_throttle_trigger_bps=int(env.get("QBT_ORCH_SOAK_THROTTLE_TRIGGER_BPS", str(hot_bps))),
     )
 
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -354,6 +362,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         planner_dry_run=planner_dry_run,
         planner_active_slots=int(os.environ.get("QBT_ORCH_ACTIVE_SLOTS", "5")),
         planner_slow_active_demote_sec=int(os.environ.get("QBT_ORCH_SLOW_ACTIVE_DEMOTE_SEC", "180")),
+        disk_floor_bytes=_disk_floor_bytes_from_env(os.environ),
         upload_runner=upload_runner,
         upload_dry_run=upload_dry_run,
         cleanup_runner=cleanup_runner,

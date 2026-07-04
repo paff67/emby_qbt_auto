@@ -56,7 +56,7 @@ class DownloadPlanner:
         executor,
         dry_run: bool = True,
         active_slots: int = 5,
-        disk_floor_bytes: int = 2 * 1024**3,
+        disk_floor_bytes: int = 3 * 1024**3,
         slow_active_demote_sec: int = 180,
         now=None,
     ):

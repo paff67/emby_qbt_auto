@@ -76,7 +76,7 @@ class FileBatchService:
         qbt=None,
         executor=None,
         batch_pipeline_enabled: bool = True,
-        disk_floor_bytes: int = 2 * 1024**3,
+        disk_floor_bytes: int = 3 * 1024**3,
         filesystem_slack_bytes: int = 128 * 1024**2,
         max_batch_bytes: int = 12 * 1024**3,
         max_inflight_batches_per_torrent: int = 2,

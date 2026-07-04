@@ -15,3 +15,6 @@ class Executor:
         current = bool(self.qbt.torrent_info(hash).get("seq_dl"))
         if current == bool(desired): return False
         self.qbt_post("/api/v2/torrents/toggleSequentialDownload", {"hashes": hash}); return True
+
+    def set_download_limit(self, hash: str, limit_bps: int) -> None:
+        self.qbt_post("/api/v2/torrents/setDownloadLimit", {"hashes": hash, "limit": str(max(0, int(limit_bps)))})

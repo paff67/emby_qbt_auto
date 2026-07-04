@@ -25,6 +25,7 @@ class RecordingExecutor:
     def __init__(self):
         self.posts = []
         self.seq = []
+        self.download_limits = []
 
     def qbt_post(self, path, payload):
         self.posts.append((path, payload))
@@ -32,6 +33,9 @@ class RecordingExecutor:
     def set_seq_dl(self, hash, desired):
         self.seq.append((hash, desired))
         return True
+
+    def set_download_limit(self, hash, limit_bps):
+        self.download_limits.append((hash, limit_bps))
 
 
 def _migrated_db() -> Path:
@@ -156,27 +160,74 @@ def test_soak_queue_starts_resident_torrents_with_seq_false_and_exposure_reserva
         ]
 
 
-def test_soak_queue_does_not_start_when_under_min_free():
+def test_soak_queue_ignores_legacy_min_free_gate_and_uses_disk_floor_budget():
     from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
     from qbt_orchestrator.db import migrate
 
+    gib = 1024**3
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "state.sqlite"
         migrate(db, dry_run=False)
         executor = RecordingExecutor()
-        svc = SoakQueueService(db, executor, dry_run=False, config=SoakQueueConfig(min_free_bytes=8 * 1024**3), now=lambda: 1000)
+        svc = SoakQueueService(
+            db,
+            executor,
+            dry_run=False,
+            config=SoakQueueConfig(
+                resident_slots=1,
+                min_free_bytes=8 * gib,
+                disk_floor_bytes=3 * gib,
+                max_total_exposure_bytes=4 * gib,
+            ),
+            now=lambda: 1000,
+        )
 
         result = svc.run_once(
-            {"h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1024**3, "progress": 0.1}},
-            free_bytes=7 * 1024**3,
+            {"h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": gib, "piece_size": 4 * 1024**2, "progress": 0.1}},
+            free_bytes=6 * gib,
             sync_healthy=True,
         )
 
-        assert result.blocked_reason == "min_free_block"
+        assert result.blocked_reason is None
+        assert result.started == ["h1"]
+        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "h1"})]
+        decisions = _rows(db, "select reason_code from decision_log where component='soak_queue'")
+        assert "min_free_block" not in {row["reason_code"] for row in decisions}
+
+
+def test_soak_queue_blocks_new_resident_only_when_disk_floor_budget_is_exhausted():
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+    from qbt_orchestrator.db import migrate
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = RecordingExecutor()
+        svc = SoakQueueService(
+            db,
+            executor,
+            dry_run=False,
+            config=SoakQueueConfig(
+                resident_slots=1,
+                min_free_bytes=0,
+                disk_floor_bytes=3 * gib,
+                min_exposure_bytes=128 * 1024**2,
+                max_total_exposure_bytes=4 * gib,
+            ),
+            now=lambda: 1000,
+        )
+
+        result = svc.run_once(
+            {"h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": gib, "piece_size": 4 * 1024**2, "progress": 0.1}},
+            free_bytes=3 * gib + 64 * 1024**2,
+            sync_healthy=True,
+        )
+
         assert result.started == []
         assert executor.posts == []
-        decision = _rows(db, "select component,decision,reason_code from decision_log order by id desc limit 1")[0]
-        assert decision == {"component": "soak_queue", "decision": "blocked", "reason_code": "min_free_block"}
+        decision = _rows(db, "select decision,reason_code from decision_log where hash='h1' order by id desc limit 1")[0]
+        assert decision == {"decision": "blocked", "reason_code": "budget_insufficient"}
 
 
 def test_soak_queue_respects_resident_slots_and_qbt_active_cap():
@@ -322,6 +373,116 @@ def test_soak_queue_rejects_preemption_when_no_safe_victim():
         assert result.preempted_hashes == []
         decisions = _rows(db, "select decision,reason_code from decision_log where hash='hot' order by id")
         assert {"decision": "blocked", "reason_code": "no_safe_victim"} in decisions
+
+
+def test_soak_queue_throttles_hot_resident_near_disk_floor_instead_of_stopping_it():
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+    from qbt_orchestrator.db import migrate
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into soak_state(hash,state,ema_dlspeed_bps,hot_since,resident_since,exposure_bytes,last_sample_at,updated_at,reason) "
+            "values('hot','soak_resident',2097152,900,800,536870912,900,900,'hot_confirming')"
+        )
+        con.commit(); con.close()
+        executor = RecordingExecutor()
+        cfg = SoakQueueConfig(
+            resident_slots=1,
+            min_free_bytes=0,
+            disk_floor_bytes=3 * gib,
+            low_capacity_throttle_margin_bytes=1 * gib,
+            low_capacity_soak_limit_bps=256 * 1024,
+            max_total_exposure_bytes=4 * gib,
+            max_per_torrent_exposure_bytes=512 * 1024**2,
+            hot_bps=1024**2,
+            hot_confirm_sec=60,
+        )
+        svc = SoakQueueService(db, executor, dry_run=False, config=cfg, now=lambda: 1000)
+        snapshots = {
+            "hot": {"hash": "hot", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 5 * gib, "dlspeed": 2 * 1024**2, "progress": 0.2}
+        }
+
+        result = svc.run_once(snapshots, free_bytes=3 * gib + 512 * 1024**2, sync_healthy=True)
+
+        assert result.hot_hashes == ["hot"]
+        assert result.throttled_hashes == ["hot"]
+        assert executor.download_limits == [("hot", 256 * 1024)]
+        assert ("/api/v2/torrents/stop", {"hashes": "hot"}) not in executor.posts
+        row = _rows(db, "select reason from soak_state where hash='hot'")[0]
+        assert row == {"reason": "low_capacity_throttled"}
+
+
+def test_soak_queue_clears_previous_low_capacity_limit_after_capacity_recovers():
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+    from qbt_orchestrator.db import migrate
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into soak_state(hash,state,ema_dlspeed_bps,hot_since,resident_since,exposure_bytes,last_sample_at,updated_at,reason) "
+            "values('hot','soak_hot',2097152,900,800,536870912,900,900,'low_capacity_throttled')"
+        )
+        con.commit(); con.close()
+        executor = RecordingExecutor()
+        cfg = SoakQueueConfig(
+            resident_slots=1,
+            min_free_bytes=0,
+            disk_floor_bytes=3 * gib,
+            low_capacity_throttle_margin_bytes=1 * gib,
+            low_capacity_soak_limit_bps=256 * 1024,
+            max_total_exposure_bytes=4 * gib,
+            hot_bps=1024**2,
+            hot_confirm_sec=60,
+        )
+        svc = SoakQueueService(db, executor, dry_run=False, config=cfg, now=lambda: 1000)
+        snapshots = {
+            "hot": {"hash": "hot", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 5 * gib, "dlspeed": 2 * 1024**2, "progress": 0.2}
+        }
+
+        result = svc.run_once(snapshots, free_bytes=8 * gib, sync_healthy=True)
+
+        assert result.unthrottled_hashes == ["hot"]
+        assert executor.download_limits == [("hot", 0)]
+
+
+def test_soak_queue_clears_low_capacity_limit_when_resident_is_reallocated_out():
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+    from qbt_orchestrator.db import migrate
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into soak_state(hash,state,ema_dlspeed_bps,hot_since,resident_since,exposure_bytes,last_sample_at,updated_at,reason) "
+            "values('old','soak_resident',2097152,900,800,536870912,900,900,'low_capacity_throttled')"
+        )
+        con.commit(); con.close()
+        executor = RecordingExecutor()
+        cfg = SoakQueueConfig(
+            resident_slots=1,
+            min_free_bytes=0,
+            disk_floor_bytes=3 * gib,
+            max_per_torrent_exposure_bytes=512 * 1024**2,
+        )
+        svc = SoakQueueService(db, executor, dry_run=False, config=cfg, now=lambda: 1000)
+        snapshots = {
+            "old": {"hash": "old", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 5 * gib, "dlspeed": 2 * 1024**2, "progress": 0.2}
+        }
+
+        result = svc.run_once(snapshots, free_bytes=3 * gib + 64 * 1024**2, sync_healthy=True)
+
+        assert result.stopped == ["old"]
+        assert executor.download_limits == [("old", 0)]
+        assert ("/api/v2/torrents/stop", {"hashes": "old"}) in executor.posts
 
 
 if __name__ == "__main__":
