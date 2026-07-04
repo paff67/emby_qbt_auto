@@ -61,8 +61,6 @@ if "qbt-host-bridge:" not in text:
     depends_on:
       - qbittorrent
     command:
-      - "-d"
-      - "-d"
       - "TCP-LISTEN:{port},fork,reuseaddr,bind=0.0.0.0"
       - "TCP:127.0.0.1:8080"
     restart: unless-stopped

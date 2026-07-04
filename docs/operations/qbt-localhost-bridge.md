@@ -33,8 +33,6 @@ qbt-host-bridge:
   container_name: qbt-host-bridge
   network_mode: "service:qbittorrent"
   command:
-    - "-d"
-    - "-d"
     - "TCP-LISTEN:18081,fork,reuseaddr,bind=0.0.0.0"
     - "TCP:127.0.0.1:8080"
 ```
