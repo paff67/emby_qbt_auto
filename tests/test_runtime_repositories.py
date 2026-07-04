@@ -290,18 +290,19 @@ def test_upload_job_runner_marks_pipeline_batch_cleanup_deferred_and_counts_pend
 
 def test_command_processor_executes_safe_commands_and_requires_cleanup_approval():
     from qbt_orchestrator.db import migrate
-    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from qbt_orchestrator.runtime import BotCommandRepository, BotNotificationRepository, CommandProcessor
     from tests.fakes import FakeExecutor
 
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "state.sqlite"
         migrate(db, dry_run=False)
         commands = BotCommandRepository(db)
+        notifications = BotNotificationRepository(db)
         commands.insert_command("c1", 100, 2, "pause", {"args": ["h1"]})
         commands.insert_command("c2", 100, 2, "resume", {"args": ["h1"]})
         commands.insert_command("c3", 100, 3, "cleanup", {"args": ["h2"]})
         executor = FakeExecutor()
-        processor = CommandProcessor(commands, executor)
+        processor = CommandProcessor(commands, executor, notifications=notifications)
 
         assert processor.run_next() == "c1"
         assert processor.run_next() == "c2"
@@ -312,6 +313,17 @@ def test_command_processor_executes_safe_commands_and_requires_cleanup_approval(
         ]
         assert commands.get("c3")["state"] == "approval_required"
         assert commands.pending_approvals()[0]["action"] == "cleanup"
+        approval_notice = notifications.list_all()[0]
+        assert approval_notice["topic"] == "approval"
+        assert "approval required: /cleanup h2" in approval_notice["message"]
+        notice_payload = json.loads(approval_notice["payload_json"])
+        assert notice_payload["approval_id"] == "approval-c3"
+        assert notice_payload["reply_markup"] == {
+            "inline_keyboard": [[
+                {"text": "Approve", "callback_data": "approve:approval-c3"},
+                {"text": "Deny", "callback_data": "deny:approval-c3"},
+            ]]
+        }
 
 
 def test_approved_dangerous_command_executes_once_after_approval():

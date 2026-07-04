@@ -246,6 +246,38 @@ def test_telegram_notification_sender_sends_queued_messages_and_retries_failures
         assert "secret-token" not in failed["last_error"]
 
 
+def test_telegram_notification_sender_passes_inline_reply_markup_from_payload():
+    import tempfile
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.integrations.telegram import TelegramNotificationSender
+    from qbt_orchestrator.runtime import BotNotificationRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = BotNotificationRepository(db, now=lambda: 100)
+        markup = {
+            "inline_keyboard": [[
+                {"text": "Approve", "callback_data": "approve:approval-c1"},
+                {"text": "Deny", "callback_data": "deny:approval-c1"},
+            ]]
+        }
+        notice_id = repo.enqueue(100, "approval", "approval required", payload={"reply_markup": markup})
+        sent = []
+
+        class Api:
+            def get_updates(self, offset, timeout):
+                return []
+
+            def send_message(self, chat_id, text, reply_markup=None):
+                sent.append((chat_id, text, reply_markup))
+                return {"ok": True}
+
+        assert TelegramNotificationSender(repo, Api()).send_next() == notice_id
+        assert sent == [(100, "approval required", markup)]
+        assert repo.get(notice_id)["state"] == "sent"
+
+
 def test_qbt_docker_client_attaches_stdin_for_form_post_inside_container():
     from qbt_orchestrator.integrations.qbt import QbtDockerClient
 

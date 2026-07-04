@@ -801,7 +801,22 @@ class CommandProcessor:
         command_id = row["command_id"]; command = row["command"]; payload = json.loads(row["payload_json"] or "{}"); args = payload.get("args") or []
         claimed_from = row.get("_claimed_from_state") or row.get("state")
         if command in self.DANGEROUS and claimed_from != "approved":
-            self.commands.create_approval(command_id, command, payload); self.commands.set_state(command_id, "approval_required"); return command_id
+            approval_id = self.commands.create_approval(command_id, command, payload)
+            if self.notifications is not None:
+                self.notifications.enqueue(
+                    chat_id=row["chat_id"],
+                    topic="approval",
+                    level="warning",
+                    message=self._approval_message(command, args),
+                    payload={
+                        "approval_id": approval_id,
+                        "command_id": command_id,
+                        "action": command,
+                        "reply_markup": self._approval_reply_markup(approval_id),
+                    },
+                    dedupe_key=f"approval-request:{approval_id}",
+                )
+            self.commands.set_state(command_id, "approval_required"); return command_id
         if command == "pause" and args:
             self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
         if command == "resume" and args:
@@ -840,6 +855,19 @@ class CommandProcessor:
             self.commands.set_state(command_id, "done")
             return command_id
         self.commands.set_state(command_id, "ignored"); return command_id
+
+    def _approval_message(self, command: str, args: list[Any]) -> str:
+        suffix = " ".join(str(a) for a in args)
+        command_line = f"/{command} {suffix}".strip()
+        return f"approval required: {command_line}"
+
+    def _approval_reply_markup(self, approval_id: str) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [[
+                {"text": "Approve", "callback_data": f"approve:{approval_id}"},
+                {"text": "Deny", "callback_data": f"deny:{approval_id}"},
+            ]]
+        }
 
     def _readonly_message(self, command: str, args: list[Any]) -> str:
         if command == "status":

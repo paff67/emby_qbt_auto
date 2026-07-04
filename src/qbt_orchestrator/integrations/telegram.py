@@ -131,10 +131,18 @@ class TelegramNotificationSender:
             return None
         notification_id = int(row["id"])
         try:
-            self.api.send_message(int(row["chat_id"]), str(row["message"]))
+            self.api.send_message(int(row["chat_id"]), str(row["message"]), reply_markup=self._reply_markup(row))
         except Exception as exc:
             self.repo.schedule_retry(notification_id, error=str(redact(str(exc))), delay_sec=self.retry_delay)
             return notification_id
         self.repo.mark_sent(notification_id)
         return notification_id
+
+    def _reply_markup(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except Exception:
+            return None
+        reply_markup = payload.get("reply_markup")
+        return reply_markup if isinstance(reply_markup, dict) else None
 

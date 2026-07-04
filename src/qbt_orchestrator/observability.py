@@ -8,11 +8,19 @@ MAGNET = re.compile(r"magnet:\?xt=urn:btih:[A-Za-z0-9]{32,}", re.I)
 ROOT_RCLONE = re.compile(r"/root/\.config/rclone/[^\s\"']+", re.I)
 BEARER = re.compile(r"Bearer\s+[A-Za-z0-9._\-]+", re.I)
 TELEGRAM_TOKEN = re.compile(r"\b\d{5,}:\S+", re.I)
+TELEGRAM_MARKUP_KEYS = {"reply_markup", "inline_keyboard", "keyboard"}
 
 
 def redact(value: Any, key: str = "") -> Any:
     if isinstance(value, dict):
-        return {k: ("<redacted>" if SECRET_KEY.search(str(k)) else redact(v, str(k))) for k, v in value.items()}
+        return {
+            k: (
+                redact(v, "")
+                if str(k) in TELEGRAM_MARKUP_KEYS
+                else ("<redacted>" if SECRET_KEY.search(str(k)) else redact(v, str(k)))
+            )
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [redact(v, key) for v in value]
     if isinstance(value, tuple):
