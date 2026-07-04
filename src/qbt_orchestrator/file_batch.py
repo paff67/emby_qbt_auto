@@ -861,7 +861,8 @@ class FileBatchService:
             return None
         if path.is_file():
             return files, media_files, total, files[0]["remote_path"], "copyto"
-        return files, media_files, total, remote_dir, "copy"
+        copy_mode = "copy_files" if selected_qbt_files is not None else "copy"
+        return files, media_files, total, remote_dir, copy_mode
 
     @staticmethod
     def _allowed_manifest_relatives(root: Path, selected_qbt_files: list[Mapping[str, Any]] | None) -> set[str] | None:

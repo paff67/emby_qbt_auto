@@ -152,6 +152,7 @@ def test_file_batch_service_completed_manifest_excludes_qbt_priority_zero_files(
         assert qbt.calls == ["h1"]
         payload = json.loads(_rows(db, "select payload_json from torrent_jobs")[0]["payload_json"])
         assert payload["size"] == 100
+        assert payload["copy_mode"] == "copy_files"
         assert [(f["relative_path"], f["size"]) for f in payload["files"]] == [("dori-136.mp4", 100)]
         assert payload["media_files"] == [{"remote_path": "gcrypt:/dori-136.torrent-h1/dori-136.mp4", "size": 100}]
 
