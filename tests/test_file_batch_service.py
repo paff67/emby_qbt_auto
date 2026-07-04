@@ -392,6 +392,38 @@ def test_file_batch_service_pipeline_selects_real_media_and_skips_junk_candidate
         assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "0|1", "priority": "0"}) in qbt.calls
 
 
+def test_file_batch_service_pipeline_allows_real_media_with_site_prefix():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([{"index": 0, "name": "MVG-155-C/489155.com@MVG-155-C.mp4", "size": 5 * gib, "progress": 0.8, "priority": 1}])
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+            batch_live_verify=True,
+            batch_allow_hashes={"mvg"},
+            batch_max_live_batch_bytes=1536 * 1024**2,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"mvg": {"hash": "mvg", "name": "MVG-155-C", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": gib, "size": 5 * gib, "progress": 0.8}},
+            free_bytes=4 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        batch = _rows(db, "select indices_json from torrent_batches")[0]
+        assert json.loads(batch["indices_json"]) == [0]
+
+
 def test_file_batch_service_pipeline_reserves_remaining_bytes_for_partial_file():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService

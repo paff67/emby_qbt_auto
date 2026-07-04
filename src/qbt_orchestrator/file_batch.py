@@ -53,7 +53,7 @@ def _is_stopped(torrent: Mapping[str, Any]) -> bool:
 
 
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ts", ".webm", ".flv", ".mpg", ".mpeg", ".iso"}
-JUNK_BATCH_NAME = re.compile(r"(?i)(最新地址|最\s*新\s*位\s*址|收藏不迷路|官方指定|博彩|赌场|直播|telegram|996gg\.cc|489155|x\s*u\s*u|uu美少女|社\s*區|社\s*区|福利|体育|电竞|楼风)")
+JUNK_BATCH_NAME = re.compile(r"(?i)(最新地址|最\s*新\s*位\s*址|收藏不迷路|官方指定|博彩|赌场|直播|telegram|996gg\.cc|x\s*u\s*u|uu美少女|社\s*區|社\s*区|福利|体育|电竞|楼风)")
 
 
 class FileBatchService:
