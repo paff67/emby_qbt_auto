@@ -1257,6 +1257,7 @@ def test_cli_builds_qbt_host_proxy_client_without_auth_from_env():
             assert runtime.qbt.auth_enabled is False
             assert runtime.qbt.username == ""
             assert runtime.qbt.password == ""
+            assert runtime.qbt.default_headers == {"Host": "127.0.0.1:8080"}
             assert runtime.qbt.timeout == 7
             assert runtime.qbt.rate_limiter.rate_per_sec == 2
     finally:

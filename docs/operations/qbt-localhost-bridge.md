@@ -62,12 +62,13 @@ Then it updates `/etc/qbt-orchestrator/daemon.env`:
 ```env
 QBT_ORCH_QBT_API_MODE=host-proxy
 QBT_ORCH_QBT_API_BASE=http://127.0.0.1:18081
+QBT_ORCH_QBT_HTTP_HOST_HEADER=127.0.0.1:8080
 ```
 
 ## Verify
 
 ```bash
-curl -fsS http://127.0.0.1:18081/api/v2/app/version
+curl -fsS -H 'Host: 127.0.0.1:8080' http://127.0.0.1:18081/api/v2/app/version
 cd /opt/emby_qbt_auto/current
 python3 -m qbt_orchestrator.cli qbt-api-check --config /etc/qbt-orchestrator/config.json --json
 systemctl show qbt-orchestrator-daemon.service -p ActiveState -p SubState -p NRestarts -p ExecMainPID --no-pager
@@ -82,6 +83,7 @@ Expected `qbt-api-check` fields:
   "api_base": "http://127.0.0.1:18081",
   "auth_mode": "none",
   "auth_enabled": false,
+  "default_headers": {"Host": "127.0.0.1:8080"},
   "version": "v5.1.4"
 }
 ```

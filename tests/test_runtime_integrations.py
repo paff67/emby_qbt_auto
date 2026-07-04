@@ -415,6 +415,7 @@ def test_qbt_http_client_host_proxy_noauth_does_not_login_even_if_credentials_ex
         calls.append((method, url, body, dict(headers)))
         assert not url.endswith("/api/v2/auth/login")
         assert "Cookie" not in headers
+        assert headers.get("Host") == "127.0.0.1:8080"
         if url == "http://127.0.0.1:18081/api/v2/app/version":
             return 200, "v5.1.4", {}
         if url == "http://127.0.0.1:18081/api/v2/sync/maindata?rid=0":
@@ -427,6 +428,7 @@ def test_qbt_http_client_host_proxy_noauth_does_not_login_even_if_credentials_ex
         password="secret",
         transport=transport,
         auth_mode="none",
+        default_headers={"Host": "127.0.0.1:8080"},
     )
 
     assert client.app_version() == "v5.1.4"

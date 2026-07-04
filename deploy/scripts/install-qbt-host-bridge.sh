@@ -82,17 +82,18 @@ import sys
 path = Path(sys.argv[1])
 port = sys.argv[2]
 lines = path.read_text().splitlines()
-remove_prefixes = ("QBT_ORCH_QBT_API_MODE=", "QBT_ORCH_QBT_API_BASE=")
+remove_prefixes = ("QBT_ORCH_QBT_API_MODE=", "QBT_ORCH_QBT_API_BASE=", "QBT_ORCH_QBT_HTTP_HOST_HEADER=")
 out = [line for line in lines if not line.strip().startswith(remove_prefixes)]
 out.append("QBT_ORCH_QBT_API_MODE=host-proxy")
 out.append(f"QBT_ORCH_QBT_API_BASE=http://127.0.0.1:{port}")
+out.append("QBT_ORCH_QBT_HTTP_HOST_HEADER=127.0.0.1:8080")
 path.write_text("\n".join(out) + "\n")
 PY
 
 cd "$(dirname "$COMPOSE_FILE")"
 docker compose up -d qbittorrent qbt-host-bridge
 sleep 5
-curl -fsS "http://127.0.0.1:${BRIDGE_PORT}/api/v2/app/version"
+curl -fsS -H "Host: 127.0.0.1:8080" "http://127.0.0.1:${BRIDGE_PORT}/api/v2/app/version"
 systemctl restart qbt-orchestrator-daemon.service
 sleep 5
 systemctl show qbt-orchestrator-daemon.service -p ActiveState -p SubState -p NRestarts -p ExecMainPID --no-pager

@@ -107,6 +107,19 @@ def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
     timeout = int(env.get("QBT_ORCH_QBT_API_TIMEOUT_SEC", "10"))
     max_rps = float(env.get("QBT_ORCH_QBT_API_MAX_RPS", "4"))
     mode = str(env.get("QBT_ORCH_QBT_API_MODE", "docker")).strip().lower()
+    def http_headers(default_host: str | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        host = env.get("QBT_ORCH_QBT_HTTP_HOST_HEADER", default_host or "").strip()
+        referer = env.get("QBT_ORCH_QBT_HTTP_REFERER", "").strip()
+        origin = env.get("QBT_ORCH_QBT_HTTP_ORIGIN", "").strip()
+        if host:
+            headers["Host"] = host
+        if referer:
+            headers["Referer"] = referer
+        if origin:
+            headers["Origin"] = origin
+        return headers
+
     if mode in {"host-proxy", "localhost-bridge", "bridge", "host-noauth"}:
         return QbtHttpClient(
             api_base=env.get("QBT_ORCH_QBT_API_BASE", "http://127.0.0.1:18081"),
@@ -115,6 +128,7 @@ def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
             timeout=timeout,
             api_max_requests_per_sec=max_rps,
             auth_mode="none",
+            default_headers=http_headers("127.0.0.1:8080"),
         )
     if mode in {"host", "http", "host-http"}:
         return QbtHttpClient(
@@ -124,6 +138,7 @@ def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
             timeout=timeout,
             api_max_requests_per_sec=max_rps,
             auth_mode="auto",
+            default_headers=http_headers(),
         )
     if mode in {"docker", "docker-exec", "container"}:
         return QbtDockerClient(
@@ -144,6 +159,7 @@ def _qbt_api_check_payload(qbt_cfg=None, env=os.environ) -> dict:
         "api_base": getattr(qbt, "api_base", None),
         "auth_mode": getattr(qbt, "auth_mode", None),
         "auth_enabled": getattr(qbt, "auth_enabled", None),
+        "default_headers": getattr(qbt, "default_headers", {}),
     }
     version = qbt.app_version() if hasattr(qbt, "app_version") else None
     payload["version"] = version

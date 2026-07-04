@@ -160,6 +160,7 @@ class QbtHttpClient:
         timeout: int = 10,
         api_max_requests_per_sec: float = 4.0,
         auth_mode: str = "auto",
+        default_headers: Mapping[str, str] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ):
@@ -167,6 +168,7 @@ class QbtHttpClient:
         self.username = username
         self.password = password
         self.auth_mode = str(auth_mode or "auto").strip().lower()
+        self.default_headers = dict(default_headers or {})
         self.transport = transport
         self.timeout = timeout
         self.cookie: str | None = None
@@ -190,7 +192,7 @@ class QbtHttpClient:
             "POST",
             self._url("/api/v2/auth/login"),
             body,
-            {"Content-Type": "application/x-www-form-urlencoded"},
+            {**self.default_headers, "Content-Type": "application/x-www-form-urlencoded"},
             self.timeout,
         )
         if status >= 400 or not text.strip().lower().startswith("ok"):
@@ -216,7 +218,7 @@ class QbtHttpClient:
         if self.auth_enabled and self.cookie is None and (self.username or self.password):
             self._login()
         body = None if data is None else urlencode(data)
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = dict(self.default_headers)
         if body is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         if self.cookie:
