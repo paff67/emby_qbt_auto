@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .db import readonly_connect, write_transaction
+from .models import BatchReservation
 from .observability import redact
 from .policies.batching import compute_batch_reservation
 from .runtime import ObservabilityStore, TorrentJobRepository
@@ -51,7 +52,8 @@ def _is_stopped(torrent: Mapping[str, Any]) -> bool:
     return str(torrent.get("state") or "").lower() in {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "stopped"}
 
 
-MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
+MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ts", ".webm", ".flv", ".mpg", ".mpeg", ".iso"}
+JUNK_BATCH_NAME = re.compile(r"(?i)(最新地址|最\s*新\s*位\s*址|收藏不迷路|官方指定|博彩|赌场|直播|telegram|996gg\.cc|489155|x\s*u\s*u|uu美少女|社\s*區|社\s*区|福利|体育|电竞|楼风)")
 
 
 class FileBatchService:
@@ -440,9 +442,11 @@ class FileBatchService:
             size = int(row.get("size") or 0)
             if size <= 0:
                 continue
+            if not self._is_selectable_batch_media(row):
+                continue
             candidate = [*selected, row]
-            reservation = compute_batch_reservation(candidate, piece_size=piece_size, filesystem_slack=self.filesystem_slack_bytes)
-            if reservation.payload_bytes > self.max_batch_bytes:
+            reservation = self._batch_reservation(candidate, piece_size)
+            if sum(int(item.get("size") or 0) for item in candidate) > self.max_batch_bytes:
                 break
             if self._live_batch_size_cap_exceeded(reservation.reserved_bytes):
                 break
@@ -451,7 +455,45 @@ class FileBatchService:
             selected = candidate
         if not selected:
             return [], None
-        return selected, compute_batch_reservation(selected, piece_size=piece_size, filesystem_slack=self.filesystem_slack_bytes)
+        return selected, self._batch_reservation(selected, piece_size)
+
+    def _batch_reservation(self, selected: list[Mapping[str, Any]], piece_size: int) -> BatchReservation:
+        reservation_rows = []
+        for row in selected:
+            remaining = self._remaining_file_bytes(row)
+            if remaining <= 0:
+                continue
+            reservation_rows.append({"size": remaining})
+        reservation = compute_batch_reservation(reservation_rows, piece_size=piece_size, filesystem_slack=self.filesystem_slack_bytes)
+        payload_bytes = sum(int(row.get("size") or 0) for row in selected)
+        return BatchReservation(
+            payload_bytes=payload_bytes,
+            piece_spill_overhead_bytes=reservation.piece_spill_overhead_bytes,
+            filesystem_slack_bytes=reservation.filesystem_slack_bytes,
+            reserved_bytes=reservation.reserved_bytes,
+            payload_efficiency=reservation.payload_efficiency,
+        )
+
+    @staticmethod
+    def _remaining_file_bytes(row: Mapping[str, Any]) -> int:
+        size = int(row.get("size") or 0)
+        if size <= 0:
+            return 0
+        progress = max(0.0, min(1.0, float(row.get("progress") or 0.0)))
+        if progress >= 1.0:
+            return 0
+        return max(1, int(round(size * (1.0 - progress))))
+
+    @staticmethod
+    def _is_selectable_batch_media(row: Mapping[str, Any]) -> bool:
+        path = PurePosixPath(str(row.get("name") or row.get("path") or row.get("relative_path") or ""))
+        if path.suffix.lower() not in MEDIA_EXTENSIONS:
+            return False
+        if JUNK_BATCH_NAME.search(path.name):
+            return False
+        if int(row.get("size") or 0) < 50 * 1024**2:
+            return False
+        return True
 
     def _live_batch_size_cap_exceeded(self, reserved_bytes: int) -> bool:
         return self.batch_live_verify and self.batch_max_live_batch_bytes is not None and int(reserved_bytes) > int(self.batch_max_live_batch_bytes)
@@ -466,7 +508,9 @@ class FileBatchService:
             size = int(row.get("size") or 0)
             if size <= 0:
                 continue
-            reservation = compute_batch_reservation([row], piece_size=piece_size, filesystem_slack=self.filesystem_slack_bytes)
+            if not self._is_selectable_batch_media(row):
+                continue
+            reservation = self._batch_reservation([row], piece_size)
             return reservation.reserved_bytes > int(self.batch_max_live_batch_bytes) and reservation.reserved_bytes <= budget
         return False
 

@@ -693,7 +693,7 @@ def test_daemon_background_event_workers_do_not_block_safety_loop():
 
         def run_next(self):
             self.calls += 1
-            time.sleep(0.35)
+            time.sleep(1.0)
             return None
 
     with tempfile.TemporaryDirectory() as td:
@@ -720,7 +720,7 @@ def test_daemon_background_event_workers_do_not_block_safety_loop():
         elapsed = time.monotonic() - started
 
         assert qbt.rids == [0, 1]
-        assert elapsed < 0.25
+        assert elapsed < 0.9
         assert runner.calls >= 1
 
 

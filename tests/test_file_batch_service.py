@@ -354,6 +354,79 @@ def test_file_batch_service_live_verify_blocks_batch_above_reserved_size_cap():
         assert decision == {"hash": "big", "decision": "prefetch_blocked", "reason_code": "live_verify_batch_size_cap"}
 
 
+def test_file_batch_service_pipeline_selects_real_media_and_skips_junk_candidates():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt(
+            [
+                {"index": 0, "name": "Movie/2026 世界杯.url", "size": 1024, "progress": 0, "priority": 0},
+                {"index": 1, "name": "Movie/台湾uu美少女直播 20年信誉保证服务全球.mp4", "size": 24 * 1024**2, "progress": 0, "priority": 0},
+                {"index": 2, "name": "Movie/Movie.mp4", "size": gib, "progress": 0, "priority": 0},
+            ]
+        )
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"movie": {"hash": "movie", "name": "Movie", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 2 * gib, "size": 2 * gib, "progress": 0.0}},
+            free_bytes=5 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        batch = _rows(db, "select indices_json,total_bytes from torrent_batches")[0]
+        assert json.loads(batch["indices_json"]) == [2]
+        assert batch["total_bytes"] == gib
+        assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "2", "priority": "1"}) in qbt.calls
+        assert ("/api/v2/torrents/filePrio", {"hash": "movie", "id": "0|1", "priority": "0"}) in qbt.calls
+
+
+def test_file_batch_service_pipeline_reserves_remaining_bytes_for_partial_file():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([{"index": 0, "name": "Big/Big.mp4", "size": 5 * gib, "progress": 0.8, "priority": 1}], piece_size=16 * 1024**2)
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+            batch_live_verify=True,
+            batch_allow_hashes={"big"},
+            batch_max_live_batch_bytes=1536 * 1024**2,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"big": {"hash": "big", "name": "Big", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": gib, "size": 5 * gib, "progress": 0.8}},
+            free_bytes=4 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        batch = _rows(db, "select indices_json,total_bytes,reserved_bytes,piece_spill_overhead_bytes from torrent_batches")[0]
+        assert json.loads(batch["indices_json"]) == [0]
+        assert batch["total_bytes"] == 5 * gib
+        assert batch["piece_spill_overhead_bytes"] == 32 * 1024**2
+        assert batch["reserved_bytes"] == gib + 32 * 1024**2 + 128 * 1024**2
+
+
 def test_file_batch_service_pipeline_dry_run_and_qbt_failure_do_not_leave_active_reservation():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
