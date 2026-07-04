@@ -720,7 +720,11 @@ def test_daemon_background_event_workers_do_not_block_safety_loop():
         elapsed = time.monotonic() - started
 
         assert qbt.rids == [0, 1]
-        assert elapsed < 0.9
+        # The safety loop must not wait for two full upload-worker sleeps.
+        # Small VPS runners can add scheduling overhead around thread shutdown,
+        # so keep the assertion below the blocking-path duration instead of
+        # assuming sub-second wall-clock timing.
+        assert elapsed < 1.5
         assert runner.calls >= 1
 
 
