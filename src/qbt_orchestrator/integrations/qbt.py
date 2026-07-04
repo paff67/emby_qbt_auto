@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import subprocess
 import time
-from typing import Any, Callable, Sequence
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlencode
 
 Runner = Callable[[Sequence[str], str | None, int | None], tuple[int, str, str]]
+HttpTransport = Callable[[str, str, str | None, Mapping[str, str], int | None], tuple[int, str, Mapping[str, str]]]
 
 
 def default_runner(argv: Sequence[str], input_text: str | None = None, timeout: int | None = None) -> tuple[int, str, str]:
@@ -124,3 +127,124 @@ class QbtDockerClient:
 
     def post(self, path: str, payload: dict[str, Any]) -> str:
         return self._curl(path, data=payload)
+
+
+def default_http_transport(
+    method: str,
+    url: str,
+    body: str | None = None,
+    headers: Mapping[str, str] | None = None,
+    timeout: int | None = None,
+) -> tuple[int, str, Mapping[str, str]]:
+    data = None if body is None else body.encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=dict(headers or {}), method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return int(resp.status), resp.read().decode("utf-8", errors="replace"), dict(resp.headers.items())
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), exc.read().decode("utf-8", errors="replace"), dict(exc.headers.items())
+
+
+class QbtHttpClient:
+    """qBT WebAPI client using host HTTP API and qBT SID cookie auth."""
+
+    def __init__(
+        self,
+        api_base: str = "http://127.0.0.1:8081",
+        username: str = "",
+        password: str = "",
+        transport: HttpTransport = default_http_transport,
+        timeout: int = 10,
+        api_max_requests_per_sec: float = 4.0,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        self.api_base = api_base.rstrip("/")
+        self.username = username
+        self.password = password
+        self.transport = transport
+        self.timeout = timeout
+        self.cookie: str | None = None
+        self.rate_limiter = TokenBucket(api_max_requests_per_sec, clock=clock, sleeper=sleeper)
+
+    def _url(self, path: str, params: dict[str, Any] | None = None) -> str:
+        url = f"{self.api_base}{path}"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        return url
+
+    def _login(self) -> None:
+        if not self.username and not self.password:
+            raise RuntimeError("qBT host API returned unauthorized and no credentials are configured")
+        body = urlencode({"username": self.username, "password": self.password})
+        status, text, headers = self.transport(
+            "POST",
+            self._url("/api/v2/auth/login"),
+            body,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            self.timeout,
+        )
+        if status >= 400 or not text.strip().lower().startswith("ok"):
+            raise RuntimeError(f"qBT host API login failed status={status}")
+        set_cookie = None
+        for key, value in headers.items():
+            if key.lower() == "set-cookie":
+                set_cookie = value
+                break
+        if not set_cookie:
+            raise RuntimeError("qBT host API login did not return a session cookie")
+        self.cookie = set_cookie.split(";", 1)[0]
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        retry_auth: bool = True,
+    ) -> str:
+        self.rate_limiter.acquire()
+        if self.cookie is None and (self.username or self.password):
+            self._login()
+        body = None if data is None else urlencode(data)
+        headers: dict[str, str] = {}
+        if body is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        status, text, _headers = self.transport(method, self._url(path, params), body, headers, self.timeout)
+        if status in {401, 403} and retry_auth:
+            self.cookie = None
+            self._login()
+            return self._request(method, path, params=params, data=data, retry_auth=False)
+        if status >= 400:
+            raise RuntimeError(f"qBT host API failed status={status}: {text[-400:]}")
+        return text
+
+    def get_maindata(self, rid: int) -> dict[str, Any]:
+        return json.loads(self._request("GET", "/api/v2/sync/maindata", {"rid": rid}))
+
+    def torrent_info(self, hash: str) -> dict[str, Any]:
+        rows = json.loads(self._request("GET", "/api/v2/torrents/info", {"hashes": hash}))
+        return rows[0] if rows else {"hash": hash}
+
+    def torrent_files(self, hash: str) -> list[dict[str, Any]]:
+        rows = json.loads(self._request("GET", "/api/v2/torrents/files", {"hash": hash}))
+        out = []
+        for idx, row in enumerate(rows if isinstance(rows, list) else []):
+            item = dict(row)
+            item.setdefault("index", idx)
+            out.append(item)
+        return out
+
+    def torrent_properties(self, hash: str) -> dict[str, Any]:
+        return json.loads(self._request("GET", "/api/v2/torrents/properties", {"hash": hash}))
+
+    def get_preferences(self) -> dict[str, Any]:
+        return json.loads(self._request("GET", "/api/v2/app/preferences"))
+
+    def set_preferences(self, preferences: dict[str, Any]) -> str:
+        return self._request("POST", "/api/v2/app/setPreferences", data={"json": json.dumps(preferences, ensure_ascii=False)})
+
+    def post(self, path: str, payload: dict[str, Any]) -> str:
+        return self._request("POST", path, data=payload)

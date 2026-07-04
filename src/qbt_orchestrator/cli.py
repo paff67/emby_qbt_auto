@@ -6,7 +6,7 @@ from .config import load_config
 from .carousel import CarouselService
 from .db import migrate, readonly_connect, readonly_counts, recover_jobs
 from .executor import Executor
-from .integrations.qbt import QbtDockerClient
+from .integrations.qbt import QbtDockerClient, QbtHttpClient
 from .integrations.rclone import RcloneClient
 from .integrations.emby import EmbyClient
 from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
@@ -102,6 +102,28 @@ def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
         low_capacity_throttle_trigger_bps=int(env.get("QBT_ORCH_SOAK_THROTTLE_TRIGGER_BPS", str(hot_bps))),
     )
 
+
+def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
+    timeout = int(env.get("QBT_ORCH_QBT_API_TIMEOUT_SEC", "10"))
+    max_rps = float(env.get("QBT_ORCH_QBT_API_MAX_RPS", "4"))
+    mode = str(env.get("QBT_ORCH_QBT_API_MODE", "docker")).strip().lower()
+    if mode in {"host", "http", "host-http"}:
+        return QbtHttpClient(
+            api_base=env.get("QBT_ORCH_QBT_API_BASE", "http://127.0.0.1:8081"),
+            username=env.get("QBT_ORCH_QBT_USERNAME", ""),
+            password=env.get("QBT_ORCH_QBT_PASSWORD", ""),
+            timeout=timeout,
+            api_max_requests_per_sec=max_rps,
+        )
+    if mode in {"docker", "docker-exec", "container"}:
+        return QbtDockerClient(
+            container=qbt_cfg.container if qbt_cfg else "qbittorrent",
+            api_base=qbt_cfg.api_base if qbt_cfg else "http://127.0.0.1:8080",
+            timeout=timeout,
+            api_max_requests_per_sec=max_rps,
+        )
+    raise SystemExit(f"unknown QBT_ORCH_QBT_API_MODE: {mode}")
+
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 def _truthy(value: str | None) -> bool | None:
@@ -181,12 +203,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     dry_run = bool(ns.dry_run or (force_dry_run if force_dry_run is not None else (env_dry_run if env_dry_run is not None else (cfg.dry_run if cfg else True))))
     state_db = Path(os.environ.get("QBT_ORCH_STATE_DB") or (cfg.state_db if cfg else str(db)))
     qbt_cfg = cfg.qbt if cfg else None
-    qbt = QbtDockerClient(
-        container=qbt_cfg.container if qbt_cfg else "qbittorrent",
-        api_base=qbt_cfg.api_base if qbt_cfg else "http://127.0.0.1:8080",
-        timeout=int(os.environ.get("QBT_ORCH_QBT_API_TIMEOUT_SEC", "10")),
-        api_max_requests_per_sec=float(os.environ.get("QBT_ORCH_QBT_API_MAX_RPS", "4")),
-    )
+    qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)
     executor = Executor(qbt, dry_run=dry_run)
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
     telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)

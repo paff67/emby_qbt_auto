@@ -315,6 +315,97 @@ def test_qbt_docker_client_rate_limits_api_calls_with_token_bucket():
     assert len(runner.calls) == 2
 
 
+def test_qbt_http_client_logs_in_and_reuses_sid_cookie_for_host_api():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    calls = []
+
+    def transport(method, url, body, headers, timeout):
+        calls.append((method, url, body, dict(headers), timeout))
+        if url == "http://127.0.0.1:8081/api/v2/auth/login":
+            assert method == "POST"
+            assert body == "username=admin&password=secret"
+            return 200, "Ok.", {"Set-Cookie": "SID=abc123; Path=/"}
+        assert headers.get("Cookie") == "SID=abc123"
+        if url == "http://127.0.0.1:8081/api/v2/sync/maindata?rid=1":
+            return 200, json.dumps({"rid": 2, "full_update": False, "torrents": {}}), {}
+        if url == "http://127.0.0.1:8081/api/v2/torrents/stop":
+            assert method == "POST"
+            assert body == "hashes=h1%7Ch2"
+            return 200, "Ok.", {}
+        raise AssertionError(url)
+
+    client = QbtHttpClient(
+        api_base="http://127.0.0.1:8081",
+        username="admin",
+        password="secret",
+        transport=transport,
+        timeout=7,
+    )
+
+    assert client.get_maindata(1)["rid"] == 2
+    assert client.post("/api/v2/torrents/stop", {"hashes": "h1|h2"}) == "Ok."
+
+    assert [c[0] for c in calls] == ["POST", "GET", "POST"]
+    assert calls[0][4] == 7
+
+
+def test_qbt_http_client_reauthenticates_once_after_unauthorized_response():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    calls = []
+
+    def transport(method, url, body, headers, timeout):
+        calls.append((method, url, body, dict(headers)))
+        if url.endswith("/api/v2/auth/login"):
+            return 200, "Ok.", {"Set-Cookie": "SID=fresh; Path=/"}
+        if len([c for c in calls if c[1].endswith("/api/v2/app/preferences")]) == 1:
+            return 401, "Unauthorized", {}
+        assert headers.get("Cookie") == "SID=fresh"
+        return 200, json.dumps({"save_path": "/downloads/active"}), {}
+
+    client = QbtHttpClient(
+        api_base="http://127.0.0.1:8081",
+        username="admin",
+        password="secret",
+        transport=transport,
+    )
+
+    assert client.get_preferences() == {"save_path": "/downloads/active"}
+    assert [c[1] for c in calls] == [
+        "http://127.0.0.1:8081/api/v2/auth/login",
+        "http://127.0.0.1:8081/api/v2/app/preferences",
+        "http://127.0.0.1:8081/api/v2/auth/login",
+        "http://127.0.0.1:8081/api/v2/app/preferences",
+    ]
+
+
+def test_qbt_http_client_uses_same_public_methods_as_docker_client():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    responses = {
+        "/api/v2/torrents/info?hashes=h1": json.dumps([{"hash": "h1", "seq_dl": True}]),
+        "/api/v2/torrents/files?hash=h1": json.dumps([{"name": "a.mp4", "size": 1}]),
+        "/api/v2/torrents/properties?hash=h1": json.dumps({"piece_size": 4194304}),
+        "/api/v2/app/setPreferences": "Ok.",
+    }
+
+    def transport(method, url, body, headers, timeout):
+        suffix = url.removeprefix("http://127.0.0.1:8081")
+        if suffix == "/api/v2/auth/login":
+            return 200, "Ok.", {"Set-Cookie": "SID=abc; Path=/"}
+        if suffix == "/api/v2/app/setPreferences":
+            assert body == "json=%7B%22preallocate_all%22%3A+true%7D"
+        return 200, responses[suffix], {}
+
+    client = QbtHttpClient(username="admin", password="secret", transport=transport)
+
+    assert client.torrent_info("h1") == {"hash": "h1", "seq_dl": True}
+    assert client.torrent_files("h1") == [{"name": "a.mp4", "size": 1, "index": 0}]
+    assert client.torrent_properties("h1") == {"piece_size": 4194304}
+    assert client.set_preferences({"preallocate_all": True}) == "Ok."
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
