@@ -68,13 +68,25 @@ class DownloadPlanner:
         self.slow_active_demote_sec = int(slow_active_demote_sec)
         self.now = now or (lambda: int(time.time()))
 
-    def plan_and_apply(self, snapshots: Mapping[str, Mapping[str, Any]], free_bytes: int, sync_healthy: bool) -> PlannerResult:
+    def plan_and_apply(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        free_bytes: int,
+        sync_healthy: bool,
+        protected_running_hashes: set[str] | None = None,
+        forced_active_hashes: set[str] | None = None,
+        cooldown_hashes: set[str] | None = None,
+        external_reserved_bytes: int = 0,
+    ) -> PlannerResult:
+        protected_running_hashes = {str(h) for h in (protected_running_hashes or set())}
+        forced_active_hashes = {str(h) for h in (forced_active_hashes or set())}
+        cooldown_hashes = {str(h) for h in (cooldown_hashes or set())}
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
         previous_allocations = self._allocation_rows()
         dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
         now = int(self.now())
-        active_reservations = self._active_reservation_bytes(now)
-        budget = max(0, int(free_bytes) - self.disk_floor_bytes - sum(active_reservations.values()))
+        active_reservations = self._active_reservation_bytes(now, ignored_kinds={"soak_probe"} if int(external_reserved_bytes or 0) > 0 else set())
+        budget = max(0, int(free_bytes) - self.disk_floor_bytes - sum(active_reservations.values()) - int(external_reserved_bytes or 0))
         if not sync_healthy:
             for torrent in managed:
                 self._decision(str(torrent["hash"]), "hold", "sync_unhealthy", {"free_bytes": free_bytes})
@@ -94,15 +106,30 @@ class DownloadPlanner:
             and str((previous_allocations.get(str(t["hash"])) or {}).get("desired_state") or "") == "active"
             and self._should_demote_active(str(t["hash"]), t, health_rows.get(str(t["hash"])), now)
         }
+        cooldown_hashes |= active_slow
         candidates = sorted(
-            [t for t in managed if int(t.get("amount_left") or 0) > 0 and str(t.get("hash")) not in dead_hashes],
+            [
+                t
+                for t in managed
+                if int(t.get("amount_left") or 0) > 0
+                and str(t.get("hash")) not in dead_hashes
+                and str(t.get("hash")) not in cooldown_hashes
+                and (str(t.get("hash")) not in protected_running_hashes or str(t.get("hash")) in forced_active_hashes)
+            ],
             key=lambda t: (int(t.get("amount_left") or 0), -int(t.get("num_seeds") or 0), -int(t.get("num_peers") or 0), str(t.get("hash"))),
         )
         selected: list[dict[str, Any]] = []
         used = 0
-        for torrent in candidates:
-            if str(torrent.get("hash")) in active_slow:
+        forced_candidates = [t for t in candidates if str(t.get("hash")) in forced_active_hashes]
+        regular_candidates = [t for t in candidates if str(t.get("hash")) not in forced_active_hashes]
+        for torrent in forced_candidates:
+            amount_left = int(torrent.get("amount_left") or 0)
+            incremental_reserved_bytes = max(0, amount_left - int(active_reservations.get(str(torrent.get("hash")), 0)))
+            if len(selected) >= self.active_slots or used + incremental_reserved_bytes > budget:
                 continue
+            selected.append(torrent)
+            used += incremental_reserved_bytes
+        for torrent in regular_candidates:
             amount_left = int(torrent.get("amount_left") or 0)
             incremental_reserved_bytes = max(0, amount_left - int(active_reservations.get(str(torrent.get("hash")), 0)))
             if len(selected) >= self.active_slots or used + incremental_reserved_bytes > budget:
@@ -113,7 +140,13 @@ class DownloadPlanner:
         selected_hashes = [str(t["hash"]) for t in selected]
         selected_set = set(selected_hashes)
         start_hashes = [str(t["hash"]) for t in selected if _is_stopped_download(t)]
-        paused_hashes = [str(t["hash"]) for t in managed if str(t["hash"]) not in selected_set and _is_running_download(t)]
+        paused_hashes = [
+            str(t["hash"])
+            for t in managed
+            if str(t["hash"]) not in selected_set
+            and str(t["hash"]) not in protected_running_hashes
+            and _is_running_download(t)
+        ]
 
         seq_desired_actions: list[tuple[str, bool]] = []
         for torrent in managed:
@@ -128,6 +161,15 @@ class DownloadPlanner:
                 )
                 if self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
+            elif h in cooldown_hashes:
+                reason = "active_slow_3min" if h in active_slow else "cooldown"
+                desired = "soak" if h in active_slow else "soak_cooldown"
+                self._allocation(h, desired, desired, 0, False, now, reason)
+                self._decision(h, desired, reason, {"budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0)})
+                if h in active_slow:
+                    self._mark_soak_cooldown(h, now, "cooldown_active_slow")
+                if self._needs_seq_desired(h, False, previous_allocations):
+                    seq_desired_actions.append((h, False))
         for torrent in candidates:
             h = str(torrent["hash"])
             if h in selected_set:
@@ -138,17 +180,17 @@ class DownloadPlanner:
                     int(torrent.get("stalled_seconds") or 0),
                 )
                 self._allocation(h, "active", "stable", int(torrent.get("amount_left") or 0), seq, now, "budget_fit")
-                self._decision(h, "active", "budget_fit", {"reserved_bytes": int(torrent.get("amount_left") or 0), "budget_bytes": budget})
+                self._decision(h, "active", "budget_fit", {"reserved_bytes": int(torrent.get("amount_left") or 0), "budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0)})
                 if seq and self._needs_seq_desired(h, True, previous_allocations):
                     seq_desired_actions.append((h, True))
             elif h in active_slow:
                 self._allocation(h, "soak", "soak", 0, False, now, "active_slow_3min")
-                self._decision(h, "soak", "active_slow_3min", {"budget_bytes": budget})
+                self._decision(h, "soak", "active_slow_3min", {"budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0)})
                 if self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
             else:
                 self._allocation(h, "soak", "soak", 0, False, now, "budget_or_slot_exhausted")
-                self._decision(h, "soak", "budget_or_slot_exhausted", {"budget_bytes": budget})
+                self._decision(h, "soak", "budget_or_slot_exhausted", {"budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0)})
                 if self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
 
@@ -185,7 +227,8 @@ class DownloadPlanner:
         finally:
             con.close()
 
-    def _active_reservation_bytes(self, now: int) -> dict[str, int]:
+    def _active_reservation_bytes(self, now: int, ignored_kinds: set[str] | None = None) -> dict[str, int]:
+        ignored_kinds = ignored_kinds or set()
         con = _connect(self.state_db)
         try:
             rows = con.execute(
@@ -198,6 +241,8 @@ class DownloadPlanner:
                 key = str(row["hash"] or f"{row['kind']}:{row['id']}")
                 bucket = grouped.setdefault(key, {"active_download": 0, "batch": 0, "other": 0})
                 kind = str(row["kind"] or "")
+                if kind in ignored_kinds:
+                    continue
                 if kind == "active_download":
                     bucket["active_download"] += int(row["bytes"] or 0)
                 elif kind == "batch":
@@ -422,6 +467,18 @@ class DownloadPlanner:
                         )
 
         write_transaction(self.state_db, txn)
+
+    def _mark_soak_cooldown(self, hash: str, now: int, reason: str) -> None:
+        cooldown_until = int(now) + 1800
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into soak_state(hash,state,ema_dlspeed_bps,cooldown_until,last_stopped_at,exposure_bytes,last_sample_at,updated_at,reason) "
+                "values(?,?,?,?,?,?,?,?,?) "
+                "on conflict(hash) do update set state=excluded.state,cooldown_until=excluded.cooldown_until,last_stopped_at=excluded.last_stopped_at,exposure_bytes=excluded.exposure_bytes,updated_at=excluded.updated_at,reason=excluded.reason",
+                (hash, "soak_cooldown", 0, cooldown_until, now, 0, now, now, reason),
+            ),
+        )
 
     def _decision(self, hash: str, decision: str, reason_code: str, data: dict[str, Any]) -> None:
         write_transaction(

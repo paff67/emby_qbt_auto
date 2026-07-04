@@ -23,6 +23,7 @@ from .runtime import BotCommandRepository, BotNotificationRepository, CleanupReq
 from .runtime import ObservabilityStore
 from .seeding_preemption import PreemptionConfig, SeedingPreemptionService
 from .service import DaemonRuntime, build_telegram_supervisor_from_env
+from .soak_queue import SoakQueueConfig
 
 
 class PassthroughBackfill:
@@ -76,6 +77,23 @@ def _build_preemption_from_env(state_db: Path, executor, env=os.environ, global_
         remote=env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:"),
     )
 
+def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
+    return SoakQueueConfig(
+        enabled=(_truthy(env.get("QBT_ORCH_SOAK_ENABLED")) is not False),
+        resident_slots=int(env.get("QBT_ORCH_SOAK_RESIDENT_SLOTS", "8")),
+        min_free_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_FREE_GB", "8")) * 1024**3),
+        disk_floor_bytes=int(float(env.get("QBT_ORCH_DISK_FLOOR_GB", "2")) * 1024**3),
+        max_total_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MAX_EXPOSURE_GB", "4")) * 1024**3),
+        min_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_EXPOSURE_MB", "128")) * 1024**2),
+        max_per_torrent_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB", "512")) * 1024**2),
+        exposure_horizon_sec=int(env.get("QBT_ORCH_SOAK_EXPOSURE_HORIZON_SEC", "900")),
+        hot_bps=int(env.get("QBT_ORCH_SOAK_HOT_BPS", str(1024**2))),
+        low_bps=int(env.get("QBT_ORCH_SOAK_LOW_BPS", str(100 * 1024))),
+        hot_confirm_sec=int(env.get("QBT_ORCH_SOAK_HOT_CONFIRM_SEC", "60")),
+        cooldown_sec=int(env.get("QBT_ORCH_SOAK_COOLDOWN_SEC", "1800")),
+        max_qbt_active_downloads=int(env.get("QBT_ORCH_SOAK_MAX_QBT_ACTIVE_DOWNLOADS", "16")),
+    )
+
 def _print_json(obj) -> None: print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 def _truthy(value: str | None) -> bool | None:
@@ -122,7 +140,17 @@ def _status_payload(db: Path, view: str | None) -> dict:
         if view == "queue":
             rows = con.execute("select state,count(*) as count from torrent_jobs group by state").fetchall()
             by_state = {str(r["state"]): int(r["count"]) for r in rows}
-            return {"by_state": by_state, "recoverable_jobs": len(recover_jobs(db))}
+            scheduler_rows = con.execute("select desired_state,count(*) as count from scheduler_allocations group by desired_state").fetchall()
+            scheduler_by_state = {str(r["desired_state"]): int(r["count"]) for r in scheduler_rows}
+            soak_probe_reserved = con.execute(
+                "select coalesce(sum(bytes),0) from resource_reservations where kind='soak_probe' and state='active'"
+            ).fetchone()[0]
+            return {
+                "by_state": by_state,
+                "recoverable_jobs": len(recover_jobs(db)),
+                "scheduler_by_state": scheduler_by_state,
+                "soak_probe_reserved_bytes": int(soak_probe_reserved or 0),
+            }
         if view == "db":
             return {"counts": readonly_counts(db), "recoverable_jobs": len(recover_jobs(db))}
         if view == "perf":
@@ -308,6 +336,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         and not dry_run
     )
     background_event_workers = background_event_env if background_event_env is not None else default_background_event_workers
+    soak_enabled = _truthy(os.environ.get("QBT_ORCH_SOAK_ENABLED"))
+    if soak_enabled is None:
+        soak_enabled = False
+    soak_dry_env = _truthy(os.environ.get("QBT_ORCH_SOAK_DRY_RUN"))
+    soak_dry_run = True if dry_run else (soak_dry_env if soak_dry_env is not None else False)
+    soak_config = _build_soak_config_from_env(os.environ)
     runtime = DaemonRuntime(
         state_db=state_db,
         qbt=qbt,
@@ -344,6 +378,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         carousel_dry_run=carousel_dry_run,
         path_reconciler=path_reconciler,
         preemption_service=preemption_service,
+        soak_enabled=bool(soak_enabled and soak_config.enabled),
+        soak_dry_run=soak_dry_run,
+        soak_config=soak_config,
         batch_pipeline_enabled=batch_pipeline_enabled,
         batch_live_verify=batch_live_verify,
         batch_allow_hashes=batch_allow_hashes,

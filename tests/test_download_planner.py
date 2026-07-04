@@ -549,6 +549,91 @@ def test_planner_creates_refreshes_and_releases_active_download_reservations():
         }]
 
 
+
+def test_planner_does_not_pause_protected_resident_soak():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        planner = DownloadPlanner(db, executor, dry_run=False, active_slots=1, disk_floor_bytes=0)
+        snapshots = {
+            "active": {"hash": "active", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 10, "progress": 0.1},
+            "soak": {"hash": "soak", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 9, "size": 10, "progress": 0.1},
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=100,
+            sync_healthy=True,
+            protected_running_hashes={"soak"},
+        )
+
+        assert result.selected_hashes == ["active"]
+        assert ("/api/v2/torrents/stop", {"hashes": "soak"}) not in executor.posts
+        assert ("/api/v2/torrents/start", {"hashes": "active"}) in executor.posts
+
+
+def test_planner_excludes_cooldown_hash_from_full_active_selection():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        planner = DownloadPlanner(db, executor, dry_run=False, active_slots=1, disk_floor_bytes=0)
+        snapshots = {
+            "cool": {"hash": "cool", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 10, "progress": 0.1},
+            "fresh": {"hash": "fresh", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 2, "size": 10, "progress": 0.1},
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=100,
+            sync_healthy=True,
+            cooldown_hashes={"cool"},
+        )
+
+        assert result.selected_hashes == ["fresh"]
+        alloc = _rows(db, "select hash,desired_state,reason from scheduler_allocations order by hash")
+        assert {r["hash"]: (r["desired_state"], r["reason"]) for r in alloc}["cool"] == ("soak_cooldown", "cooldown")
+
+
+def test_planner_subtracts_external_soak_reservations_from_full_active_budget():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        planner = DownloadPlanner(db, executor, dry_run=False, active_slots=1, disk_floor_bytes=2 * gib)
+        snapshots = {
+            "h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": gib, "size": 2 * gib, "progress": 0.5},
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=5 * gib,
+            sync_healthy=True,
+            external_reserved_bytes=3 * gib,
+        )
+
+        assert result.selected_hashes == []
+        assert executor.posts == []
+        decision = _rows(db, "select decision,reason_code,data_json from decision_log where hash='h1' order by id desc limit 1")[0]
+        assert decision["decision"] == "soak"
+        assert decision["reason_code"] == "budget_or_slot_exhausted"
+        assert json.loads(decision["data_json"])["external_reserved_bytes"] == 3 * gib
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):

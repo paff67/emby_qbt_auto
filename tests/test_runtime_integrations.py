@@ -47,7 +47,7 @@ def test_qbt_docker_client_uses_container_local_api_and_parses_json():
     assert runner.calls[3][1] == "hashes=h1"
 
 
-def test_rclone_client_copyto_and_lsjson_size_use_root_config_without_logging_secret():
+def test_rclone_client_copyto_and_lsjson_size_use_root_config_with_redaction():
     from qbt_orchestrator.integrations.rclone import RcloneClient
 
     runner = RecordingRunner(outputs=["", json.dumps([{"Name": "a.mp4", "Size": 123}])])

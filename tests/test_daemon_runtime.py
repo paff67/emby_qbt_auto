@@ -1034,6 +1034,114 @@ def test_daemon_file_batch_live_respects_upload_backpressure_policy():
         assert event == ("upload_backpressure", "new_upload_blocked")
 
 
+
+def test_runtime_planner_tick_runs_soak_queue_before_planner_and_protects_residents():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+    from qbt_orchestrator.soak_queue import SoakQueueConfig
+
+    class SeqExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.seq = []
+        def set_seq_dl(self, hash, desired):
+            self.seq.append((hash, desired))
+            return True
+
+    class SnapshotQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "active": {"hash": "active", "name": "Active", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 10, "progress": 0.1},
+                    "soak": {"hash": "soak", "name": "Soak", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 9, "size": 10, "progress": 0.9},
+                },
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = SeqExecutor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=SnapshotQbt(),
+            executor=executor,
+            free_bytes_provider=lambda: 20 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            planner_dry_run=False,
+            planner_active_slots=1,
+            soak_enabled=True,
+            soak_dry_run=False,
+            soak_config=SoakQueueConfig(resident_slots=1, min_free_bytes=0, disk_floor_bytes=0, max_qbt_active_downloads=16),
+        )
+        daemon.tick_safety()
+        result = daemon.planner_tick()
+
+        assert result["soak_queue"]["started"] == ["soak"]
+        assert result["planner"]["selected_hashes"] == ["active"]
+        assert ("/api/v2/torrents/start", {"hashes": "soak"}) in executor.posts
+        assert ("/api/v2/torrents/start", {"hashes": "active"}) in executor.posts
+        assert ("/api/v2/torrents/stop", {"hashes": "soak"}) not in executor.posts
+
+
+def test_cli_builds_soak_queue_from_env_with_live_defaults():
+    import argparse
+    import os
+    from qbt_orchestrator.cli import _build_runtime
+    from qbt_orchestrator.db import migrate
+
+    keys = [
+        "QBT_ORCH_STATE_DB", "QBT_ORCH_DRY_RUN", "QBT_ORCH_PLANNER_DRY_RUN", "QBT_ORCH_SOAK_ENABLED",
+        "QBT_ORCH_SOAK_DRY_RUN", "QBT_ORCH_SOAK_RESIDENT_SLOTS", "QBT_ORCH_SOAK_MIN_FREE_GB",
+        "QBT_ORCH_SOAK_MAX_EXPOSURE_GB", "QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB",
+        "QBT_ORCH_DISK_PATH", "QBT_ORCH_ORPHAN_JANITOR", "QBT_ORCH_JUNK_JANITOR", "QBT_ORCH_CAROUSEL",
+        "QBT_ORCH_QBT_PREFERENCES_GUARD", "QBT_ORCH_PATH_RECONCILE",
+    ]
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "state.sqlite"
+            migrate(db, dry_run=False)
+            os.environ.update({
+                "QBT_ORCH_STATE_DB": str(db),
+                "QBT_ORCH_DRY_RUN": "0",
+                "QBT_ORCH_PLANNER_DRY_RUN": "0",
+                "QBT_ORCH_SOAK_ENABLED": "1",
+                "QBT_ORCH_SOAK_DRY_RUN": "0",
+                "QBT_ORCH_SOAK_RESIDENT_SLOTS": "8",
+                "QBT_ORCH_SOAK_MIN_FREE_GB": "8",
+                "QBT_ORCH_SOAK_MAX_EXPOSURE_GB": "4",
+                "QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB": "512",
+                "QBT_ORCH_DISK_PATH": td,
+                "QBT_ORCH_ORPHAN_JANITOR": "0",
+                "QBT_ORCH_JUNK_JANITOR": "0",
+                "QBT_ORCH_CAROUSEL": "0",
+                "QBT_ORCH_QBT_PREFERENCES_GUARD": "0",
+                "QBT_ORCH_PATH_RECONCILE": "0",
+            })
+            ns = argparse.Namespace(cmd="daemon", dry_run=False, config=None, safety_interval=0, max_safety_ticks=1)
+            runtime, dry_run = _build_runtime(ns, db)
+
+            assert dry_run is False
+            assert runtime.planner_dry_run is False
+            assert runtime.soak_queue_service is not None
+            assert runtime.soak_queue_service.dry_run is False
+            assert runtime.soak_queue_service.config.resident_slots == 8
+            assert runtime.soak_queue_service.config.min_free_bytes == 8 * 1024**3
+            assert runtime.soak_queue_service.config.max_total_exposure_bytes == 4 * 1024**3
+            assert runtime.soak_queue_service.config.max_per_torrent_exposure_bytes == 512 * 1024**2
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):

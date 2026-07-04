@@ -19,6 +19,7 @@ from .observability import redact
 from .planner import DownloadPlanner
 from .policies.disk import classify_disk
 from .runtime import BotCommandRepository, ObservabilityStore
+from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
 from .telegram_control import TelegramAuthorizer
 
 
@@ -161,6 +162,10 @@ class DaemonRuntime:
         carousel_dry_run: bool = True,
         path_reconciler=None,
         preemption_service=None,
+        soak_queue_service=None,
+        soak_enabled: bool = False,
+        soak_dry_run: bool = True,
+        soak_config: SoakQueueConfig | None = None,
         batch_pipeline_enabled: bool = False,
         batch_live_verify: bool = False,
         batch_allow_hashes: set[str] | None = None,
@@ -203,6 +208,18 @@ class DaemonRuntime:
         self.junk_janitor = junk_janitor
         self.path_reconciler = path_reconciler
         self.preemption_service = preemption_service
+        self.soak_dry_run = soak_dry_run or dry_run
+        if soak_queue_service is not None:
+            self.soak_queue_service = soak_queue_service
+        elif soak_enabled:
+            self.soak_queue_service = SoakQueueService(
+                self.state_db,
+                self.executor,
+                dry_run=self.soak_dry_run,
+                config=soak_config or SoakQueueConfig(),
+            )
+        else:
+            self.soak_queue_service = None
         self.batch_pipeline_enabled = bool(batch_pipeline_enabled)
         self.batch_live_verify = bool(batch_live_verify)
         self.batch_allow_hashes = {str(item).strip().lower() for item in (batch_allow_hashes or set()) if str(item).strip()}
@@ -258,6 +275,16 @@ class DaemonRuntime:
 
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        free_bytes = int(self.free_bytes_provider())
+        sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
+        if self.soak_queue_service is not None:
+            soak_result = self.soak_queue_service.run_once(
+                snapshots,
+                free_bytes=free_bytes,
+                sync_healthy=sync_healthy,
+            )
+        else:
+            soak_result = SoakQueueResult(dry_run=self.dry_run)
         planner = DownloadPlanner(
             self.state_db,
             self.executor,
@@ -265,14 +292,17 @@ class DaemonRuntime:
             active_slots=self.planner_active_slots,
             slow_active_demote_sec=self.planner_slow_active_demote_sec,
         )
-        free_bytes = int(self.free_bytes_provider())
         result = planner.plan_and_apply(
             snapshots,
             free_bytes=free_bytes,
-            sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+            sync_healthy=sync_healthy,
+            protected_running_hashes=soak_result.protected_hashes,
+            forced_active_hashes=set(soak_result.hot_hashes),
+            cooldown_hashes=set(soak_result.cooldown_hashes),
+            external_reserved_bytes=int(soak_result.reserved_bytes),
         )
         preemption_result = None
-        if self.preemption_service is not None and bool(self.monitor.sync.high_risk_actions_allowed):
+        if self.preemption_service is not None and sync_healthy:
             preemption_result = self.preemption_service.evaluate_and_apply(
                 snapshots,
                 disk_state=classify_disk(free_bytes).state.value,
@@ -285,6 +315,14 @@ class DaemonRuntime:
             "conservative": result.conservative,
             "budget_bytes": result.budget_bytes,
             "planner_dry_run": self.planner_dry_run,
+            "planner": {
+                "selected_hashes": result.selected_hashes,
+                "paused_hashes": result.paused_hashes,
+                "conservative": result.conservative,
+                "budget_bytes": result.budget_bytes,
+                "planner_dry_run": self.planner_dry_run,
+            },
+            "soak_queue": soak_result.as_dict(),
             "preemption": None if preemption_result is None else getattr(preemption_result, "__dict__", preemption_result),
         }
 

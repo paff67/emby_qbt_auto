@@ -605,6 +605,27 @@ def test_cli_wires_qbt_api_rate_limit_env_to_client():
         assert FakeQbtClient.kwargs["api_max_requests_per_sec"] == 2.0
 
 
+
+def test_status_queue_includes_soak_counts():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute("insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,reserved_bytes,allocated_at,reason) values('s1','soak_resident','soak_resident','soak_resident',128,1,'budget_fit')")
+        con.execute("insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,reserved_bytes,allocated_at,reason) values('s2','soak_hot','soak_hot','soak_hot',256,1,'hot_promoted')")
+        con.execute("insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values('s1','soak_probe',128,'active',1,999,'soak_resident')")
+        con.execute("insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values('s2','soak_probe',256,'active',1,999,'soak_resident')")
+        con.commit(); con.close()
+
+        payload = json.loads(run_cli(["status", "queue", "--state-db", str(db), "--json"])[1])
+
+        assert payload["scheduler_by_state"]["soak_resident"] == 1
+        assert payload["scheduler_by_state"]["soak_hot"] == 1
+        assert payload["soak_probe_reserved_bytes"] == 384
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
