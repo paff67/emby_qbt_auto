@@ -459,6 +459,48 @@ def test_file_batch_service_pipeline_reserves_remaining_bytes_for_partial_file()
         assert batch["reserved_bytes"] == gib + 32 * 1024**2 + 128 * 1024**2
 
 
+def test_file_batch_service_pipeline_does_not_reselect_inflight_batch_indices():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+            ("big", 1, "downloading", "pipeline", "[0]", 5 * gib, gib, 900, 900),
+        )
+        con.commit(); con.close()
+        qbt = BatchQbt(
+            [
+                {"index": 0, "name": "Big/A.mp4", "size": 5 * gib, "progress": 0.8, "priority": 1},
+                {"index": 1, "name": "Big/B.mp4", "size": 512 * 1024**2, "progress": 0.0, "priority": 0},
+            ]
+        )
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            max_inflight_batches_per_torrent=2,
+            now=lambda: 1_000,
+        )
+
+        result = service.sync_completed(
+            {"big": {"hash": "big", "name": "Big", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 2 * gib, "size": 6 * gib, "progress": 0.7}},
+            free_bytes=6 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        batches = _rows(db, "select batch_no,indices_json from torrent_batches order by id")
+        assert [(row["batch_no"], json.loads(row["indices_json"])) for row in batches] == [(1, [0]), (2, [1])]
+        assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "1", "priority": "1"}) in qbt.calls
+        assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "0", "priority": "0"}) not in qbt.calls
+
+
 def test_file_batch_service_pipeline_dry_run_and_qbt_failure_do_not_leave_active_reservation():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService

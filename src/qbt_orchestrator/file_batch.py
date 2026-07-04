@@ -218,7 +218,8 @@ class FileBatchService:
         except Exception as exc:
             self.obs.event("error", "file_batch", "batch_file_probe_failed", str(redact(str(exc))), {"hash": h}, hash=h)
             return {"created": 0, "blocked": 1, "upload_queued": queued}
-        selected, reservation = self._select_batch_files(files, piece_size, free_bytes)
+        already_selected_indices = self._inflight_batch_indices(h)
+        selected, reservation = self._select_batch_files(files, piece_size, free_bytes, already_selected_indices=already_selected_indices)
         if not selected or reservation is None:
             reason_code = "live_verify_batch_size_cap" if self._first_pending_file_exceeds_live_cap(files, piece_size, free_bytes) else "batch_budget_insufficient"
             self._decision(
@@ -275,7 +276,7 @@ class FileBatchService:
             return {"created": 0, "blocked": 0, "upload_queued": queued}
         batch_id = self._create_batch_and_reservation(h, indices, reservation, piece_size)
         try:
-            self._apply_batch_to_qbt(h, indices, [int(f.get("index")) for f in files], should_start=_is_stopped(torrent))
+            self._apply_batch_to_qbt(h, indices, [int(f.get("index")) for f in files], should_start=_is_stopped(torrent), protected_indices=already_selected_indices)
         except Exception as exc:
             self._mark_batch_failed(batch_id, str(exc))
             return {"created": 0, "blocked": 1, "upload_queued": queued}
@@ -433,10 +434,13 @@ class FileBatchService:
             return max(1, int(props.get("piece_size") or props.get("pieceSize") or 16 * 1024**2))
         return 16 * 1024**2
 
-    def _select_batch_files(self, files: list[Mapping[str, Any]], piece_size: int, free_bytes: int):
+    def _select_batch_files(self, files: list[Mapping[str, Any]], piece_size: int, free_bytes: int, already_selected_indices: set[int] | None = None):
         budget = self._safe_batch_budget(free_bytes)
         selected: list[Mapping[str, Any]] = []
+        already_selected_indices = already_selected_indices or set()
         for row in sorted(files, key=lambda f: int(f.get("index") or 0)):
+            if int(row.get("index") or 0) in already_selected_indices:
+                continue
             if float(row.get("progress") or 0) >= 1.0:
                 continue
             size = int(row.get("size") or 0)
@@ -538,6 +542,27 @@ class FileBatchService:
         finally:
             con.close()
 
+    def _inflight_batch_indices(self, h: str) -> set[int]:
+        states = ("reserved", "applied_to_qbt", "downloading", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_deferred")
+        placeholders = ",".join("?" for _ in states)
+        con = _connect(self.state_db)
+        try:
+            rows = con.execute(f"select indices_json from torrent_batches where hash=? and state in ({placeholders})", (h, *states)).fetchall()
+        finally:
+            con.close()
+        out: set[int] = set()
+        for row in rows:
+            try:
+                values = json.loads(row["indices_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            for value in values:
+                try:
+                    out.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+        return out
+
     def _next_batch_no(self, con: sqlite3.Connection, h: str) -> int:
         row = con.execute("select coalesce(max(batch_no),0)+1 from torrent_batches where hash=?", (h,)).fetchone()
         return int(row[0] if row else 1)
@@ -607,8 +632,9 @@ class FileBatchService:
             )
         write_transaction(self.state_db, txn)
 
-    def _apply_batch_to_qbt(self, h: str, selected_indices: list[int], all_indices: list[int], *, should_start: bool) -> None:
-        unselected = [i for i in all_indices if i not in set(selected_indices)]
+    def _apply_batch_to_qbt(self, h: str, selected_indices: list[int], all_indices: list[int], *, should_start: bool, protected_indices: set[int] | None = None) -> None:
+        protected_indices = protected_indices or set()
+        unselected = [i for i in all_indices if i not in set(selected_indices) and i not in protected_indices]
         if selected_indices:
             self._qbt_post("/api/v2/torrents/filePrio", {"hash": h, "id": "|".join(str(i) for i in selected_indices), "priority": "1"}, h)
         if unselected:
