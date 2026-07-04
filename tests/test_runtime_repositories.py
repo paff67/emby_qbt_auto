@@ -669,6 +669,34 @@ def test_reconcile_expired_running_upload_job_to_retry_wait():
         assert "lease expired" in row["last_stderr_tail"]
 
 
+def test_reconcile_exhausted_retry_wait_upload_job_to_failed():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, reconcile_jobs
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1000)
+        job_id = repo.enqueue("gone", None, "upload", {"local": "/missing", "remote": "gcrypt:/gone", "size": 1}, priority=1)
+        con = sqlite3.connect(db)
+        con.execute(
+            "update torrent_jobs set state='retry_wait', attempts=6, max_attempts=6, next_run_at=?, last_stderr_tail='directory not found' where id=?",
+            (999999, job_id),
+        )
+        con.commit(); con.close()
+
+        dry_report = reconcile_jobs(db, now=2000, dry_run=True)
+        assert dry_report["exhausted_retry_wait"] == 1
+        assert repo.get(job_id)["state"] == "retry_wait"
+
+        report = reconcile_jobs(db, now=2000, dry_run=False)
+        assert report["exhausted_retry_wait"] == 1
+        row = repo.get(job_id)
+        assert row["state"] == "failed"
+        assert row["last_exit_code"] == 1
+        assert "retry attempts exhausted" in row["last_stderr_tail"]
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):

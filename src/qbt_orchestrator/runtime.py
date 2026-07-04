@@ -551,8 +551,14 @@ def reconcile_jobs(state_db: str | Path, now: int | None = None, dry_run: bool =
     now = int(now if now is not None else time.time())
     con = _connect(state_db)
     rows = [dict(r) for r in con.execute("select * from torrent_jobs where state='running' and lease_until is not null and lease_until<?", (now,))]
+    exhausted_retry_wait = [
+        dict(r)
+        for r in con.execute(
+            "select * from torrent_jobs where state='retry_wait' and attempts>=max_attempts"
+        )
+    ]
     con.close()
-    if rows and not dry_run:
+    if (rows or exhausted_retry_wait) and not dry_run:
         def txn(wcon: sqlite3.Connection) -> None:
             for row in rows:
                 wcon.execute(
@@ -560,9 +566,19 @@ def reconcile_jobs(state_db: str | Path, now: int | None = None, dry_run: bool =
                     "last_stderr_tail=?, last_exit_code=coalesce(last_exit_code,1), updated_at=? where id=?",
                     (now + retry_delay_sec, "lease expired during reconcile", now, row["id"]),
                 )
+            for row in exhausted_retry_wait:
+                previous = str(row.get("last_stderr_tail") or "").strip()
+                message = "retry attempts exhausted"
+                if previous:
+                    message = f"{message}; last error: {previous}"
+                wcon.execute(
+                    "update torrent_jobs set state='failed', lease_owner=null, lease_until=null, next_run_at=null, "
+                    "last_stderr_tail=?, last_exit_code=coalesce(last_exit_code,1), updated_at=? where id=?",
+                    (redact(message)[:1000], now, row["id"]),
+                )
 
         write_transaction(state_db, txn)
-    return {"expired_running": len(rows), "dry_run": 1 if dry_run else 0}
+    return {"expired_running": len(rows), "exhausted_retry_wait": len(exhausted_retry_wait), "dry_run": 1 if dry_run else 0}
 
 
 class BotCommandRepository:
