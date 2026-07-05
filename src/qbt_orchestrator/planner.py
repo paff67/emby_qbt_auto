@@ -168,11 +168,13 @@ class DownloadPlanner:
         selected_hashes = [str(t["hash"]) for t in selected]
         selected_set = set(selected_hashes)
         start_hashes = [str(t["hash"]) for t in selected if _is_stopped_download(t)]
+        recovery_keep_running_slow = set(active_slow) if mode == "recovery" else set()
         paused_hashes = [
             str(t["hash"])
             for t in managed
             if str(t["hash"]) not in selected_set
             and str(t["hash"]) not in protected_running_hashes
+            and str(t["hash"]) not in recovery_keep_running_slow
             and _is_running_download(t)
         ]
 
@@ -191,10 +193,14 @@ class DownloadPlanner:
                     seq_desired_actions.append((h, False))
             elif h in cooldown_hashes:
                 reason = "active_slow_3min" if h in active_slow else "cooldown"
+                if h in recovery_keep_running_slow:
+                    reason = "active_slow_3min_recovery_soak"
                 desired = "soak" if h in active_slow else "soak_cooldown"
                 self._allocation(h, desired, desired, 0, False, now, reason)
                 self._decision(h, desired, reason, {"budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0)})
-                if h in active_slow:
+                if h in recovery_keep_running_slow:
+                    self._mark_soak_resident(h, now, "recovery_active_slow")
+                elif h in active_slow:
                     self._mark_soak_cooldown(h, now, "cooldown_active_slow")
                 if self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
@@ -595,6 +601,17 @@ class DownloadPlanner:
                 "values(?,?,?,?,?,?,?,?,?) "
                 "on conflict(hash) do update set state=excluded.state,cooldown_until=excluded.cooldown_until,last_stopped_at=excluded.last_stopped_at,exposure_bytes=excluded.exposure_bytes,updated_at=excluded.updated_at,reason=excluded.reason",
                 (hash, "soak_cooldown", 0, cooldown_until, now, 0, now, now, reason),
+            ),
+        )
+
+    def _mark_soak_resident(self, hash: str, now: int, reason: str) -> None:
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into soak_state(hash,state,ema_dlspeed_bps,resident_since,cooldown_until,last_started_at,exposure_bytes,last_sample_at,updated_at,reason) "
+                "values(?,?,?,?,?,?,?,?,?,?) "
+                "on conflict(hash) do update set state=excluded.state,resident_since=coalesce(soak_state.resident_since,excluded.resident_since),cooldown_until=null,last_started_at=coalesce(soak_state.last_started_at,excluded.last_started_at),exposure_bytes=excluded.exposure_bytes,last_sample_at=excluded.last_sample_at,updated_at=excluded.updated_at,reason=excluded.reason",
+                (hash, "soak_resident", 0, now, None, now, 0, now, now, reason),
             ),
         )
 

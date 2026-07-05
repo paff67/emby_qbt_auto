@@ -151,6 +151,60 @@ def test_planner_reconciles_scheduler_allocations_for_hashes_absent_from_qbt_syn
         assert decisions == [{"hash": "absent", "decision": "allocation_reconciled", "reason_code": "qbt_absent"}]
 
 
+def test_planner_recovery_demotes_slow_active_into_running_soak_without_stopping_it():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    gib = 1024**3
+    mib = 1024**2
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,reserved_bytes,allocated_at,reason) "
+            "values('slow','active','active','stable',?,?,?)",
+            (120 * mib, 900, "budget_fit"),
+        )
+        con.execute(
+            "insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,low_speed_since,active_since,updated_at) "
+            "values('slow',900,0,100,100,0.98,1,1,900,900,900)"
+        )
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        snapshots = {
+            "slow": {"hash": "slow", "category": "auto", "tags": "auto", "state": "stalledDL", "amount_left": 120 * mib, "size": 6 * gib, "completed": 5 * gib, "progress": 0.98, "dlspeed": 0, "num_seeds": 1, "num_peers": 1},
+            "next": {"hash": "next", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 300 * mib, "size": 5 * gib, "completed": 4 * gib, "progress": 0.95, "dlspeed": 0, "num_seeds": 2, "num_peers": 2},
+        }
+        planner = DownloadPlanner(
+            db,
+            executor,
+            dry_run=False,
+            active_slots=5,
+            disk_floor_bytes=3 * gib,
+            recovery_enabled=True,
+            recovery_enter_bytes=3 * gib + 512 * mib,
+            emergency_floor_bytes=int(1.5 * gib),
+            recovery_margin_bytes=256 * mib,
+            recovery_active_slots=4,
+            recovery_max_remaining_bytes=int(1.5 * gib),
+            slow_active_demote_sec=180,
+            now=lambda: 1200,
+        )
+
+        result = planner.plan_and_apply(snapshots, free_bytes=2 * gib + 400 * mib, sync_healthy=True)
+
+        assert result.mode == "recovery"
+        assert result.selected_hashes == ["next"]
+        assert ("/api/v2/torrents/stop", {"hashes": "slow"}) not in executor.posts
+        assert ("/api/v2/torrents/start", {"hashes": "next"}) in executor.posts
+        alloc = _rows(db, "select desired_state,reason from scheduler_allocations where hash='slow'")[0]
+        assert alloc == {"desired_state": "soak", "reason": "active_slow_3min_recovery_soak"}
+        soak = _rows(db, "select state,cooldown_until,reason from soak_state where hash='slow'")[0]
+        assert soak == {"state": "soak_resident", "cooldown_until": None, "reason": "recovery_active_slow"}
+
+
 def test_planner_resets_active_and_low_speed_timers_when_promoting_from_soak():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner
