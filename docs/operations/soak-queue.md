@@ -2,11 +2,13 @@
 
 `soak_resident` 是独立于 full active slots 的常驻探测队列。它启动低速/未知速度任务，但只按短期 exposure 预留空间，默认单任务 128-512MiB，总 exposure 上限 4GiB。
 
-当前策略更激进：`QBT_ORCH_DISK_FLOOR_GB=3` 是统一的安全地板。只要 `free_bytes - disk_floor - active/batch reservations` 仍有预算，soak 会常驻运行；历史 `QBT_ORCH_SOAK_MIN_FREE_GB` 只保留为兼容字段，不再作为 6-8GiB 的硬停止阈值。
+当前策略更激进：`QBT_ORCH_DISK_FLOOR_GB=3` 是统一的 normal 调度地板，`QBT_ORCH_EMERGENCY_FLOOR_GB=1.5` 是 Safety Loop 硬停线。只要 `free_bytes - disk_floor - active/batch reservations` 仍有预算，soak 会常驻运行；进入 recovery 区间时，已有 resident soak 不因预算为负主动停止，而是优先限速。历史 `QBT_ORCH_SOAK_MIN_FREE_GB` 只保留为兼容字段，不再作为 6-8GiB 的硬停止阈值。
 
 `soak_hot` 是 resident soak 在 EMA 速度超过 `QBT_ORCH_SOAK_HOT_BPS` 并持续 `QBT_ORCH_SOAK_HOT_CONFIRM_SEC` 后的提权状态。预算不足时，它会尝试暂停非 hold、非 seed-long、非临近完成的 active 任务，释放 `active_download` reservation。
 
 当磁盘接近地板（默认 `QBT_ORCH_DISK_FLOOR_GB + QBT_ORCH_SOAK_LOW_CAPACITY_THROTTLE_MARGIN_GB`）且 soak 速度突增时，daemon 对对应 hash 调用 qBT `setDownloadLimit`，默认限速 `QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS=262144`，优先限速而不是因为速度突增停止 soak。容量恢复后会对上次低容量限速的 resident 解除限速（limit=0）。
+
+recovery mode：当 `1.5GiB <= free < QBT_ORCH_RECOVERY_ENTER_GB` 时，full active 只选择 `amount_left<=QBT_ORCH_RECOVERY_MAX_REMAINING_GB` 的高进度/小剩余任务，总 reservation 不能突破 `free - emergency_floor - recovery_margin`；新大 batch/carousel 仍由各自 min-free/预算阻断。
 
 常用检查：
 
@@ -23,6 +25,12 @@ sqlite3 /var/lib/qbt-orchestrator/state.sqlite "select hash,state,ema_dlspeed_bp
 
 ```env
 QBT_ORCH_DISK_FLOOR_GB=3
+QBT_ORCH_EMERGENCY_FLOOR_GB=1.5
+QBT_ORCH_RECOVERY_MODE=1
+QBT_ORCH_RECOVERY_ENTER_GB=3.5
+QBT_ORCH_RECOVERY_ACTIVE_SLOTS=4
+QBT_ORCH_RECOVERY_MAX_REMAINING_GB=1.5
+QBT_ORCH_RECOVERY_MARGIN_MB=256
 QBT_ORCH_SOAK_MIN_FREE_GB=0
 QBT_ORCH_SOAK_LOW_CAPACITY_THROTTLE_MARGIN_GB=1
 QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS=262144
@@ -35,4 +43,4 @@ QBT_ORCH_SOAK_THROTTLE_TRIGGER_BPS=1048576
 QBT_ORCH_SOAK_ENABLED=0
 ```
 
-修改后重启 `qbt-orchestrator-daemon.service`。Safety Loop 的 `<2GiB` 紧急暂停不依赖 Soak Queue，关闭 soak 不会影响 emergency pause。
+修改后重启 `qbt-orchestrator-daemon.service`。Safety Loop 的 `<1.5GiB` 紧急暂停不依赖 Soak Queue，关闭 soak 不会影响 emergency pause。

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Callable, Mapping
 
+from .alerts import SchedulerAlertConfig, SchedulerAlertService
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
 from .db import migrate, write_transaction
@@ -19,7 +20,7 @@ from .observe_promotion import ObservePromotionService
 from .observability import redact
 from .planner import DownloadPlanner
 from .policies.disk import classify_disk
-from .runtime import BotCommandRepository, ObservabilityStore
+from .runtime import BotCommandRepository, BotNotificationRepository, ObservabilityStore
 from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
 from .telegram_control import TelegramAuthorizer
 
@@ -140,6 +141,12 @@ class DaemonRuntime:
         planner_active_slots: int = 5,
         planner_slow_active_demote_sec: int = 180,
         disk_floor_bytes: int = 3 * 1024**3,
+        emergency_floor_bytes: int = int(1.5 * 1024**3),
+        recovery_enabled: bool = True,
+        recovery_enter_bytes: int | None = None,
+        recovery_margin_bytes: int = 256 * 1024**2,
+        recovery_active_slots: int = 4,
+        recovery_max_remaining_bytes: int = int(1.5 * 1024**3),
         upload_runner=None,
         upload_dry_run: bool = True,
         cleanup_runner=None,
@@ -178,6 +185,11 @@ class DaemonRuntime:
         background_event_workers: bool = False,
         event_worker_interval: float = 1.0,
         event_worker_join_timeout: float = 0.2,
+        scheduler_alerts_enabled: bool = False,
+        scheduler_alert_chat_ids: list[str] | None = None,
+        scheduler_alert_interval_sec: int = 1800,
+        disk_alert_margin_bytes: int = 512 * 1024**2,
+        scheduler_alert_service=None,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -192,6 +204,12 @@ class DaemonRuntime:
         self.planner_active_slots = int(planner_active_slots)
         self.planner_slow_active_demote_sec = int(planner_slow_active_demote_sec)
         self.disk_floor_bytes = int(disk_floor_bytes)
+        self.emergency_floor_bytes = int(emergency_floor_bytes)
+        self.recovery_enabled = bool(recovery_enabled)
+        self.recovery_enter_bytes = int(recovery_enter_bytes if recovery_enter_bytes is not None else self.disk_floor_bytes)
+        self.recovery_margin_bytes = int(recovery_margin_bytes)
+        self.recovery_active_slots = int(recovery_active_slots)
+        self.recovery_max_remaining_bytes = int(recovery_max_remaining_bytes)
         self.upload_runner = upload_runner
         self.upload_dry_run = upload_dry_run or dry_run
         self.cleanup_runner = cleanup_runner
@@ -247,8 +265,21 @@ class DaemonRuntime:
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
-        self.monitor = SafetyMonitor(qbt, executor, free_bytes_provider, managed_count_provider=managed_count_provider)
+        self.monitor = SafetyMonitor(qbt, executor, free_bytes_provider, managed_count_provider=managed_count_provider, emergency_floor_bytes=self.emergency_floor_bytes)
         self.obs = ObservabilityStore(self.state_db)
+        if scheduler_alert_service is not None:
+            self.scheduler_alert_service = scheduler_alert_service
+        else:
+            chat_ids = [str(x).strip() for x in (scheduler_alert_chat_ids or []) if str(x).strip()]
+            self.scheduler_alert_service = SchedulerAlertService(
+                BotNotificationRepository(self.state_db),
+                SchedulerAlertConfig(
+                    enabled=bool(scheduler_alerts_enabled and chat_ids),
+                    chat_ids=chat_ids,
+                    interval_sec=int(scheduler_alert_interval_sec),
+                    disk_alert_margin_bytes=int(disk_alert_margin_bytes),
+                ),
+            )
         self._stopping = False
 
     def stop(self, *_args) -> None:
@@ -297,6 +328,12 @@ class DaemonRuntime:
             active_slots=self.planner_active_slots,
             slow_active_demote_sec=self.planner_slow_active_demote_sec,
             disk_floor_bytes=self.disk_floor_bytes,
+            recovery_enabled=self.recovery_enabled,
+            recovery_enter_bytes=self.recovery_enter_bytes,
+            emergency_floor_bytes=self.emergency_floor_bytes,
+            recovery_margin_bytes=self.recovery_margin_bytes,
+            recovery_active_slots=self.recovery_active_slots,
+            recovery_max_remaining_bytes=self.recovery_max_remaining_bytes,
         )
         result = planner.plan_and_apply(
             snapshots,
@@ -311,25 +348,37 @@ class DaemonRuntime:
         if self.preemption_service is not None and sync_healthy:
             preemption_result = self.preemption_service.evaluate_and_apply(
                 snapshots,
-                disk_state=classify_disk(free_bytes).state.value,
+                disk_state=classify_disk(free_bytes, emergency_free_bytes=self.emergency_floor_bytes).state.value,
                 trigger_reason="planner_pressure",
                 selected_hashes=set(result.selected_hashes),
             )
+        alert_ids = self.scheduler_alert_service.evaluate_and_enqueue(
+            snapshots=snapshots,
+            free_bytes=free_bytes,
+            disk_floor_bytes=self.disk_floor_bytes,
+            recovery_enter_bytes=self.recovery_enter_bytes,
+            emergency_floor_bytes=self.emergency_floor_bytes,
+            planner_result=result,
+            sync_healthy=sync_healthy,
+        )
         return {
             "selected": result.selected_hashes,
             "paused": result.paused_hashes,
             "conservative": result.conservative,
             "budget_bytes": result.budget_bytes,
+            "mode": result.mode,
             "planner_dry_run": self.planner_dry_run,
             "planner": {
                 "selected_hashes": result.selected_hashes,
                 "paused_hashes": result.paused_hashes,
                 "conservative": result.conservative,
                 "budget_bytes": result.budget_bytes,
+                "mode": result.mode,
                 "planner_dry_run": self.planner_dry_run,
             },
             "soak_queue": soak_result.as_dict(),
             "preemption": None if preemption_result is None else getattr(preemption_result, "__dict__", preemption_result),
+            "alerts_enqueued": alert_ids,
         }
 
     def file_batch_tick(self) -> dict:

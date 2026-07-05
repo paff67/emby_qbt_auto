@@ -22,6 +22,8 @@ class SoakQueueConfig:
     # longer acts as a hard gate. Disk-floor budget below decides starts.
     min_free_bytes: int = 0
     disk_floor_bytes: int = 3 * 1024**3
+    emergency_floor_bytes: int = int(1.5 * 1024**3)
+    recovery_margin_bytes: int = 256 * 1024**2
     max_total_exposure_bytes: int = 4 * 1024**3
     min_exposure_bytes: int = 128 * 1024**2
     max_per_torrent_exposure_bytes: int = 512 * 1024**2
@@ -268,6 +270,7 @@ class SoakQueueService:
         snapshots: Mapping[str, Mapping[str, Any]],
         now: int,
     ) -> tuple[list[Mapping[str, Any]], dict[str, int], list[str]]:
+        recovery_mode = int(self.config.emergency_floor_bytes) <= int(free_bytes) < int(self.config.disk_floor_bytes)
         safe_budget = max(0, int(free_bytes) - int(self.config.disk_floor_bytes) - self._non_soak_reservation_bytes(now))
         cap = min(int(self.config.max_total_exposure_bytes), safe_budget)
         out: list[Mapping[str, Any]] = []
@@ -276,6 +279,20 @@ class SoakQueueService:
         for torrent in selected:
             h = str(torrent["hash"])
             exposure = int(exposures.get(h) or 0)
+            if recovery_mode and self._is_existing_running_resident(h, torrent, rows):
+                out.append(torrent)
+                exposures[h] = 0
+                self._decision(
+                    h,
+                    "resident_keep",
+                    "soak_recovery_preserve",
+                    {
+                        "free_bytes": int(free_bytes),
+                        "disk_floor_bytes": int(self.config.disk_floor_bytes),
+                        "emergency_floor_bytes": int(self.config.emergency_floor_bytes),
+                    },
+                )
+                continue
             if used + exposure > cap:
                 if self._is_hot_ready(h, rows.get(h) or {}, ema_by_hash.get(h, 0), now):
                     needed = used + exposure - cap
@@ -293,6 +310,12 @@ class SoakQueueService:
             out.append(torrent)
             used += exposure
         return out, {str(t["hash"]): int(exposures.get(str(t["hash"]), 0)) for t in out}, preempted
+
+    def _is_existing_running_resident(self, hash: str, torrent: Mapping[str, Any], rows: dict[str, dict[str, Any]]) -> bool:
+        return (
+            str((rows.get(str(hash)) or {}).get("state") or "") in {"soak_resident", "soak_hot"}
+            and _is_running_download(torrent)
+        )
 
     def _is_hot_ready(self, hash: str, row: dict[str, Any], ema: int, now: int) -> bool:
         hot_since = row.get("hot_since")
@@ -522,14 +545,16 @@ class SoakQueueService:
                 keep_id = ids[0] if ids else None
                 expires_at = now + 120
                 if keep_id is None:
+                    reason = "soak_resident_recovery_preserve" if int(bytes_reserved) <= 0 else "soak_resident"
                     con.execute(
                         "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
-                        (h, "soak_probe", int(bytes_reserved), "active", now, expires_at, "soak_resident"),
+                        (h, "soak_probe", int(bytes_reserved), "active", now, expires_at, reason),
                     )
                 else:
+                    reason = "soak_resident_recovery_preserve" if int(bytes_reserved) <= 0 else "soak_resident"
                     con.execute(
                         "update resource_reservations set bytes=?, expires_at=?, released_at=null, reason=? where id=?",
-                        (int(bytes_reserved), expires_at, "soak_resident", keep_id),
+                        (int(bytes_reserved), expires_at, reason, keep_id),
                     )
                     if len(ids) > 1:
                         placeholders = ",".join("?" for _ in ids[1:])

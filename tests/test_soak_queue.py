@@ -416,6 +416,72 @@ def test_soak_queue_throttles_hot_resident_near_disk_floor_instead_of_stopping_i
         assert row == {"reason": "low_capacity_throttled"}
 
 
+def test_soak_queue_recovery_mode_keeps_existing_resident_running_and_throttles_instead_of_stopping():
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+    from qbt_orchestrator.db import migrate
+
+    gib = 1024**3
+    mib = 1024**2
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into soak_state(hash,state,ema_dlspeed_bps,hot_since,resident_since,exposure_bytes,last_sample_at,updated_at,reason) "
+            "values('soak-hot','soak_resident',2097152,null,900,536870912,900,900,'resident')"
+        )
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,reserved_bytes,allocated_at,reason) "
+            "values('soak-hot','soak_resident','soak_resident','soak_resident',536870912,900,'resident')"
+        )
+        con.execute(
+            "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) "
+            "values('soak-hot','soak_probe',536870912,'active',900,1200,'soak_resident')"
+        )
+        con.commit(); con.close()
+        executor = RecordingExecutor()
+        cfg = SoakQueueConfig(
+            resident_slots=8,
+            disk_floor_bytes=3 * gib,
+            emergency_floor_bytes=int(1.5 * gib),
+            recovery_margin_bytes=256 * mib,
+            max_total_exposure_bytes=4 * gib,
+            low_capacity_throttle_margin_bytes=1 * gib,
+            low_capacity_throttle_trigger_bps=1024**2,
+            low_capacity_soak_limit_bps=256 * 1024,
+            hot_bps=1024**2,
+            hot_confirm_sec=60,
+        )
+        svc = SoakQueueService(db, executor, dry_run=False, config=cfg, now=lambda: 1000)
+        snapshots = {
+            "soak-hot": {
+                "hash": "soak-hot",
+                "category": "auto",
+                "tags": "auto",
+                "state": "downloading",
+                "amount_left": 2 * gib,
+                "size": 4 * gib,
+                "progress": 0.5,
+                "dlspeed": 2 * 1024**2,
+                "piece_size": 16 * mib,
+            }
+        }
+
+        result = svc.run_once(snapshots, free_bytes=2 * gib, sync_healthy=True)
+
+        assert result.stopped == []
+        assert result.resident_hashes == ["soak-hot"]
+        assert all(path != "/api/v2/torrents/stop" for path, _payload in executor.posts)
+        assert ("soak-hot", 256 * 1024) in executor.download_limits
+        reservations = _rows(db, "select hash,state,bytes,reason from resource_reservations where hash='soak-hot' and kind='soak_probe' order by id")
+        assert reservations[-1] == {
+            "hash": "soak-hot",
+            "state": "active",
+            "bytes": 0,
+            "reason": "soak_resident_recovery_preserve",
+        }
+
+
 def test_soak_queue_clears_previous_low_capacity_limit_after_capacity_recovers():
     from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
     from qbt_orchestrator.db import migrate

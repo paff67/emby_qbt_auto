@@ -82,6 +82,14 @@ def _disk_floor_bytes_from_env(env=os.environ) -> int:
     return int(float(env.get("QBT_ORCH_DISK_FLOOR_GB", "3")) * 1024**3)
 
 
+def _emergency_floor_bytes_from_env(env=os.environ) -> int:
+    return int(float(env.get("QBT_ORCH_EMERGENCY_FLOOR_GB", "1.5")) * 1024**3)
+
+
+def _recovery_enter_bytes_from_env(env=os.environ) -> int:
+    return int(float(env.get("QBT_ORCH_RECOVERY_ENTER_GB", "3.5")) * 1024**3)
+
+
 def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
     hot_bps = int(env.get("QBT_ORCH_SOAK_HOT_BPS", str(1024**2)))
     return SoakQueueConfig(
@@ -89,6 +97,8 @@ def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
         resident_slots=int(env.get("QBT_ORCH_SOAK_RESIDENT_SLOTS", "8")),
         min_free_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_FREE_GB", "0")) * 1024**3),
         disk_floor_bytes=_disk_floor_bytes_from_env(env),
+        emergency_floor_bytes=_emergency_floor_bytes_from_env(env),
+        recovery_margin_bytes=int(float(env.get("QBT_ORCH_RECOVERY_MARGIN_MB", "256")) * 1024**2),
         max_total_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MAX_EXPOSURE_GB", "4")) * 1024**3),
         min_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_EXPOSURE_MB", "128")) * 1024**2),
         max_per_torrent_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB", "512")) * 1024**2),
@@ -186,6 +196,11 @@ def _csv_set(value: str | None) -> set[str]:
     if not value:
         return set()
     return {item.strip().lower() for item in value.replace(";", ",").split(",") if item.strip()}
+
+def _csv_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
 
 def _free_bytes_for(path: str):
     def sample() -> int:
@@ -429,6 +444,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     soak_dry_env = _truthy(os.environ.get("QBT_ORCH_SOAK_DRY_RUN"))
     soak_dry_run = True if dry_run else (soak_dry_env if soak_dry_env is not None else False)
     soak_config = _build_soak_config_from_env(os.environ)
+    alert_chat_ids = _csv_list(os.environ.get("QBT_ORCH_TG_ALERT_CHAT_IDS")) or _csv_list(os.environ.get("QBT_ORCH_TG_ADMINS"))
+    scheduler_alerts_env = _truthy(os.environ.get("QBT_ORCH_SCHEDULER_ALERTS"))
+    scheduler_alerts_enabled = bool(scheduler_alerts_env if scheduler_alerts_env is not None else bool(alert_chat_ids))
     runtime = DaemonRuntime(
         state_db=state_db,
         qbt=qbt,
@@ -442,6 +460,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         planner_active_slots=int(os.environ.get("QBT_ORCH_ACTIVE_SLOTS", "5")),
         planner_slow_active_demote_sec=int(os.environ.get("QBT_ORCH_SLOW_ACTIVE_DEMOTE_SEC", "180")),
         disk_floor_bytes=_disk_floor_bytes_from_env(os.environ),
+        emergency_floor_bytes=_emergency_floor_bytes_from_env(os.environ),
+        recovery_enabled=(_truthy(os.environ.get("QBT_ORCH_RECOVERY_MODE")) is not False),
+        recovery_enter_bytes=_recovery_enter_bytes_from_env(os.environ),
+        recovery_margin_bytes=int(float(os.environ.get("QBT_ORCH_RECOVERY_MARGIN_MB", "256")) * 1024**2),
+        recovery_active_slots=int(os.environ.get("QBT_ORCH_RECOVERY_ACTIVE_SLOTS", "4")),
+        recovery_max_remaining_bytes=int(float(os.environ.get("QBT_ORCH_RECOVERY_MAX_REMAINING_GB", "1.5")) * 1024**3),
         upload_runner=upload_runner,
         upload_dry_run=upload_dry_run,
         cleanup_runner=cleanup_runner,
@@ -479,6 +503,10 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         background_event_workers=background_event_workers,
         event_worker_interval=float(os.environ.get("QBT_ORCH_EVENT_WORKER_INTERVAL_SEC", "1")),
         event_worker_join_timeout=float(os.environ.get("QBT_ORCH_EVENT_WORKER_JOIN_TIMEOUT_SEC", "0.2")),
+        scheduler_alerts_enabled=scheduler_alerts_enabled,
+        scheduler_alert_chat_ids=alert_chat_ids,
+        scheduler_alert_interval_sec=int(os.environ.get("QBT_ORCH_SCHEDULER_ALERT_INTERVAL_SEC", "1800")),
+        disk_alert_margin_bytes=int(float(os.environ.get("QBT_ORCH_DISK_ALERT_MARGIN_MB", "512")) * 1024**2),
     )
     return runtime, dry_run
 

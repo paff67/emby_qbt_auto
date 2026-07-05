@@ -3,8 +3,8 @@ from typing import Iterable, Mapping
 from ..models import DiskPressureState, DiskSample, QbtAction
 GIB = 1024 ** 3
 
-def classify_disk(free_bytes: int) -> DiskSample:
-    if free_bytes < 2 * GIB: state = DiskPressureState.EMERGENCY
+def classify_disk(free_bytes: int, emergency_free_bytes: int = 2 * GIB) -> DiskSample:
+    if free_bytes < int(emergency_free_bytes): state = DiskPressureState.EMERGENCY
     elif free_bytes < 3 * GIB: state = DiskPressureState.CRITICAL
     elif free_bytes < 4 * GIB: state = DiskPressureState.GUARD
     elif free_bytes < 5 * GIB: state = DiskPressureState.WATCH

@@ -82,6 +82,108 @@ def test_daemon_runtime_emergency_tick_pauses_managed_downloads():
         assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h1"})]
 
 
+def test_daemon_runtime_uses_configurable_one_point_five_gib_emergency_floor():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    gib = 1024**3
+
+    class ManagedQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {"rid": rid + 1, "full_update": True, "torrents": {"h1": {"hash": "h1", "name": "a", "category": "auto", "state": "downloading"}}, "server_state": {}}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=ManagedQbt(),
+            executor=executor,
+            free_bytes_provider=lambda: int(1.6 * gib),
+            dry_run=False,
+            safety_interval=0,
+            emergency_floor_bytes=int(1.5 * gib),
+        )
+        daemon.run(max_safety_ticks=1)
+        assert executor.posts == []
+
+        daemon_low = DaemonRuntime(
+            state_db=db,
+            qbt=ManagedQbt(),
+            executor=executor,
+            free_bytes_provider=lambda: int(1.4 * gib),
+            dry_run=False,
+            safety_interval=0,
+            emergency_floor_bytes=int(1.5 * gib),
+        )
+        daemon_low.run(max_safety_ticks=1)
+        assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h1"})]
+
+
+def test_daemon_runtime_enqueues_proactive_telegram_alerts_for_all_stopped_and_near_thresholds():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    gib = 1024**3
+    mib = 1024**2
+
+    class StoppedQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "huge": {
+                        "hash": "huge",
+                        "name": "too-large",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 10 * gib,
+                        "size": 12 * gib,
+                        "progress": 0.1,
+                    }
+                },
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=StoppedQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 3 * gib + 64 * mib,
+            dry_run=True,
+            safety_interval=0,
+            disk_floor_bytes=3 * gib,
+            recovery_enter_bytes=3 * gib + 512 * mib,
+            emergency_floor_bytes=int(1.5 * gib),
+            scheduler_alert_chat_ids=["12345"],
+            scheduler_alerts_enabled=True,
+            scheduler_alert_interval_sec=60,
+            disk_alert_margin_bytes=512 * mib,
+        )
+
+        daemon.monitor.tick()
+        daemon.planner_tick()
+        daemon.planner_tick()
+
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute("select chat_id,topic,level,message,state from bot_notifications order by id")]
+        con.close()
+        assert [(r["chat_id"], r["topic"], r["level"], r["state"]) for r in rows] == [
+            ("12345", "scheduler_all_stopped", "warning", "queued"),
+            ("12345", "disk_threshold", "warning", "queued"),
+        ]
+        assert "free=" in rows[1]["message"]
+
+
 class FakeTelegramService:
     def __init__(self, fail_once=False):
         self.calls = 0

@@ -22,6 +22,7 @@ class PlannerResult:
     paused_hashes: list[str]
     conservative: bool = False
     budget_bytes: int = 0
+    mode: str = "normal"
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -58,14 +59,26 @@ class DownloadPlanner:
         active_slots: int = 5,
         disk_floor_bytes: int = 3 * 1024**3,
         slow_active_demote_sec: int = 180,
+        recovery_enabled: bool = False,
+        recovery_enter_bytes: int | None = None,
+        emergency_floor_bytes: int | None = None,
+        recovery_margin_bytes: int = 256 * 1024**2,
+        recovery_active_slots: int = 4,
+        recovery_max_remaining_bytes: int = int(1.5 * 1024**3),
         now=None,
     ):
         self.state_db = Path(state_db)
         self.executor = executor
         self.dry_run = dry_run
         self.active_slots = int(active_slots)
-        self.disk_floor_bytes = disk_floor_bytes
+        self.disk_floor_bytes = int(disk_floor_bytes)
         self.slow_active_demote_sec = int(slow_active_demote_sec)
+        self.recovery_enabled = bool(recovery_enabled)
+        self.recovery_enter_bytes = int(recovery_enter_bytes if recovery_enter_bytes is not None else self.disk_floor_bytes)
+        self.emergency_floor_bytes = int(emergency_floor_bytes if emergency_floor_bytes is not None else min(2 * 1024**3, max(0, self.disk_floor_bytes)))
+        self.recovery_margin_bytes = int(recovery_margin_bytes)
+        self.recovery_active_slots = int(recovery_active_slots)
+        self.recovery_max_remaining_bytes = int(recovery_max_remaining_bytes)
         self.now = now or (lambda: int(time.time()))
 
     def plan_and_apply(
@@ -82,15 +95,33 @@ class DownloadPlanner:
         forced_active_hashes = {str(h) for h in (forced_active_hashes or set())}
         cooldown_hashes = {str(h) for h in (cooldown_hashes or set())}
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
+        now = int(self.now())
         previous_allocations = self._allocation_rows()
         dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
-        now = int(self.now())
         active_reservations = self._active_reservation_bytes(now, ignored_kinds={"soak_probe"} if int(external_reserved_bytes or 0) > 0 else set())
-        budget = max(0, int(free_bytes) - self.disk_floor_bytes - sum(active_reservations.values()) - int(external_reserved_bytes or 0))
+        mode = self._mode_for_free_bytes(int(free_bytes))
+        budget_floor = self.disk_floor_bytes
+        extra_margin = 0
+        slot_limit = self.active_slots
+        if mode == "recovery":
+            budget_floor = self.emergency_floor_bytes
+            extra_margin = self.recovery_margin_bytes
+            slot_limit = self.recovery_active_slots
+        elif mode == "emergency":
+            budget_floor = self.emergency_floor_bytes
+            extra_margin = 0
+            slot_limit = 0
+        budget = max(0, int(free_bytes) - int(budget_floor) - int(extra_margin) - sum(active_reservations.values()) - int(external_reserved_bytes or 0))
         if not sync_healthy:
             for torrent in managed:
                 self._decision(str(torrent["hash"]), "hold", "sync_unhealthy", {"free_bytes": free_bytes})
-            return PlannerResult([], [], conservative=True, budget_bytes=budget)
+            return PlannerResult([], [], conservative=True, budget_bytes=budget, mode=mode)
+        if not self.dry_run:
+            self._reconcile_absent_allocations(set(str(h) for h in snapshots.keys()), now)
+            previous_allocations = self._allocation_rows()
+            dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
+            active_reservations = self._active_reservation_bytes(now, ignored_kinds={"soak_probe"} if int(external_reserved_bytes or 0) > 0 else set())
+            budget = max(0, int(free_bytes) - int(budget_floor) - int(extra_margin) - sum(active_reservations.values()) - int(external_reserved_bytes or 0))
 
         health_rows = self._health_rows()
         auto_dead = {
@@ -107,16 +138,13 @@ class DownloadPlanner:
             and self._should_demote_active(str(t["hash"]), t, health_rows.get(str(t["hash"])), now)
         }
         cooldown_hashes |= active_slow
-        candidates = sorted(
-            [
-                t
-                for t in managed
-                if int(t.get("amount_left") or 0) > 0
-                and str(t.get("hash")) not in dead_hashes
-                and str(t.get("hash")) not in cooldown_hashes
-                and (str(t.get("hash")) not in protected_running_hashes or str(t.get("hash")) in forced_active_hashes)
-            ],
-            key=lambda t: (int(t.get("amount_left") or 0), -int(t.get("num_seeds") or 0), -int(t.get("num_peers") or 0), str(t.get("hash"))),
+        candidates, skipped_reasons = self._candidate_lists(
+            managed,
+            mode=mode,
+            dead_hashes=dead_hashes,
+            cooldown_hashes=cooldown_hashes,
+            protected_running_hashes=protected_running_hashes,
+            forced_active_hashes=forced_active_hashes,
         )
         selected: list[dict[str, Any]] = []
         used = 0
@@ -125,14 +153,14 @@ class DownloadPlanner:
         for torrent in forced_candidates:
             amount_left = int(torrent.get("amount_left") or 0)
             incremental_reserved_bytes = max(0, amount_left - int(active_reservations.get(str(torrent.get("hash")), 0)))
-            if len(selected) >= self.active_slots or used + incremental_reserved_bytes > budget:
+            if len(selected) >= slot_limit or used + incremental_reserved_bytes > budget:
                 continue
             selected.append(torrent)
             used += incremental_reserved_bytes
         for torrent in regular_candidates:
             amount_left = int(torrent.get("amount_left") or 0)
             incremental_reserved_bytes = max(0, amount_left - int(active_reservations.get(str(torrent.get("hash")), 0)))
-            if len(selected) >= self.active_slots or used + incremental_reserved_bytes > budget:
+            if len(selected) >= slot_limit or used + incremental_reserved_bytes > budget:
                 continue
             selected.append(torrent)
             used += incremental_reserved_bytes
@@ -173,14 +201,15 @@ class DownloadPlanner:
         for torrent in candidates:
             h = str(torrent["hash"])
             if h in selected_set:
+                reason = "recovery_budget_fit" if mode == "recovery" else "budget_fit"
                 seq = desired_seq_dl(
                     LifecycleState.ACTIVE,
                     int(torrent.get("num_seeds") or 0),
                     int(torrent.get("num_peers") or 0),
                     int(torrent.get("stalled_seconds") or 0),
                 )
-                self._allocation(h, "active", "stable", int(torrent.get("amount_left") or 0), seq, now, "budget_fit")
-                self._decision(h, "active", "budget_fit", {"reserved_bytes": int(torrent.get("amount_left") or 0), "budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0)})
+                self._allocation(h, "active", "stable", int(torrent.get("amount_left") or 0), seq, now, reason)
+                self._decision(h, "active", reason, {"reserved_bytes": int(torrent.get("amount_left") or 0), "budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0), "mode": mode})
                 if seq and self._needs_seq_desired(h, True, previous_allocations):
                     seq_desired_actions.append((h, True))
             elif h in active_slow:
@@ -189,10 +218,20 @@ class DownloadPlanner:
                 if self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
             else:
-                self._allocation(h, "soak", "soak", 0, False, now, "budget_or_slot_exhausted")
-                self._decision(h, "soak", "budget_or_slot_exhausted", {"budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0)})
+                reason = "recovery_budget_or_slot_exhausted" if mode == "recovery" else "budget_or_slot_exhausted"
+                self._allocation(h, "soak", "soak", 0, False, now, reason)
+                self._decision(h, "soak", reason, {"budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0), "mode": mode})
                 if self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
+        for torrent in managed:
+            h = str(torrent["hash"])
+            reason = skipped_reasons.get(h)
+            if not reason or h in selected_set or h in dead_hashes or h in cooldown_hashes:
+                continue
+            self._allocation(h, "soak", "soak", 0, False, now, reason)
+            self._decision(h, "soak", reason, {"budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0), "mode": mode, "amount_left": int(torrent.get("amount_left") or 0)})
+            if self._needs_seq_desired(h, False, previous_allocations):
+                seq_desired_actions.append((h, False))
 
         self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead, previous_allocations=previous_allocations)
         if not self.dry_run:
@@ -200,7 +239,54 @@ class DownloadPlanner:
         self._apply_seq_desired(seq_desired_actions)
         self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
-        return PlannerResult(selected_hashes, paused_hashes, conservative=False, budget_bytes=budget)
+        return PlannerResult(selected_hashes, paused_hashes, conservative=False, budget_bytes=budget, mode=mode)
+
+    def _mode_for_free_bytes(self, free_bytes: int) -> str:
+        if int(free_bytes) < int(self.emergency_floor_bytes):
+            return "emergency"
+        if self.recovery_enabled and int(free_bytes) < int(self.recovery_enter_bytes):
+            return "recovery"
+        return "normal"
+
+    def _candidate_lists(
+        self,
+        managed: list[Mapping[str, Any]],
+        mode: str,
+        dead_hashes: set[str],
+        cooldown_hashes: set[str],
+        protected_running_hashes: set[str],
+        forced_active_hashes: set[str],
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        candidates: list[dict[str, Any]] = []
+        skipped: dict[str, str] = {}
+        for torrent in managed:
+            h = str(torrent.get("hash") or "")
+            amount_left = int(torrent.get("amount_left") or 0)
+            if amount_left <= 0 or h in dead_hashes or h in cooldown_hashes:
+                continue
+            if h in protected_running_hashes and h not in forced_active_hashes:
+                skipped[h] = "protected_running"
+                continue
+            if mode == "recovery" and amount_left > int(self.recovery_max_remaining_bytes):
+                skipped[h] = "recovery_remaining_too_large"
+                continue
+            candidates.append(dict(torrent))
+        if mode == "recovery":
+            candidates.sort(key=self._recovery_sort_key)
+        else:
+            candidates.sort(key=lambda t: (int(t.get("amount_left") or 0), -int(t.get("num_seeds") or 0), -int(t.get("num_peers") or 0), str(t.get("hash"))))
+        return candidates, skipped
+
+    def _recovery_sort_key(self, torrent: Mapping[str, Any]) -> tuple[Any, ...]:
+        progress = float(torrent.get("progress") or 0)
+        amount_left = int(torrent.get("amount_left") or 0)
+        completed = int(torrent.get("completed_bytes") or torrent.get("completed") or torrent.get("downloaded") or 0)
+        if completed <= 0:
+            size = int(torrent.get("size") or 0)
+            completed = max(0, size - amount_left)
+        seeds = int(torrent.get("num_seeds") or torrent.get("num_complete") or 0)
+        peers = int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0)
+        return (-progress, amount_left, -completed, -seeds, -peers, str(torrent.get("hash") or ""))
 
     def _allocation_rows(self) -> dict[str, dict[str, Any]]:
         con = _connect(self.state_db)
@@ -209,6 +295,38 @@ class DownloadPlanner:
             return {str(r["hash"]): dict(r) for r in rows}
         finally:
             con.close()
+
+    def _reconcile_absent_allocations(self, snapshot_hashes: set[str], now: int) -> list[str]:
+        snapshot_hashes = {str(h) for h in snapshot_hashes if str(h)}
+
+        def txn(con: sqlite3.Connection) -> list[str]:
+            rows = [str(r["hash"]) for r in con.execute("select hash from scheduler_allocations").fetchall()]
+            absent = sorted(h for h in rows if h and h not in snapshot_hashes)
+            if not absent:
+                return []
+            placeholders = ",".join("?" for _ in absent)
+            con.execute(f"delete from scheduler_allocations where hash in ({placeholders})", absent)
+            con.execute(
+                f"update resource_reservations set state='released', released_at=?, reason=? "
+                f"where state='active' and hash in ({placeholders})",
+                (int(now), "qbt_absent_reconciled", *absent),
+            )
+            con.execute(f"delete from soak_state where hash in ({placeholders})", absent)
+            for h in absent:
+                con.execute(
+                    "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
+                    (
+                        int(now),
+                        "planner",
+                        h,
+                        "allocation_reconciled",
+                        "qbt_absent",
+                        json.dumps({"released_reservations": True}, ensure_ascii=False),
+                    ),
+                )
+            return absent
+
+        return list(write_transaction(self.state_db, txn) or [])
 
     def _needs_seq_false(self, hash: str, previous_allocations: dict[str, dict[str, Any]]) -> bool:
         return self._needs_seq_desired(hash, False, previous_allocations)
