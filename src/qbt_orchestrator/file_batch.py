@@ -320,7 +320,7 @@ class FileBatchService:
         h = str(torrent.get("hash") or "")
         if not h:
             return False
-        rows = self._active_pipeline_batch_rows(h)
+        rows = self._pipeline_batch_rows(h)
         if not rows:
             return False
         if not _is_stopped(torrent):
@@ -335,27 +335,33 @@ class FileBatchService:
         # The reservation is still valid and planner has not placed the torrent
         # into a cooldown/dead state.  Re-start the qBT torrent instead of
         # letting a durable batch reservation silently drift away from qBT state.
+        active_rows = [row for row in rows if int(row.get("has_active_reservation") or 0)]
+        if not active_rows:
+            return False
         try:
             self._qbt_post("/api/v2/torrents/start", {"hashes": h}, h)
         except Exception as exc:
             self.obs.event("error", "file_batch", "batch_reconcile_start_failed", str(redact(str(exc))), {"hash": h}, hash=h)
             return True
-        self._decision(h, "batch_reconciled", "restarted_reserved_batch", {"batch_ids": [int(row["id"]) for row in rows]})
-        self.obs.event("info", "file_batch", "batch_restarted", f"restarted reserved batch for {h[:8]}", {"hash": h, "batch_ids": [int(row["id"]) for row in rows]}, hash=h)
+        self._decision(h, "batch_reconciled", "restarted_reserved_batch", {"batch_ids": [int(row["id"]) for row in active_rows]})
+        self.obs.event("info", "file_batch", "batch_restarted", f"restarted reserved batch for {h[:8]}", {"hash": h, "batch_ids": [int(row["id"]) for row in active_rows]}, hash=h)
         return True
 
-    def _active_pipeline_batch_rows(self, h: str) -> list[dict[str, Any]]:
+    def _pipeline_batch_rows(self, h: str) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in PIPELINE_DOWNLOAD_STATES)
         con = _connect(self.state_db)
         try:
             return [
                 dict(r)
                 for r in con.execute(
-                    f"select tb.* from torrent_batches tb "
-                    f"join resource_reservations rr on rr.batch_id=tb.id and rr.kind='batch' "
-                    f"where tb.hash=? and tb.state in ({placeholders}) and rr.state='active' "
-                    f"and (rr.expires_at is null or rr.expires_at>?) order by tb.id",
-                    (h, *PIPELINE_DOWNLOAD_STATES, int(self.now())),
+                    f"select tb.*, exists("
+                    f"  select 1 from resource_reservations rr "
+                    f"  where rr.batch_id=tb.id and rr.kind='batch' and rr.state='active' "
+                    f"  and (rr.expires_at is null or rr.expires_at>?)"
+                    f") as has_active_reservation "
+                    f"from torrent_batches tb "
+                    f"where tb.hash=? and tb.state in ({placeholders}) order by tb.id",
+                    (int(self.now()), h, *PIPELINE_DOWNLOAD_STATES),
                 ).fetchall()
             ]
         finally:
