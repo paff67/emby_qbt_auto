@@ -12,7 +12,7 @@ from .alerts import SchedulerAlertConfig, SchedulerAlertService
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
 from .db import migrate, write_transaction
-from .file_batch import FileBatchService
+from .file_batch import FileBatchService, active_pipeline_batch_hashes
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
@@ -321,6 +321,7 @@ class DaemonRuntime:
             )
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
+        batch_protected_hashes = active_pipeline_batch_hashes(self.state_db)
         planner = DownloadPlanner(
             self.state_db,
             self.executor,
@@ -339,7 +340,7 @@ class DaemonRuntime:
             snapshots,
             free_bytes=free_bytes,
             sync_healthy=sync_healthy,
-            protected_running_hashes=soak_result.protected_hashes,
+            protected_running_hashes=soak_result.protected_hashes | batch_protected_hashes,
             forced_active_hashes=set(soak_result.hot_hashes),
             cooldown_hashes=set(soak_result.cooldown_hashes),
             external_reserved_bytes=int(soak_result.reserved_bytes),

@@ -2,7 +2,7 @@
 
 `soak_resident` 是独立于 full active slots 的常驻探测队列。它启动低速/未知速度任务，但只按短期 exposure 预留空间，默认单任务 128-512MiB，总 exposure 上限 4GiB。
 
-当前策略更激进：`QBT_ORCH_DISK_FLOOR_GB=3` 是统一的 normal 调度地板，`QBT_ORCH_EMERGENCY_FLOOR_GB=1.5` 是 Safety Loop 硬停线。只要 `free_bytes - disk_floor - active/batch reservations` 仍有预算，soak 会常驻运行；进入 recovery 区间时，已有 resident soak 不因预算为负主动停止，而是优先限速。历史 `QBT_ORCH_SOAK_MIN_FREE_GB` 只保留为兼容字段，不再作为 6-8GiB 的硬停止阈值。
+当前策略更激进：US1 live 推荐 `QBT_ORCH_DISK_FLOOR_GB=2` 作为统一的 normal 调度地板，`QBT_ORCH_RECOVERY_ENTER_GB=2.5` 作为 recovery 入口，`QBT_ORCH_EMERGENCY_FLOOR_GB=1.5` 是 Safety Loop 硬停线。只要 `free_bytes - disk_floor - active/batch reservations` 仍有预算，soak 会常驻运行；进入 recovery 区间时，已有 resident soak 不因预算为负主动停止，而是优先限速。历史 `QBT_ORCH_SOAK_MIN_FREE_GB` 只保留为兼容字段，不再作为 6-8GiB 的硬停止阈值。
 
 `soak_hot` 是 resident soak 在 EMA 速度超过 `QBT_ORCH_SOAK_HOT_BPS` 并持续 `QBT_ORCH_SOAK_HOT_CONFIRM_SEC` 后的提权状态。预算不足时，它会尝试暂停非 hold、非 seed-long、非临近完成的 active 任务，释放 `active_download` reservation。
 
@@ -24,10 +24,10 @@ sqlite3 /var/lib/qbt-orchestrator/state.sqlite "select hash,state,ema_dlspeed_bp
 关键环境变量：
 
 ```env
-QBT_ORCH_DISK_FLOOR_GB=3
+QBT_ORCH_DISK_FLOOR_GB=2
 QBT_ORCH_EMERGENCY_FLOOR_GB=1.5
 QBT_ORCH_RECOVERY_MODE=1
-QBT_ORCH_RECOVERY_ENTER_GB=3.5
+QBT_ORCH_RECOVERY_ENTER_GB=2.5
 QBT_ORCH_RECOVERY_ACTIVE_SLOTS=4
 QBT_ORCH_RECOVERY_MAX_REMAINING_GB=1.5
 QBT_ORCH_RECOVERY_MARGIN_MB=256

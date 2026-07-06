@@ -1194,6 +1194,59 @@ def test_runtime_planner_tick_runs_soak_queue_before_planner_and_protects_reside
         assert ("/api/v2/torrents/stop", {"hashes": "soak"}) not in executor.posts
 
 
+def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    gib = 1024**3
+
+    class BatchSnapshotQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "batch": {"hash": "batch", "name": "Batch", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 3 * gib, "size": 5 * gib, "progress": 0.4},
+                    "tiny": {"hash": "tiny", "name": "Tiny", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1, "size": 10, "progress": 0.9},
+                },
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+            (1, "batch", 1, "downloading", "pipeline", "[0]", 5 * gib, 3 * gib, 900, 900),
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
+            ("batch", 1, "batch", 3 * gib, "active", 900, None, "batch_pipeline_reserved"),
+        )
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=BatchSnapshotQbt(),
+            executor=executor,
+            free_bytes_provider=lambda: 6 * gib,
+            dry_run=False,
+            safety_interval=0,
+            planner_dry_run=False,
+            planner_active_slots=1,
+            disk_floor_bytes=2 * gib,
+        )
+        daemon.tick_safety()
+
+        result = daemon.planner_tick()
+
+        assert result["planner"]["selected_hashes"] == ["tiny"]
+        assert ("/api/v2/torrents/start", {"hashes": "tiny"}) in executor.posts
+        assert not any(path == "/api/v2/torrents/stop" and payload == {"hashes": "batch"} for path, payload in executor.posts)
+
+
 def test_cli_builds_soak_queue_from_env_with_live_defaults():
     import argparse
     import os

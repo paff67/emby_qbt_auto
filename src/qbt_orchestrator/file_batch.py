@@ -55,6 +55,31 @@ def _is_stopped(torrent: Mapping[str, Any]) -> bool:
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ts", ".webm", ".flv", ".mpg", ".mpeg", ".iso"}
 DEFAULT_DOWNLOAD_EXTENSIONS = {".txt"}
 JUNK_BATCH_NAME = re.compile(r"(?i)(最新地址|最\s*新\s*位\s*址|收藏不迷路|官方指定|博彩|赌场|直播|telegram|996gg\.cc|x\s*u\s*u|uu美少女|社\s*區|社\s*区|福利|体育|电竞|楼风)")
+PIPELINE_DOWNLOAD_STATES = ("reserved", "applied_to_qbt", "downloading")
+
+
+def active_pipeline_batch_hashes(state_db: str | Path, now: int | None = None) -> set[str]:
+    """Hashes with live pipeline batch reservations that planner must not stop.
+
+    Batch reservations are explicit disk-budget claims for a selected subset of
+    qBT files.  While such a reservation is active, planner should not pause the
+    torrent as an unselected low-speed download, otherwise qBT live state and
+    the durable reservation diverge.
+    """
+    now = int(time.time() if now is None else now)
+    placeholders = ",".join("?" for _ in PIPELINE_DOWNLOAD_STATES)
+    con = _connect(state_db)
+    try:
+        rows = con.execute(
+            f"select distinct tb.hash from torrent_batches tb "
+            f"join resource_reservations rr on rr.batch_id=tb.id and rr.kind='batch' "
+            f"where tb.state in ({placeholders}) and rr.state='active' "
+            f"and (rr.expires_at is null or rr.expires_at>?)",
+            (*PIPELINE_DOWNLOAD_STATES, now),
+        ).fetchall()
+        return {str(r["hash"]) for r in rows if str(r["hash"] or "")}
+    finally:
+        con.close()
 
 
 class FileBatchService:
@@ -197,6 +222,8 @@ class FileBatchService:
             self.obs.event("error", "file_batch", "batch_file_probe_failed", str(redact(str(exc))), {"hash": h}, hash=h)
             return {"created": 0, "blocked": 1}
         queued = self._queue_downloaded_pipeline_batches(torrent, files)
+        if self._reconcile_pipeline_batch_state(torrent, files):
+            return {"created": 0, "blocked": 1, "upload_queued": queued}
         if tick_cap_reached:
             self._decision(
                 h,
@@ -288,6 +315,97 @@ class FileBatchService:
         self.obs.event("info", "file_batch", "batch_applied", f"batch {batch_id} applied", {"batch_id": batch_id, **payload}, hash=h)
         self._new_batches_created_this_tick += 1
         return {"created": 1, "blocked": 0, "upload_queued": queued}
+
+    def _reconcile_pipeline_batch_state(self, torrent: Mapping[str, Any], files: list[Mapping[str, Any]]) -> bool:
+        h = str(torrent.get("hash") or "")
+        if not h:
+            return False
+        rows = self._active_pipeline_batch_rows(h)
+        if not rows:
+            return False
+        if not _is_stopped(torrent):
+            return False
+        allocation = self._scheduler_allocation(h)
+        desired = str((allocation or {}).get("desired_state") or "")
+        if desired in {"soak", "soak_cooldown", "dead", "carousel_probe"}:
+            batch_ids = [int(row["id"]) for row in rows]
+            self._pause_pipeline_batches(batch_ids, h, "batch_reconcile_planner_stopped", "planner_stopped_batch")
+            return True
+
+        # The reservation is still valid and planner has not placed the torrent
+        # into a cooldown/dead state.  Re-start the qBT torrent instead of
+        # letting a durable batch reservation silently drift away from qBT state.
+        try:
+            self._qbt_post("/api/v2/torrents/start", {"hashes": h}, h)
+        except Exception as exc:
+            self.obs.event("error", "file_batch", "batch_reconcile_start_failed", str(redact(str(exc))), {"hash": h}, hash=h)
+            return True
+        self._decision(h, "batch_reconciled", "restarted_reserved_batch", {"batch_ids": [int(row["id"]) for row in rows]})
+        self.obs.event("info", "file_batch", "batch_restarted", f"restarted reserved batch for {h[:8]}", {"hash": h, "batch_ids": [int(row["id"]) for row in rows]}, hash=h)
+        return True
+
+    def _active_pipeline_batch_rows(self, h: str) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in PIPELINE_DOWNLOAD_STATES)
+        con = _connect(self.state_db)
+        try:
+            return [
+                dict(r)
+                for r in con.execute(
+                    f"select tb.* from torrent_batches tb "
+                    f"join resource_reservations rr on rr.batch_id=tb.id and rr.kind='batch' "
+                    f"where tb.hash=? and tb.state in ({placeholders}) and rr.state='active' "
+                    f"and (rr.expires_at is null or rr.expires_at>?) order by tb.id",
+                    (h, *PIPELINE_DOWNLOAD_STATES, int(self.now())),
+                ).fetchall()
+            ]
+        finally:
+            con.close()
+
+    def _scheduler_allocation(self, h: str) -> dict[str, Any] | None:
+        con = _connect(self.state_db)
+        try:
+            row = con.execute("select * from scheduler_allocations where hash=?", (h,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            con.close()
+
+    def _pause_pipeline_batches(self, batch_ids: list[int], h: str, reservation_reason: str, decision_reason: str) -> None:
+        if not batch_ids:
+            return
+        now = int(self.now())
+        placeholders = ",".join("?" for _ in batch_ids)
+
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
+                f"update torrent_batches set state='paused_by_planner', updated_at=? where id in ({placeholders})",
+                (now, *batch_ids),
+            )
+            con.execute(
+                f"update resource_reservations set state='released', released_at=?, reason=? "
+                f"where kind='batch' and state='active' and batch_id in ({placeholders})",
+                (now, reservation_reason, *batch_ids),
+            )
+            con.execute(
+                "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
+                (
+                    now,
+                    "file_batch",
+                    h,
+                    "batch_reconciled",
+                    decision_reason,
+                    json.dumps(redact({"batch_ids": batch_ids, "released_reservation": True}), ensure_ascii=False),
+                ),
+            )
+
+        write_transaction(self.state_db, txn)
+        self.obs.event(
+            "warning",
+            "file_batch",
+            "batch_reconciled",
+            f"released stale batch reservation for {h[:8]}",
+            {"batch_ids": batch_ids, "reason": reservation_reason},
+            hash=h,
+        )
 
     def _live_verify_canary_allowed(self, h: str, tags: set[str]) -> bool:
         if not self.batch_live_verify:

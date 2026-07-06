@@ -845,6 +845,48 @@ def test_file_batch_service_queues_downloaded_pipeline_batch_without_delete():
         ]
 
 
+def test_file_batch_service_reconciles_stopped_cooldown_batch_by_releasing_reservation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+            (7, "stale", 1, "downloading", "pipeline", "[0]", 5 * gib, gib, 900, 900),
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
+            ("stale", 7, "batch", gib, "active", 900, 4600, "batch_pipeline_reserved"),
+        )
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) values(?,?,?,?,?,?)",
+            ("stale", "soak_cooldown", "soak_cooldown", "soak_cooldown", 900, "active_slow_3min"),
+        )
+        con.commit(); con.close()
+        qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.4, "priority": 1}])
+        service = FileBatchService(state_db=db, dry_run=False, qbt=qbt, disk_floor_bytes=2 * gib, now=lambda: 1_000)
+
+        result = service.sync_completed(
+            {"stale": {"hash": "stale", "name": "Stale", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 3 * gib, "size": 5 * gib, "progress": 0.4}},
+            free_bytes=6 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 0
+        assert result.batches_blocked == 1
+        assert not any(call[0] == "/api/v2/torrents/start" for call in qbt.calls)
+        batch = _rows(db, "select state,updated_at from torrent_batches where id=7")[0]
+        assert batch == {"state": "paused_by_planner", "updated_at": 1_000}
+        reservation = _rows(db, "select state,released_at,reason from resource_reservations where batch_id=7 and kind='batch'")[0]
+        assert reservation == {"state": "released", "released_at": 1_000, "reason": "batch_reconcile_planner_stopped"}
+        decision = _rows(db, "select decision,reason_code from decision_log where component='file_batch' and hash='stale' order by id desc limit 1")[0]
+        assert decision == {"decision": "batch_reconciled", "reason_code": "planner_stopped_batch"}
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
