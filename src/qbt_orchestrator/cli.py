@@ -279,9 +279,11 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     planner_dry_run = True if dry_run else (planner_env if planner_env is not None else True)
     rclone_cfg = cfg.rclone if cfg else None
     free_bytes_provider = _free_bytes_for(disk_path)
+    io_governor_enabled_env = _truthy(os.environ.get("QBT_ORCH_IO_GOVERNOR_ENABLED"))
     io_governor = IoGovernor(
         iowait_provider=_iowait_provider_from_env(),
         free_bytes_provider=free_bytes_provider,
+        enabled=bool(io_governor_enabled_env) if io_governor_enabled_env is not None else False,
     )
     rclone = RcloneClient(
         config_path=rclone_cfg.config if rclone_cfg else "/root/.config/rclone/rclone.conf",

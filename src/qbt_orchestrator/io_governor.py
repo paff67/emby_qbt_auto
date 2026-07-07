@@ -20,6 +20,7 @@ class RcloneLimits:
     transfers: int
     checkers: int
     bwlimit: str | None
+    state: str = "ok"
 
 
 @dataclass(frozen=True)
@@ -47,11 +48,13 @@ class IoGovernor:
         free_bytes_provider: Callable[[], int] | None = None,
         iowait_warn_percent: float = 20.0,
         iowait_critical_percent: float = 35.0,
+        enabled: bool = False,
     ):
         self.iowait_provider = iowait_provider or (lambda: 0.0)
         self.free_bytes_provider = free_bytes_provider or (lambda: 1 << 60)
         self.iowait_warn_percent = float(iowait_warn_percent)
         self.iowait_critical_percent = float(iowait_critical_percent)
+        self.enabled = bool(enabled)
         self._last_snapshot: dict[str, Any] = {}
 
     def rclone_limits(self, default_transfers: int = 4, default_checkers: int = 8) -> RcloneLimits:
@@ -62,6 +65,17 @@ class IoGovernor:
         transfers = int(default_transfers)
         checkers = int(default_checkers)
         bwlimit: str | None = None
+        if not self.enabled:
+            self._last_snapshot = {
+                "component": "io_governor",
+                "state": "disabled",
+                "iowait_percent": iowait,
+                "free_bytes": free_bytes,
+                "transfers": transfers,
+                "checkers": checkers,
+                "bwlimit": None,
+            }
+            return RcloneLimits(transfers=transfers, checkers=checkers, bwlimit=None, state="disabled")
         if iowait >= self.iowait_critical_percent or free_bytes < 3 * gib:
             state = "critical"
             transfers = 1
@@ -81,7 +95,7 @@ class IoGovernor:
             "checkers": checkers,
             "bwlimit": bwlimit,
         }
-        return RcloneLimits(transfers=transfers, checkers=checkers, bwlimit=bwlimit)
+        return RcloneLimits(transfers=transfers, checkers=checkers, bwlimit=bwlimit, state=state)
 
     def last_snapshot(self) -> dict[str, Any]:
         return dict(self._last_snapshot)

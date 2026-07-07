@@ -166,7 +166,7 @@ def test_cli_once_wires_upload_worker_in_dry_run_by_default():
         assert state == "queued"
 
 
-def test_cli_wires_io_governor_limits_provider_to_rclone_client():
+def test_cli_wires_io_governor_full_speed_limits_provider_to_rclone_client_by_default():
     from qbt_orchestrator import cli
 
     class FakeQbt:
@@ -192,10 +192,12 @@ def test_cli_wires_io_governor_limits_provider_to_rclone_client():
         old_rclone = getattr(cli, "RcloneClient", None)
         old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
         old_iowait = os.environ.get("QBT_ORCH_IOWAIT_PERCENT")
+        old_io_enabled = os.environ.get("QBT_ORCH_IO_GOVERNOR_ENABLED")
         cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
         cli.RcloneClient = FakeRcloneClient
         os.environ["QBT_ORCH_DISK_PATH"] = td
         os.environ["QBT_ORCH_IOWAIT_PERCENT"] = "40"
+        os.environ.pop("QBT_ORCH_IO_GOVERNOR_ENABLED", None)
         try:
             rc, _out = run_cli(["once", "--dry-run", "--state-db", str(db)])
         finally:
@@ -210,13 +212,18 @@ def test_cli_wires_io_governor_limits_provider_to_rclone_client():
                 os.environ.pop("QBT_ORCH_IOWAIT_PERCENT", None)
             else:
                 os.environ["QBT_ORCH_IOWAIT_PERCENT"] = old_iowait
+            if old_io_enabled is None:
+                os.environ.pop("QBT_ORCH_IO_GOVERNOR_ENABLED", None)
+            else:
+                os.environ["QBT_ORCH_IO_GOVERNOR_ENABLED"] = old_io_enabled
 
         assert rc == 0
         provider = FakeRcloneClient.kwargs["limits_provider"]
         limits = provider()
-        assert limits.transfers == 1
-        assert limits.checkers == 2
-        assert limits.bwlimit == "2M"
+        assert limits.transfers == 4
+        assert limits.checkers == 8
+        assert limits.bwlimit is None
+        assert limits.state == "disabled"
 
 
 def test_cli_wires_sqlite_maintenance_retention_env_to_runtime():

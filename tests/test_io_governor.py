@@ -78,7 +78,7 @@ def test_upload_backpressure_blocks_new_file_batch_jobs_and_records_metrics():
         assert data["reason"] == "upload_backlog_over_limit"
 
 
-def test_io_governor_throttles_rclone_command_with_dynamic_limits():
+def test_io_governor_defaults_to_full_speed_without_bwlimit_even_under_pressure():
     from qbt_orchestrator.integrations.rclone import RcloneClient
     from qbt_orchestrator.io_governor import IoGovernor
 
@@ -88,7 +88,7 @@ def test_io_governor_throttles_rclone_command_with_dynamic_limits():
         calls.append((list(argv), input_text, timeout))
         return 0, json.dumps([{"Name": "a.mp4", "Size": 123}]), ""
 
-    governor = IoGovernor(iowait_provider=lambda: 40.0, free_bytes_provider=lambda: 6 * 1024**3)
+    governor = IoGovernor(iowait_provider=lambda: 40.0, free_bytes_provider=lambda: 2 * 1024**3)
     client = RcloneClient(
         config_path="/root/.config/rclone/rclone.conf",
         transfers=4,
@@ -100,11 +100,37 @@ def test_io_governor_throttles_rclone_command_with_dynamic_limits():
     assert client.lsjson_size("gcrypt:/A/a.mp4") == 123
     argv = calls[0][0]
     assert "--transfers" in argv
+    assert argv[argv.index("--transfers") + 1] == "4"
+    assert argv[argv.index("--checkers") + 1] == "8"
+    assert "--bwlimit" not in argv
+    assert governor.last_snapshot()["iowait_percent"] == 40.0
+    assert governor.last_snapshot()["state"] == "disabled"
+
+
+def test_io_governor_can_throttle_when_explicitly_enabled():
+    from qbt_orchestrator.integrations.rclone import RcloneClient
+    from qbt_orchestrator.io_governor import IoGovernor
+
+    calls = []
+
+    def runner(argv, input_text=None, timeout=None):
+        calls.append((list(argv), input_text, timeout))
+        return 0, json.dumps([{"Name": "a.mp4", "Size": 123}]), ""
+
+    governor = IoGovernor(iowait_provider=lambda: 40.0, free_bytes_provider=lambda: 6 * 1024**3, enabled=True)
+    client = RcloneClient(
+        config_path="/root/.config/rclone/rclone.conf",
+        transfers=4,
+        checkers=8,
+        limits_provider=governor.rclone_limits,
+        runner=runner,
+    )
+
+    assert client.lsjson_size("gcrypt:/A/a.mp4") == 123
+    argv = calls[0][0]
     assert argv[argv.index("--transfers") + 1] == "1"
     assert argv[argv.index("--checkers") + 1] == "2"
-    assert "--bwlimit" in argv
     assert argv[argv.index("--bwlimit") + 1] == "2M"
-    assert governor.last_snapshot()["iowait_percent"] == 40.0
     assert governor.last_snapshot()["state"] == "critical"
 
 
