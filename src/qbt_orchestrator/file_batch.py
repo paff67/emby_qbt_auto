@@ -482,12 +482,14 @@ class FileBatchService:
             size = int(row.get("size") or 0)
             if not rel or size <= 0:
                 continue
-            local_path = root_path / rel
-            if not local_path.exists():
+            resolved = self._resolve_selected_local_file(root_path, row)
+            if resolved is None:
+                local_path = root_path.joinpath(*PurePosixPath(rel).parts)
                 self.obs.event("warning", "file_batch", "batch_local_file_missing", f"missing {rel}", {"batch_id": batch_id, "local_path": str(local_path)}, hash=h)
                 return None
-            remote_path = f"{remote_dir.rstrip('/')}/{rel.replace('\\', '/')}"
-            item = {"relative_path": rel.replace("\\", "/"), "local_path": str(local_path), "remote_path": remote_path, "size": size}
+            local_path, rel_posix = resolved
+            remote_path = f"{remote_dir.rstrip('/')}/{rel_posix}"
+            item = {"relative_path": rel_posix, "local_path": str(local_path), "remote_path": remote_path, "size": size}
             files.append(item)
             total += size
             if local_path.suffix.lower() in MEDIA_EXTENSIONS:
@@ -936,10 +938,20 @@ class FileBatchService:
             save_path = str(torrent.get("save_path") or f"{self.container_downloads}/active")
             raw = str(PurePosixPath(save_path) / str(torrent.get("name") or torrent.get("hash") or "torrent"))
         if raw == self.container_downloads:
-            return self.host_downloads
-        if raw.startswith(self.container_downloads + "/"):
-            return self._host_path_for_container_suffix(raw[len(self.container_downloads):])
-        return raw
+            local = self.host_downloads
+        elif raw.startswith(self.container_downloads + "/"):
+            local = self._host_path_for_container_suffix(raw[len(self.container_downloads):])
+        else:
+            local = raw
+
+        # qBT v5 reports ``content_path`` as the concrete file path for
+        # single-file torrents.  Upload manifests, however, are rooted at the
+        # torrent folder so qBT file rows like ``DASS-592/movie.mp4`` can be
+        # normalized to ``movie.mp4`` and copied as a normal manifest.
+        path = Path(local)
+        if path.is_file():
+            return str(path.parent)
+        return local
 
     def _host_path_for_container_suffix(self, suffix: str) -> str:
         rel = str(suffix or "").replace("\\", "/").lstrip("/")
@@ -998,9 +1010,53 @@ class FileBatchService:
             rel = FileBatchService._file_relative_path(row)
             if not rel:
                 continue
-            rel_path = PurePosixPath(rel)
+            rel_path = FileBatchService._safe_qbt_relative_path(rel)
+            if rel_path is None:
+                continue
             allowed.add(rel_path.as_posix())
             parts = rel_path.parts
             if len(parts) > 1 and parts[0] == root_name:
-                allowed.add(PurePosixPath(*parts[1:]).as_posix())
+                stripped = FileBatchService._safe_qbt_relative_path(PurePosixPath(*parts[1:]).as_posix())
+                if stripped is not None:
+                    allowed.add(stripped.as_posix())
         return allowed
+
+    def _resolve_selected_local_file(self, root: Path, row: Mapping[str, Any]) -> tuple[Path, str] | None:
+        rel = self._file_relative_path(row)
+        rel_path = self._safe_qbt_relative_path(rel)
+        if rel_path is None:
+            return None
+        candidate_relatives = [rel_path]
+        parts = rel_path.parts
+        if len(parts) > 1 and parts[0] == root.name:
+            stripped = self._safe_qbt_relative_path(PurePosixPath(*parts[1:]).as_posix())
+            if stripped is not None:
+                candidate_relatives.append(stripped)
+        if root.is_file() and parts and root.name == parts[-1]:
+            return root, root.name
+        root_resolved = root.resolve(strict=False)
+        seen: set[str] = set()
+        for candidate_rel in candidate_relatives:
+            rel_posix = candidate_rel.as_posix()
+            if rel_posix in seen:
+                continue
+            seen.add(rel_posix)
+            candidate = root.joinpath(*candidate_rel.parts)
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            try:
+                candidate.resolve(strict=False).relative_to(root_resolved)
+            except ValueError:
+                continue
+            return candidate, rel_posix
+        return None
+
+    @staticmethod
+    def _safe_qbt_relative_path(rel: str) -> PurePosixPath | None:
+        rel = str(rel or "").replace("\\", "/").lstrip("/")
+        if not rel:
+            return None
+        path = PurePosixPath(rel)
+        if any(part in {"", ".", ".."} for part in path.parts):
+            return None
+        return path

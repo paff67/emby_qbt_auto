@@ -157,6 +157,149 @@ def test_file_batch_service_completed_manifest_excludes_qbt_priority_zero_files(
         assert payload["media_files"] == [{"remote_path": "gcrypt:/dori-136.torrent-h1/dori-136.mp4", "size": 100}]
 
 
+def test_file_batch_service_enqueues_completed_single_file_when_qbt_content_path_is_file():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    class SingleFileQbt:
+        def torrent_files(self, h):
+            assert h == "9307b3e6da70"
+            return [
+                {
+                    "index": 0,
+                    "name": "DASS-592/hhd800.com@DASS-592.mp4",
+                    "size": 100,
+                    "progress": 1.0,
+                    "priority": 1,
+                }
+            ]
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "downloads"
+        movie = root / "active" / "DASS-592" / "hhd800.com@DASS-592.mp4"
+        movie.parent.mkdir(parents=True)
+        movie.write_bytes(b"a" * 100)
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            host_downloads=str(root),
+            container_downloads="/downloads",
+            remote="gcrypt:",
+            qbt=SingleFileQbt(),
+        )
+
+        result = service.sync_completed(
+            {
+                "9307b3e6da70": {
+                    "hash": "9307b3e6da70",
+                    "name": "DASS-592",
+                    "category": "auto",
+                    "tags": "auto, checked",
+                    "state": "stoppedUP",
+                    "amount_left": 0,
+                    "size": 100,
+                    "progress": 1.0,
+                    "save_path": "/downloads/active",
+                    "content_path": "/downloads/active/DASS-592/hhd800.com@DASS-592.mp4",
+                }
+            }
+        )
+
+        assert result.enqueued == 1
+        payload = json.loads(_rows(db, "select payload_json from torrent_jobs")[0]["payload_json"])
+        assert payload["local"] == str(root / "active" / "DASS-592")
+        assert payload["remote"] == "gcrypt:/DASS-592-9307b3e6da70"
+        assert payload["copy_mode"] == "copy_files"
+        assert [(f["relative_path"], f["local_path"], f["size"]) for f in payload["files"]] == [
+            ("hhd800.com@DASS-592.mp4", str(movie), 100)
+        ]
+        assert payload["media_files"] == [{"remote_path": "gcrypt:/DASS-592-9307b3e6da70/hhd800.com@DASS-592.mp4", "size": 100}]
+        events = _rows(db, "select event_type from events_v2 order by id")
+        assert {"event_type": "completed_manifest_empty_after_qbt_filter"} not in events
+
+
+def test_file_batch_service_queues_downloaded_single_file_batch_when_qbt_content_path_is_file():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    class SingleFileBatchQbt:
+        def __init__(self):
+            self.posts = []
+
+        def torrent_files(self, h):
+            assert h == "d95978e5"
+            return [
+                {
+                    "index": 0,
+                    "name": "KIT-002/hhd800.com@KIT-002.mp4",
+                    "size": 120,
+                    "progress": 1.0,
+                    "priority": 1,
+                }
+            ]
+
+        def qbt_post(self, path, payload):
+            self.posts.append((path, payload))
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "downloads"
+        movie = root / "active" / "KIT-002" / "hhd800.com@KIT-002.mp4"
+        movie.parent.mkdir(parents=True)
+        movie.write_bytes(b"b" * 120)
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            """
+            insert into torrent_batches(hash,batch_no,state,mode,indices_json,total_bytes,downloaded_bytes,reserved_bytes,piece_size,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            ("d95978e5", 1, "downloading", "pipeline", "[0]", 120, 0, 120, 2097152, 1000, 1000),
+        )
+        con.commit()
+        con.close()
+        qbt = SingleFileBatchQbt()
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            host_downloads=str(root),
+            container_downloads="/downloads",
+            remote="gcrypt:",
+            qbt=qbt,
+            batch_max_new_per_tick=0,
+            now=lambda: 2000,
+        )
+
+        result = service.sync_completed(
+            {
+                "d95978e5": {
+                    "hash": "d95978e5",
+                    "name": "KIT-002",
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "stalledDL",
+                    "amount_left": 1,
+                    "size": 120,
+                    "progress": 0.99,
+                    "save_path": "/downloads/active",
+                    "content_path": "/downloads/active/KIT-002/hhd800.com@KIT-002.mp4",
+                }
+            },
+            free_bytes=10 * 1024**3,
+        )
+
+        assert result.enqueued == 1
+        payload = json.loads(_rows(db, "select payload_json from torrent_jobs where job_type='upload'")[0]["payload_json"])
+        assert payload["local"] == str(root / "active" / "KIT-002")
+        assert payload["copy_mode"] == "copy_files"
+        assert [(f["relative_path"], f["local_path"], f["size"]) for f in payload["files"]] == [
+            ("hhd800.com@KIT-002.mp4", str(movie), 120)
+        ]
+        assert qbt.posts == [("/api/v2/torrents/filePrio", {"hash": "d95978e5", "id": "0", "priority": "0"})]
+
+
 def test_file_batch_service_dry_run_records_without_inserting_job():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
