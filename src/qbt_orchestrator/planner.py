@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -15,6 +15,24 @@ from .policies.download_mode import desired_seq_dl
 
 STOPPED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "stopped"}
 
+ALLOCATION_UPSERT_SQL = (
+    "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason) "
+    "values(?,?,?,?,?,?,?,?,?) "
+    "on conflict(hash) do update set desired_state=excluded.desired_state, applied_state=excluded.applied_state, "
+    "slot_kind=excluded.slot_kind, priority_score=excluded.priority_score, reserved_bytes=excluded.reserved_bytes, "
+    "desired_seq_dl=excluded.desired_seq_dl, allocated_at=excluded.allocated_at, reason=excluded.reason"
+)
+
+HEALTH_UPSERT_SQL = (
+    "insert into torrent_health(hash,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,low_speed_since,no_progress_since,active_since,soak_since,dead_since,updated_at) "
+    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+    "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,dead_since=excluded.dead_since,updated_at=excluded.updated_at"
+)
+
+DECISION_INSERT_SQL = (
+    "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)"
+)
+
 
 @dataclass(frozen=True)
 class PlannerResult:
@@ -23,6 +41,18 @@ class PlannerResult:
     conservative: bool = False
     budget_bytes: int = 0
     mode: str = "normal"
+
+
+@dataclass
+class PlannerPersistenceBatch:
+    """All durable state mutations produced by one planner calculation."""
+
+    allocations: list[dict[str, Any]] = field(default_factory=list)
+    health_rows: list[dict[str, Any]] = field(default_factory=list)
+    decisions: list[dict[str, Any]] = field(default_factory=list)
+    soak_cooldowns: list[dict[str, Any]] = field(default_factory=list)
+    soak_residents: list[dict[str, Any]] = field(default_factory=list)
+    reservation_sync: tuple[dict[str, int], set[str], int] | None = None
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -80,8 +110,35 @@ class DownloadPlanner:
         self.recovery_active_slots = int(recovery_active_slots)
         self.recovery_max_remaining_bytes = int(recovery_max_remaining_bytes)
         self.now = now or (lambda: int(time.time()))
+        self._pending_persistence: PlannerPersistenceBatch | None = None
 
     def plan_and_apply(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        free_bytes: int,
+        sync_healthy: bool,
+        protected_running_hashes: set[str] | None = None,
+        forced_active_hashes: set[str] | None = None,
+        cooldown_hashes: set[str] | None = None,
+        external_reserved_bytes: int = 0,
+    ) -> PlannerResult:
+        if self._pending_persistence is not None:
+            raise RuntimeError("planner persistence batch is already active")
+        self._pending_persistence = PlannerPersistenceBatch()
+        try:
+            return self._plan_and_apply_impl(
+                snapshots,
+                free_bytes,
+                sync_healthy,
+                protected_running_hashes=protected_running_hashes,
+                forced_active_hashes=forced_active_hashes,
+                cooldown_hashes=cooldown_hashes,
+                external_reserved_bytes=external_reserved_bytes,
+            )
+        finally:
+            self._pending_persistence = None
+
+    def _plan_and_apply_impl(
         self,
         snapshots: Mapping[str, Mapping[str, Any]],
         free_bytes: int,
@@ -115,6 +172,7 @@ class DownloadPlanner:
         if not sync_healthy:
             for torrent in managed:
                 self._decision(str(torrent["hash"]), "hold", "sync_unhealthy", {"free_bytes": free_bytes})
+            self._flush_persistence_batch()
             return PlannerResult([], [], conservative=True, budget_bytes=budget, mode=mode)
         if not self.dry_run:
             self._reconcile_absent_allocations(set(str(h) for h in snapshots.keys()), now)
@@ -242,6 +300,7 @@ class DownloadPlanner:
         self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead, previous_allocations=previous_allocations)
         if not self.dry_run:
             self._sync_active_download_reservations(selected, {str(t["hash"]) for t in managed}, now)
+        self._flush_persistence_batch()
         self._apply_seq_desired(seq_desired_actions)
         self._qbt_post("/api/v2/torrents/start", start_hashes)
         self._qbt_post("/api/v2/torrents/stop", paused_hashes)
@@ -425,71 +484,70 @@ class DownloadPlanner:
     ) -> None:
         dead_set = dead_set or set()
         previous_allocations = previous_allocations or {}
-        def txn(con: sqlite3.Connection) -> None:
-            for torrent in torrents:
-                h = str(torrent.get("hash") or "")
-                if not h:
-                    continue
-                old = previous.get(h) or {}
-                dlspeed = int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or 0)
-                upspeed = int(torrent.get("upspeed_bps") or torrent.get("upspeed") or 0)
-                completed = int(torrent.get("completed_bytes") or torrent.get("completed") or torrent.get("downloaded") or 0)
-                progress = float(torrent.get("progress") or 0)
-                seeds = int(torrent.get("num_seeds") or torrent.get("num_complete") or 0)
-                peers = int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0)
-                prev_alloc_state = str((previous_allocations.get(h) or {}).get("desired_state") or "")
-                if dlspeed < 100 * 1024:
-                    if h in selected_set and prev_alloc_state != "active":
-                        low_speed_since = now
-                    else:
-                        low_speed_since = old.get("low_speed_since") or now
-                else:
-                    low_speed_since = None
-                old_completed = int(old.get("completed_bytes") or 0)
-                old_progress = float(old.get("progress") or 0)
-                no_progress_since = old.get("no_progress_since") if (completed <= old_completed and progress <= old_progress and old) else None
-                if old and completed <= old_completed and progress <= old_progress and no_progress_since is None:
-                    no_progress_since = now
-                last_swarm_seen_at = now if (seeds > 0 or peers > 0) else old.get("last_swarm_seen_at")
-                if h in selected_set:
-                    active_since = old.get("active_since") if prev_alloc_state == "active" else now
-                    if active_since is None:
-                        active_since = now
-                    soak_since = None
-                    dead_since = None
-                elif h in dead_set:
-                    active_since = None
-                    soak_since = None
-                    dead_since = old.get("dead_since") or now
-                else:
-                    active_since = None
-                    soak_since = old.get("soak_since") or now
-                    dead_since = old.get("dead_since")
-                con.execute(
-                    "insert into torrent_health(hash,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,low_speed_since,no_progress_since,active_since,soak_since,dead_since,updated_at) "
-                    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                    "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,dead_since=excluded.dead_since,updated_at=excluded.updated_at",
-                    (
-                        h,
-                        now,
-                        dlspeed,
-                        upspeed,
-                        completed,
-                        old_completed,
-                        progress,
-                        seeds,
-                        peers,
-                        last_swarm_seen_at,
-                        low_speed_since,
-                        no_progress_since,
-                        active_since,
-                        soak_since,
-                        dead_since,
-                        now,
-                    ),
-                )
+        rows: list[dict[str, Any]] = []
+        for torrent in torrents:
+            h = str(torrent.get("hash") or "")
+            if not h:
+                continue
+            old = previous.get(h) or {}
+            dlspeed = int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or 0)
+            upspeed = int(torrent.get("upspeed_bps") or torrent.get("upspeed") or 0)
+            completed = int(torrent.get("completed_bytes") or torrent.get("completed") or torrent.get("downloaded") or 0)
+            progress = float(torrent.get("progress") or 0)
+            seeds = int(torrent.get("num_seeds") or torrent.get("num_complete") or 0)
+            peers = int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0)
+            prev_alloc_state = str((previous_allocations.get(h) or {}).get("desired_state") or "")
+            if dlspeed < 100 * 1024:
+                low_speed_since = now if h in selected_set and prev_alloc_state != "active" else old.get("low_speed_since") or now
+            else:
+                low_speed_since = None
+            old_completed = int(old.get("completed_bytes") or 0)
+            old_progress = float(old.get("progress") or 0)
+            no_progress_since = old.get("no_progress_since") if (completed <= old_completed and progress <= old_progress and old) else None
+            if old and completed <= old_completed and progress <= old_progress and no_progress_since is None:
+                no_progress_since = now
+            last_swarm_seen_at = now if (seeds > 0 or peers > 0) else old.get("last_swarm_seen_at")
+            if h in selected_set:
+                active_since = old.get("active_since") if prev_alloc_state == "active" else now
+                if active_since is None:
+                    active_since = now
+                soak_since = None
+                dead_since = None
+            elif h in dead_set:
+                active_since = None
+                soak_since = None
+                dead_since = old.get("dead_since") or now
+            else:
+                active_since = None
+                soak_since = old.get("soak_since") or now
+                dead_since = old.get("dead_since")
+            rows.append(
+                {
+                    "hash": h,
+                    "now": int(now),
+                    "dlspeed": dlspeed,
+                    "upspeed": upspeed,
+                    "completed": completed,
+                    "old_completed": old_completed,
+                    "progress": progress,
+                    "seeds": seeds,
+                    "peers": peers,
+                    "last_swarm_seen_at": last_swarm_seen_at,
+                    "low_speed_since": low_speed_since,
+                    "no_progress_since": no_progress_since,
+                    "active_since": active_since,
+                    "soak_since": soak_since,
+                    "dead_since": dead_since,
+                }
+            )
 
-        write_transaction(self.state_db, txn)
+        if self._pending_persistence is not None:
+            self._pending_persistence.health_rows.extend(rows)
+            return
+        write_transaction(
+            self.state_db,
+            lambda con: con.executemany(HEALTH_UPSERT_SQL, [self._health_params(row) for row in rows]),
+        )
 
     def _qbt_post(self, path: str, hashes: list[str]) -> None:
         if not hashes:
@@ -534,66 +592,202 @@ class DownloadPlanner:
                 self._action(path, payload, "failed", False, str(exc))
                 raise
 
+    @staticmethod
+    def _allocation_params(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            row["hash"],
+            row["desired_state"],
+            row["desired_state"],
+            row["slot_kind"],
+            0,
+            int(row["reserved_bytes"]),
+            1 if row["seq_dl"] else 0,
+            int(row["ts"]),
+            row["reason"],
+        )
+
+    @staticmethod
+    def _health_params(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            row["hash"],
+            int(row["now"]),
+            int(row["dlspeed"]),
+            int(row["upspeed"]),
+            int(row["completed"]),
+            int(row["old_completed"]),
+            float(row["progress"]),
+            int(row["seeds"]),
+            int(row["peers"]),
+            row["last_swarm_seen_at"],
+            row["low_speed_since"],
+            row["no_progress_since"],
+            row["active_since"],
+            row["soak_since"],
+            row["dead_since"],
+            int(row["now"]),
+        )
+
+    def _flush_persistence_batch(self) -> None:
+        batch = self._pending_persistence
+        if batch is None:
+            return
+        self._pending_persistence = None
+        self._persist_planner_batch(batch)
+
+    def _persist_planner_batch(self, batch: PlannerPersistenceBatch) -> None:
+        def txn(con: sqlite3.Connection) -> None:
+            if batch.allocations:
+                con.executemany(ALLOCATION_UPSERT_SQL, [self._allocation_params(row) for row in batch.allocations])
+            if batch.soak_cooldowns:
+                con.executemany(
+                    "insert into soak_state(hash,state,ema_dlspeed_bps,cooldown_until,last_stopped_at,exposure_bytes,last_sample_at,updated_at,reason) "
+                    "values(?,?,?,?,?,?,?,?,?) "
+                    "on conflict(hash) do update set state=excluded.state,cooldown_until=excluded.cooldown_until,last_stopped_at=excluded.last_stopped_at,exposure_bytes=excluded.exposure_bytes,updated_at=excluded.updated_at,reason=excluded.reason",
+                    [
+                        (
+                            row["hash"],
+                            "soak_cooldown",
+                            0,
+                            int(row["cooldown_until"]),
+                            int(row["now"]),
+                            0,
+                            int(row["now"]),
+                            int(row["now"]),
+                            row["reason"],
+                        )
+                        for row in batch.soak_cooldowns
+                    ],
+                )
+            if batch.soak_residents:
+                con.executemany(
+                    "insert into soak_state(hash,state,ema_dlspeed_bps,resident_since,cooldown_until,last_started_at,exposure_bytes,last_sample_at,updated_at,reason) "
+                    "values(?,?,?,?,?,?,?,?,?,?) "
+                    "on conflict(hash) do update set state=excluded.state,resident_since=coalesce(soak_state.resident_since,excluded.resident_since),cooldown_until=null,last_started_at=coalesce(soak_state.last_started_at,excluded.last_started_at),exposure_bytes=excluded.exposure_bytes,last_sample_at=excluded.last_sample_at,updated_at=excluded.updated_at,reason=excluded.reason",
+                    [
+                        (
+                            row["hash"],
+                            "soak_resident",
+                            0,
+                            int(row["now"]),
+                            None,
+                            int(row["now"]),
+                            0,
+                            int(row["now"]),
+                            int(row["now"]),
+                            row["reason"],
+                        )
+                        for row in batch.soak_residents
+                    ],
+                )
+            if batch.health_rows:
+                con.executemany(HEALTH_UPSERT_SQL, [self._health_params(row) for row in batch.health_rows])
+            if batch.reservation_sync is not None:
+                selected_by_hash, managed_hashes, now = batch.reservation_sync
+                self._apply_active_download_reservations(con, selected_by_hash, managed_hashes, now)
+            if batch.decisions:
+                con.executemany(
+                    DECISION_INSERT_SQL,
+                    [
+                        (
+                            int(row["ts"]),
+                            "planner",
+                            row["hash"],
+                            row["decision"],
+                            row["reason_code"],
+                            row["data_json"],
+                        )
+                        for row in batch.decisions
+                    ],
+                )
+
+        write_transaction(self.state_db, txn)
+
     def _allocation(self, hash: str, desired_state: str, slot_kind: str, reserved_bytes: int, seq_dl: bool, ts: int, reason: str) -> None:
+        if self._pending_persistence is not None:
+            self._pending_persistence.allocations.append(
+                {
+                    "hash": hash,
+                    "desired_state": desired_state,
+                    "slot_kind": slot_kind,
+                    "reserved_bytes": int(reserved_bytes),
+                    "seq_dl": bool(seq_dl),
+                    "ts": int(ts),
+                    "reason": reason,
+                }
+            )
+            return
         write_transaction(
             self.state_db,
             lambda con: con.execute(
-                "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason) "
-                "values(?,?,?,?,?,?,?,?,?) "
-                "on conflict(hash) do update set desired_state=excluded.desired_state, applied_state=excluded.applied_state, "
-                "slot_kind=excluded.slot_kind, priority_score=excluded.priority_score, reserved_bytes=excluded.reserved_bytes, "
-                "desired_seq_dl=excluded.desired_seq_dl, allocated_at=excluded.allocated_at, reason=excluded.reason",
+                ALLOCATION_UPSERT_SQL,
                 (hash, desired_state, desired_state, slot_kind, 0, reserved_bytes, 1 if seq_dl else 0, ts, reason),
             ),
         )
 
     def _sync_active_download_reservations(self, selected: list[Mapping[str, Any]], managed_hashes: set[str], now: int) -> None:
         selected_by_hash = {str(t.get("hash")): int(t.get("amount_left") or 0) for t in selected if str(t.get("hash") or "")}
-        selected_hashes = set(selected_by_hash)
+        if self._pending_persistence is not None:
+            self._pending_persistence.reservation_sync = (selected_by_hash, set(managed_hashes), int(now))
+            return
 
         def txn(con: sqlite3.Connection) -> None:
-            active_rows = [
-                dict(r)
-                for r in con.execute(
-                    "select id,hash from resource_reservations where kind='active_download' and state='active'"
-                ).fetchall()
-            ]
-            active_by_hash: dict[str, list[int]] = {}
-            for row in active_rows:
-                active_by_hash.setdefault(str(row["hash"] or ""), []).append(int(row["id"]))
-
-            for h in sorted(managed_hashes - selected_hashes):
-                con.execute(
-                    "update resource_reservations set state='released', released_at=?, reason=? "
-                    "where kind='active_download' and state='active' and hash=?",
-                    (now, "planner_reallocated", h),
-                )
-
-            for h, bytes_reserved in selected_by_hash.items():
-                existing_ids = active_by_hash.get(h) or []
-                keep_id = existing_ids[0] if existing_ids else None
-                expires_at = now + 120
-                if keep_id is None:
-                    con.execute(
-                        "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
-                        (h, "active_download", bytes_reserved, "active", now, expires_at, "planner_active_download"),
-                    )
-                else:
-                    con.execute(
-                        "update resource_reservations set bytes=?, expires_at=?, released_at=null, reason=? where id=?",
-                        (bytes_reserved, expires_at, "planner_active_download", keep_id),
-                    )
-                    if len(existing_ids) > 1:
-                        placeholders = ",".join("?" for _ in existing_ids[1:])
-                        con.execute(
-                            f"update resource_reservations set state='released', released_at=?, reason=? where id in ({placeholders})",
-                            (now, "planner_duplicate_released", *existing_ids[1:]),
-                        )
+            self._apply_active_download_reservations(con, selected_by_hash, set(managed_hashes), int(now))
 
         write_transaction(self.state_db, txn)
 
+    @staticmethod
+    def _apply_active_download_reservations(
+        con: sqlite3.Connection,
+        selected_by_hash: dict[str, int],
+        managed_hashes: set[str],
+        now: int,
+    ) -> None:
+        selected_hashes = set(selected_by_hash)
+        active_rows = [
+            dict(row)
+            for row in con.execute(
+                "select id,hash from resource_reservations where kind='active_download' and state='active'"
+            ).fetchall()
+        ]
+        active_by_hash: dict[str, list[int]] = {}
+        for row in active_rows:
+            active_by_hash.setdefault(str(row["hash"] or ""), []).append(int(row["id"]))
+
+        for torrent_hash in sorted(managed_hashes - selected_hashes):
+            con.execute(
+                "update resource_reservations set state='released', released_at=?, reason=? "
+                "where kind='active_download' and state='active' and hash=?",
+                (int(now), "planner_reallocated", torrent_hash),
+            )
+
+        for torrent_hash, bytes_reserved in selected_by_hash.items():
+            existing_ids = active_by_hash.get(torrent_hash) or []
+            keep_id = existing_ids[0] if existing_ids else None
+            expires_at = int(now) + 120
+            if keep_id is None:
+                con.execute(
+                    "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
+                    (torrent_hash, "active_download", int(bytes_reserved), "active", int(now), expires_at, "planner_active_download"),
+                )
+            else:
+                con.execute(
+                    "update resource_reservations set bytes=?, expires_at=?, released_at=null, reason=? where id=?",
+                    (int(bytes_reserved), expires_at, "planner_active_download", keep_id),
+                )
+                if len(existing_ids) > 1:
+                    placeholders = ",".join("?" for _ in existing_ids[1:])
+                    con.execute(
+                        f"update resource_reservations set state='released', released_at=?, reason=? where id in ({placeholders})",
+                        (int(now), "planner_duplicate_released", *existing_ids[1:]),
+                    )
+
     def _mark_soak_cooldown(self, hash: str, now: int, reason: str) -> None:
         cooldown_until = int(now) + 1800
+        if self._pending_persistence is not None:
+            self._pending_persistence.soak_cooldowns.append(
+                {"hash": hash, "now": int(now), "cooldown_until": cooldown_until, "reason": reason}
+            )
+            return
         write_transaction(
             self.state_db,
             lambda con: con.execute(
@@ -605,6 +799,11 @@ class DownloadPlanner:
         )
 
     def _mark_soak_resident(self, hash: str, now: int, reason: str) -> None:
+        if self._pending_persistence is not None:
+            self._pending_persistence.soak_residents.append(
+                {"hash": hash, "now": int(now), "reason": reason}
+            )
+            return
         write_transaction(
             self.state_db,
             lambda con: con.execute(
@@ -616,10 +815,21 @@ class DownloadPlanner:
         )
 
     def _decision(self, hash: str, decision: str, reason_code: str, data: dict[str, Any]) -> None:
+        if self._pending_persistence is not None:
+            self._pending_persistence.decisions.append(
+                {
+                    "ts": int(self.now()),
+                    "hash": hash,
+                    "decision": decision,
+                    "reason_code": reason_code,
+                    "data_json": json.dumps(redact(data), ensure_ascii=False),
+                }
+            )
+            return
         write_transaction(
             self.state_db,
             lambda con: con.execute(
-                "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
+                DECISION_INSERT_SQL,
                 (int(self.now()), "planner", hash, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
             ),
         )

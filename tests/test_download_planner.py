@@ -767,6 +767,39 @@ def test_planner_subtracts_external_soak_reservations_from_full_active_budget():
         assert json.loads(decision["data_json"])["external_reserved_bytes"] == 3 * gib
 
 
+def test_planner_uses_at_most_two_write_transactions_for_one_tick():
+    from qbt_orchestrator.db import db_actor_metrics, migrate, stop_write_actors
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        stop_write_actors()
+        planner = DownloadPlanner(db, FakeExecutor(), dry_run=False, active_slots=0, disk_floor_bytes=0, now=lambda: 1000)
+        snapshots = {
+            f"h{index:03d}": {
+                "hash": f"h{index:03d}",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": index + 1,
+                "size": 1000,
+                "progress": 0.1,
+            }
+            for index in range(100)
+        }
+        before = db_actor_metrics(db)["writes_completed"]
+
+        planner.plan_and_apply(snapshots, free_bytes=100_000, sync_healthy=True)
+
+        written = db_actor_metrics(db)["writes_completed"] - before
+        assert written <= 2
+        assert len(_rows(db, "select hash from scheduler_allocations")) == 100
+        assert len(_rows(db, "select hash from torrent_health")) == 100
+        assert len(_rows(db, "select hash from decision_log where component='planner'")) == 100
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
