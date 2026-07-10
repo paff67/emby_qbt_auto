@@ -220,8 +220,10 @@ def test_daemon_runtime_enqueues_proactive_telegram_alerts_for_all_stopped_and_n
         assert [(r["chat_id"], r["topic"], r["level"], r["state"]) for r in rows] == [
             ("12345", "scheduler_all_stopped", "warning", "queued"),
             ("12345", "disk_threshold", "warning", "queued"),
+            ("12345", "capacity_deadlock", "critical", "queued"),
         ]
         assert "free=" in rows[1]["message"]
+        assert "manual intervention required" in rows[2]["message"]
 
 
 class FakeTelegramService:
@@ -1510,6 +1512,7 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
         "QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS",
         "QBT_ORCH_DISK_PATH", "QBT_ORCH_ORPHAN_JANITOR", "QBT_ORCH_JUNK_JANITOR", "QBT_ORCH_CAROUSEL",
         "QBT_ORCH_QBT_PREFERENCES_GUARD", "QBT_ORCH_PATH_RECONCILE",
+        "QBT_ORCH_DRAIN_EXIT_GB", "QBT_ORCH_EXPLORE_ENTER_GB", "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS",
     ]
     old = {k: os.environ.get(k) for k in keys}
     try:
@@ -1535,6 +1538,9 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
                 "QBT_ORCH_CAROUSEL": "0",
                 "QBT_ORCH_QBT_PREFERENCES_GUARD": "0",
                 "QBT_ORCH_PATH_RECONCILE": "0",
+                "QBT_ORCH_DRAIN_EXIT_GB": "5.5",
+                "QBT_ORCH_EXPLORE_ENTER_GB": "9",
+                "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS": "0",
             })
             ns = argparse.Namespace(cmd="daemon", dry_run=False, config=None, safety_interval=0, max_safety_ticks=1)
             runtime, dry_run = _build_runtime(ns, db)
@@ -1551,6 +1557,9 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
             assert runtime.soak_queue_service.config.max_total_exposure_bytes == 4 * 1024**3
             assert runtime.soak_queue_service.config.max_per_torrent_exposure_bytes == 512 * 1024**2
             assert runtime.disk_floor_bytes == 3 * 1024**3
+            assert runtime.drain_exit_bytes == int(5.5 * 1024**3)
+            assert runtime.explore_enter_bytes == 9 * 1024**3
+            assert runtime.capacity_deadlock_alerts_enabled is False
     finally:
         for k, v in old.items():
             if v is None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import signal
 import sqlite3
 import threading
@@ -9,9 +10,15 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from .alerts import SchedulerAlertConfig, SchedulerAlertService
+from .capacity_state import (
+    CapacityStateStore,
+    ModeController,
+    build_capacity_observation,
+    detect_capacity_state,
+)
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
-from .db import migrate, start_persistent_write_actor, stop_write_actor, write_transaction
+from .db import migrate, readonly_connect, start_persistent_write_actor, stop_write_actor, write_transaction
 from .file_batch import FileBatchService, active_pipeline_batch_hashes
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .junk_janitor import JunkJanitorService
@@ -146,6 +153,8 @@ class DaemonRuntime:
         emergency_floor_bytes: int = int(1.5 * 1024**3),
         recovery_enabled: bool = True,
         recovery_enter_bytes: int | None = None,
+        drain_exit_bytes: int | None = None,
+        explore_enter_bytes: int = 8 * 1024**3,
         recovery_margin_bytes: int = 256 * 1024**2,
         recovery_active_slots: int = 4,
         recovery_max_remaining_bytes: int = int(1.5 * 1024**3),
@@ -191,6 +200,7 @@ class DaemonRuntime:
         scheduler_alert_chat_ids: list[str] | None = None,
         scheduler_alert_interval_sec: int = 1800,
         disk_alert_margin_bytes: int = 512 * 1024**2,
+        capacity_deadlock_alerts_enabled: bool = True,
         scheduler_alert_service=None,
         sync_repeated_full_limit: int = 3,
         sync_degraded_interval_sec: float = 10.0,
@@ -213,6 +223,12 @@ class DaemonRuntime:
         self.emergency_floor_bytes = int(emergency_floor_bytes)
         self.recovery_enabled = bool(recovery_enabled)
         self.recovery_enter_bytes = int(recovery_enter_bytes if recovery_enter_bytes is not None else self.disk_floor_bytes)
+        self.drain_exit_bytes = int(
+            drain_exit_bytes
+            if drain_exit_bytes is not None
+            else max(self.disk_floor_bytes, self.recovery_enter_bytes) + 512 * 1024**2
+        )
+        self.explore_enter_bytes = int(explore_enter_bytes)
         self.recovery_margin_bytes = int(recovery_margin_bytes)
         self.recovery_active_slots = int(recovery_active_slots)
         self.recovery_max_remaining_bytes = int(recovery_max_remaining_bytes)
@@ -285,6 +301,16 @@ class DaemonRuntime:
             monotonic=monotonic,
         )
         self.obs = ObservabilityStore(self.state_db)
+        self.mode_controller = ModeController(
+            emergency_enter=self.emergency_floor_bytes,
+            drain_enter=self.recovery_enter_bytes,
+            drain_exit=self.drain_exit_bytes,
+            explore_enter=self.explore_enter_bytes,
+        )
+        self.capacity_state_store = CapacityStateStore(self.state_db)
+        self._mode_lock = threading.Lock()
+        self._scheduler_mode = self.capacity_state_store.current_mode("normal")
+        self.capacity_deadlock_alerts_enabled = bool(capacity_deadlock_alerts_enabled)
         self._sync_session_degraded_reported = False
         if scheduler_alert_service is not None:
             self.scheduler_alert_service = scheduler_alert_service
@@ -297,6 +323,7 @@ class DaemonRuntime:
                     chat_ids=chat_ids,
                     interval_sec=int(scheduler_alert_interval_sec),
                     disk_alert_margin_bytes=int(disk_alert_margin_bytes),
+                    capacity_deadlock_enabled=self.capacity_deadlock_alerts_enabled,
                 ),
             )
         self._stopping = False
@@ -331,6 +358,7 @@ class DaemonRuntime:
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
         free_bytes = int(self.free_bytes_provider())
+        scheduler_mode = self._next_scheduler_mode(free_bytes)
         sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
         if self.soak_queue_service is not None:
             soak_result = self.soak_queue_service.run_once(
@@ -372,6 +400,25 @@ class DaemonRuntime:
                 trigger_reason="planner_pressure",
                 selected_hashes=set(result.selected_hashes),
             )
+        capacity_observation = build_capacity_observation(
+            snapshots,
+            available_growth_bytes=int(result.budget_bytes),
+            selected_hashes={str(item) for item in result.selected_hashes},
+            disk_releasing_jobs=self._disk_releasing_job_count(),
+            free_bytes=free_bytes,
+        )
+        capacity_details = capacity_observation.as_details()
+        capacity_result = detect_capacity_state(
+            mode=scheduler_mode,
+            managed_incomplete=capacity_observation.managed_incomplete,
+            feasible_full_finish=capacity_observation.feasible_full_finish,
+            disk_releasing_jobs=capacity_observation.disk_releasing_jobs,
+        )
+        capacity_transition = self.capacity_state_store.persist(
+            scheduler_mode,
+            capacity_result,
+            capacity_details,
+        )
         alert_ids = self.scheduler_alert_service.evaluate_and_enqueue(
             snapshots=snapshots,
             free_bytes=free_bytes,
@@ -381,12 +428,32 @@ class DaemonRuntime:
             planner_result=result,
             sync_healthy=sync_healthy,
         )
+        if hasattr(self.scheduler_alert_service, "enqueue_capacity_deadlock"):
+            alert_ids.extend(
+                self.scheduler_alert_service.enqueue_capacity_deadlock(
+                    capacity_transition,
+                    required_minimum_growth_bytes=capacity_observation.required_minimum_growth_bytes,
+                    top_manual_candidates=list(capacity_observation.top_manual_candidates),
+                )
+            )
+        capacity_payload = {
+            "scheduler_mode": capacity_transition.scheduler_mode,
+            "state": capacity_transition.state,
+            "reason": capacity_transition.reason,
+            "entered_at": capacity_transition.entered_at,
+            "last_evaluated_at": capacity_transition.last_evaluated_at,
+            "transitioned": capacity_transition.transitioned,
+            "previous_state": capacity_transition.previous_state,
+            "details": capacity_transition.details,
+            "actions": list(capacity_result.actions),
+        }
         return {
             "selected": result.selected_hashes,
             "paused": result.paused_hashes,
             "conservative": result.conservative,
             "budget_bytes": result.budget_bytes,
             "mode": result.mode,
+            "scheduler_mode": scheduler_mode,
             "planner_dry_run": self.planner_dry_run,
             "planner": {
                 "selected_hashes": result.selected_hashes,
@@ -398,6 +465,7 @@ class DaemonRuntime:
             },
             "soak_queue": soak_result.as_dict(),
             "preemption": None if preemption_result is None else getattr(preemption_result, "__dict__", preemption_result),
+            "capacity": capacity_payload,
             "alerts_enqueued": alert_ids,
         }
 
@@ -458,18 +526,77 @@ class DaemonRuntime:
         if self.junk_janitor is not None:
             payload["junk_janitor"] = self.junk_janitor.reconcile(
                 snapshots,
-                self._junk_file_lists(snapshots) if scheduler_mode == "normal" else {},
+                self._junk_file_lists(snapshots) if scheduler_mode in {"normal", "explore"} else {},
                 sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
             )
         return payload
 
     def _batch_scheduler_mode(self, free_bytes: int) -> str:
-        """Map the legacy recovery thresholds to batch admission semantics."""
-        if int(free_bytes) < self.emergency_floor_bytes:
-            return "emergency"
-        if self.recovery_enabled and int(free_bytes) < self.recovery_enter_bytes:
-            return "drain"
-        return "normal"
+        """Return the shared hysteretic mode used by batch admission."""
+        return self._next_scheduler_mode(free_bytes)
+
+    def _next_scheduler_mode(self, free_bytes: int) -> str:
+        with self._mode_lock:
+            if not self.recovery_enabled and int(free_bytes) >= self.emergency_floor_bytes:
+                self._scheduler_mode = "explore" if int(free_bytes) >= self.explore_enter_bytes else "normal"
+            else:
+                self._scheduler_mode = self.mode_controller.next_mode(self._scheduler_mode, int(free_bytes))
+            return self._scheduler_mode
+
+    def _disk_releasing_job_count(self) -> int:
+        con = readonly_connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select job_type,payload_json from torrent_jobs "
+                "where state in ('queued','running','verify_pending','retry_wait','cleanup_wait')"
+            ).fetchall()
+        finally:
+            con.close()
+        count = 0
+        for row in rows:
+            job_type = str(row["job_type"] or "")
+            if job_type == "cleanup_full_torrent":
+                count += 1
+                continue
+            if job_type != "upload":
+                continue
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if bool(payload.get("full_torrent")):
+                count += 1
+        return count
+
+    def _effective_config_snapshot(self) -> dict:
+        return {
+            "thresholds": {
+                "emergency_enter_bytes": self.emergency_floor_bytes,
+                "drain_enter_bytes": self.recovery_enter_bytes,
+                "drain_exit_bytes": self.drain_exit_bytes,
+                "explore_enter_bytes": self.explore_enter_bytes,
+            },
+            "limits": {
+                "planner_active_slots": self.planner_active_slots,
+                "recovery_active_slots": self.recovery_active_slots,
+                "recovery_max_remaining_bytes": self.recovery_max_remaining_bytes,
+            },
+            "feature_flags": {
+                "dry_run": bool(self.dry_run),
+                "planner_dry_run": bool(self.planner_dry_run),
+                "file_batch_dry_run": bool(self.file_batch_dry_run),
+                "recovery_enabled": bool(self.recovery_enabled),
+                "soak_queue": self.soak_queue_service is not None,
+                "batch_pipeline": bool(self.batch_pipeline_enabled),
+                "batch_live_verify": bool(self.batch_live_verify),
+                "background_event_workers": bool(self.background_event_workers),
+                "background_periodic_workers": bool(self.background_periodic_workers),
+                "scheduler_alerts": bool(self.scheduler_alert_service.config.enabled)
+                if hasattr(self.scheduler_alert_service, "config")
+                else False,
+                "capacity_deadlock_alerts": bool(self.capacity_deadlock_alerts_enabled),
+            },
+        }
 
     def _junk_file_lists(self, snapshots: Mapping[str, Mapping[str, object]]) -> dict[str, list[dict]]:
         if not hasattr(self.qbt, "torrent_files"):
@@ -844,6 +971,13 @@ class DaemonRuntime:
         start_persistent_write_actor(self.state_db)
         ticks = 0
         try:
+            self.obs.event(
+                "info",
+                "daemon",
+                "effective_config",
+                "resolved scheduler thresholds and feature flags",
+                self._effective_config_snapshot(),
+            )
             self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.start()

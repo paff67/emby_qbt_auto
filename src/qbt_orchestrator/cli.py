@@ -90,6 +90,14 @@ def _recovery_enter_bytes_from_env(env=os.environ) -> int:
     return int(float(env.get("QBT_ORCH_RECOVERY_ENTER_GB", "3.5")) * 1024**3)
 
 
+def _drain_exit_bytes_from_env(env=os.environ) -> int:
+    return int(float(env.get("QBT_ORCH_DRAIN_EXIT_GB", "5")) * 1024**3)
+
+
+def _explore_enter_bytes_from_env(env=os.environ) -> int:
+    return int(float(env.get("QBT_ORCH_EXPLORE_ENTER_GB", "8")) * 1024**3)
+
+
 def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
     hot_bps = int(env.get("QBT_ORCH_SOAK_HOT_BPS", str(1024**2)))
     return SoakQueueConfig(
@@ -475,6 +483,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         emergency_floor_bytes=_emergency_floor_bytes_from_env(os.environ),
         recovery_enabled=(_truthy(os.environ.get("QBT_ORCH_RECOVERY_MODE")) is not False),
         recovery_enter_bytes=_recovery_enter_bytes_from_env(os.environ),
+        drain_exit_bytes=_drain_exit_bytes_from_env(os.environ),
+        explore_enter_bytes=_explore_enter_bytes_from_env(os.environ),
         recovery_margin_bytes=int(float(os.environ.get("QBT_ORCH_RECOVERY_MARGIN_MB", "256")) * 1024**2),
         recovery_active_slots=int(os.environ.get("QBT_ORCH_RECOVERY_ACTIVE_SLOTS", "4")),
         recovery_max_remaining_bytes=int(float(os.environ.get("QBT_ORCH_RECOVERY_MAX_REMAINING_GB", "1.5")) * 1024**3),
@@ -519,6 +529,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         scheduler_alert_chat_ids=alert_chat_ids,
         scheduler_alert_interval_sec=int(os.environ.get("QBT_ORCH_SCHEDULER_ALERT_INTERVAL_SEC", "1800")),
         disk_alert_margin_bytes=int(float(os.environ.get("QBT_ORCH_DISK_ALERT_MARGIN_MB", "512")) * 1024**2),
+        capacity_deadlock_alerts_enabled=(
+            _truthy(os.environ.get("QBT_ORCH_CAPACITY_DEADLOCK_ALERTS")) is not False
+        ),
         sync_repeated_full_limit=int(os.environ.get("QBT_ORCH_SYNC_REPEATED_FULL_LIMIT", "3")),
         sync_degraded_interval_sec=float(os.environ.get("QBT_ORCH_SYNC_DEGRADED_INTERVAL_SEC", "10")),
         background_periodic_workers=background_periodic_workers,
