@@ -37,13 +37,3 @@ python -m qbt_orchestrator.cli status --json --state-db .tmp-state.sqlite
 
 生产部署必须先 backup + migrate dry-run + once dry-run + daemon dry-run，再切换旧 timer。
 
-## 设计来源
-
-完整设计方案见本机：
-`C:/Users/paff/Documents/tem/docs/superpowers/specs/2026-07-02-qbt-orchestrator-daemon-upgrade-design.md`
-
-VPS 真实情况记录：
-
-- `docs/prep/vps-baseline-20260702.md`
-- `docs/prep/root-verification-20260702.md`
-- `docs/traceability/requirements-map.md`
