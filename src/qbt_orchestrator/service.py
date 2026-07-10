@@ -191,6 +191,8 @@ class DaemonRuntime:
         scheduler_alert_interval_sec: int = 1800,
         disk_alert_margin_bytes: int = 512 * 1024**2,
         scheduler_alert_service=None,
+        sync_repeated_full_limit: int = 3,
+        sync_degraded_interval_sec: float = 10.0,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -266,8 +268,18 @@ class DaemonRuntime:
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
-        self.monitor = SafetyMonitor(qbt, executor, free_bytes_provider, managed_count_provider=managed_count_provider, emergency_floor_bytes=self.emergency_floor_bytes)
+        self.monitor = SafetyMonitor(
+            qbt,
+            executor,
+            free_bytes_provider,
+            managed_count_provider=managed_count_provider,
+            emergency_floor_bytes=self.emergency_floor_bytes,
+            sync_repeated_full_limit=sync_repeated_full_limit,
+            sync_degraded_interval_sec=sync_degraded_interval_sec,
+            monotonic=monotonic,
+        )
         self.obs = ObservabilityStore(self.state_db)
+        self._sync_session_degraded_reported = False
         if scheduler_alert_service is not None:
             self.scheduler_alert_service = scheduler_alert_service
         else:
@@ -484,12 +496,37 @@ class DaemonRuntime:
         result = self.monitor.tick()
         free_bytes = int(self.free_bytes_provider())
         self._persist_disk_state(free_bytes, result.disk_state)
+        sync_stats = self.monitor.sync.session_stats.as_dict()
+        if self.monitor.sync.session_stats.degraded and not self._sync_session_degraded_reported:
+            self.obs.event(
+                "warning",
+                "qbt",
+                "sync_session_degraded",
+                "qBT sync repeatedly returned full snapshots; degraded polling enabled",
+                sync_stats,
+            )
+            self._sync_session_degraded_reported = True
+        elif not self.monitor.sync.session_stats.degraded and self._sync_session_degraded_reported:
+            self.obs.event(
+                "info",
+                "qbt",
+                "sync_session_recovered",
+                "qBT sync resumed delta snapshots",
+                sync_stats,
+            )
+            self._sync_session_degraded_reported = False
         self.obs.event(
             "info",
             "daemon",
             "safety_tick",
             f"disk={result.disk_state} sync={result.sync_health}",
-            {"free_bytes": free_bytes, "sync_health": result.sync_health, "dry_run": self.dry_run},
+            {
+                "free_bytes": free_bytes,
+                "sync_health": result.sync_health,
+                "sync_skipped": result.sync_skipped,
+                "sync_session": sync_stats,
+                "dry_run": self.dry_run,
+            },
         )
 
     def process_bot_commands(self, max_commands: int = 20) -> int:

@@ -148,7 +148,7 @@ def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
             password=env.get("QBT_ORCH_QBT_PASSWORD", ""),
             timeout=timeout,
             api_max_requests_per_sec=max_rps,
-            auth_mode="auto",
+            auth_mode=env.get("QBT_ORCH_QBT_AUTH_MODE", "required"),
             default_headers=http_headers(),
         )
     if mode in {"docker", "docker-exec", "container"}:
@@ -509,6 +509,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         scheduler_alert_chat_ids=alert_chat_ids,
         scheduler_alert_interval_sec=int(os.environ.get("QBT_ORCH_SCHEDULER_ALERT_INTERVAL_SEC", "1800")),
         disk_alert_margin_bytes=int(float(os.environ.get("QBT_ORCH_DISK_ALERT_MARGIN_MB", "512")) * 1024**2),
+        sync_repeated_full_limit=int(os.environ.get("QBT_ORCH_SYNC_REPEATED_FULL_LIMIT", "3")),
+        sync_degraded_interval_sec=float(os.environ.get("QBT_ORCH_SYNC_DEGRADED_INTERVAL_SEC", "10")),
     )
     return runtime, dry_run
 

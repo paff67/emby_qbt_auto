@@ -54,7 +54,45 @@ def test_daemon_runtime_runs_safety_ticks_and_persists_disk_state():
         event_count = con.execute("select count(*) from events_v2 where component='daemon' and event_type='safety_tick'").fetchone()[0]
         con.close()
         assert row == ("ok", 6 * 1024**3)
-        assert event_count == 2
+    assert event_count == 2
+
+
+def test_daemon_emits_one_event_when_sync_session_becomes_degraded():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class RepeatedFullQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = RepeatedFullQbt()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0,
+            sync_repeated_full_limit=1,
+            sync_degraded_interval_sec=60,
+        )
+
+        daemon.tick_safety()
+        daemon.tick_safety()
+        daemon.tick_safety()
+
+        con = sqlite3.connect(db)
+        events = con.execute(
+            "select event_type,data_json from events_v2 where component='qbt' and event_type='sync_session_degraded'"
+        ).fetchall()
+        con.close()
+        assert len(events) == 1
+        assert json.loads(events[0][1])["repeated_full_updates"] == 1
+        assert qbt.rids == [0, 1]
 
 
 def test_daemon_runtime_emergency_tick_pauses_managed_downloads():

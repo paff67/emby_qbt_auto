@@ -350,6 +350,55 @@ def test_qbt_http_client_logs_in_and_reuses_sid_cookie_for_host_api():
     assert calls[0][4] == 7
 
 
+def test_qbt_sync_session_reuses_sid_and_observes_delta():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    request_cookies = []
+    responses = iter(
+        [
+            {"rid": 10, "full_update": True, "torrents": {"h": {"size": 1}}},
+            {"rid": 11, "full_update": False, "torrents": {"h": {"dlspeed": 2}}},
+        ]
+    )
+
+    def transport(method, url, body, headers, timeout):
+        if url.endswith("/api/v2/auth/login"):
+            return 200, "Ok.", {"Set-Cookie": "SID=abc; Path=/"}
+        request_cookies.append(headers.get("Cookie"))
+        return 200, json.dumps(next(responses)), {}
+
+    client = QbtHttpClient(username="u", password="p", transport=transport, auth_mode="required")
+    first = client.get_maindata(0)
+    second = client.get_maindata(first["rid"])
+
+    assert second["full_update"] is False
+    assert request_cookies == ["SID=abc", "SID=abc"]
+
+
+def test_qbt_client_builder_honors_required_auth_mode():
+    from qbt_orchestrator.cli import _build_qbt_client_from_env
+
+    client = _build_qbt_client_from_env(
+        env={
+            "QBT_ORCH_QBT_API_MODE": "host",
+            "QBT_ORCH_QBT_API_BASE": "http://127.0.0.1:8081",
+            "QBT_ORCH_QBT_USERNAME": "user",
+            "QBT_ORCH_QBT_PASSWORD": "pass",
+            "QBT_ORCH_QBT_AUTH_MODE": "required",
+        }
+    )
+
+    assert client.auth_mode == "required"
+
+
+def test_qbt_token_bucket_uses_a_thread_lock():
+    from qbt_orchestrator.integrations.qbt import TokenBucket
+
+    bucket = TokenBucket(1)
+
+    assert hasattr(bucket, "_lock")
+
+
 def test_qbt_http_client_reauthenticates_once_after_unauthorized_response():
     from qbt_orchestrator.integrations.qbt import QbtHttpClient
 

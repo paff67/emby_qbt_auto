@@ -128,6 +128,57 @@ def test_qbt_sync_partial_delta_preserves_full_snapshot_fields():
     assert snap.dlspeed_bps == 123
 
 
+def test_qbt_sync_detects_repeated_full_updates_and_backs_off_until_due():
+    from qbt_orchestrator.qbt_sync import QbtSyncCache
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    class RepeatedFullClient:
+        def __init__(self):
+            self.rids = []
+
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            if len(self.rids) <= 4:
+                return {
+                    "rid": rid + 1,
+                    "full_update": True,
+                    "torrents": {"h": {"category": "auto", "size": 1}},
+                }
+            return {"rid": rid + 1, "full_update": False, "torrents": {"h": {"dlspeed": 2}}}
+
+    clock = Clock()
+    client = RepeatedFullClient()
+    cache = QbtSyncCache(
+        client,
+        repeated_full_limit=3,
+        degraded_interval_sec=10,
+        monotonic=clock,
+    )
+
+    for _ in range(4):
+        cache.poll_once()
+
+    assert cache.session_stats.full_updates == 4
+    assert cache.session_stats.repeated_full_updates == 3
+    assert cache.session_stats.consecutive_repeated_full_updates == 3
+    assert cache.session_stats.degraded is True
+
+    skipped = cache.poll_once()
+    assert skipped.skipped is True
+    assert client.rids == [0, 1, 2, 3]
+
+    clock.now = 10.0
+    recovered = cache.poll_once()
+    assert recovered.skipped is False
+    assert cache.session_stats.delta_updates == 1
+    assert cache.session_stats.degraded is False
+
+
 def test_torrent_snapshot_preserves_speed_and_completed_for_health_planner():
     from qbt_orchestrator.models import TorrentSnapshot
 
@@ -496,7 +547,6 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
-
 
 
 
