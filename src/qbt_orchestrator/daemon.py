@@ -45,5 +45,6 @@ class SafetyMonitor:
         if disk.state.value == "emergency":
             action = emergency_pause_action([vars(snapshot) for snapshot in self.sync.snapshots.values()])
             if action:
-                self.executor.qbt_post(action.path, action.payload)
+                emergency_post = getattr(self.executor, "emergency_qbt_post", self.executor.qbt_post)
+                emergency_post(action.path, action.payload)
         return SafetyTickResult(disk.state.value, sync_result.health.value, sync_skipped=sync_result.skipped)

@@ -20,6 +20,7 @@ from .observe_promotion import ObservePromotionService
 from .observability import redact
 from .planner import DownloadPlanner
 from .policies.disk import classify_disk
+from .periodic import PeriodicTask, PeriodicWorker
 from .runtime import BotCommandRepository, BotNotificationRepository, ObservabilityStore
 from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
 from .telegram_control import TelegramAuthorizer
@@ -193,6 +194,8 @@ class DaemonRuntime:
         scheduler_alert_service=None,
         sync_repeated_full_limit: int = 3,
         sync_degraded_interval_sec: float = 10.0,
+        background_periodic_workers: bool = False,
+        periodic_worker_join_timeout: float = 5.0,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -257,6 +260,9 @@ class DaemonRuntime:
         self.event_worker_join_timeout = max(0.0, float(event_worker_join_timeout))
         self._event_worker_stop = threading.Event()
         self._event_worker_threads: list[threading.Thread] = []
+        self.background_periodic_workers = bool(background_periodic_workers)
+        self.periodic_worker_join_timeout = max(0.0, float(periodic_worker_join_timeout))
+        self._periodic_workers: list[PeriodicWorker] = []
         self.junk_file_refresh_limit = int(junk_file_refresh_limit)
         self.carousel_dry_run = carousel_dry_run or dry_run
         if carousel_service is not None:
@@ -731,30 +737,83 @@ class DaemonRuntime:
                 )
             self._event_worker_stop.wait(self.event_worker_interval)
 
+    def _start_periodic_workers(self) -> None:
+        if not self.background_periodic_workers:
+            return
+        if any(worker.is_alive() for worker in self._periodic_workers):
+            return
+        self._periodic_workers = []
+        for loop_task in self.loop_tasks:
+            task = PeriodicTask(
+                loop_task.name,
+                loop_task.interval_sec,
+                lambda current=loop_task: self._execute_loop_task(current),
+            )
+            worker = PeriodicWorker(task, monotonic=self.monotonic, on_error=self._periodic_worker_error)
+            self._periodic_workers.append(worker)
+            worker.start()
+        self.obs.event(
+            "info",
+            "daemon",
+            "periodic_workers_started",
+            "background periodic workers started",
+            {"workers": [worker.task.name for worker in self._periodic_workers]},
+        )
+
+    def _stop_periodic_workers(self) -> list[str]:
+        if not self._periodic_workers:
+            return []
+        for worker in self._periodic_workers:
+            worker.stop()
+        for worker in self._periodic_workers:
+            worker.join(timeout=self.periodic_worker_join_timeout)
+        alive = [worker.task.name for worker in self._periodic_workers if worker.is_alive()]
+        self.obs.event(
+            "info",
+            "daemon",
+            "periodic_workers_stopped",
+            "background periodic workers stop requested",
+            {"alive": alive},
+        )
+        self._periodic_workers = [worker for worker in self._periodic_workers if worker.is_alive()]
+        return alive
+
+    def _periodic_worker_error(self, name: str, exc: Exception) -> None:
+        self.obs.event(
+            "error",
+            name,
+            "periodic_worker_failed",
+            str(redact(str(exc))),
+            {"background_periodic_workers": True, "dry_run": self.dry_run},
+        )
+
     def run_due_loop_tasks(self) -> int:
         ran = 0
         now_monotonic = self.monotonic()
         for task in self.loop_tasks:
             if not task.due(now_monotonic):
                 continue
-            started = self.monotonic()
-            result = None
-            callback_error = None
-            try:
-                result = task.callback()
-            except Exception as exc:
-                callback_error = exc
-            duration = max(0.0, self.monotonic() - started)
-            try:
-                if callback_error is None:
-                    self.obs.event("info", task.name, "loop_tick", f"{task.name} loop completed", {"result": result, "dry_run": self.dry_run})
-                else:
-                    self.obs.event("error", task.name, "loop_failed", str(redact(str(callback_error))), {"dry_run": self.dry_run})
-            finally:
-                self._loop_metric(task, duration, succeeded=callback_error is None)
-                task.mark_ran(now_monotonic)
-                ran += 1
+            self._execute_loop_task(task)
+            task.mark_ran(now_monotonic)
+            ran += 1
         return ran
+
+    def _execute_loop_task(self, task: LoopTask) -> None:
+        started = self.monotonic()
+        result = None
+        callback_error = None
+        try:
+            result = task.callback()
+        except Exception as exc:
+            callback_error = exc
+        duration = max(0.0, self.monotonic() - started)
+        try:
+            if callback_error is None:
+                self.obs.event("info", task.name, "loop_tick", f"{task.name} loop completed", {"result": result, "dry_run": self.dry_run})
+            else:
+                self.obs.event("error", task.name, "loop_failed", str(redact(str(callback_error))), {"dry_run": self.dry_run})
+        finally:
+            self._loop_metric(task, duration, succeeded=callback_error is None)
 
     def _loop_metric(self, task: LoopTask, duration: float, *, succeeded: bool) -> None:
         self.obs.rolling_timing_metric(
@@ -786,6 +845,7 @@ class DaemonRuntime:
         if self.telegram_supervisor is not None:
             self.telegram_supervisor.start()
         self._start_background_event_workers()
+        self._start_periodic_workers()
         ticks = 0
         try:
             while not self._stopping:
@@ -794,7 +854,8 @@ class DaemonRuntime:
                     self.tick_safety()
                 except Exception as exc:  # keep safety process supervised and observable
                     self.obs.event("error", "daemon", "safety_tick_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-                self.run_due_loop_tasks()
+                if not self.background_periodic_workers:
+                    self.run_due_loop_tasks()
                 try:
                     self.process_bot_commands()
                 except Exception as exc:
@@ -827,6 +888,7 @@ class DaemonRuntime:
                 if sleep_for > 0:
                     self.sleeper(sleep_for)
         finally:
+            self._stop_periodic_workers()
             self._stop_background_event_workers()
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.stop()

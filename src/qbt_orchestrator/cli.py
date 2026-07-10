@@ -440,6 +440,16 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         and not dry_run
     )
     background_event_workers = background_event_env if background_event_env is not None else default_background_event_workers
+    background_periodic_env = _truthy(os.environ.get("QBT_ORCH_BACKGROUND_PERIODIC_WORKERS"))
+    default_background_periodic_workers = (
+        getattr(ns, "cmd", "") == "daemon"
+        and getattr(ns, "max_safety_ticks", None) is None
+    )
+    background_periodic_workers = (
+        background_periodic_env
+        if background_periodic_env is not None
+        else default_background_periodic_workers
+    )
     soak_enabled = _truthy(os.environ.get("QBT_ORCH_SOAK_ENABLED"))
     if soak_enabled is None:
         soak_enabled = False
@@ -511,6 +521,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         disk_alert_margin_bytes=int(float(os.environ.get("QBT_ORCH_DISK_ALERT_MARGIN_MB", "512")) * 1024**2),
         sync_repeated_full_limit=int(os.environ.get("QBT_ORCH_SYNC_REPEATED_FULL_LIMIT", "3")),
         sync_degraded_interval_sec=float(os.environ.get("QBT_ORCH_SYNC_DEGRADED_INTERVAL_SEC", "10")),
+        background_periodic_workers=background_periodic_workers,
+        periodic_worker_join_timeout=float(os.environ.get("QBT_ORCH_PERIODIC_WORKER_JOIN_TIMEOUT_SEC", "5")),
     )
     return runtime, dry_run
 

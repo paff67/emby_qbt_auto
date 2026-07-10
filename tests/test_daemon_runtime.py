@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 import sys
@@ -957,6 +958,51 @@ def test_daemon_background_event_workers_do_not_block_safety_loop():
         # assuming sub-second wall-clock timing.
         assert elapsed < 1.5
         assert runner.calls >= 1
+
+
+def test_daemon_background_periodic_workers_do_not_block_safety_loop():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    class BlockingInventory:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def __call__(self):
+            self.started.set()
+            self.release.wait(timeout=2)
+            return {"released": self.release.is_set()}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        blocker = BlockingInventory()
+        qbt = FakeQbt()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0.01,
+            loop_tasks=[LoopTask("file_batch", 60, blocker, max_runtime_sec=0.05)],
+            background_periodic_workers=True,
+            periodic_worker_join_timeout=0.01,
+            sync_repeated_full_limit=999,
+        )
+
+        started = time.monotonic()
+        try:
+            daemon.run(max_safety_ticks=5)
+            elapsed = time.monotonic() - started
+            assert blocker.started.wait(timeout=0.2)
+            assert qbt.rids == [0, 1, 2, 3, 4]
+            assert elapsed < 0.5
+        finally:
+            blocker.release.set()
+            for worker in list(daemon._periodic_workers):
+                worker.join(timeout=1)
 
 
 class RecordingBackfill:
