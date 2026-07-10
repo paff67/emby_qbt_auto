@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
+from .budget import future_growth_by_hash, resource_claims_from_rows
 from .db import readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
 from .models import BatchReservation
@@ -605,9 +606,10 @@ class FileBatchService:
                 (int(downloaded_bytes), now, int(job_id), int(downloaded_bytes), now, now, int(batch_id)),
             )
             con.execute(
-                "update resource_reservations set state='released', released_at=?, reason='batch_downloaded_upload_queued' "
+                "update resource_reservations set accounting_class='future_growth',owner='file_batch',"
+                "state='released',released_at=?,last_observed_at=?,reason='batch_downloaded_upload_queued' "
                 "where batch_id=? and kind='batch' and state='active'",
-                (now, int(batch_id)),
+                (now, now, int(batch_id)),
             )
             existing = con.execute(
                 "select id from resource_reservations where batch_id=? and kind='cleanup_pending' order by id limit 1",
@@ -615,13 +617,29 @@ class FileBatchService:
             ).fetchone()
             if existing:
                 con.execute(
-                    "update resource_reservations set hash=?, bytes=?, state='active', released_at=null, reason='batch_upload_queued' where id=?",
-                    (h, int(downloaded_bytes), int(existing["id"])),
+                    "update resource_reservations set hash=?,accounting_class='current_pinned',owner='file_batch',"
+                    "bytes=?,state='active',expires_at=null,released_at=null,lease_generation=lease_generation+1,last_observed_at=?,"
+                    "reason='batch_upload_queued' where id=?",
+                    (h, int(downloaded_bytes), now, int(existing["id"])),
                 )
             else:
                 con.execute(
-                    "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
-                    (h, int(batch_id), "cleanup_pending", int(downloaded_bytes), "active", now, None, "batch_upload_queued"),
+                    "insert into resource_reservations("
+                    "hash,batch_id,kind,accounting_class,owner,bytes,state,created_at,expires_at,last_observed_at,reason) "
+                    "values(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        h,
+                        int(batch_id),
+                        "cleanup_pending",
+                        "current_pinned",
+                        "file_batch",
+                        int(downloaded_bytes),
+                        "active",
+                        now,
+                        None,
+                        now,
+                        "batch_upload_queued",
+                    ),
                 )
         write_transaction(self.state_db, txn)
 
@@ -807,21 +825,11 @@ class FileBatchService:
         con = _connect(self.state_db)
         try:
             rows = con.execute(
-                "select id,hash,kind,bytes from resource_reservations where state='active' and (expires_at is null or expires_at>?)",
+                "select id,hash,kind,accounting_class,bytes from resource_reservations "
+                "where state='active' and (expires_at is null or expires_at>?)",
                 (int(self.now()),),
             ).fetchall()
-            grouped: dict[str, dict[str, int]] = {}
-            for row in rows:
-                key = str(row["hash"] or f"{row['kind']}:{row['id']}")
-                bucket = grouped.setdefault(key, {"active_download": 0, "batch": 0, "other": 0})
-                kind = str(row["kind"] or "")
-                if kind == "active_download":
-                    bucket["active_download"] += int(row["bytes"] or 0)
-                elif kind == "batch":
-                    bucket["batch"] += int(row["bytes"] or 0)
-                else:
-                    bucket["other"] += int(row["bytes"] or 0)
-            return sum(max(bucket["active_download"], bucket["batch"]) + bucket["other"] for bucket in grouped.values())
+            return sum(future_growth_by_hash(resource_claims_from_rows(rows)).values())
         finally:
             con.close()
 
@@ -894,8 +902,22 @@ class FileBatchService:
             )
             batch_id = int(cur.lastrowid)
             con.execute(
-                "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
-                (h, batch_id, "batch", int(reservation.reserved_bytes), "active", now, now + self.reservation_ttl_sec, "batch_pipeline_reserved"),
+                "insert into resource_reservations("
+                "hash,batch_id,kind,accounting_class,owner,bytes,state,created_at,expires_at,last_observed_at,reason) "
+                "values(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    h,
+                    batch_id,
+                    "batch",
+                    "future_growth",
+                    "file_batch",
+                    int(reservation.reserved_bytes),
+                    "active",
+                    now,
+                    now + self.reservation_ttl_sec,
+                    now,
+                    "batch_pipeline_reserved",
+                ),
             )
             return batch_id
 

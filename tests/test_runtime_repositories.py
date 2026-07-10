@@ -281,8 +281,20 @@ def test_upload_job_runner_marks_pipeline_batch_cleanup_deferred_and_counts_pend
         assert rclone.dir_copies == []
         batch = _rows(db, "select state,upload_job_id,local_pinned_bytes,cleanup_deferred_at from torrent_batches where id=1")[0]
         assert batch == {"state": "cleanup_deferred", "upload_job_id": job_id, "local_pinned_bytes": 10, "cleanup_deferred_at": 100}
-        reservation = _rows(db, "select kind,bytes,state,reason from resource_reservations where batch_id=1 and kind='cleanup_pending'")[0]
-        assert reservation == {"kind": "cleanup_pending", "bytes": 10, "state": "active", "reason": "batch_cleanup_deferred"}
+        reservation = _rows(
+            db,
+            "select kind,accounting_class,owner,last_observed_at,bytes,state,reason "
+            "from resource_reservations where batch_id=1 and kind='cleanup_pending'",
+        )[0]
+        assert reservation == {
+            "kind": "cleanup_pending",
+            "accounting_class": "current_pinned",
+            "owner": "upload_job_runner",
+            "last_observed_at": 100,
+            "bytes": 10,
+            "state": "active",
+            "reason": "batch_cleanup_deferred",
+        }
         media_job = repo.claim_next("media_pipeline")
         assert media_job is not None
         assert media_job["batch_id"] == 1
@@ -715,4 +727,3 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
-

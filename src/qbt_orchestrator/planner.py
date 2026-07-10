@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from .budget import future_growth_by_hash, resource_claims_from_rows
 from .db import readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
 from .models import LifecycleState
@@ -414,27 +415,14 @@ class DownloadPlanner:
         con = _connect(self.state_db)
         try:
             rows = con.execute(
-                "select id,hash,kind,bytes from resource_reservations "
+                "select id,hash,kind,accounting_class,bytes from resource_reservations "
                 "where state='active' and (expires_at is null or expires_at>?)",
                 (int(now),),
             ).fetchall()
-            grouped: dict[str, dict[str, int]] = {}
-            for row in rows:
-                key = str(row["hash"] or f"{row['kind']}:{row['id']}")
-                bucket = grouped.setdefault(key, {"active_download": 0, "batch": 0, "other": 0})
-                kind = str(row["kind"] or "")
-                if kind in ignored_kinds:
-                    continue
-                if kind == "active_download":
-                    bucket["active_download"] += int(row["bytes"] or 0)
-                elif kind == "batch":
-                    bucket["batch"] += int(row["bytes"] or 0)
-                else:
-                    bucket["other"] += int(row["bytes"] or 0)
-            out: dict[str, int] = {}
-            for key, bucket in grouped.items():
-                out[key] = max(bucket["active_download"], bucket["batch"]) + bucket["other"]
-            return out
+            return future_growth_by_hash(
+                resource_claims_from_rows(rows),
+                ignored_kinds=ignored_kinds,
+            )
         finally:
             con.close()
 
@@ -765,13 +753,27 @@ class DownloadPlanner:
             expires_at = int(now) + 120
             if keep_id is None:
                 con.execute(
-                    "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
-                    (torrent_hash, "active_download", int(bytes_reserved), "active", int(now), expires_at, "planner_active_download"),
+                    "insert into resource_reservations("
+                    "hash,kind,accounting_class,owner,bytes,state,created_at,expires_at,last_observed_at,reason) "
+                    "values(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        torrent_hash,
+                        "active_download",
+                        "future_growth",
+                        "planner",
+                        int(bytes_reserved),
+                        "active",
+                        int(now),
+                        expires_at,
+                        int(now),
+                        "planner_active_download",
+                    ),
                 )
             else:
                 con.execute(
-                    "update resource_reservations set bytes=?, expires_at=?, released_at=null, reason=? where id=?",
-                    (int(bytes_reserved), expires_at, "planner_active_download", keep_id),
+                    "update resource_reservations set accounting_class='future_growth',owner='planner',bytes=?,expires_at=?,"
+                    "released_at=null,lease_generation=lease_generation+1,last_observed_at=?,reason=? where id=?",
+                    (int(bytes_reserved), expires_at, int(now), "planner_active_download", keep_id),
                 )
                 if len(existing_ids) > 1:
                     placeholders = ",".join("?" for _ in existing_ids[1:])

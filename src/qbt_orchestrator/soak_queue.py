@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from .budget import future_growth_by_hash, resource_claims_from_rows
 from .db import readonly_connect, write_transaction
 from .observability import redact
 
@@ -328,23 +329,17 @@ class SoakQueueService:
     def _non_soak_reservation_bytes(self, now: int) -> int:
         con = readonly_connect(self.state_db)
         try:
-            grouped: dict[str, dict[str, int]] = {}
-            for row in con.execute(
-                "select id,hash,kind,bytes from resource_reservations where state='active' and (expires_at is null or expires_at>?)",
+            rows = con.execute(
+                "select id,hash,kind,accounting_class,bytes from resource_reservations "
+                "where state='active' and (expires_at is null or expires_at>?)",
                 (int(now),),
-            ).fetchall():
-                kind = str(row["kind"] or "")
-                if kind == "soak_probe":
-                    continue
-                key = str(row["hash"] or f"{kind}:{row['id']}")
-                bucket = grouped.setdefault(key, {"active_download": 0, "batch": 0, "other": 0})
-                if kind == "active_download":
-                    bucket["active_download"] += int(row["bytes"] or 0)
-                elif kind == "batch":
-                    bucket["batch"] += int(row["bytes"] or 0)
-                else:
-                    bucket["other"] += int(row["bytes"] or 0)
-            return sum(max(v["active_download"], v["batch"]) + v["other"] for v in grouped.values())
+            ).fetchall()
+            return sum(
+                future_growth_by_hash(
+                    resource_claims_from_rows(rows),
+                    ignored_kinds={"soak_probe"},
+                ).values()
+            )
         finally:
             con.close()
 
@@ -547,14 +542,17 @@ class SoakQueueService:
                 if keep_id is None:
                     reason = "soak_resident_recovery_preserve" if int(bytes_reserved) <= 0 else "soak_resident"
                     con.execute(
-                        "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
-                        (h, "soak_probe", int(bytes_reserved), "active", now, expires_at, reason),
+                        "insert into resource_reservations("
+                        "hash,kind,accounting_class,owner,bytes,state,created_at,expires_at,last_observed_at,reason) "
+                        "values(?,?,?,?,?,?,?,?,?,?)",
+                        (h, "soak_probe", "future_growth", "soak_queue", int(bytes_reserved), "active", now, expires_at, now, reason),
                     )
                 else:
                     reason = "soak_resident_recovery_preserve" if int(bytes_reserved) <= 0 else "soak_resident"
                     con.execute(
-                        "update resource_reservations set bytes=?, expires_at=?, released_at=null, reason=? where id=?",
-                        (int(bytes_reserved), expires_at, reason, keep_id),
+                        "update resource_reservations set accounting_class='future_growth',owner='soak_queue',bytes=?,"
+                        "expires_at=?,released_at=null,lease_generation=lease_generation+1,last_observed_at=?,reason=? where id=?",
+                        (int(bytes_reserved), expires_at, now, reason, keep_id),
                     )
                     if len(ids) > 1:
                         placeholders = ",".join("?" for _ in ids[1:])

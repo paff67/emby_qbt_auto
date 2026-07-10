@@ -505,6 +505,44 @@ def test_file_batch_service_blocks_pipeline_batch_when_reservation_budget_is_ins
         assert decision["reason_code"] == "global_batch_budget_below_minimum"
 
 
+def test_file_batch_budget_reports_but_does_not_subtract_current_pinned_inventory():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into resource_reservations("
+            "hash,kind,accounting_class,bytes,state,created_at,reason) values(?,?,?,?,?,?,?)",
+            ("pinned", "cleanup_pending", "current_pinned", 10 * gib, "active", 100, "verified_waiting_cleanup"),
+        )
+        con.commit(); con.close()
+        qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0}])
+        service = FileBatchService(state_db=db, dry_run=False, qbt=qbt, disk_floor_bytes=2 * gib, now=lambda: 1_000)
+
+        result = service.sync_completed(
+            {"new": {"hash": "new", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0}},
+            free_bytes=4 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.batches_created == 1
+        claim = _rows(
+            db,
+            "select accounting_class,owner,lease_generation,last_observed_at "
+            "from resource_reservations where kind='batch'",
+        )[0]
+        assert claim == {
+            "accounting_class": "future_growth",
+            "owner": "file_batch",
+            "lease_generation": 0,
+            "last_observed_at": 1_000,
+        }
+
+
 def test_file_batch_service_live_verify_with_explicit_canary_blocks_nonmatching_hash_before_file_probe():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
@@ -1043,10 +1081,32 @@ def test_file_batch_service_queues_downloaded_pipeline_batch_without_delete():
             "local_pinned_bytes": 15,
             "upload_queued_at": 1_000,
         }
-        reservations = _rows(db, "select kind,bytes,state,released_at,reason from resource_reservations order by id")
+        reservations = _rows(
+            db,
+            "select kind,accounting_class,owner,last_observed_at,bytes,state,released_at,reason "
+            "from resource_reservations order by id",
+        )
         assert reservations == [
-            {"kind": "batch", "bytes": 100, "state": "released", "released_at": 1_000, "reason": "batch_downloaded_upload_queued"},
-            {"kind": "cleanup_pending", "bytes": 15, "state": "active", "released_at": None, "reason": "batch_upload_queued"},
+            {
+                "kind": "batch",
+                "accounting_class": "future_growth",
+                "owner": "file_batch",
+                "last_observed_at": 1_000,
+                "bytes": 100,
+                "state": "released",
+                "released_at": 1_000,
+                "reason": "batch_downloaded_upload_queued",
+            },
+            {
+                "kind": "cleanup_pending",
+                "accounting_class": "current_pinned",
+                "owner": "file_batch",
+                "last_observed_at": 1_000,
+                "bytes": 15,
+                "state": "active",
+                "released_at": None,
+                "reason": "batch_upload_queued",
+            },
         ]
 
 

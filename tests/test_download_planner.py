@@ -579,6 +579,58 @@ def test_planner_subtracts_active_resource_reservations_from_budget():
         assert decision["reason_code"] == "budget_or_slot_exhausted"
 
 
+def test_planner_does_not_subtract_current_pinned_inventory_from_df_free():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into resource_reservations(hash,kind,accounting_class,bytes,state,created_at,reason) "
+            "values('pinned','cleanup_pending','current_pinned',?,'active',900,'cleanup_wait')",
+            (5 * gib,),
+        )
+        con.execute(
+            "insert into resource_reservations(hash,kind,accounting_class,bytes,state,created_at,expires_at,reason) "
+            "values('future','active_download','future_growth',?,'active',900,2000,'existing')",
+            (1 * gib,),
+        )
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(db, executor, dry_run=False, active_slots=1, disk_floor_bytes=2 * gib, now=lambda: 1000)
+        snapshots = {
+            "new": {
+                "hash": "new",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": 4 * gib,
+                "size": 8 * gib,
+                "progress": 0.5,
+            }
+        }
+
+        result = planner.plan_and_apply(snapshots, free_bytes=7 * gib, sync_healthy=True)
+
+        assert result.budget_bytes == 4 * gib
+        assert result.selected_hashes == ["new"]
+        claim = _rows(
+            db,
+            "select accounting_class,owner,lease_generation,last_observed_at "
+            "from resource_reservations where hash='new' and kind='active_download'",
+        )[0]
+        assert claim == {
+            "accounting_class": "future_growth",
+            "owner": "planner",
+            "lease_generation": 0,
+            "last_observed_at": 1000,
+        }
+
+
 def test_planner_deduplicates_batch_and_active_download_reservations_for_same_hash():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner

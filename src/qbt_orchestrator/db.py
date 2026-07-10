@@ -348,8 +348,14 @@ def migration_sql() -> list[str]:
         "create index if not exists idx_torrent_batches_state on torrent_batches(state)",
         "create index if not exists idx_torrent_batches_cleanup_deferred on torrent_batches(state,cleanup_deferred_at)",
         "create table if not exists resource_reservations(id integer primary key autoincrement, hash text, batch_id integer, kind text, bytes integer not null, state text default 'active', created_at integer, expires_at integer, released_at integer, reason text)",
+        "alter table resource_reservations add column accounting_class text not null default 'future_growth'",
+        "alter table resource_reservations add column owner text",
+        "alter table resource_reservations add column lease_generation integer not null default 0",
+        "alter table resource_reservations add column last_observed_at integer",
+        "update resource_reservations set accounting_class='current_pinned' where kind='cleanup_pending'",
         "create index if not exists idx_reservations_active on resource_reservations(state,expires_at)",
         "create index if not exists idx_reservations_hash on resource_reservations(hash)",
+        "create index if not exists idx_reservations_accounting_active on resource_reservations(accounting_class,state,expires_at)",
         "create table if not exists scheduler_allocations(hash text primary key, desired_state text, applied_state text, slot_kind text, priority_score real default 0, reserved_bytes integer default 0, download_limit_bps integer, upload_limit_bps integer, force_start integer default 0, desired_seq_dl integer, applied_seq_dl integer, allocated_at integer, applied_at integer, expires_at integer, reason text)",
         "create table if not exists disk_state(id integer primary key check(id=1), sampled_at integer, free_bytes integer, pressure_state text, previous_state text, state_since integer, resume_allowed integer default 1)",
         "create table if not exists torrent_jobs(id integer primary key autoincrement, hash text, batch_id integer, job_type text, state text default 'queued', priority integer default 100, payload_json text, payload_schema_version integer default 1, lease_owner text, lease_until integer, attempts integer default 0, max_attempts integer default 6, next_run_at integer, last_exit_code integer, last_stderr_tail text, cancel_requested integer default 0, cancel_requested_at integer, created_at integer, updated_at integer)",
@@ -396,6 +402,7 @@ def migration_sql() -> list[str]:
         "create index if not exists idx_seeding_preemptions_ts on seeding_preemptions(ts)",
         "create index if not exists idx_seeding_preemptions_hash on seeding_preemptions(seeding_hash)",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(3,'resource_ledger_v2',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

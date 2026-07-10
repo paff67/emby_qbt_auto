@@ -296,13 +296,29 @@ class UploadJobRunner:
             h = row.get("hash")
             if existing:
                 con.execute(
-                    "update resource_reservations set hash=?, bytes=?, state='active', released_at=null, reason=? where id=?",
-                    (h, size, reservation_reason, int(existing["id"])),
+                    "update resource_reservations set hash=?,accounting_class='current_pinned',owner='upload_job_runner',"
+                    "bytes=?,state='active',expires_at=null,released_at=null,lease_generation=lease_generation+1,last_observed_at=?,"
+                    "reason=? where id=?",
+                    (h, size, now, reservation_reason, int(existing["id"])),
                 )
             else:
                 con.execute(
-                    "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
-                    (h, batch_id, "cleanup_pending", size, "active", now, None, reservation_reason),
+                    "insert into resource_reservations("
+                    "hash,batch_id,kind,accounting_class,owner,bytes,state,created_at,expires_at,last_observed_at,reason) "
+                    "values(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        h,
+                        batch_id,
+                        "cleanup_pending",
+                        "current_pinned",
+                        "upload_job_runner",
+                        size,
+                        "active",
+                        now,
+                        None,
+                        now,
+                        reservation_reason,
+                    ),
                 )
 
         write_transaction(self.repo.state_db, txn)
@@ -589,8 +605,10 @@ class CleanupRequestRunner:
             placeholders = ",".join("?" for _ in ids)
             con.execute(f"update torrent_batches set state='cleanup_requested', updated_at=? where id in ({placeholders})", (now, *ids))
             con.execute(
-                f"update resource_reservations set state='active', reason=? where kind='cleanup_pending' and batch_id in ({placeholders})",
-                ("cleanup_requested_logical_only", *ids),
+                f"update resource_reservations set accounting_class='current_pinned',owner='command_processor',"
+                f"state='active',lease_generation=lease_generation+1,last_observed_at=?,reason=? "
+                f"where kind='cleanup_pending' and batch_id in ({placeholders})",
+                (now, "cleanup_requested_logical_only", *ids),
             )
             con.execute(
                 "update torrent_jobs set state='done', last_exit_code=0, lease_owner=null, lease_until=null, updated_at=? where id=?",
