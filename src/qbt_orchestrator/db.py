@@ -71,6 +71,16 @@ class WriteResult:
     rowcount: int
 
 
+def _detach_cursor(value: Any) -> Any:
+    """Convert a SQLite cursor into connection-independent write metadata."""
+    if not isinstance(value, sqlite3.Cursor):
+        return value
+    lastrowid = int(value.lastrowid or 0)
+    rowcount = int(value.rowcount if value.rowcount is not None else -1)
+    value.close()
+    return WriteResult(lastrowid, rowcount)
+
+
 class _SyncWriteActor:
     """Per-DB single writer for synchronous daemon code.
 
@@ -86,6 +96,10 @@ class _SyncWriteActor:
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
         self._connection: sqlite3.Connection | None = None
+        self._ready = threading.Event()
+        self._persistent = False
+        self._direct_lock = threading.RLock()
+        self._direct_thread_id: int | None = None
         self._lock = threading.Lock()
         self._stopped = True
         self._enqueued_total = 0
@@ -96,11 +110,21 @@ class _SyncWriteActor:
     def start(self) -> None:
         with self._lock:
             if self._thread and self._thread.is_alive():
-                return
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._stopped = False
-            self._thread = threading.Thread(target=self._run, name=f"qbt-db-writer:{self.path}", daemon=True)
-            self._thread.start()
+                ready = self._ready
+            else:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._stopped = False
+                self._ready.clear()
+                self._thread = threading.Thread(target=self._run, name=f"qbt-db-writer:{self.path}", daemon=True)
+                self._thread.start()
+                ready = self._ready
+        if not ready.wait(timeout=5):
+            raise TimeoutError(f"SQLite writer did not start for {self.path}")
+
+    def enable_persistence(self) -> None:
+        """Keep the writer connection open until actor shutdown."""
+        with self._lock:
+            self._persistent = True
 
     def stop(self) -> None:
         with self._lock:
@@ -122,6 +146,10 @@ class _SyncWriteActor:
             raise value
 
     def transaction(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        with self._lock:
+            persistent = self._persistent
+        if not persistent:
+            return self._direct_transaction(fn)
         self.start()
         if self._thread_id == threading.get_ident() and self._connection is not None:
             return fn(self._connection)
@@ -134,7 +162,41 @@ class _SyncWriteActor:
             return value
         raise value
 
+    def _direct_transaction(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """Serialize one-off writes without leaving a Windows file handle open."""
+        with self._direct_lock:
+            if self._direct_thread_id == threading.get_ident() and self._connection is not None:
+                return fn(self._connection)
+            con = _connect(self.path)
+            con.execute("pragma journal_mode=WAL")
+            con.execute("pragma busy_timeout=5000")
+            self._direct_thread_id = threading.get_ident()
+            self._connection = con
+            with self._lock:
+                self._enqueued_total += 1
+            try:
+                result = _detach_cursor(fn(con))
+                con.commit()
+                with self._lock:
+                    self._completed_total += 1
+                return result
+            except Exception:
+                con.rollback()
+                with self._lock:
+                    self._failed_total += 1
+                raise
+            finally:
+                self._connection = None
+                self._direct_thread_id = None
+                con.close()
+
     def flush(self) -> None:
+        with self._lock:
+            persistent = self._persistent
+        if not persistent:
+            with self._lock:
+                self._flushes_completed += 1
+            return
         self.start()
         reply: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
         self._queue.put(("flush", None, reply))
@@ -156,6 +218,8 @@ class _SyncWriteActor:
 
     def _run(self) -> None:
         self._thread_id = threading.get_ident()
+        con: sqlite3.Connection | None = None
+        self._ready.set()
         try:
             while True:
                 op, payload, reply = self._queue.get()
@@ -169,23 +233,23 @@ class _SyncWriteActor:
                     return
                 try:
                     if op == "flush":
+                        if con is not None:
+                            con.commit()
                         with self._lock:
                             self._flushes_completed += 1
                         reply.put((True, True))
                     else:
-                        con = _connect(self.path)
-                        self._connection = con
-                        con.execute("pragma journal_mode=WAL")
-                        con.execute("pragma busy_timeout=5000")
+                        if con is None:
+                            con = _connect(self.path)
+                            con.execute("pragma journal_mode=WAL")
+                            con.execute("pragma busy_timeout=5000")
+                            self._connection = con
                         try:
-                            result = payload(con)
+                            result = _detach_cursor(payload(con))
                             con.commit()
                         except Exception:
                             con.rollback()
                             raise
-                        finally:
-                            self._connection = None
-                            con.close()
                         with self._lock:
                             self._completed_total += 1
                         reply.put((True, result))
@@ -194,9 +258,17 @@ class _SyncWriteActor:
                         self._failed_total += 1
                     reply.put((False, exc))
                 finally:
+                    with self._lock:
+                        persistent = self._persistent
+                    if con is not None and not persistent:
+                        self._connection = None
+                        con.close()
+                        con = None
                     self._queue.task_done()
         finally:
             self._connection = None
+            if con is not None:
+                con.close()
 
 
 _WRITE_ACTORS: dict[str, _SyncWriteActor] = {}
@@ -215,6 +287,21 @@ def _actor_for(path: str | Path) -> _SyncWriteActor:
 
 def write_transaction(path: str | Path, fn: Callable[[sqlite3.Connection], Any]) -> Any:
     return _actor_for(path).transaction(fn)
+
+
+def start_persistent_write_actor(path: str | Path) -> None:
+    """Acquire a long-lived writer for a daemon-scoped SQLite database."""
+    actor = _actor_for(path)
+    actor.enable_persistence()
+    actor.start()
+
+
+def stop_write_actor(path: str | Path) -> None:
+    key = str(Path(path).resolve())
+    with _WRITE_ACTORS_LOCK:
+        actor = _WRITE_ACTORS.pop(key, None)
+    if actor is not None:
+        actor.stop()
 
 
 def flush_write_actor(path: str | Path) -> None:

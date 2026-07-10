@@ -11,7 +11,7 @@ from typing import Callable, Mapping
 from .alerts import SchedulerAlertConfig, SchedulerAlertService
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
-from .db import migrate, write_transaction
+from .db import migrate, start_persistent_write_actor, stop_write_actor, write_transaction
 from .file_batch import FileBatchService, active_pipeline_batch_hashes
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .junk_janitor import JunkJanitorService
@@ -841,13 +841,14 @@ class DaemonRuntime:
         write_transaction(self.state_db, txn)
 
     def run(self, max_safety_ticks: int | None = None) -> int:
-        self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
-        if self.telegram_supervisor is not None:
-            self.telegram_supervisor.start()
-        self._start_background_event_workers()
-        self._start_periodic_workers()
+        start_persistent_write_actor(self.state_db)
         ticks = 0
         try:
+            self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
+            if self.telegram_supervisor is not None:
+                self.telegram_supervisor.start()
+            self._start_background_event_workers()
+            self._start_periodic_workers()
             while not self._stopping:
                 started = self.monotonic()
                 try:
@@ -892,5 +893,8 @@ class DaemonRuntime:
             self._stop_background_event_workers()
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.stop()
-            self.obs.event("info", "daemon", "stopped", "qbt orchestrator daemon stopped", {"ticks": ticks})
+            try:
+                self.obs.event("info", "daemon", "stopped", "qbt orchestrator daemon stopped", {"ticks": ticks})
+            finally:
+                stop_write_actor(self.state_db)
         return ticks
