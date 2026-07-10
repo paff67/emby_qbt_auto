@@ -339,7 +339,8 @@ atexit.register(stop_write_actors)
 def migration_sql() -> list[str]:
     return [
         "create table if not exists schema_migrations(version integer primary key, name text not null, applied_at integer not null)",
-        "create table if not exists torrent_health(hash text primary key, sampled_at integer, dlspeed_bps integer default 0, upspeed_bps integer default 0, ema_fast_bps real default 0, ema_slow_bps real default 0, completed_bytes integer default 0, last_completed_bytes integer default 0, progress real default 0, num_seeds integer default 0, num_peers integer default 0, last_swarm_seen_at integer, low_speed_since integer, no_progress_since integer, active_since integer, soak_since integer, dead_since integer, promote_candidate_since integer, updated_at integer)",
+        "create table if not exists torrent_health(hash text primary key, sampled_at integer, dlspeed_bps integer default 0, upspeed_bps integer default 0, ema_fast_bps real default 0, ema_slow_bps real default 0, completed_bytes integer default 0, last_completed_bytes integer default 0, progress real default 0, num_seeds integer default 0, num_peers integer default 0, last_swarm_seen_at integer, no_swarm_since integer, low_speed_since integer, no_progress_since integer, active_since integer, soak_since integer, dead_since integer, promote_candidate_since integer, updated_at integer)",
+        "alter table torrent_health add column no_swarm_since integer",
         "create table if not exists torrent_batches(id integer primary key autoincrement, hash text not null, batch_no integer not null, state text not null, mode text, indices_json text not null default '[]', total_bytes integer default 0, downloaded_bytes integer default 0, reserved_bytes integer default 0, piece_size integer default 0, selected_extents integer default 0, piece_spill_overhead_bytes integer default 0, payload_efficiency real default 1.0, priority_applied integer default 0, upload_job_id integer, created_at integer, updated_at integer, local_pinned_bytes integer default 0, cleanup_deferred_at integer, cleanup_done_at integer, unique(hash,batch_no))",
         "alter table torrent_batches add column downloaded_at integer",
         "alter table torrent_batches add column upload_queued_at integer",
@@ -357,6 +358,18 @@ def migration_sql() -> list[str]:
         "create index if not exists idx_reservations_hash on resource_reservations(hash)",
         "create index if not exists idx_reservations_accounting_active on resource_reservations(accounting_class,state,expires_at)",
         "create table if not exists scheduler_allocations(hash text primary key, desired_state text, applied_state text, slot_kind text, priority_score real default 0, reserved_bytes integer default 0, download_limit_bps integer, upload_limit_bps integer, force_start integer default 0, desired_seq_dl integer, applied_seq_dl integer, allocated_at integer, applied_at integer, expires_at integer, reason text)",
+        "alter table scheduler_allocations add column owner text not null default 'legacy'",
+        "alter table scheduler_allocations add column plan_generation integer not null default 0",
+        "create table if not exists scheduler_intents(component text not null, hash text not null, intent text not null, priority integer not null, expires_at integer, data_json text not null, primary key(component,hash))",
+        "create index if not exists idx_scheduler_intents_expiry_priority on scheduler_intents(expires_at,priority,component,hash)",
+        "insert or replace into scheduler_intents(component,hash,intent,priority,expires_at,data_json) "
+        "select 'batch',tb.hash,'protect_batch',20,"
+        "case when sum(case when rr.expires_at is null then 1 else 0 end)>0 then null else max(rr.expires_at) end,"
+        "'{\"batch_id\":'||max(tb.id)||'}' "
+        "from torrent_batches tb join resource_reservations rr on rr.batch_id=tb.id and rr.kind='batch' "
+        "where tb.state in ('reserved','applied_to_qbt','downloading') and rr.state='active' "
+        "and (rr.expires_at is null or rr.expires_at>strftime('%s','now')) group by tb.hash",
+        "create table if not exists scheduler_plan_state(id integer primary key check(id=1), current_generation integer not null default 0, updated_at integer not null)",
         "create table if not exists disk_state(id integer primary key check(id=1), sampled_at integer, free_bytes integer, pressure_state text, previous_state text, state_since integer, resume_allowed integer default 1)",
         "create table if not exists capacity_state(id integer primary key check(id=1), scheduler_mode text not null, state text not null, entered_at integer not null, last_evaluated_at integer not null, reason text, details_json text not null default '{}')",
         "create table if not exists torrent_jobs(id integer primary key autoincrement, hash text, batch_id integer, job_type text, state text default 'queued', priority integer default 100, payload_json text, payload_schema_version integer default 1, lease_owner text, lease_until integer, attempts integer default 0, max_attempts integer default 6, next_run_at integer, last_exit_code integer, last_stderr_tail text, cancel_requested integer default 0, cancel_requested_at integer, created_at integer, updated_at integer)",
@@ -405,6 +418,7 @@ def migration_sql() -> list[str]:
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(3,'resource_ledger_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(4,'capacity_state_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(5,'scheduler_intents_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

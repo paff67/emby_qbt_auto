@@ -15,6 +15,7 @@ from .models import BatchReservation
 from .observability import redact
 from .policies.batching import compute_batch_reservation
 from .runtime import ObservabilityStore, TorrentJobRepository
+from .scheduler_intents import SchedulerIntent, SchedulerIntentRepository
 
 
 @dataclass(frozen=True)
@@ -59,30 +60,6 @@ MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ts", ".web
 DEFAULT_DOWNLOAD_EXTENSIONS = {".txt"}
 JUNK_BATCH_NAME = re.compile(r"(?i)(最新地址|最\s*新\s*位\s*址|收藏不迷路|官方指定|博彩|赌场|直播|telegram|996gg\.cc|x\s*u\s*u|uu美少女|社\s*區|社\s*区|福利|体育|电竞|楼风)")
 PIPELINE_DOWNLOAD_STATES = ("reserved", "applied_to_qbt", "downloading")
-
-
-def active_pipeline_batch_hashes(state_db: str | Path, now: int | None = None) -> set[str]:
-    """Hashes with live pipeline batch reservations that planner must not stop.
-
-    Batch reservations are explicit disk-budget claims for a selected subset of
-    qBT files.  While such a reservation is active, planner should not pause the
-    torrent as an unselected low-speed download, otherwise qBT live state and
-    the durable reservation diverge.
-    """
-    now = int(time.time() if now is None else now)
-    placeholders = ",".join("?" for _ in PIPELINE_DOWNLOAD_STATES)
-    con = _connect(state_db)
-    try:
-        rows = con.execute(
-            f"select distinct tb.hash from torrent_batches tb "
-            f"join resource_reservations rr on rr.batch_id=tb.id and rr.kind='batch' "
-            f"where tb.state in ({placeholders}) and rr.state='active' "
-            f"and (rr.expires_at is null or rr.expires_at>?)",
-            (*PIPELINE_DOWNLOAD_STATES, now),
-        ).fetchall()
-        return {str(r["hash"]) for r in rows if str(r["hash"] or "")}
-    finally:
-        con.close()
 
 
 class FileBatchService:
@@ -144,6 +121,7 @@ class FileBatchService:
         self.jobs = TorrentJobRepository(state_db)
         self.obs = ObservabilityStore(state_db, now=self.now)
         self.decision_recorder = DecisionRecorder(state_db, now=self.now)
+        self.intent_repository = SchedulerIntentRepository(state_db)
         self._pending_decisions: list[DecisionEntry] | None = None
         self._decision_reason_counts: dict[str, int] = {}
         self._decision_sample_hashes: list[str] = []
@@ -378,7 +356,7 @@ class FileBatchService:
             return {"created": 0, "blocked": 0, "upload_queued": queued}
         batch_id = self._create_batch_and_reservation(h, indices, reservation, piece_size)
         try:
-            self._apply_batch_to_qbt(h, indices, files, should_start=_is_stopped(torrent), protected_indices=already_selected_indices)
+            self._apply_batch_to_qbt(h, indices, files, protected_indices=already_selected_indices)
         except Exception as exc:
             self._mark_batch_failed(batch_id, str(exc))
             return {"created": 0, "blocked": 1, "upload_queued": queued}
@@ -395,6 +373,10 @@ class FileBatchService:
         rows = self._pipeline_batch_rows(h)
         if not rows:
             return False
+        write_transaction(
+            self.state_db,
+            lambda con: self._refresh_batch_intent_in_transaction(con, h, int(self.now())),
+        )
         if not _is_stopped(torrent):
             return False
         allocation = self._scheduler_allocation(h)
@@ -404,19 +386,13 @@ class FileBatchService:
             self._pause_pipeline_batches(batch_ids, h, "batch_reconcile_planner_stopped", "planner_stopped_batch")
             return True
 
-        # The reservation is still valid and planner has not placed the torrent
-        # into a cooldown/dead state.  Re-start the qBT torrent instead of
-        # letting a durable batch reservation silently drift away from qBT state.
+        # A live lease is represented as an intent; the next central planner
+        # generation performs the start rather than this worker racing it.
         active_rows = [row for row in rows if int(row.get("has_active_reservation") or 0)]
         if not active_rows:
             return False
-        try:
-            self._qbt_post("/api/v2/torrents/start", {"hashes": h}, h)
-        except Exception as exc:
-            self.obs.event("error", "file_batch", "batch_reconcile_start_failed", str(redact(str(exc))), {"hash": h}, hash=h)
-            return True
-        self._decision(h, "batch_reconciled", "restarted_reserved_batch", {"batch_ids": [int(row["id"]) for row in active_rows]})
-        self.obs.event("info", "file_batch", "batch_restarted", f"restarted reserved batch for {h[:8]}", {"hash": h, "batch_ids": [int(row["id"]) for row in active_rows]}, hash=h)
+        self._decision(h, "batch_reconciled", "refreshed_reserved_batch_intent", {"batch_ids": [int(row["id"]) for row in active_rows]})
+        self.obs.event("info", "file_batch", "batch_intent_refreshed", f"refreshed reserved batch intent for {h[:8]}", {"hash": h, "batch_ids": [int(row["id"]) for row in active_rows]}, hash=h)
         return True
 
     def _pipeline_batch_rows(self, h: str) -> list[dict[str, Any]]:
@@ -466,6 +442,7 @@ class FileBatchService:
                 f"where kind='batch' and state='active' and batch_id in ({placeholders})",
                 (now, reservation_reason, *batch_ids),
             )
+            self._refresh_batch_intent_in_transaction(con, h, now)
             transitioned[0] = self.decision_recorder.record_many_in_transaction(
                 con,
                 [DecisionEntry("file_batch", h, "batch_reconciled", decision_reason, decision_data)],
@@ -641,6 +618,8 @@ class FileBatchService:
                         "batch_upload_queued",
                     ),
                 )
+            if h:
+                self._refresh_batch_intent_in_transaction(con, h, now)
         write_transaction(self.state_db, txn)
 
     def _piece_size(self, h: str, torrent: Mapping[str, Any]) -> int:
@@ -919,6 +898,7 @@ class FileBatchService:
                     "batch_pipeline_reserved",
                 ),
             )
+            self._refresh_batch_intent_in_transaction(con, h, now)
             return batch_id
 
         return int(write_transaction(self.state_db, txn))
@@ -936,6 +916,8 @@ class FileBatchService:
     def _mark_batch_failed(self, batch_id: int, error: str) -> None:
         now = int(self.now())
         def txn(con: sqlite3.Connection) -> None:
+            row = con.execute("select hash from torrent_batches where id=?", (int(batch_id),)).fetchone()
+            h = str(row["hash"]) if row else ""
             con.execute("update torrent_batches set state='failed', updated_at=? where id=?", (now, int(batch_id)))
             con.execute(
                 "update resource_reservations set state='released', released_at=?, reason='qbt_apply_failed' where batch_id=? and state='active'",
@@ -945,9 +927,42 @@ class FileBatchService:
                 "insert into action_log(ts,job_id,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?,?)",
                 (now, int(batch_id), "batch_pipeline", "torrent_batches", "{}", "failed", 0, redact(error)),
             )
+            if h:
+                self._refresh_batch_intent_in_transaction(con, h, now)
         write_transaction(self.state_db, txn)
 
-    def _apply_batch_to_qbt(self, h: str, selected_indices: list[int], all_files: list[Mapping[str, Any]], *, should_start: bool, protected_indices: set[int] | None = None) -> None:
+    def _refresh_batch_intent_in_transaction(
+        self,
+        con: sqlite3.Connection,
+        h: str,
+        now: int,
+    ) -> None:
+        """Keep one protect intent aligned with the hash's live batch leases."""
+        placeholders = ",".join("?" for _ in PIPELINE_DOWNLOAD_STATES)
+        row = con.execute(
+            f"select tb.id,rr.expires_at from torrent_batches tb "
+            f"join resource_reservations rr on rr.batch_id=tb.id and rr.kind='batch' "
+            f"where tb.hash=? and tb.state in ({placeholders}) and rr.state='active' "
+            f"and (rr.expires_at is null or rr.expires_at>?) "
+            f"order by coalesce(rr.expires_at,9223372036854775807) desc,tb.id desc limit 1",
+            (str(h), *PIPELINE_DOWNLOAD_STATES, int(now)),
+        ).fetchone()
+        if row is None:
+            self.intent_repository.delete_in_transaction(con, "batch", h)
+            return
+        self.intent_repository.upsert_in_transaction(
+            con,
+            SchedulerIntent(
+                "batch",
+                str(h),
+                "protect_batch",
+                20,
+                None if row["expires_at"] is None else int(row["expires_at"]),
+                {"batch_id": int(row["id"])},
+            ),
+        )
+
+    def _apply_batch_to_qbt(self, h: str, selected_indices: list[int], all_files: list[Mapping[str, Any]], *, protected_indices: set[int] | None = None) -> None:
         protected_indices = protected_indices or set()
         default_download_indices = {int(row.get("index") or 0) for row in all_files if self._keeps_default_download_priority(row)}
         all_indices = [int(f.get("index")) for f in all_files]
@@ -956,8 +971,6 @@ class FileBatchService:
             self._qbt_post("/api/v2/torrents/filePrio", {"hash": h, "id": "|".join(str(i) for i in selected_indices), "priority": "1"}, h)
         if unselected:
             self._qbt_post("/api/v2/torrents/filePrio", {"hash": h, "id": "|".join(str(i) for i in unselected), "priority": "0"}, h)
-        if should_start:
-            self._qbt_post("/api/v2/torrents/start", {"hashes": h}, h)
 
     def _qbt_post(self, path: str, payload: dict[str, Any], h: str | None) -> None:
         if self.executor is not None and hasattr(self.executor, "qbt_post"):

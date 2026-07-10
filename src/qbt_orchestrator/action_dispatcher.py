@@ -44,6 +44,7 @@ class DispatchedAction:
     path: str = field(compare=False)
     payload: dict[str, Any] = field(compare=False)
     future: ActionFuture = field(compare=False)
+    guard: Callable[[], bool] | None = field(default=None, compare=False)
     stop: bool = field(default=False, compare=False)
 
 
@@ -66,6 +67,7 @@ class ActionDispatcher:
         payload: dict[str, Any],
         *,
         priority: ActionPriority | int = ActionPriority.CONTROL,
+        guard: Callable[[], bool] | None = None,
         wait: bool = True,
     ) -> Any:
         with self._state_lock:
@@ -81,6 +83,7 @@ class ActionDispatcher:
                 str(path),
                 copy.deepcopy(dict(payload)),
                 future,
+                guard=guard,
             )
         )
         return future.result() if wait else future
@@ -121,6 +124,11 @@ class ActionDispatcher:
                 if action.stop:
                     return
                 try:
+                    # Validate at the last possible point.  A plan can become
+                    # stale while its action waits behind another qBT write.
+                    if action.guard is not None and not bool(action.guard()):
+                        action.future.set_result(False)
+                        continue
                     action.future.set_result(self.handler(action.path, action.payload))
                 except BaseException as exc:
                     action.future.set_exception(exc)

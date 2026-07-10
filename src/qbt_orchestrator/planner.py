@@ -13,22 +13,24 @@ from .decision_recorder import DecisionEntry, DecisionRecorder
 from .models import LifecycleState
 from .observability import redact
 from .policies.download_mode import desired_seq_dl
+from .scheduler_intents import SchedulerIntentRepository
 
 
 STOPPED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "stopped"}
 
 ALLOCATION_UPSERT_SQL = (
-    "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason) "
-    "values(?,?,?,?,?,?,?,?,?) "
+    "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason,owner,plan_generation) "
+    "values(?,?,?,?,?,?,?,?,?,?,?) "
     "on conflict(hash) do update set desired_state=excluded.desired_state, applied_state=excluded.applied_state, "
     "slot_kind=excluded.slot_kind, priority_score=excluded.priority_score, reserved_bytes=excluded.reserved_bytes, "
-    "desired_seq_dl=excluded.desired_seq_dl, allocated_at=excluded.allocated_at, reason=excluded.reason"
+    "desired_seq_dl=excluded.desired_seq_dl, allocated_at=excluded.allocated_at, reason=excluded.reason, "
+    "owner=excluded.owner, plan_generation=excluded.plan_generation"
 )
 
 HEALTH_UPSERT_SQL = (
-    "insert into torrent_health(hash,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,low_speed_since,no_progress_since,active_since,soak_since,dead_since,updated_at) "
-    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-    "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,dead_since=excluded.dead_since,updated_at=excluded.updated_at"
+    "insert into torrent_health(hash,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,no_swarm_since,low_speed_since,no_progress_since,active_since,soak_since,dead_since,updated_at) "
+    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+    "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,no_swarm_since=excluded.no_swarm_since,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,dead_since=excluded.dead_since,updated_at=excluded.updated_at"
 )
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class PlannerResult:
     conservative: bool = False
     budget_bytes: int = 0
     mode: str = "normal"
+    plan_generation: int = 0
 
 
 @dataclass
@@ -108,6 +111,7 @@ class DownloadPlanner:
         self.recovery_max_remaining_bytes = int(recovery_max_remaining_bytes)
         self.now = now or (lambda: int(time.time()))
         self.decision_recorder = DecisionRecorder(self.state_db, now=self.now)
+        self.intent_repository = SchedulerIntentRepository(self.state_db)
         self._pending_persistence: PlannerPersistenceBatch | None = None
 
     def plan_and_apply(
@@ -159,8 +163,24 @@ class DownloadPlanner:
         )
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
         now = int(self.now())
+        active_intents = self.intent_repository.active(now)
+        intent_priority: dict[str, int] = {}
+        for intent in active_intents:
+            h = str(intent.hash)
+            intent_priority[h] = max(intent_priority.get(h, -1), int(intent.priority))
+            if intent.intent in {"probe", "availability_probe"}:
+                forced_active_hashes.add(h)
+            elif intent.intent == "protect_batch":
+                protected_running_hashes.add(h)
+                forced_active_hashes.add(h)
+            elif intent.intent == "cooldown":
+                cooldown_hashes.add(h)
         previous_allocations = self._allocation_rows()
         dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
+        carousel_states = self._carousel_state_rows()
+        dead_hashes |= {h for h, state in carousel_states.items() if state == "dead"}
+        dead_hashes -= {h for h, state in carousel_states.items() if state in {"probing", "soak"}}
+        dead_hashes -= forced_active_hashes
         active_reservations = self._active_reservation_bytes(now, ignored_kinds={"soak_probe"} if int(external_reserved_bytes or 0) > 0 else set())
         mode = self._mode_for_free_bytes(int(free_bytes))
         budget_floor = self.disk_floor_bytes
@@ -178,12 +198,16 @@ class DownloadPlanner:
         if not sync_healthy:
             for torrent in managed:
                 self._decision(str(torrent["hash"]), "hold", "sync_unhealthy", {"free_bytes": free_bytes})
-            self._flush_persistence_batch()
-            return PlannerResult([], [], conservative=True, budget_bytes=budget, mode=mode)
+            generation = self._flush_persistence_batch()
+            return PlannerResult([], [], conservative=True, budget_bytes=budget, mode=mode, plan_generation=generation)
         if not self.dry_run:
             self._reconcile_absent_allocations(set(str(h) for h in snapshots.keys()), now)
             previous_allocations = self._allocation_rows()
             dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
+            carousel_states = self._carousel_state_rows()
+            dead_hashes |= {h for h, state in carousel_states.items() if state == "dead"}
+            dead_hashes -= {h for h, state in carousel_states.items() if state in {"probing", "soak"}}
+            dead_hashes -= forced_active_hashes
             active_reservations = self._active_reservation_bytes(now, ignored_kinds={"soak_probe"} if int(external_reserved_bytes or 0) > 0 else set())
             budget = max(0, int(free_bytes) - int(budget_floor) - int(extra_margin) - sum(active_reservations.values()) - int(external_reserved_bytes or 0))
 
@@ -191,7 +215,8 @@ class DownloadPlanner:
         auto_dead = {
             str(t["hash"])
             for t in managed
-            if self._should_mark_dead(str(t["hash"]), t, health_rows.get(str(t["hash"])), previous_allocations.get(str(t["hash"])), now)
+            if str(t["hash"]) not in forced_active_hashes
+            and self._should_mark_dead(str(t["hash"]), t, health_rows.get(str(t["hash"])), previous_allocations.get(str(t["hash"])), now)
         }
         dead_hashes |= auto_dead
         active_slow = {
@@ -214,6 +239,9 @@ class DownloadPlanner:
         selected: list[dict[str, Any]] = []
         used = 0
         forced_candidates = [t for t in candidates if str(t.get("hash")) in forced_active_hashes]
+        forced_candidates.sort(
+            key=lambda t: (-intent_priority.get(str(t.get("hash")), 0), str(t.get("hash")))
+        )
         regular_candidates = [t for t in candidates if str(t.get("hash")) not in forced_active_hashes]
         for torrent in forced_candidates:
             amount_left = int(torrent.get("amount_left") or 0)
@@ -252,7 +280,7 @@ class DownloadPlanner:
                     h,
                     "dead",
                     "health_no_swarm_no_progress",
-                    {"last_swarm_seen_at": (health_rows.get(h) or {}).get("last_swarm_seen_at"), "no_progress_since": (health_rows.get(h) or {}).get("no_progress_since")},
+                    {"no_swarm_since": (health_rows.get(h) or {}).get("no_swarm_since"), "no_progress_since": (health_rows.get(h) or {}).get("no_progress_since")},
                 )
                 if self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
@@ -273,7 +301,7 @@ class DownloadPlanner:
             h = str(torrent["hash"])
             if h in selected_set:
                 reason = "recovery_budget_fit" if mode == "recovery" else "budget_fit"
-                seq = desired_seq_dl(
+                seq = False if h in forced_active_hashes else desired_seq_dl(
                     LifecycleState.ACTIVE,
                     int(torrent.get("num_seeds") or 0),
                     int(torrent.get("num_peers") or 0),
@@ -281,7 +309,9 @@ class DownloadPlanner:
                 )
                 self._allocation(h, "active", "stable", int(torrent.get("amount_left") or 0), seq, now, reason)
                 self._decision(h, "active", reason, {"reserved_bytes": int(torrent.get("amount_left") or 0), "budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0), "mode": mode})
-                if seq and self._needs_seq_desired(h, True, previous_allocations):
+                if h in forced_active_hashes and self._needs_seq_desired(h, False, previous_allocations):
+                    seq_desired_actions.append((h, False))
+                elif seq and self._needs_seq_desired(h, True, previous_allocations):
                     seq_desired_actions.append((h, True))
             elif h in active_slow:
                 self._allocation(h, "soak", "soak", 0, False, now, "active_slow_3min")
@@ -307,11 +337,18 @@ class DownloadPlanner:
         self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead, previous_allocations=previous_allocations)
         if not self.dry_run:
             self._sync_active_download_reservations(selected, {str(t["hash"]) for t in managed}, now)
-        self._flush_persistence_batch()
-        self._apply_seq_desired(seq_desired_actions)
-        self._qbt_post("/api/v2/torrents/start", start_hashes)
-        self._qbt_post("/api/v2/torrents/stop", paused_hashes)
-        return PlannerResult(selected_hashes, paused_hashes, conservative=False, budget_bytes=budget, mode=mode)
+        generation = self._flush_persistence_batch()
+        self._apply_seq_desired(seq_desired_actions, plan_generation=generation)
+        self._qbt_post("/api/v2/torrents/start", start_hashes, plan_generation=generation)
+        self._qbt_post("/api/v2/torrents/stop", paused_hashes, plan_generation=generation)
+        return PlannerResult(
+            selected_hashes,
+            paused_hashes,
+            conservative=False,
+            budget_bytes=budget,
+            mode=mode,
+            plan_generation=generation,
+        )
 
     def _mode_for_free_bytes(self, free_bytes: int) -> str:
         if int(free_bytes) < int(self.emergency_floor_bytes):
@@ -337,7 +374,7 @@ class DownloadPlanner:
             amount_left = int(torrent.get("amount_left") or 0)
             if amount_left <= 0 or h in dead_hashes or h in cooldown_hashes:
                 continue
-            if allowed_active_hashes is not None and h not in allowed_active_hashes:
+            if allowed_active_hashes is not None and h not in allowed_active_hashes and h not in forced_active_hashes:
                 skipped[h] = "global_scheduler_not_selected"
                 continue
             if h in protected_running_hashes and h not in forced_active_hashes:
@@ -369,6 +406,16 @@ class DownloadPlanner:
         try:
             rows = con.execute("select * from scheduler_allocations").fetchall()
             return {str(r["hash"]): dict(r) for r in rows}
+        finally:
+            con.close()
+
+    def _carousel_state_rows(self) -> dict[str, str]:
+        con = _connect(self.state_db)
+        try:
+            return {
+                str(row["hash"]): str(row["state"])
+                for row in con.execute("select hash,state from carousel_state").fetchall()
+            }
         finally:
             con.close()
 
@@ -467,11 +514,11 @@ class DownloadPlanner:
             return False
         if int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0) > 0:
             return False
-        last_swarm_seen_at = health.get("last_swarm_seen_at")
+        no_swarm_since = health.get("no_swarm_since")
         no_progress_since = health.get("no_progress_since")
-        if last_swarm_seen_at is None or no_progress_since is None:
+        if no_swarm_since is None or no_progress_since is None:
             return False
-        return int(now) - int(last_swarm_seen_at) >= 3600 and int(now) - int(no_progress_since) >= 3600
+        return int(now) - int(no_swarm_since) >= 3600 and int(now) - int(no_progress_since) >= 3600
 
     def _update_health(
         self,
@@ -506,7 +553,14 @@ class DownloadPlanner:
             no_progress_since = old.get("no_progress_since") if (completed <= old_completed and progress <= old_progress and old) else None
             if old and completed <= old_completed and progress <= old_progress and no_progress_since is None:
                 no_progress_since = now
-            last_swarm_seen_at = now if (seeds > 0 or peers > 0) else old.get("last_swarm_seen_at")
+            if seeds > 0 or peers > 0:
+                last_swarm_seen_at = now
+                no_swarm_since = None
+            else:
+                last_swarm_seen_at = old.get("last_swarm_seen_at")
+                no_swarm_since = old.get("no_swarm_since")
+                if no_swarm_since is None:
+                    no_swarm_since = now
             if h in selected_set:
                 active_since = old.get("active_since") if prev_alloc_state == "active" else now
                 if active_since is None:
@@ -533,6 +587,7 @@ class DownloadPlanner:
                     "seeds": seeds,
                     "peers": peers,
                     "last_swarm_seen_at": last_swarm_seen_at,
+                    "no_swarm_since": no_swarm_since,
                     "low_speed_since": low_speed_since,
                     "no_progress_since": no_progress_since,
                     "active_since": active_since,
@@ -549,7 +604,7 @@ class DownloadPlanner:
             lambda con: con.executemany(HEALTH_UPSERT_SQL, [self._health_params(row) for row in rows]),
         )
 
-    def _qbt_post(self, path: str, hashes: list[str]) -> None:
+    def _qbt_post(self, path: str, hashes: list[str], plan_generation: int | None = None) -> None:
         if not hashes:
             return
         payload = {"hashes": "|".join(hashes)}
@@ -557,16 +612,27 @@ class DownloadPlanner:
             self._action(path, payload, "dry_run", True)
             return
         try:
-            self.executor.qbt_post(path, payload)
+            guard = lambda: self._is_generation_current(plan_generation)
+            if hasattr(self.executor, "qbt_post_guarded") and plan_generation is not None:
+                applied = bool(self.executor.qbt_post_guarded(path, payload, guard=guard))
+                if not applied:
+                    self._action(path, payload, "skipped_stale_generation", False)
+                    return
+            else:
+                if plan_generation is not None and not guard():
+                    self._action(path, payload, "skipped_stale_generation", False)
+                    return
+                self.executor.qbt_post(path, payload)
             self._action(path, payload, "succeeded", False)
         except Exception as exc:
             self._action(path, payload, "failed", False, str(exc))
             raise
 
-    def _force_seq_false(self, hashes: list[str]) -> None:
-        self._apply_seq_desired([(h, False) for h in hashes])
-
-    def _apply_seq_desired(self, desired_actions: list[tuple[str, bool]]) -> None:
+    def _apply_seq_desired(
+        self,
+        desired_actions: list[tuple[str, bool]],
+        plan_generation: int | None = None,
+    ) -> None:
         if not desired_actions or not hasattr(self.executor, "set_seq_dl"):
             return
         seen: set[tuple[str, bool]] = set()
@@ -585,7 +651,16 @@ class DownloadPlanner:
                 self._action(path, payload, "dry_run", True)
                 continue
             try:
-                changed = bool(self.executor.set_seq_dl(h, bool(desired)))
+                guard = lambda: self._is_generation_current(plan_generation)
+                if hasattr(self.executor, "set_seq_dl_guarded") and plan_generation is not None:
+                    changed = bool(
+                        self.executor.set_seq_dl_guarded(h, bool(desired), guard=guard)
+                    )
+                else:
+                    if plan_generation is not None and not guard():
+                        self._action(path, payload, "skipped_stale_generation", False)
+                        continue
+                    changed = bool(self.executor.set_seq_dl(h, bool(desired)))
                 if changed:
                     self._action(path, payload, "succeeded", False)
             except Exception as exc:
@@ -593,7 +668,7 @@ class DownloadPlanner:
                 raise
 
     @staticmethod
-    def _allocation_params(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    def _allocation_params(row: Mapping[str, Any], plan_generation: int) -> tuple[Any, ...]:
         return (
             row["hash"],
             row["desired_state"],
@@ -604,6 +679,8 @@ class DownloadPlanner:
             1 if row["seq_dl"] else 0,
             int(row["ts"]),
             row["reason"],
+            "central",
+            int(plan_generation),
         )
 
     @staticmethod
@@ -619,6 +696,7 @@ class DownloadPlanner:
             int(row["seeds"]),
             int(row["peers"]),
             row["last_swarm_seen_at"],
+            row["no_swarm_since"],
             row["low_speed_since"],
             row["no_progress_since"],
             row["active_since"],
@@ -627,17 +705,29 @@ class DownloadPlanner:
             int(row["now"]),
         )
 
-    def _flush_persistence_batch(self) -> None:
+    def _flush_persistence_batch(self) -> int:
         batch = self._pending_persistence
         if batch is None:
-            return
+            return 0
         self._pending_persistence = None
-        self._persist_planner_batch(batch)
+        return self._persist_planner_batch(batch)
 
-    def _persist_planner_batch(self, batch: PlannerPersistenceBatch) -> None:
-        def txn(con: sqlite3.Connection) -> None:
+    def _persist_planner_batch(self, batch: PlannerPersistenceBatch) -> int:
+        def txn(con: sqlite3.Connection) -> int:
+            row = con.execute(
+                "select current_generation from scheduler_plan_state where id=1"
+            ).fetchone()
+            plan_generation = int(row["current_generation"] if row else 0) + 1
+            con.execute(
+                "insert into scheduler_plan_state(id,current_generation,updated_at) values(1,?,?) "
+                "on conflict(id) do update set current_generation=excluded.current_generation,updated_at=excluded.updated_at",
+                (plan_generation, int(self.now())),
+            )
             if batch.allocations:
-                con.executemany(ALLOCATION_UPSERT_SQL, [self._allocation_params(row) for row in batch.allocations])
+                con.executemany(
+                    ALLOCATION_UPSERT_SQL,
+                    [self._allocation_params(row, plan_generation) for row in batch.allocations],
+                )
             if batch.soak_cooldowns:
                 con.executemany(
                     "insert into soak_state(hash,state,ema_dlspeed_bps,cooldown_until,last_stopped_at,exposure_bytes,last_sample_at,updated_at,reason) "
@@ -699,8 +789,9 @@ class DownloadPlanner:
                         for row in batch.decisions
                     ],
                 )
+            return plan_generation
 
-        write_transaction(self.state_db, txn)
+        return int(write_transaction(self.state_db, txn))
 
     def _allocation(self, hash: str, desired_state: str, slot_kind: str, reserved_bytes: int, seq_dl: bool, ts: int, reason: str) -> None:
         if self._pending_persistence is not None:
@@ -716,13 +807,19 @@ class DownloadPlanner:
                 }
             )
             return
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                ALLOCATION_UPSERT_SQL,
-                (hash, desired_state, desired_state, slot_kind, 0, reserved_bytes, 1 if seq_dl else 0, ts, reason),
-            ),
-        )
+        raise RuntimeError("planner allocation writes require an active persistence batch")
+
+    def _is_generation_current(self, plan_generation: int | None) -> bool:
+        if plan_generation is None:
+            return True
+        con = _connect(self.state_db)
+        try:
+            row = con.execute(
+                "select current_generation from scheduler_plan_state where id=1"
+            ).fetchone()
+            return bool(row) and int(row["current_generation"]) == int(plan_generation)
+        finally:
+            con.close()
 
     def _sync_active_download_reservations(self, selected: list[Mapping[str, Any]], managed_hashes: set[str], now: int) -> None:
         selected_by_hash = {str(t.get("hash")): int(t.get("amount_left") or 0) for t in selected if str(t.get("hash") or "")}

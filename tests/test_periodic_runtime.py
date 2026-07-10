@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import inspect
 
 
 def test_periodic_worker_skips_missed_intervals_without_overlap():
@@ -73,3 +74,38 @@ def test_action_dispatcher_prioritizes_emergency_over_queued_actions():
     dispatcher.join(timeout=1)
 
     assert [path for path, _payload in calls] == ["/first", "/emergency", "/maintenance"]
+
+
+def test_action_dispatcher_skips_queued_action_when_generation_guard_is_stale():
+    from qbt_orchestrator.action_dispatcher import ActionDispatcher
+
+    assert "guard" in inspect.signature(ActionDispatcher.submit).parameters
+    calls = []
+    first_started = threading.Event()
+    release_first = threading.Event()
+    generation_current = [True]
+
+    def handler(path, payload):
+        calls.append((path, payload))
+        if path == "/first":
+            first_started.set()
+            release_first.wait(timeout=1)
+        return "Ok."
+
+    dispatcher = ActionDispatcher(handler)
+    first = dispatcher.submit("/first", {"id": 1}, wait=False)
+    assert first_started.wait(timeout=0.5)
+    queued = dispatcher.submit(
+        "/stale",
+        {"id": 2},
+        guard=lambda: generation_current[0],
+        wait=False,
+    )
+    generation_current[0] = False
+    release_first.set()
+
+    assert first.result(timeout=1) == "Ok."
+    assert queued.result(timeout=1) is False
+    dispatcher.close()
+    dispatcher.join(timeout=1)
+    assert calls == [("/first", {"id": 1})]

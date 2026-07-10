@@ -126,7 +126,7 @@ def test_soak_queue_updates_ema_speed_persistently():
         assert row == {"ema_dlspeed_bps": 1300, "last_sample_at": 115}
 
 
-def test_soak_queue_starts_resident_torrents_with_seq_false_and_exposure_reservation():
+def test_soak_queue_emits_probe_intents_without_direct_qbt_or_allocation_writes():
     from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
     from qbt_orchestrator.db import migrate
 
@@ -145,14 +145,24 @@ def test_soak_queue_starts_resident_torrents_with_seq_false_and_exposure_reserva
 
         assert result.started == ["h1", "h2"]
         assert result.resident_hashes == ["h1", "h2"]
-        assert executor.seq == [("h1", False), ("h2", False)]
-        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "h1|h2"})]
-        allocations = _rows(db, "select hash,desired_state,slot_kind,reserved_bytes,desired_seq_dl from scheduler_allocations order by hash")
-        assert [(r["hash"], r["desired_state"], r["slot_kind"], r["desired_seq_dl"]) for r in allocations] == [
-            ("h1", "soak_resident", "soak_resident", 0),
-            ("h2", "soak_resident", "soak_resident", 0),
+        assert executor.seq == []
+        assert executor.posts == []
+        assert _rows(db, "select * from scheduler_allocations") == []
+        intents = _rows(
+            db,
+            "select component,hash,intent,priority,expires_at,data_json from scheduler_intents order by hash",
+        )
+        assert [
+            (r["component"], r["hash"], r["intent"], r["priority"], r["expires_at"])
+            for r in intents
+        ] == [
+            ("soak", "h1", "probe", 30, 1120),
+            ("soak", "h2", "probe", 30, 1120),
         ]
-        assert all(r["reserved_bytes"] == 128 * 1024**2 for r in allocations)
+        assert [json.loads(r["data_json"]) for r in intents] == [
+            {"exposure_bytes": 128 * 1024**2},
+            {"exposure_bytes": 128 * 1024**2},
+        ]
         reservations = _rows(db, "select hash,kind,bytes,state,reason from resource_reservations order by hash")
         assert [(r["hash"], r["kind"], r["bytes"], r["state"], r["reason"]) for r in reservations] == [
             ("h1", "soak_probe", 128 * 1024**2, "active", "soak_resident"),
@@ -190,7 +200,10 @@ def test_soak_queue_ignores_legacy_min_free_gate_and_uses_disk_floor_budget():
 
         assert result.blocked_reason is None
         assert result.started == ["h1"]
-        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "h1"})]
+        assert executor.posts == []
+        assert _rows(db, "select hash,intent from scheduler_intents") == [
+            {"hash": "h1", "intent": "probe"}
+        ]
         decisions = _rows(db, "select reason_code from decision_log where component='soak_queue'")
         assert "min_free_block" not in {row["reason_code"] for row in decisions}
 
@@ -250,7 +263,10 @@ def test_soak_queue_respects_resident_slots_and_qbt_active_cap():
         result = svc.run_once(snapshots, free_bytes=20 * 1024**3, sync_healthy=True)
 
         assert result.started == ["h1"]
-        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "h1"})]
+        assert executor.posts == []
+        assert _rows(db, "select hash,intent from scheduler_intents") == [
+            {"hash": "h1", "intent": "probe"}
+        ]
 
 
 
@@ -311,7 +327,22 @@ def test_soak_queue_hot_preempts_high_write_pressure_active_when_budget_needed()
 
         assert result.hot_hashes == ["hot"]
         assert result.preempted_hashes == ["victim"]
-        assert ("/api/v2/torrents/stop", {"hashes": "victim"}) in executor.posts
+        assert executor.posts == []
+        victim_intent = _rows(
+            db,
+            "select component,hash,intent,expires_at from scheduler_intents where hash='victim'",
+        )[0]
+        assert victim_intent == {
+            "component": "soak",
+            "hash": "victim",
+            "intent": "cooldown",
+            "expires_at": 2800,
+        }
+        victim_allocation = _rows(
+            db,
+            "select desired_state,reason from scheduler_allocations where hash='victim'",
+        )[0]
+        assert victim_allocation == {"desired_state": "active", "reason": "budget_fit"}
         reservation = _rows(db, "select state,reason from resource_reservations where hash='victim' and kind='active_download'")[0]
         assert reservation == {"state": "released", "reason": "hot_soak_preempted_active"}
         decision = _rows(db, "select decision,reason_code from decision_log where hash='victim' order by id desc limit 1")[0]
@@ -548,7 +579,11 @@ def test_soak_queue_clears_low_capacity_limit_when_resident_is_reallocated_out()
 
         assert result.stopped == ["old"]
         assert executor.download_limits == [("old", 0)]
-        assert ("/api/v2/torrents/stop", {"hashes": "old"}) in executor.posts
+        assert executor.posts == []
+        assert _rows(
+            db,
+            "select hash,intent,expires_at from scheduler_intents where hash='old'",
+        ) == [{"hash": "old", "intent": "cooldown", "expires_at": 2800}]
 
 
 if __name__ == "__main__":

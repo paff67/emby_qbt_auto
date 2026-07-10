@@ -880,7 +880,7 @@ git commit -m "feat: add global capacity constrained scheduler"
 - Test: `tests/test_carousel.py`
 - Test: `tests/test_soak_queue.py`
 
-- [ ] **Step 1: Add intent and generation fields**
+- [x] **Step 1: Add intent and generation fields**
 
 ```sql
 alter table scheduler_allocations add column owner text not null default 'legacy';
@@ -896,7 +896,7 @@ create table if not exists scheduler_intents(
 );
 ```
 
-- [ ] **Step 2: Change soak/carousel/batch to emit intents**
+- [x] **Step 2: Change soak/carousel/batch to emit intents**
 
 ```python
 Intent(component="soak", hash=h, intent="probe", priority=30, expires_at=now+120, data={"exposure_bytes": exposure})
@@ -906,15 +906,15 @@ Intent(component="batch", hash=h, intent="protect_batch", priority=20, expires_a
 
 These modules must stop writing `scheduler_allocations` directly.
 
-- [ ] **Step 3: Apply one generation atomically**
+- [x] **Step 3: Apply one generation atomically**
 
 The central planner reads all nonexpired intents, produces final allocations, writes one `plan_generation`, then dispatcher applies only actions for that generation. An older worker result cannot overwrite a newer generation.
 
-- [ ] **Step 4: Fix never-seen-swarm dead detection**
+- [x] **Step 4: Fix never-seen-swarm dead detection**
 
 Initialize `no_swarm_since` at first health observation when seeds and peers are both zero. Mark dead when both no-swarm and no-progress durations exceed the configured threshold, including torrents that have never seen swarm.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_scheduler_engine.py tests/test_carousel.py tests/test_soak_queue.py tests/test_download_planner.py -q
@@ -1477,4 +1477,3 @@ git commit -m "docs: add scheduler v3 rollout and rollback gates"
 - Normal upload cannot exceed `max_attempts`; expired leases are recovered automatically.
 - Full-torrent cleanup requires remote verification and seed policy approval.
 - All schema changes are additive and legacy scheduler rollback remains available.
-

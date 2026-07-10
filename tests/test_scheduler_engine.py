@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import random
 import json
+import importlib.util
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -15,6 +16,128 @@ sys.path.insert(0, str(ROOT))
 
 MIB = 1024**2
 GIB = 1024**3
+
+
+def test_scheduler_schema_tracks_intents_and_plan_generation():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+
+        con = sqlite3.connect(db)
+        allocation_columns = {
+            row[1] for row in con.execute("pragma table_info(scheduler_allocations)")
+        }
+        health_columns = {
+            row[1] for row in con.execute("pragma table_info(torrent_health)")
+        }
+        intent_columns = [
+            row[1] for row in con.execute("pragma table_info(scheduler_intents)")
+        ]
+        plan_state_columns = [
+            row[1] for row in con.execute("pragma table_info(scheduler_plan_state)")
+        ]
+        con.close()
+
+        assert {"owner", "plan_generation"} <= allocation_columns
+        assert "no_swarm_since" in health_columns
+        assert intent_columns == [
+            "component",
+            "hash",
+            "intent",
+            "priority",
+            "expires_at",
+            "data_json",
+        ]
+        assert plan_state_columns == ["id", "current_generation", "updated_at"]
+
+
+def test_scheduler_intent_repository_refreshes_payload_and_filters_expired_rows():
+    assert importlib.util.find_spec("qbt_orchestrator.scheduler_intents") is not None
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.scheduler_intents import SchedulerIntent, SchedulerIntentRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = SchedulerIntentRepository(db)
+
+        repo.upsert(
+            SchedulerIntent(
+                component="soak",
+                hash="h1",
+                intent="probe",
+                priority=30,
+                expires_at=200,
+                data={"exposure_bytes": 128 * MIB},
+            )
+        )
+        repo.upsert(
+            SchedulerIntent(
+                component="soak",
+                hash="h1",
+                intent="probe",
+                priority=35,
+                expires_at=220,
+                data={"exposure_bytes": 256 * MIB},
+            )
+        )
+        repo.upsert(
+            SchedulerIntent(
+                component="batch",
+                hash="h2",
+                intent="protect_batch",
+                priority=20,
+                expires_at=150,
+                data={"batch_id": 7},
+            )
+        )
+
+        active = repo.active(now=151)
+
+        assert [(item.component, item.hash, item.priority) for item in active] == [
+            ("soak", "h1", 35)
+        ]
+        assert active[0].expires_at == 220
+        assert active[0].data == {"exposure_bytes": 256 * MIB}
+        assert repo.active(now=220) == []
+
+
+def test_migration_backfills_active_batch_lease_as_protect_intent():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,created_at,updated_at) "
+            "values(1,'legacy-batch',1,'downloading','pipeline','[0]',1,1)"
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) "
+            "values('legacy-batch',1,'batch',100,'active',1,null,'legacy')"
+        )
+        con.execute("delete from scheduler_intents")
+        con.commit()
+        con.close()
+
+        migrate(db, dry_run=False)
+
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select component,hash,intent,priority,expires_at,data_json from scheduler_intents"
+        ).fetchone()
+        con.close()
+        assert row == (
+            "batch",
+            "legacy-batch",
+            "protect_batch",
+            20,
+            None,
+            '{"batch_id":1}',
+        )
 
 
 def _item(item_id, torrent_hash, kind, growth, *, release=0, priority=0, hold=False, probability=0.5):

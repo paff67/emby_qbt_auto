@@ -20,7 +20,7 @@ from .capacity_state import (
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
 from .db import migrate, readonly_connect, start_persistent_write_actor, stop_write_actor, write_transaction
-from .file_batch import FileBatchService, active_pipeline_batch_hashes
+from .file_batch import FileBatchService
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
@@ -378,7 +378,6 @@ class DaemonRuntime:
             )
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
-        batch_protected_hashes = active_pipeline_batch_hashes(self.state_db)
         engine_plan = None
         engine_budget = None
         if self.scheduler_engine_mode != "legacy":
@@ -419,10 +418,6 @@ class DaemonRuntime:
             snapshots,
             free_bytes=free_bytes,
             sync_healthy=sync_healthy,
-            protected_running_hashes=soak_result.protected_hashes | batch_protected_hashes,
-            forced_active_hashes=set(soak_result.hot_hashes),
-            cooldown_hashes=set(soak_result.cooldown_hashes),
-            external_reserved_bytes=int(soak_result.reserved_bytes),
             allowed_active_hashes=allowed_active_hashes,
         )
         scheduler_payload = self._scheduler_engine_payload(
@@ -500,6 +495,7 @@ class DaemonRuntime:
                 "conservative": result.conservative,
                 "budget_bytes": result.budget_bytes,
                 "mode": result.mode,
+                "plan_generation": result.plan_generation,
                 "planner_dry_run": self.planner_dry_run,
             },
             "soak_queue": soak_result.as_dict(),

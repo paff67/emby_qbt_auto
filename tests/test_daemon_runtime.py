@@ -1439,10 +1439,11 @@ def test_runtime_planner_tick_runs_soak_queue_before_planner_and_protects_reside
         result = daemon.planner_tick()
 
         assert result["soak_queue"]["started"] == ["soak"]
-        assert result["planner"]["selected_hashes"] == ["active"]
+        assert result["planner"]["selected_hashes"] == ["soak"]
+        assert result["planner"]["plan_generation"] == 1
         assert ("/api/v2/torrents/start", {"hashes": "soak"}) in executor.posts
-        assert ("/api/v2/torrents/start", {"hashes": "active"}) in executor.posts
-        assert ("/api/v2/torrents/stop", {"hashes": "soak"}) not in executor.posts
+        assert ("/api/v2/torrents/start", {"hashes": "active"}) not in executor.posts
+        assert executor.seq == [("active", False), ("soak", False)]
 
 
 def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
@@ -1476,6 +1477,10 @@ def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
             "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
             ("batch", 1, "batch", 3 * gib, "active", 900, None, "batch_pipeline_reserved"),
         )
+        con.execute(
+            "insert into scheduler_intents(component,hash,intent,priority,expires_at,data_json) values(?,?,?,?,?,?)",
+            ("batch", "batch", "protect_batch", 20, None, '{"batch_id":1}'),
+        )
         con.commit(); con.close()
         executor = FakeExecutor()
         daemon = DaemonRuntime(
@@ -1493,8 +1498,8 @@ def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
 
         result = daemon.planner_tick()
 
-        assert result["planner"]["selected_hashes"] == ["tiny"]
-        assert ("/api/v2/torrents/start", {"hashes": "tiny"}) in executor.posts
+        assert result["planner"]["selected_hashes"] == ["batch"]
+        assert ("/api/v2/torrents/start", {"hashes": "tiny"}) not in executor.posts
         assert not any(path == "/api/v2/torrents/stop" and payload == {"hashes": "batch"} for path, payload in executor.posts)
 
 

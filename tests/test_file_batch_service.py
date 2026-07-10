@@ -445,7 +445,7 @@ def test_file_batch_service_creates_pipeline_batch_with_reservation_and_file_pri
         assert result.batches_created == 1
         assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "0|1", "priority": "1"}) in qbt.calls
         assert ("/api/v2/torrents/filePrio", {"hash": "big", "id": "2", "priority": "0"}) in qbt.calls
-        assert ("/api/v2/torrents/start", {"hashes": "big"}) in qbt.calls
+        assert not any(call[0] == "/api/v2/torrents/start" for call in qbt.calls)
         assert not any(call[0] == "/api/v2/torrents/delete" for call in qbt.calls)
 
         batch = _rows(db, "select hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,piece_size,selected_extents,piece_spill_overhead_bytes,priority_applied from torrent_batches")[0]
@@ -468,6 +468,25 @@ def test_file_batch_service_creates_pipeline_batch_with_reservation_and_file_pri
         assert reservation["state"] == "active"
         assert reservation["expires_at"] == 13_600
         assert reservation["reason"] == "batch_pipeline_reserved"
+        intent = _rows(
+            db,
+            "select component,hash,intent,priority,expires_at,data_json from scheduler_intents where hash='big'",
+        )[0]
+        assert {
+            "component": intent["component"],
+            "hash": intent["hash"],
+            "intent": intent["intent"],
+            "priority": intent["priority"],
+            "expires_at": intent["expires_at"],
+            "data": json.loads(intent["data_json"]),
+        } == {
+            "component": "batch",
+            "hash": "big",
+            "intent": "protect_batch",
+            "priority": 20,
+            "expires_at": 13_600,
+            "data": {"batch_id": 1},
+        }
 
 
 def test_file_batch_service_blocks_pipeline_batch_when_reservation_budget_is_insufficient():
