@@ -479,6 +479,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         planner_dry_run=planner_dry_run,
         planner_active_slots=int(os.environ.get("QBT_ORCH_ACTIVE_SLOTS", "5")),
         planner_slow_active_demote_sec=int(os.environ.get("QBT_ORCH_SLOW_ACTIVE_DEMOTE_SEC", "180")),
+        scheduler_engine_mode=os.environ.get("QBT_ORCH_SCHEDULER_ENGINE", "legacy"),
         disk_floor_bytes=_disk_floor_bytes_from_env(os.environ),
         emergency_floor_bytes=_emergency_floor_bytes_from_env(os.environ),
         recovery_enabled=(_truthy(os.environ.get("QBT_ORCH_RECOVERY_MODE")) is not False),

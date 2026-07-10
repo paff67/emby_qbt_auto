@@ -119,6 +119,7 @@ class DownloadPlanner:
         forced_active_hashes: set[str] | None = None,
         cooldown_hashes: set[str] | None = None,
         external_reserved_bytes: int = 0,
+        allowed_active_hashes: set[str] | None = None,
     ) -> PlannerResult:
         if self._pending_persistence is not None:
             raise RuntimeError("planner persistence batch is already active")
@@ -132,6 +133,7 @@ class DownloadPlanner:
                 forced_active_hashes=forced_active_hashes,
                 cooldown_hashes=cooldown_hashes,
                 external_reserved_bytes=external_reserved_bytes,
+                allowed_active_hashes=allowed_active_hashes,
             )
         finally:
             self._pending_persistence = None
@@ -145,10 +147,16 @@ class DownloadPlanner:
         forced_active_hashes: set[str] | None = None,
         cooldown_hashes: set[str] | None = None,
         external_reserved_bytes: int = 0,
+        allowed_active_hashes: set[str] | None = None,
     ) -> PlannerResult:
         protected_running_hashes = {str(h) for h in (protected_running_hashes or set())}
         forced_active_hashes = {str(h) for h in (forced_active_hashes or set())}
         cooldown_hashes = {str(h) for h in (cooldown_hashes or set())}
+        allowed_active_hashes = (
+            None
+            if allowed_active_hashes is None
+            else {str(h) for h in allowed_active_hashes}
+        )
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
         now = int(self.now())
         previous_allocations = self._allocation_rows()
@@ -201,6 +209,7 @@ class DownloadPlanner:
             cooldown_hashes=cooldown_hashes,
             protected_running_hashes=protected_running_hashes,
             forced_active_hashes=forced_active_hashes,
+            allowed_active_hashes=allowed_active_hashes,
         )
         selected: list[dict[str, Any]] = []
         used = 0
@@ -319,6 +328,7 @@ class DownloadPlanner:
         cooldown_hashes: set[str],
         protected_running_hashes: set[str],
         forced_active_hashes: set[str],
+        allowed_active_hashes: set[str] | None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         candidates: list[dict[str, Any]] = []
         skipped: dict[str, str] = {}
@@ -326,6 +336,9 @@ class DownloadPlanner:
             h = str(torrent.get("hash") or "")
             amount_left = int(torrent.get("amount_left") or 0)
             if amount_left <= 0 or h in dead_hashes or h in cooldown_hashes:
+                continue
+            if allowed_active_hashes is not None and h not in allowed_active_hashes:
+                skipped[h] = "global_scheduler_not_selected"
                 continue
             if h in protected_running_hashes and h not in forced_active_hashes:
                 skipped[h] = "protected_running"

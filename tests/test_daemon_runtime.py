@@ -1513,6 +1513,7 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
         "QBT_ORCH_DISK_PATH", "QBT_ORCH_ORPHAN_JANITOR", "QBT_ORCH_JUNK_JANITOR", "QBT_ORCH_CAROUSEL",
         "QBT_ORCH_QBT_PREFERENCES_GUARD", "QBT_ORCH_PATH_RECONCILE",
         "QBT_ORCH_DRAIN_EXIT_GB", "QBT_ORCH_EXPLORE_ENTER_GB", "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS",
+        "QBT_ORCH_SCHEDULER_ENGINE",
     ]
     old = {k: os.environ.get(k) for k in keys}
     try:
@@ -1541,6 +1542,7 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
                 "QBT_ORCH_DRAIN_EXIT_GB": "5.5",
                 "QBT_ORCH_EXPLORE_ENTER_GB": "9",
                 "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS": "0",
+                "QBT_ORCH_SCHEDULER_ENGINE": "shadow",
             })
             ns = argparse.Namespace(cmd="daemon", dry_run=False, config=None, safety_interval=0, max_safety_ticks=1)
             runtime, dry_run = _build_runtime(ns, db)
@@ -1560,6 +1562,7 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
             assert runtime.drain_exit_bytes == int(5.5 * 1024**3)
             assert runtime.explore_enter_bytes == 9 * 1024**3
             assert runtime.capacity_deadlock_alerts_enabled is False
+            assert runtime.scheduler_engine_mode == "shadow"
     finally:
         for k, v in old.items():
             if v is None:

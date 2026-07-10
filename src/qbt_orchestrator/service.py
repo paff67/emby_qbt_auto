@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from .alerts import SchedulerAlertConfig, SchedulerAlertService
+from .budget import calculate_growth_budget, resource_claims_from_rows
 from .capacity_state import (
     CapacityStateStore,
     ModeController,
@@ -29,8 +30,10 @@ from .planner import DownloadPlanner
 from .policies.disk import classify_disk
 from .periodic import PeriodicTask, PeriodicWorker
 from .runtime import BotCommandRepository, BotNotificationRepository, ObservabilityStore
+from .scheduler_engine import SchedulerEngine
 from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
 from .telegram_control import TelegramAuthorizer
+from .work_items import build_full_finish_work_items
 
 
 @dataclass
@@ -149,6 +152,9 @@ class DaemonRuntime:
         planner_dry_run: bool = True,
         planner_active_slots: int = 5,
         planner_slow_active_demote_sec: int = 180,
+        scheduler_engine_mode: str = "legacy",
+        scheduler_engine=None,
+        scheduler_unit_bytes: int = 64 * 1024**2,
         disk_floor_bytes: int = 3 * 1024**3,
         emergency_floor_bytes: int = int(1.5 * 1024**3),
         recovery_enabled: bool = True,
@@ -219,6 +225,10 @@ class DaemonRuntime:
         self.planner_dry_run = planner_dry_run or dry_run
         self.planner_active_slots = int(planner_active_slots)
         self.planner_slow_active_demote_sec = int(planner_slow_active_demote_sec)
+        self.scheduler_engine_mode = str(scheduler_engine_mode or "legacy").strip().lower()
+        if self.scheduler_engine_mode not in {"legacy", "shadow", "live"}:
+            raise ValueError("scheduler_engine_mode must be legacy, shadow, or live")
+        self.scheduler_engine = scheduler_engine or SchedulerEngine(unit_bytes=int(scheduler_unit_bytes))
         self.disk_floor_bytes = int(disk_floor_bytes)
         self.emergency_floor_bytes = int(emergency_floor_bytes)
         self.recovery_enabled = bool(recovery_enabled)
@@ -369,6 +379,28 @@ class DaemonRuntime:
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
         batch_protected_hashes = active_pipeline_batch_hashes(self.state_db)
+        engine_plan = None
+        engine_budget = None
+        if self.scheduler_engine_mode != "legacy":
+            engine_items = build_full_finish_work_items(snapshots)
+            engine_budget = self._scheduler_growth_budget(
+                free_bytes,
+                reallocatable_hashes={item.hash for item in engine_items if not item.hold},
+            )
+            engine_slots = self.recovery_active_slots if scheduler_mode == "drain" else self.planner_active_slots
+            if scheduler_mode == "emergency" or not sync_healthy:
+                engine_slots = 0
+            engine_plan = self.scheduler_engine.select(
+                engine_items,
+                scheduler_mode,
+                engine_budget.available_growth_bytes,
+                engine_slots,
+            )
+        allowed_active_hashes = (
+            {item.hash for item in engine_plan.selected}
+            if self.scheduler_engine_mode == "live" and engine_plan is not None
+            else None
+        )
         planner = DownloadPlanner(
             self.state_db,
             self.executor,
@@ -391,6 +423,13 @@ class DaemonRuntime:
             forced_active_hashes=set(soak_result.hot_hashes),
             cooldown_hashes=set(soak_result.cooldown_hashes),
             external_reserved_bytes=int(soak_result.reserved_bytes),
+            allowed_active_hashes=allowed_active_hashes,
+        )
+        scheduler_payload = self._scheduler_engine_payload(
+            engine_plan,
+            engine_budget,
+            legacy_selected_hashes=result.selected_hashes,
+            legacy_budget_bytes=result.budget_bytes,
         )
         preemption_result = None
         if self.preemption_service is not None and sync_healthy:
@@ -465,6 +504,7 @@ class DaemonRuntime:
             },
             "soak_queue": soak_result.as_dict(),
             "preemption": None if preemption_result is None else getattr(preemption_result, "__dict__", preemption_result),
+            "scheduler_engine": scheduler_payload,
             "capacity": capacity_payload,
             "alerts_enqueued": alert_ids,
         }
@@ -568,6 +608,79 @@ class DaemonRuntime:
                 count += 1
         return count
 
+    def _scheduler_growth_budget(
+        self,
+        free_bytes: int,
+        *,
+        reallocatable_hashes: set[str] | None = None,
+    ):
+        con = readonly_connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select hash,kind,accounting_class,bytes from resource_reservations "
+                "where state='active' and (expires_at is null or expires_at>?)",
+                (int(time.time()),),
+            ).fetchall()
+        finally:
+            con.close()
+        # Only active-download claims represented by a non-hold WorkItem are
+        # replaced this tick. Every other future claim remains external.
+        reallocatable = {str(item) for item in (reallocatable_hashes or set())}
+        external_claims = [
+            claim
+            for claim in resource_claims_from_rows(rows)
+            if not (str(claim.kind) == "active_download" and str(claim.hash) in reallocatable)
+        ]
+        return calculate_growth_budget(
+            free_bytes=int(free_bytes),
+            emergency_floor_bytes=self.emergency_floor_bytes,
+            dynamic_guard_bytes=max(0, self.disk_floor_bytes - self.emergency_floor_bytes),
+            claims=external_claims,
+        )
+
+    def _scheduler_engine_payload(
+        self,
+        engine_plan,
+        engine_budget,
+        *,
+        legacy_selected_hashes,
+        legacy_budget_bytes: int,
+    ) -> dict:
+        legacy_selected = sorted(str(item) for item in legacy_selected_hashes)
+        if engine_plan is None or engine_budget is None:
+            return {
+                "mode": "legacy",
+                "applied_plan": "legacy",
+                "selected_hashes": legacy_selected,
+            }
+        engine_selected = sorted(item.hash for item in engine_plan.selected)
+        engine_set = set(engine_selected)
+        legacy_set = set(legacy_selected)
+        unsafe_rejections = sum(
+            int(engine_plan.rejection_counts.get(reason) or 0)
+            for reason in ("hold", "mode_disallowed", "budget_exceeded")
+        )
+        payload = {
+            "mode": self.scheduler_engine_mode,
+            "applied_plan": "engine" if self.scheduler_engine_mode == "live" else "legacy",
+            "selected_hashes": engine_selected,
+            "engine_selected_hashes": engine_selected,
+            "legacy_selected_hashes": legacy_selected,
+            "only_engine_hashes": sorted(engine_set - legacy_set),
+            "only_legacy_hashes": sorted(legacy_set - engine_set),
+            "engine_budget_bytes": int(engine_plan.available_growth_bytes),
+            "legacy_budget_bytes": int(legacy_budget_bytes),
+            "budget_difference_bytes": int(engine_plan.available_growth_bytes) - int(legacy_budget_bytes),
+            "future_growth_reserved_bytes": int(engine_budget.future_growth_reserved_bytes),
+            "current_pinned_bytes": int(engine_budget.current_pinned_bytes),
+            "unsafe_plan_rejection_count": unsafe_rejections,
+            "rejection_counts": dict(engine_plan.rejection_counts),
+        }
+        # Persist one comparison sample; only shadow guarantees the Planner side
+        # is an unconstrained legacy counterfactual.
+        self.obs.metric_snapshot(f"scheduler_engine_{self.scheduler_engine_mode}", payload)
+        return payload
+
     def _effective_config_snapshot(self) -> dict:
         return {
             "thresholds": {
@@ -584,6 +697,7 @@ class DaemonRuntime:
             "feature_flags": {
                 "dry_run": bool(self.dry_run),
                 "planner_dry_run": bool(self.planner_dry_run),
+                "scheduler_engine": self.scheduler_engine_mode,
                 "file_batch_dry_run": bool(self.file_batch_dry_run),
                 "recovery_enabled": bool(self.recovery_enabled),
                 "soak_queue": self.soak_queue_service is not None,

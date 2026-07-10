@@ -852,6 +852,37 @@ def test_planner_uses_at_most_two_write_transactions_for_one_tick():
         assert len(_rows(db, "select hash from decision_log where component='planner'")) == 100
 
 
+def test_planner_allowed_active_hashes_prevents_legacy_slot_backfill():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        planner = DownloadPlanner(db, executor, dry_run=False, active_slots=2, disk_floor_bytes=0, now=lambda: 100)
+        snapshots = {
+            "a": {"hash": "a", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1, "size": 10, "progress": 0.1},
+            "b": {"hash": "b", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 2, "size": 10, "progress": 0.1},
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=100,
+            sync_healthy=True,
+            allowed_active_hashes={"b"},
+        )
+
+        assert result.selected_hashes == ["b"]
+        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "b"})]
+        rows = _rows(db, "select hash,desired_state,reason from scheduler_allocations order by hash")
+        assert rows == [
+            {"hash": "a", "desired_state": "soak", "reason": "global_scheduler_not_selected"},
+            {"hash": "b", "desired_state": "active", "reason": "budget_fit"},
+        ]
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
