@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
@@ -24,6 +24,7 @@ class FileBatchResult:
     dry_run: int = 0
     batches_created: int = 0
     batches_blocked: int = 0
+    blocked_reasons: dict[str, int] = field(default_factory=dict)
 
 
 def _connect(path) -> sqlite3.Connection:
@@ -141,7 +142,13 @@ class FileBatchService:
         self.jobs = TorrentJobRepository(state_db)
         self.obs = ObservabilityStore(state_db)
 
-    def sync_completed(self, snapshots: Mapping[str, Mapping[str, Any]], free_bytes: int | None = None, sync_healthy: bool = True) -> FileBatchResult:
+    def sync_completed(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        free_bytes: int | None = None,
+        sync_healthy: bool = True,
+        scheduler_mode: str = "normal",
+    ) -> FileBatchResult:
         self._new_batches_created_this_tick = 0
         scanned = len(snapshots)
         eligible = 0
@@ -149,14 +156,29 @@ class FileBatchService:
         skipped_existing = 0
         batches_created = 0
         batches_blocked = 0
+        blocked_reasons: dict[str, int] = {}
+
+        # Evaluate global admission once.  Under disk pressure this keeps the
+        # whole scan on snapshot/SQLite data and avoids per-torrent qBT calls.
+        batch_admitted, admission_reason = self._batch_admission_allowed(free_bytes, scheduler_mode)
         for h, raw in snapshots.items():
             torrent = dict(raw)
             torrent.setdefault("hash", h)
             if _is_managed(torrent) and not _is_completed(torrent):
-                batch_result = self._maybe_create_pipeline_batch(torrent, free_bytes=free_bytes, sync_healthy=sync_healthy)
-                batches_created += int(batch_result.get("created") or 0)
-                batches_blocked += int(batch_result.get("blocked") or 0)
-                enqueued += int(batch_result.get("upload_queued") or 0)
+                if not batch_admitted:
+                    batches_blocked += 1
+                    blocked_reasons[admission_reason] = blocked_reasons.get(admission_reason, 0) + 1
+                    self._decision(
+                        str(torrent.get("hash") or h),
+                        "prefetch_blocked",
+                        admission_reason,
+                        {"free_bytes": free_bytes, "scheduler_mode": scheduler_mode},
+                    )
+                else:
+                    batch_result = self._maybe_create_pipeline_batch(torrent, free_bytes=free_bytes, sync_healthy=sync_healthy)
+                    batches_created += int(batch_result.get("created") or 0)
+                    batches_blocked += int(batch_result.get("blocked") or 0)
+                    enqueued += int(batch_result.get("upload_queued") or 0)
             if not (_is_managed(torrent) and _is_completed(torrent)):
                 continue
             eligible += 1
@@ -188,7 +210,23 @@ class FileBatchService:
             dry_run=eligible - enqueued - skipped_existing if self.dry_run else 0,
             batches_created=batches_created,
             batches_blocked=batches_blocked,
+            blocked_reasons=blocked_reasons,
         )
+
+    def _batch_admission_allowed(self, free_bytes: int | None, scheduler_mode: str) -> tuple[bool, str]:
+        """Return the tick-wide admission decision before qBT file inventory.
+
+        A missing disk measurement preserves the legacy no-budget behavior;
+        the existing per-torrent guard will still refuse to create a batch.
+        """
+        if str(scheduler_mode).lower() in {"drain", "emergency"}:
+            return False, "mode_disallows_batch"
+        if free_bytes is None:
+            return True, "ok"
+        minimum = self.filesystem_slack_bytes + 32 * 1024**2
+        if self._safe_batch_budget(free_bytes) < minimum:
+            return False, "global_batch_budget_below_minimum"
+        return True, "ok"
 
     def _maybe_create_pipeline_batch(self, torrent: Mapping[str, Any], *, free_bytes: int | None, sync_healthy: bool) -> dict[str, int]:
         h = str(torrent.get("hash") or "")

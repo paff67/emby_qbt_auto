@@ -384,6 +384,8 @@ class DaemonRuntime:
 
     def file_batch_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        free_bytes = int(self.free_bytes_provider())
+        scheduler_mode = self._batch_scheduler_mode(free_bytes)
         observe_result = None
         if self.observe_promotion_service is not None:
             observe_result = self.observe_promotion_service.promote_ready(
@@ -418,8 +420,9 @@ class DaemonRuntime:
         )
         result = service.sync_completed(
             snapshots,
-            free_bytes=int(self.free_bytes_provider()),
+            free_bytes=free_bytes,
             sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+            scheduler_mode=scheduler_mode,
         )
         payload = {
             "scanned": result.scanned,
@@ -429,16 +432,25 @@ class DaemonRuntime:
             "file_batch_dry_run": bool(result.dry_run),
             "batches_created": result.batches_created,
             "batches_blocked": result.batches_blocked,
+            "blocked_reasons": result.blocked_reasons,
         }
         if observe_result is not None:
             payload["observe_promotion"] = observe_result
         if self.junk_janitor is not None:
             payload["junk_janitor"] = self.junk_janitor.reconcile(
                 snapshots,
-                self._junk_file_lists(snapshots),
+                self._junk_file_lists(snapshots) if scheduler_mode == "normal" else {},
                 sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
             )
         return payload
+
+    def _batch_scheduler_mode(self, free_bytes: int) -> str:
+        """Map the legacy recovery thresholds to batch admission semantics."""
+        if int(free_bytes) < self.emergency_floor_bytes:
+            return "emergency"
+        if self.recovery_enabled and int(free_bytes) < self.recovery_enter_bytes:
+            return "drain"
+        return "normal"
 
     def _junk_file_lists(self, snapshots: Mapping[str, Mapping[str, object]]) -> dict[str, list[dict]]:
         if not hasattr(self.qbt, "torrent_files"):

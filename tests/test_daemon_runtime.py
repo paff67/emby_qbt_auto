@@ -1080,6 +1080,80 @@ def test_daemon_file_batch_loop_creates_pipeline_batch_from_qbt_file_list():
         assert '"batches_created": 1' in loop
 
 
+def test_daemon_drain_file_batch_does_not_call_torrent_files():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    gib = 1024**3
+
+    class DrainQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.heavy_calls = []
+
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "big": {
+                        "name": "Big",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 5 * gib,
+                        "size": 5 * gib,
+                        "progress": 0.0,
+                    }
+                },
+                "server_state": {},
+            }
+
+        def torrent_files(self, hash):
+            self.heavy_calls.append(("torrent_files", hash))
+            return [{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.0, "priority": 0}]
+
+        def torrent_properties(self, hash):
+            self.heavy_calls.append(("torrent_properties", hash))
+            return {"piece_size": 16 * 1024**2}
+
+    class RecordingJunkJanitor:
+        def __init__(self):
+            self.file_lists = None
+
+        def reconcile(self, snapshots, file_lists, sync_healthy):
+            self.file_lists = file_lists
+            return {"scanned": len(snapshots)}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = DrainQbt()
+        junk_janitor = RecordingJunkJanitor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: int(2.2 * gib),
+            dry_run=False,
+            safety_interval=0,
+            file_batch_dry_run=False,
+            batch_pipeline_enabled=True,
+            disk_floor_bytes=3 * gib,
+            junk_janitor=junk_janitor,
+        )
+        daemon.tick_safety()
+
+        result = daemon.file_batch_tick()
+
+        assert qbt.heavy_calls == []
+        assert result["batches_created"] == 0
+        assert result["batches_blocked"] == 1
+        assert result["blocked_reasons"] == {"mode_disallows_batch": 1}
+        assert junk_janitor.file_lists == {}
+
+
 def test_daemon_file_batch_live_respects_upload_backpressure_policy():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.io_governor import UploadBackpressurePolicy

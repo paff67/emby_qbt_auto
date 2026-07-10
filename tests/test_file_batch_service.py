@@ -340,6 +340,66 @@ class BatchQbt:
             raise RuntimeError("qbt filePrio failed")
 
 
+def test_file_batch_skips_all_inventory_calls_when_scheduler_mode_disallows_batch():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.0, "priority": 0}])
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+        )
+
+        result = service.sync_completed(
+            {"h1": {"hash": "h1", "category": "auto", "state": "stoppedDL", "size": 5 * gib, "amount_left": 5 * gib}},
+            free_bytes=6 * gib,
+            sync_healthy=True,
+            scheduler_mode="drain",
+        )
+
+        assert qbt.calls == []
+        assert result.batches_created == 0
+        assert result.batches_blocked == 1
+        assert result.blocked_reasons == {"mode_disallows_batch": 1}
+
+
+def test_file_batch_skips_all_inventory_calls_when_global_budget_is_below_minimum():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.0, "priority": 0}])
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            disk_floor_bytes=2 * gib,
+            filesystem_slack_bytes=128 * 1024**2,
+        )
+
+        result = service.sync_completed(
+            {"h1": {"hash": "h1", "category": "auto", "state": "stoppedDL", "size": 5 * gib, "amount_left": 5 * gib}},
+            free_bytes=2 * gib + 120 * 1024**2,
+            sync_healthy=True,
+            scheduler_mode="normal",
+        )
+
+        assert qbt.calls == []
+        assert result.batches_created == 0
+        assert result.batches_blocked == 1
+        assert result.blocked_reasons == {"global_batch_budget_below_minimum": 1}
+
+
 def test_file_batch_service_creates_pipeline_batch_with_reservation_and_file_priorities():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
@@ -434,13 +494,15 @@ def test_file_batch_service_blocks_pipeline_batch_when_reservation_budget_is_ins
         )
 
         assert result.batches_created == 0
-        assert qbt.calls == [("torrent_files", "big"), ("torrent_properties", "big")]
+        assert result.batches_blocked == 1
+        assert result.blocked_reasons == {"global_batch_budget_below_minimum": 1}
+        assert qbt.calls == []
         assert _rows(db, "select * from torrent_batches") == []
         assert _rows(db, "select * from resource_reservations where kind='batch'") == []
         decision = _rows(db, "select component,hash,decision,reason_code,data_json from decision_log where component='file_batch' order by id desc limit 1")[0]
         assert decision["hash"] == "big"
         assert decision["decision"] == "prefetch_blocked"
-        assert decision["reason_code"] == "batch_budget_insufficient"
+        assert decision["reason_code"] == "global_batch_budget_below_minimum"
 
 
 def test_file_batch_service_live_verify_with_explicit_canary_blocks_nonmatching_hash_before_file_probe():
