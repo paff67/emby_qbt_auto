@@ -91,6 +91,43 @@ def test_qbt_sync_full_update_rebuilds_and_unhealthy_preserves_cache():
     assert cache.high_risk_actions_allowed is False
 
 
+def test_qbt_sync_partial_delta_preserves_full_snapshot_fields():
+    from qbt_orchestrator.qbt_sync import QbtSyncCache, SyncHealth
+    from tests.fakes import FakeQbtClient
+
+    client = FakeQbtClient(
+        maindata=[
+            {
+                "rid": 1,
+                "full_update": True,
+                "torrents": {
+                    "h1": {
+                        "name": "one",
+                        "category": "auto",
+                        "tags": "auto",
+                        "amount_left": 100,
+                        "size": 200,
+                        "progress": 0.5,
+                    }
+                },
+            },
+            {"rid": 2, "full_update": False, "torrents": {"h1": {"dlspeed": 123}}},
+        ]
+    )
+    cache = QbtSyncCache(client)
+
+    assert cache.poll_once().health == SyncHealth.HEALTHY_FULL
+    assert cache.poll_once().health == SyncHealth.HEALTHY_DELTA
+
+    snap = cache.snapshots["h1"]
+    assert snap.category == "auto"
+    assert snap.tags == "auto"
+    assert snap.amount_left == 100
+    assert snap.size == 200
+    assert snap.progress == 0.5
+    assert snap.dlspeed_bps == 123
+
+
 def test_torrent_snapshot_preserves_speed_and_completed_for_health_planner():
     from qbt_orchestrator.models import TorrentSnapshot
 
@@ -459,7 +496,6 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
-
 
 
 
