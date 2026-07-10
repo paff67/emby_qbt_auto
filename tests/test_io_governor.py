@@ -70,7 +70,11 @@ def test_upload_backpressure_blocks_new_file_batch_jobs_and_records_metrics():
         events = _rows(db, "select component,event_type,message from events_v2 order by id")
         assert events[-1]["component"] == "upload_backpressure"
         assert events[-1]["event_type"] == "new_upload_blocked"
-        metrics = _rows(db, "select component,metrics_json from metrics_snapshots order by id")
+        metrics = _rows(
+            db,
+            "select component,metrics_json from metrics_snapshots "
+            "where component='upload_backpressure' order by id",
+        )
         assert metrics[-1]["component"] == "upload_backpressure"
         data = json.loads(metrics[-1]["metrics_json"])
         assert data["allow_new_upload_jobs"] is False

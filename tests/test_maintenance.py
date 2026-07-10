@@ -31,6 +31,8 @@ def test_sqlite_maintenance_retention_deletes_old_rows_and_checkpoints_wal():
             ("decision_log", "ts,component,hash,decision,reason_code,data_json", (new_ts, "new", "h", "d", "r", "{}")),
             ("metrics_snapshots", "ts,component,metrics_json", (old_ts, "old", "{}")),
             ("metrics_snapshots", "ts,component,metrics_json", (new_ts, "new", "{}")),
+            ("junk_janitor_events", "ts,path", (old_ts, "/old")),
+            ("junk_janitor_events", "ts,path", (new_ts, "/new")),
         ]:
             placeholders = ",".join("?" for _ in values)
             con.execute(f"insert into {table}({columns}) values({placeholders})", values)
@@ -51,16 +53,17 @@ def test_sqlite_maintenance_retention_deletes_old_rows_and_checkpoints_wal():
             "action_log": 1,
             "decision_log": 1,
             "metrics_snapshots": 1,
+            "junk_janitor_events": 1,
         }
         assert result["wal_checkpoint"][0] in {0, 1}
         con = sqlite3.connect(db)
         old_counts = {
             table: con.execute(f"select count(*) from {table} where ts=?", (old_ts,)).fetchone()[0]
-            for table in ("events_v2", "action_log", "decision_log", "metrics_snapshots")
+            for table in ("events_v2", "action_log", "decision_log", "metrics_snapshots", "junk_janitor_events")
         }
         new_counts = {
             table: con.execute(f"select count(*) from {table} where ts=?", (new_ts,)).fetchone()[0]
-            for table in ("events_v2", "action_log", "decision_log", "metrics_snapshots")
+            for table in ("events_v2", "action_log", "decision_log", "metrics_snapshots", "junk_janitor_events")
         }
         con.close()
         assert old_counts == {table: 0 for table in old_counts}

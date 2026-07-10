@@ -9,7 +9,9 @@ from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 from .db import write_transaction
+from .decision_recorder import DecisionRecorder
 from .observability import redact
+from .runtime import ObservabilityStore
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".ts", ".webm"}
@@ -79,11 +81,28 @@ class ObservePromotionService:
         self.dry_run = bool(dry_run)
         self.config = config or ObservePromotionConfig()
         self.now = now or (lambda: int(time.time()))
+        self.decision_recorder = DecisionRecorder(state_db, now=self.now)
+        self.obs = ObservabilityStore(state_db, now=self.now)
 
     def promote_ready(self, snapshots: Mapping[str, Mapping[str, Any]], sync_healthy: bool) -> dict[str, Any]:
         if not sync_healthy:
-            self._event("warning", None, "suspended_unhealthy_sync", "observe promotion suspended because qBT sync is unhealthy", {"dry_run": self.dry_run})
+            self._transition_event(
+                "warning",
+                None,
+                "suspended",
+                "unhealthy_sync",
+                "suspended_unhealthy_sync",
+                "observe promotion suspended because qBT sync is unhealthy",
+                {"dry_run": self.dry_run},
+            )
+            self._record_loop_metrics(0, [], {}, suspended=True)
             return {"suspended": True, "reason": "unhealthy_sync", "scanned": 0, "promoted": [], "skipped": {}, "dropped_indices": {}, "dry_run": self.dry_run}
+
+        # Reset the component-wide suspended state so a later outage is a new
+        # transition, while avoiding a repetitive "healthy" event.
+        self.decision_recorder.record(
+            "observe_promotion", "", "running", "sync_healthy", {"dry_run": self.dry_run}
+        )
 
         scanned = 0
         promoted: list[str] = []
@@ -100,18 +119,42 @@ class ObservePromotionService:
             scanned += 1
             if self._has_metadata_explicitly_false(torrent):
                 skipped[torrent_hash] = "metadata_not_ready"
-                self._event("info", torrent_hash, "skipped", "observe torrent metadata is not ready", {"reason": "metadata_not_ready"})
+                self._transition_event(
+                    "info",
+                    torrent_hash,
+                    "skipped",
+                    "metadata_not_ready",
+                    "skipped",
+                    "observe torrent metadata is not ready",
+                    {"reason": "metadata_not_ready"},
+                )
                 continue
             try:
                 files = [dict(item) for item in self.qbt.torrent_files(torrent_hash)]
             except Exception as exc:
                 skipped[torrent_hash] = "file_list_failed"
-                self._event("error", torrent_hash, "file_list_failed", str(redact(str(exc))), {"reason": "file_list_failed"})
+                self._transition_event(
+                    "error",
+                    torrent_hash,
+                    "skipped",
+                    "file_list_failed",
+                    "file_list_failed",
+                    str(redact(str(exc))),
+                    {"reason": "file_list_failed"},
+                )
                 continue
             selection = self._select_files(files)
             if not selection["main_indices"]:
                 skipped[torrent_hash] = "metadata_not_ready" if not files else "no_main_media"
-                self._event("info", torrent_hash, "skipped", "observe torrent has no selectable main media yet", {"reason": skipped[torrent_hash], "files": len(files)})
+                self._transition_event(
+                    "info",
+                    torrent_hash,
+                    "skipped",
+                    skipped[torrent_hash],
+                    "skipped",
+                    "observe torrent has no selectable main media yet",
+                    {"reason": skipped[torrent_hash], "files": len(files)},
+                )
                 continue
 
             keep = selection["keep_indices"]
@@ -124,16 +167,26 @@ class ObservePromotionService:
                 except Exception as exc:
                     failed = True
                     skipped[torrent_hash] = "qbt_write_failed"
-                    self._event("error", torrent_hash, "qbt_write_failed", str(redact(str(exc))), {"path": path, "payload": payload})
+                    self._transition_event(
+                        "error",
+                        torrent_hash,
+                        "promotion_failed",
+                        "qbt_write_failed",
+                        "qbt_write_failed",
+                        str(redact(str(exc))),
+                        {"path": path, "payload": payload},
+                    )
                     break
             if failed:
                 continue
             promoted.append(torrent_hash)
             dropped_indices[torrent_hash] = drop
             kept_indices[torrent_hash] = keep
-            self._event(
+            self._transition_event(
                 "info",
                 torrent_hash,
+                "promoted",
+                "promotion_complete",
                 "promoted",
                 "observe torrent promoted to auto",
                 {
@@ -144,6 +197,7 @@ class ObservePromotionService:
                 },
             )
 
+        self._record_loop_metrics(scanned, promoted, skipped, suspended=False)
         return {
             "suspended": False,
             "scanned": scanned,
@@ -223,6 +277,45 @@ class ObservePromotionService:
             )
 
         write_transaction(self.state_db, txn)
+
+    def _transition_event(
+        self,
+        level: str,
+        h: str | None,
+        decision: str,
+        reason_code: str,
+        event_type: str,
+        message: str,
+        data: dict[str, Any],
+    ) -> bool:
+        changed = self.decision_recorder.record(
+            "observe_promotion", h, decision, reason_code, data
+        )
+        if changed:
+            self._event(level, h, event_type, message, data)
+        return changed
+
+    def _record_loop_metrics(
+        self,
+        scanned: int,
+        promoted: Sequence[str],
+        skipped: Mapping[str, str],
+        *,
+        suspended: bool,
+    ) -> None:
+        reason_counts: dict[str, int] = {}
+        for reason in skipped.values():
+            reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+        self.obs.metric_snapshot(
+            "observe_promotion",
+            {
+                "suspended": bool(suspended),
+                "scanned": int(scanned),
+                "promoted": len(promoted),
+                **dict(sorted(reason_counts.items())),
+                "sample_hashes": sorted(str(h) for h in skipped)[:3],
+            },
+        )
 
     @staticmethod
     def _snapshot(raw: Any) -> dict[str, Any]:

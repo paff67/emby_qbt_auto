@@ -9,7 +9,13 @@ from typing import Callable
 from .db import write_transaction
 from .observability import redact
 
-RETENTION_TABLES = ("events_v2", "action_log", "decision_log", "metrics_snapshots")
+RETENTION_TABLES = (
+    "events_v2",
+    "action_log",
+    "decision_log",
+    "metrics_snapshots",
+    "junk_janitor_events",
+)
 
 
 class SQLiteMaintenanceService:

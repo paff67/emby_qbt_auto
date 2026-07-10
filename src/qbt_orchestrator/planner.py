@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .db import readonly_connect, write_transaction
+from .decision_recorder import DecisionEntry, DecisionRecorder
 from .models import LifecycleState
 from .observability import redact
 from .policies.download_mode import desired_seq_dl
@@ -28,11 +29,6 @@ HEALTH_UPSERT_SQL = (
     "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
     "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,dead_since=excluded.dead_since,updated_at=excluded.updated_at"
 )
-
-DECISION_INSERT_SQL = (
-    "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)"
-)
-
 
 @dataclass(frozen=True)
 class PlannerResult:
@@ -110,6 +106,7 @@ class DownloadPlanner:
         self.recovery_active_slots = int(recovery_active_slots)
         self.recovery_max_remaining_bytes = int(recovery_max_remaining_bytes)
         self.now = now or (lambda: int(time.time()))
+        self.decision_recorder = DecisionRecorder(self.state_db, now=self.now)
         self._pending_persistence: PlannerPersistenceBatch | None = None
 
     def plan_and_apply(
@@ -377,18 +374,20 @@ class DownloadPlanner:
                 (int(now), "qbt_absent_reconciled", *absent),
             )
             con.execute(f"delete from soak_state where hash in ({placeholders})", absent)
-            for h in absent:
-                con.execute(
-                    "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
-                    (
-                        int(now),
+            self.decision_recorder.record_many_in_transaction(
+                con,
+                [
+                    DecisionEntry(
                         "planner",
                         h,
                         "allocation_reconciled",
                         "qbt_absent",
-                        json.dumps({"released_reservations": True}, ensure_ascii=False),
-                    ),
-                )
+                        {"released_reservations": True},
+                    )
+                    for h in absent
+                ],
+                ts=now,
+            )
             return absent
 
         return list(write_transaction(self.state_db, txn) or [])
@@ -685,16 +684,16 @@ class DownloadPlanner:
                 selected_by_hash, managed_hashes, now = batch.reservation_sync
                 self._apply_active_download_reservations(con, selected_by_hash, managed_hashes, now)
             if batch.decisions:
-                con.executemany(
-                    DECISION_INSERT_SQL,
+                self.decision_recorder.record_many_in_transaction(
+                    con,
                     [
-                        (
-                            int(row["ts"]),
+                        DecisionEntry(
                             "planner",
                             row["hash"],
                             row["decision"],
                             row["reason_code"],
-                            row["data_json"],
+                            row["data"],
+                            ts=int(row["ts"]),
                         )
                         for row in batch.decisions
                     ],
@@ -822,17 +821,11 @@ class DownloadPlanner:
                     "hash": hash,
                     "decision": decision,
                     "reason_code": reason_code,
-                    "data_json": json.dumps(redact(data), ensure_ascii=False),
+                    "data": dict(data),
                 }
             )
             return
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                DECISION_INSERT_SQL,
-                (int(self.now()), "planner", hash, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
-            ),
-        )
+        self.decision_recorder.record("planner", hash, decision, reason_code, data)
 
     def _action(self, path: str, payload: dict[str, Any], status: str, dry_run: bool, error: str | None = None) -> None:
         write_transaction(

@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .db import readonly_connect, write_transaction
+from .decision_recorder import DecisionEntry, DecisionRecorder
 from .models import BatchReservation
 from .observability import redact
 from .policies.batching import compute_batch_reservation
@@ -140,7 +141,11 @@ class FileBatchService:
         self._new_batches_created_this_tick = 0
         self.now = now or (lambda: int(time.time()))
         self.jobs = TorrentJobRepository(state_db)
-        self.obs = ObservabilityStore(state_db)
+        self.obs = ObservabilityStore(state_db, now=self.now)
+        self.decision_recorder = DecisionRecorder(state_db, now=self.now)
+        self._pending_decisions: list[DecisionEntry] | None = None
+        self._decision_reason_counts: dict[str, int] = {}
+        self._decision_sample_hashes: list[str] = []
 
     def sync_completed(
         self,
@@ -148,6 +153,34 @@ class FileBatchService:
         free_bytes: int | None = None,
         sync_healthy: bool = True,
         scheduler_mode: str = "normal",
+    ) -> FileBatchResult:
+        if self._pending_decisions is not None:
+            raise RuntimeError("file batch decision collection is already active")
+        self._pending_decisions = []
+        self._decision_reason_counts = {}
+        self._decision_sample_hashes = []
+        try:
+            result = self._sync_completed_impl(snapshots, free_bytes, sync_healthy, scheduler_mode)
+        except BaseException:
+            self._flush_decision_summary({"succeeded": False, "scanned": len(snapshots)})
+            raise
+        self._flush_decision_summary(
+            {
+                "succeeded": True,
+                "scanned": result.scanned,
+                "eligible": result.eligible,
+                "batches_created": result.batches_created,
+                "batches_blocked": result.batches_blocked,
+            }
+        )
+        return result
+
+    def _sync_completed_impl(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        free_bytes: int | None,
+        sync_healthy: bool,
+        scheduler_mode: str,
     ) -> FileBatchResult:
         self._new_batches_created_this_tick = 0
         scanned = len(snapshots)
@@ -418,6 +451,9 @@ class FileBatchService:
             return
         now = int(self.now())
         placeholders = ",".join("?" for _ in batch_ids)
+        decision_data = {"batch_ids": batch_ids, "released_reservation": True}
+        self._track_decision(h, decision_reason)
+        transitioned = [False]
 
         def txn(con: sqlite3.Connection) -> None:
             con.execute(
@@ -429,27 +465,22 @@ class FileBatchService:
                 f"where kind='batch' and state='active' and batch_id in ({placeholders})",
                 (now, reservation_reason, *batch_ids),
             )
-            con.execute(
-                "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
-                (
-                    now,
-                    "file_batch",
-                    h,
-                    "batch_reconciled",
-                    decision_reason,
-                    json.dumps(redact({"batch_ids": batch_ids, "released_reservation": True}), ensure_ascii=False),
-                ),
-            )
+            transitioned[0] = self.decision_recorder.record_many_in_transaction(
+                con,
+                [DecisionEntry("file_batch", h, "batch_reconciled", decision_reason, decision_data)],
+                ts=now,
+            )[0]
 
         write_transaction(self.state_db, txn)
-        self.obs.event(
-            "warning",
-            "file_batch",
-            "batch_reconciled",
-            f"released stale batch reservation for {h[:8]}",
-            {"batch_ids": batch_ids, "reason": reservation_reason},
-            hash=h,
-        )
+        if transitioned[0]:
+            self.obs.event(
+                "warning",
+                "file_batch",
+                "batch_reconciled",
+                f"released stale batch reservation for {h[:8]}",
+                {"batch_ids": batch_ids, "reason": reservation_reason},
+                hash=h,
+            )
 
     def _live_verify_canary_allowed(self, h: str, tags: set[str]) -> bool:
         if not self.batch_live_verify:
@@ -918,12 +949,41 @@ class FileBatchService:
         self.obs.action(h, None, "batch_qbt_post", path, payload, "succeeded", False)
 
     def _decision(self, h: str, decision: str, reason_code: str, data: dict[str, Any]) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
-                (int(self.now()), "file_batch", h, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
-            ),
+        entry = DecisionEntry(
+            "file_batch",
+            h,
+            decision,
+            reason_code,
+            dict(data),
+            ts=int(self.now()),
+        )
+        self._track_decision(h, reason_code)
+        if self._pending_decisions is not None:
+            self._pending_decisions.append(entry)
+            return
+        self.decision_recorder.record_many([entry])
+
+    def _track_decision(self, h: str, reason_code: str) -> None:
+        if self._pending_decisions is None:
+            return
+        reason = str(reason_code)
+        self._decision_reason_counts[reason] = self._decision_reason_counts.get(reason, 0) + 1
+        torrent_hash = str(h or "")
+        if torrent_hash and torrent_hash not in self._decision_sample_hashes and len(self._decision_sample_hashes) < 3:
+            self._decision_sample_hashes.append(torrent_hash)
+
+    def _flush_decision_summary(self, base_metrics: Mapping[str, Any]) -> None:
+        entries = self._pending_decisions or []
+        reason_counts = dict(sorted(self._decision_reason_counts.items()))
+        sample_hashes = list(self._decision_sample_hashes[:3])
+        self._pending_decisions = None
+        self._decision_reason_counts = {}
+        self._decision_sample_hashes = []
+        if entries:
+            self.decision_recorder.record_many(entries)
+        self.obs.metric_snapshot(
+            "file_batch",
+            {**dict(base_metrics), **reason_counts, "sample_hashes": sample_hashes},
         )
 
     def _existing_upload_job(self, torrent_hash: str) -> bool:

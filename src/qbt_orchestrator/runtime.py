@@ -106,6 +106,20 @@ class ObservabilityStore:
 
         return int(write_transaction(self.state_db, txn))
 
+    def metric_snapshot(self, component: str, metrics: dict[str, Any]) -> int:
+        """Append one redacted aggregate sample for a completed periodic loop."""
+
+        payload = json.dumps(redact(metrics), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        def txn(con: sqlite3.Connection) -> int:
+            cur = con.execute(
+                "insert into metrics_snapshots(ts,component,metrics_json) values(?,?,?)",
+                (int(self.now()), component, payload),
+            )
+            return int(cur.lastrowid)
+
+        return int(write_transaction(self.state_db, txn))
+
     def action(self, hash: str | None, job_id: int | None, action_type: str, path: str, payload: dict[str, Any], status: str, dry_run: bool = False, correlation_id: str | None = None, error: str | None = None) -> int:
         def txn(con: sqlite3.Connection) -> int:
             cur = con.execute(
