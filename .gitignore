@@ -38,6 +38,7 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
+.worktrees/
 
 # OS/editor
 .DS_Store
