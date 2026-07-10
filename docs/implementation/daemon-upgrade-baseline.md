@@ -27,9 +27,9 @@
 
 ### Phase 0：仓库与测试基线
 
-- 保留 `legacy/live_20260702/` 快照。
+- 旧 `legacy/live_20260702/` 快照仅保留在 Git 历史中；当前 GitHub 工作树只携带 daemon v2 正式实现、部署资产、运行文档与必要测试集。
 - 建立 fake qBT / fake rclone / fake filesystem / fake Telegram 基础设施。
-- 新代码必须测试先行；legacy smoke tests 保持通过。
+- 新代码必须测试先行；当前测试门禁以 `tests/` 中 daemon v2 fake/integration 回归测试为准。
 
 ### Phase 1：纯计算 policy 与 models
 

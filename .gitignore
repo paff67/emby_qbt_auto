@@ -17,6 +17,14 @@
 *.p12
 *.bak
 *.bak.*
+*.backup
+*.orig
+*.old
+*.tmp
+*.tar
+*.tar.gz
+*.tgz
+*.zip
 config.json
 rclone.conf
 
