@@ -15,6 +15,13 @@ def _connect(path: str | Path) -> sqlite3.Connection:
     return readonly_connect(path)
 
 
+def _nearest_rank(values: list[int], percentile: int) -> int:
+    """Return a deterministic nearest-rank percentile for a bounded sample."""
+    ordered = sorted(int(value) for value in values)
+    rank = max(1, (len(ordered) * int(percentile) + 99) // 100)
+    return ordered[min(len(ordered), rank) - 1]
+
+
 class ObservabilityStore:
     def __init__(self, state_db: str | Path, now=None):
         self.state_db = Path(state_db)
@@ -27,6 +34,73 @@ class ObservabilityStore:
             cur = con.execute(
                 "insert into events_v2(ts,level,component,event_type,hash,job_id,correlation_id,message,data_json) values(?,?,?,?,?,?,?,?,?)",
                 (int(self.now()), level, component, event_type, hash, job_id, correlation_id, safe_message, json.dumps(safe_data, ensure_ascii=False)),
+            )
+            return int(cur.lastrowid)
+
+        return int(write_transaction(self.state_db, txn))
+
+    def rolling_timing_metric(
+        self,
+        component: str,
+        *,
+        duration_ms: int,
+        max_runtime_ms: int,
+        succeeded: bool,
+        recent_limit: int = 60,
+    ) -> int:
+        """Update one bounded timing row for a repeatedly executed component.
+
+        Keeping a short recent-duration window makes P50/P95 available without
+        appending a metrics row on every loop execution.  Cumulative counters
+        remain useful across the whole process lifetime.
+        """
+        duration_ms = max(0, int(duration_ms))
+        max_runtime_ms = max(0, int(max_runtime_ms))
+        recent_limit = max(1, int(recent_limit))
+        deadline_missed = duration_ms > max_runtime_ms
+        now = int(self.now())
+
+        def txn(con: sqlite3.Connection) -> int:
+            row = con.execute(
+                "select id,metrics_json from metrics_snapshots where component=? order by id desc limit 1",
+                (component,),
+            ).fetchone()
+            previous: dict[str, Any] = {}
+            if row and row["metrics_json"]:
+                try:
+                    loaded = json.loads(row["metrics_json"])
+                    if isinstance(loaded, dict):
+                        previous = loaded
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    previous = {}
+
+            recent = [int(value) for value in previous.get("recent_duration_ms", []) if isinstance(value, (int, float))]
+            recent.append(duration_ms)
+            recent = recent[-recent_limit:]
+            sample_count = int(previous.get("sample_count") or 0) + 1
+            total_duration_ms = int(previous.get("total_duration_ms") or 0) + duration_ms
+            metrics = {
+                "duration_ms": duration_ms,
+                "max_runtime_ms": max_runtime_ms,
+                "deadline_missed": deadline_missed,
+                "succeeded": bool(succeeded),
+                "sample_count": sample_count,
+                "failure_count": int(previous.get("failure_count") or 0) + (0 if succeeded else 1),
+                "deadline_miss_count": int(previous.get("deadline_miss_count") or 0) + (1 if deadline_missed else 0),
+                "total_duration_ms": total_duration_ms,
+                "average_duration_ms": total_duration_ms // sample_count,
+                "max_duration_ms": max(int(previous.get("max_duration_ms") or 0), duration_ms),
+                "p50_duration_ms": _nearest_rank(recent, 50),
+                "p95_duration_ms": _nearest_rank(recent, 95),
+                "recent_duration_ms": recent,
+            }
+            payload = json.dumps(redact(metrics), ensure_ascii=False)
+            if row:
+                con.execute("update metrics_snapshots set ts=?,metrics_json=? where id=?", (now, payload, int(row["id"])))
+                return int(row["id"])
+            cur = con.execute(
+                "insert into metrics_snapshots(ts,component,metrics_json) values(?,?,?)",
+                (now, component, payload),
             )
             return int(cur.lastrowid)
 

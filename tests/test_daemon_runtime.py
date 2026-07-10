@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import time
@@ -435,6 +436,96 @@ def test_daemon_runtime_runs_design_multirate_loops_and_records_events():
         events = con.execute("select event_type,count(*) from events_v2 group by event_type").fetchall()
         con.close()
         assert ("loop_tick", 8) in events
+
+
+class SequenceMonotonic:
+    def __init__(self, values):
+        self._values = iter(values)
+
+    def __call__(self):
+        return float(next(self._values))
+
+
+def test_loop_task_records_duration_and_deadline_miss():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = SequenceMonotonic([0.0, 0.0, 7.5])
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            monotonic=clock,
+            loop_tasks=[LoopTask("file_batch", 60, lambda: {"ok": True}, max_runtime_sec=5)],
+        )
+
+        assert daemon.run_due_loop_tasks() == 1
+
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select component,metrics_json from metrics_snapshots where component='loop_runtime:file_batch'"
+        ).fetchone()
+        con.close()
+        assert row is not None
+        metrics = json.loads(row[1])
+        assert metrics["duration_ms"] == 7500
+        assert metrics["max_runtime_ms"] == 5000
+        assert metrics["deadline_missed"] is True
+        assert metrics["sample_count"] == 1
+        assert metrics["deadline_miss_count"] == 1
+
+
+def test_loop_runtime_metric_rolls_up_and_records_failed_callbacks():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    outcomes = iter([False, True])
+
+    def callback():
+        if next(outcomes):
+            raise RuntimeError("planned failure")
+        return {"ok": True}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = SequenceMonotonic([0.0, 0.0, 1.0, 61.0, 61.0, 68.5])
+        task = LoopTask("file_batch", 60, callback, max_runtime_sec=5)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            monotonic=clock,
+            loop_tasks=[task],
+        )
+
+        assert daemon.run_due_loop_tasks() == 1
+        assert daemon.run_due_loop_tasks() == 1
+
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "select metrics_json from metrics_snapshots where component='loop_runtime:file_batch'"
+        ).fetchall()
+        failed_events = con.execute(
+            "select count(*) from events_v2 where component='file_batch' and event_type='loop_failed'"
+        ).fetchone()[0]
+        con.close()
+        assert len(rows) == 1
+        metrics = json.loads(rows[0][0])
+        assert metrics["sample_count"] == 2
+        assert metrics["failure_count"] == 1
+        assert metrics["deadline_miss_count"] == 1
+        assert metrics["recent_duration_ms"] == [1000, 7500]
+        assert metrics["p50_duration_ms"] == 1000
+        assert metrics["p95_duration_ms"] == 7500
+        assert failed_events == 1
 
 
 def test_daemon_maintenance_records_qbt_path_drift_from_sync_cache():

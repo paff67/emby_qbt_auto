@@ -31,6 +31,7 @@ class LoopTask:
     interval_sec: float
     callback: Callable[[], object]
     next_due: float = 0.0
+    max_runtime_sec: float = 1.0
 
     def due(self, now_monotonic: float) -> bool:
         return now_monotonic >= self.next_due
@@ -291,10 +292,10 @@ class DaemonRuntime:
 
     def _default_loop_tasks(self) -> list[LoopTask]:
         return [
-            LoopTask("planner", 15, self.planner_tick),
-            LoopTask("file_batch", 60, self.file_batch_tick),
-            LoopTask("maintenance", 300, self.maintenance_tick),
-            LoopTask("carousel", 1800, self.carousel_tick),
+            LoopTask("planner", 15, self.planner_tick, max_runtime_sec=2),
+            LoopTask("file_batch", 60, self.file_batch_tick, max_runtime_sec=5),
+            LoopTask("maintenance", 300, self.maintenance_tick, max_runtime_sec=5),
+            LoopTask("carousel", 1800, self.carousel_tick, max_runtime_sec=2),
         ]
 
     def maintenance_tick(self) -> dict:
@@ -699,15 +700,32 @@ class DaemonRuntime:
         for task in self.loop_tasks:
             if not task.due(now_monotonic):
                 continue
+            started = self.monotonic()
+            result = None
+            callback_error = None
             try:
                 result = task.callback()
-                self.obs.event("info", task.name, "loop_tick", f"{task.name} loop completed", {"result": result, "dry_run": self.dry_run})
             except Exception as exc:
-                self.obs.event("error", task.name, "loop_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                callback_error = exc
+            duration = max(0.0, self.monotonic() - started)
+            try:
+                if callback_error is None:
+                    self.obs.event("info", task.name, "loop_tick", f"{task.name} loop completed", {"result": result, "dry_run": self.dry_run})
+                else:
+                    self.obs.event("error", task.name, "loop_failed", str(redact(str(callback_error))), {"dry_run": self.dry_run})
             finally:
+                self._loop_metric(task, duration, succeeded=callback_error is None)
                 task.mark_ran(now_monotonic)
                 ran += 1
         return ran
+
+    def _loop_metric(self, task: LoopTask, duration: float, *, succeeded: bool) -> None:
+        self.obs.rolling_timing_metric(
+            f"loop_runtime:{task.name}",
+            duration_ms=int(duration * 1000),
+            max_runtime_ms=int(task.max_runtime_sec * 1000),
+            succeeded=succeeded,
+        )
 
     def _persist_disk_state(self, free_bytes: int, state: str) -> None:
         now = int(time.time())
