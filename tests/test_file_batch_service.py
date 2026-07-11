@@ -29,10 +29,14 @@ def test_batch_schema_tracks_renewable_lease_and_file_index_claims():
 
         batch_columns = {row["name"] for row in _rows(db, "pragma table_info(torrent_batches)")}
         claim_columns = [row["name"] for row in _rows(db, "pragma table_info(batch_file_claims)")]
+        inventory_state_columns = [row["name"] for row in _rows(db, "pragma table_info(batch_inventory_state)")]
+        inventory_cache_columns = [row["name"] for row in _rows(db, "pragma table_info(batch_inventory_cache)")]
         indexes = {row["name"] for row in _rows(db, "pragma index_list(batch_file_claims)")}
 
         assert {"lease_until", "last_progress_at", "last_progress_bytes", "source_present"} <= batch_columns
         assert claim_columns == ["batch_id", "hash", "file_index", "state", "created_at", "released_at"]
+        assert inventory_state_columns == ["id", "cursor_hash", "window_started_at", "probes_in_window", "updated_at"]
+        assert inventory_cache_columns == ["hash", "snapshot_fingerprint", "files_json", "piece_size", "refreshed_at"]
         assert "idx_batch_file_claim_active" in indexes
 
 
@@ -488,6 +492,144 @@ class BatchQbt:
             raise RuntimeError("qbt filePrio failed")
 
 
+class PerHashBatchQbt(BatchQbt):
+    def __init__(self, files_by_hash, piece_size=16 * 1024 * 1024):
+        super().__init__([], piece_size=piece_size)
+        self.files_by_hash = files_by_hash
+
+    def torrent_files(self, hash):
+        self.calls.append(("torrent_files", hash))
+        return list(self.files_by_hash[hash])
+
+
+def test_global_batch_selection_is_independent_of_snapshot_order():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+
+    def selected_hash(order):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "state.sqlite"
+            migrate(db, dry_run=False)
+            qbt = PerHashBatchQbt(
+                {
+                    "large-cost": [{"index": 0, "name": "large.mp4", "size": 2 * gib, "progress": 0.0, "priority": 0}],
+                    "high-value": [{"index": 0, "name": "valuable.mp4", "size": gib, "progress": 0.0, "priority": 0}],
+                }
+            )
+            service = FileBatchService(
+                state_db=db,
+                dry_run=False,
+                qbt=qbt,
+                disk_floor_bytes=2 * gib,
+                batch_max_new_per_tick=1,
+            )
+            snapshots = {
+                key: {
+                    "hash": key,
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "stoppedDL",
+                    "size": 2 * gib if key == "large-cost" else gib,
+                    "amount_left": 2 * gib if key == "large-cost" else gib,
+                    "operator_priority": 1 if key == "large-cost" else 10,
+                    "num_seeds": 1,
+                }
+                for key in order
+            }
+            result = service.sync_completed(snapshots, free_bytes=6 * gib, sync_healthy=True)
+            assert result.batches_created == 1
+            return _rows(db, "select hash from torrent_batches")[0]["hash"]
+
+    first = selected_hash(["large-cost", "high-value"])
+    second = selected_hash(["high-value", "large-cost"])
+
+    assert first == second == "high-value"
+
+
+def test_batch_inventory_probe_limit_rotates_with_persisted_cursor_and_caches_piece_size():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    clock = [1_000]
+    snapshots = {
+        key: {
+            "hash": key,
+            "category": "auto",
+            "tags": "auto",
+            "state": "stoppedDL",
+            "size": gib,
+            "amount_left": gib,
+            "progress": 0.0,
+        }
+        for key in ["d", "c", "b", "a"]
+    }
+    files = {
+        key: [{"index": 0, "name": f"{key}.mp4", "size": gib, "progress": 0.0, "priority": 0}]
+        for key in snapshots
+    }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+
+        first_qbt = PerHashBatchQbt(files)
+        first = FileBatchService(
+            db,
+            dry_run=True,
+            qbt=first_qbt,
+            disk_floor_bytes=2 * gib,
+            batch_inventory_limit=2,
+            batch_max_new_per_tick=0,
+            now=lambda: clock[0],
+        )
+        first.sync_completed(snapshots, free_bytes=8 * gib, sync_healthy=True)
+        assert [call for call in first_qbt.calls if call[0] == "torrent_files"] == [
+            ("torrent_files", "a"),
+            ("torrent_files", "b"),
+        ]
+
+        clock[0] += 61
+        second_qbt = PerHashBatchQbt(files)
+        second = FileBatchService(
+            db,
+            dry_run=True,
+            qbt=second_qbt,
+            disk_floor_bytes=2 * gib,
+            batch_inventory_limit=2,
+            batch_max_new_per_tick=0,
+            now=lambda: clock[0],
+        )
+        second.sync_completed(snapshots, free_bytes=8 * gib, sync_healthy=True)
+        assert [call for call in second_qbt.calls if call[0] == "torrent_files"] == [
+            ("torrent_files", "c"),
+            ("torrent_files", "d"),
+        ]
+
+        clock[0] += 61
+        third_qbt = PerHashBatchQbt(files)
+        third = FileBatchService(
+            db,
+            dry_run=True,
+            qbt=third_qbt,
+            disk_floor_bytes=2 * gib,
+            batch_inventory_limit=2,
+            batch_max_new_per_tick=0,
+            now=lambda: clock[0],
+        )
+        third.sync_completed(snapshots, free_bytes=8 * gib, sync_healthy=True)
+        assert [call for call in third_qbt.calls if call[0] == "torrent_files"] == [
+            ("torrent_files", "a"),
+            ("torrent_files", "b"),
+        ]
+        assert not any(call[0] == "torrent_properties" for call in third_qbt.calls)
+        assert _rows(db, "select cursor_hash,probes_in_window from batch_inventory_state where id=1") == [
+            {"cursor_hash": "b", "probes_in_window": 2}
+        ]
+
+
 def test_file_batch_skips_all_inventory_calls_when_scheduler_mode_disallows_batch():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
@@ -749,7 +891,7 @@ def test_file_batch_service_live_verify_with_explicit_canary_blocks_nonmatching_
         assert decision == {"component": "file_batch", "hash": "big", "decision": "prefetch_blocked", "reason_code": "live_verify_no_canary_match"}
 
 
-def test_file_batch_service_live_verify_canary_limits_new_batches_per_tick_before_second_probe():
+def test_file_batch_service_live_verify_canary_selects_one_after_global_discovery():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
 
@@ -781,11 +923,11 @@ def test_file_batch_service_live_verify_canary_limits_new_batches_per_tick_befor
         assert result.batches_created == 1
         assert result.batches_blocked == 1
         assert ("torrent_files", "h1") in qbt.calls
-        assert ("torrent_files", "h2") not in qbt.calls
+        assert ("torrent_files", "h2") in qbt.calls
         batches = _rows(db, "select hash,state from torrent_batches order by id")
         assert batches == [{"hash": "h1", "state": "downloading"}]
         decision = _rows(db, "select hash,decision,reason_code from decision_log order by id desc limit 1")[0]
-        assert decision == {"hash": "h2", "decision": "prefetch_blocked", "reason_code": "live_verify_new_batch_tick_cap"}
+        assert decision == {"hash": "h2", "decision": "prefetch_blocked", "reason_code": "global_batch_selection_not_selected"}
 
 
 def test_file_batch_service_live_verify_blocks_batch_above_reserved_size_cap():

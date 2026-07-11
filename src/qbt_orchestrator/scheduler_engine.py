@@ -86,6 +86,11 @@ class SchedulerEngine:
             ):
                 reject("mode_disallowed")
                 continue
+            if item.kind is WorkKind.BATCH_DELIVERY and (
+                int(item.releasable_bytes) != 0 or int(item.pinned_after_success_bytes) <= 0
+            ):
+                reject("invalid_delivery_semantics")
+                continue
             if max(0, int(item.incremental_growth_bytes)) > available:
                 reject("budget_exceeded")
                 continue

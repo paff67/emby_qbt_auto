@@ -533,6 +533,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         batch_allow_tag=batch_allow_tag,
         batch_max_live_batch_bytes=batch_max_live_batch_bytes,
         batch_max_new_per_tick=batch_max_new_per_tick,
+        batch_inventory_limit=int(os.environ.get("QBT_ORCH_BATCH_INVENTORY_LIMIT", "8")),
         background_event_workers=background_event_workers,
         event_worker_interval=float(os.environ.get("QBT_ORCH_EVENT_WORKER_INTERVAL_SEC", "1")),
         event_worker_join_timeout=float(os.environ.get("QBT_ORCH_EVENT_WORKER_JOIN_TIMEOUT_SEC", "0.2")),

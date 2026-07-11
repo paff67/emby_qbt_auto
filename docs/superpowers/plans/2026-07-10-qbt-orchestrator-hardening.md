@@ -1061,13 +1061,17 @@ Implemented verification: targeted batch/maintenance regression `37 passed`; ful
 ### Task 14: Build batch candidates globally and treat them as delivery-only work
 
 **Files:**
+- Modify: `src/qbt_orchestrator/db.py`
 - Modify: `src/qbt_orchestrator/file_batch.py`
 - Modify: `src/qbt_orchestrator/work_items.py`
 - Modify: `src/qbt_orchestrator/scheduler_engine.py`
+- Modify: `src/qbt_orchestrator/service.py`
+- Modify: `src/qbt_orchestrator/cli.py`
 - Test: `tests/test_file_batch_service.py`
 - Test: `tests/test_scheduler_engine.py`
+- Test: `tests/test_cli_observability.py`
 
-- [ ] **Step 1: Add a test proving snapshot order cannot change batch selection**
+- [x] **Step 1: Add a test proving snapshot order cannot change batch selection**
 
 ```python
 def test_global_batch_selection_is_independent_of_snapshot_order(db):
@@ -1076,11 +1080,11 @@ def test_global_batch_selection_is_independent_of_snapshot_order(db):
     assert first.selected_ids == second.selected_ids
 ```
 
-- [ ] **Step 2: Split discovery from selection**
+- [x] **Step 2: Split discovery from selection**
 
 `FileBatchService` returns `WorkItem(kind=BATCH_DELIVERY)` candidates. The central scheduler selects across all torrents. Batch candidates must have `releasable_bytes=0` and nonzero `pinned_after_success_bytes`, so drain mode rejects them automatically.
 
-- [ ] **Step 3: Add bounded rotating inventory**
+- [x] **Step 3: Add bounded rotating inventory**
 
 Cache `piece_size` for the life of a torrent. Refresh file lists only for:
 
@@ -1090,14 +1094,18 @@ Cache `piece_size` for the life of a torrent. Refresh file lists only for:
 
 Default limit: 8.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_file_batch_service.py tests/test_scheduler_engine.py -q
 python -m pytest -q
-git add src/qbt_orchestrator/file_batch.py src/qbt_orchestrator/work_items.py src/qbt_orchestrator/scheduler_engine.py tests/test_file_batch_service.py tests/test_scheduler_engine.py
+git add src/qbt_orchestrator/db.py src/qbt_orchestrator/file_batch.py src/qbt_orchestrator/work_items.py src/qbt_orchestrator/scheduler_engine.py src/qbt_orchestrator/service.py src/qbt_orchestrator/cli.py tests/test_file_batch_service.py tests/test_scheduler_engine.py tests/test_cli_observability.py docs/
 git commit -m "refactor: allocate delivery batches globally"
 ```
+
+Implementation notes: discovery reads bounded cached qBT inventory and produces `BATCH_DELIVERY` work items; the shared deterministic `SchedulerEngine` selects all torrent candidates together before any reservation or `filePrio` mutation. Delivery work declares zero releasable bytes and nonzero pinned-after-success bytes, and invalid delivery semantics are rejected. Migration 7 persists a per-minute round-robin cursor plus inventory/piece-size cache. `QBT_ORCH_BATCH_INVENTORY_LIMIT` defaults to 8.
+
+Implemented verification: focused batch/scheduler/CLI regression `63 passed`; full suite `304 passed`; `compileall`, `git diff --check`, and destructive-call scan passed.
 
 ---
 

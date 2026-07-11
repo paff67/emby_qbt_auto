@@ -199,6 +199,7 @@ class DaemonRuntime:
         batch_allow_tag: str = "",
         batch_max_live_batch_bytes: int = 0,
         batch_max_new_per_tick: int = 1_000_000,
+        batch_inventory_limit: int = 8,
         background_event_workers: bool = False,
         event_worker_interval: float = 1.0,
         event_worker_join_timeout: float = 0.2,
@@ -281,6 +282,7 @@ class DaemonRuntime:
         self.batch_allow_tag = str(batch_allow_tag or "").strip()
         self.batch_max_live_batch_bytes = int(batch_max_live_batch_bytes or 0)
         self.batch_max_new_per_tick = int(batch_max_new_per_tick)
+        self.batch_inventory_limit = max(0, int(batch_inventory_limit))
         self.background_event_workers = bool(background_event_workers)
         self.event_worker_interval = max(0.01, float(event_worker_interval))
         self.event_worker_join_timeout = max(0.0, float(event_worker_join_timeout))
@@ -541,6 +543,8 @@ class DaemonRuntime:
             batch_allow_tag=self.batch_allow_tag,
             batch_max_live_batch_bytes=self.batch_max_live_batch_bytes,
             batch_max_new_per_tick=self.batch_max_new_per_tick,
+            batch_inventory_limit=self.batch_inventory_limit,
+            scheduler_engine=self.scheduler_engine,
             disk_floor_bytes=self.disk_floor_bytes,
         )
         result = service.sync_completed(

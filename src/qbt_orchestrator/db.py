@@ -351,6 +351,8 @@ def migration_sql() -> list[str]:
         "alter table torrent_batches add column source_present integer not null default 1",
         "create table if not exists batch_file_claims(batch_id integer not null, hash text not null, file_index integer not null, state text not null, created_at integer not null, released_at integer, primary key(batch_id,file_index))",
         "create unique index if not exists idx_batch_file_claim_active on batch_file_claims(hash,file_index) where state='active'",
+        "create table if not exists batch_inventory_state(id integer primary key check(id=1), cursor_hash text, window_started_at integer not null, probes_in_window integer not null default 0, updated_at integer not null)",
+        "create table if not exists batch_inventory_cache(hash text primary key, snapshot_fingerprint text not null, files_json text not null, piece_size integer not null default 0, refreshed_at integer not null)",
         "create index if not exists idx_torrent_batches_hash_state on torrent_batches(hash,state)",
         "create index if not exists idx_torrent_batches_state on torrent_batches(state)",
         "create index if not exists idx_torrent_batches_cleanup_deferred on torrent_batches(state,cleanup_deferred_at)",
@@ -426,6 +428,7 @@ def migration_sql() -> list[str]:
         "insert or ignore into schema_migrations(version,name,applied_at) values(4,'capacity_state_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(5,'scheduler_intents_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(6,'batch_lease_claims_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(7,'batch_inventory_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

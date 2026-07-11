@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
@@ -25,6 +25,7 @@ class WorkItem:
     wait_age_sec: int
     operator_priority: int
     hold: bool = False
+    data: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def stable_key(self) -> tuple[str, str]:
@@ -113,3 +114,33 @@ def build_full_finish_work_items(
             )
         )
     return sorted(items, key=lambda item: item.stable_key)
+
+
+def build_batch_delivery_work_item(
+    torrent: Mapping[str, Any],
+    *,
+    candidate_id: str,
+    incremental_growth_bytes: int,
+    payload_bytes: int,
+    data: Mapping[str, Any] | None = None,
+    now: int | None = None,
+) -> WorkItem:
+    """Build delivery-only work that cannot claim future cleanup relief."""
+
+    observed_at = int(time.time()) if now is None else int(now)
+    torrent_hash = str(torrent.get("hash") or "")
+    added_at = int(torrent.get("added_on") or torrent.get("queued_at") or observed_at)
+    return WorkItem(
+        id=str(candidate_id),
+        hash=torrent_hash,
+        kind=WorkKind.BATCH_DELIVERY,
+        incremental_growth_bytes=max(0, int(incremental_growth_bytes)),
+        releasable_bytes=0,
+        pinned_after_success_bytes=max(1, int(payload_bytes)),
+        completion_probability=_completion_probability(torrent),
+        throughput_bps=max(0, int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or 0)),
+        wait_age_sec=max(0, observed_at - added_at),
+        operator_priority=int(torrent.get("operator_priority") or 0),
+        hold="hold" in _tags(torrent),
+        data=dict(data or {}),
+    )

@@ -425,6 +425,7 @@ def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
         monkeypatch.setenv("QBT_ORCH_BATCH_ALLOW_TAG", "batch-canary")
         monkeypatch.setenv("QBT_ORCH_BATCH_MAX_LIVE_BATCH_BYTES_GB", "1.5")
         monkeypatch.setenv("QBT_ORCH_BATCH_MAX_NEW_PER_TICK", "1")
+        monkeypatch.setenv("QBT_ORCH_BATCH_INVENTORY_LIMIT", "6")
 
         runtime, _ = _build_runtime(Ns(), db)
 
@@ -434,6 +435,7 @@ def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
         assert runtime.batch_allow_tag == "batch-canary"
         assert runtime.batch_max_live_batch_bytes == int(1.5 * 1024**3)
         assert runtime.batch_max_new_per_tick == 1
+        assert runtime.batch_inventory_limit == 6
 
 
 def test_cli_runtime_enables_background_event_workers_only_for_live_daemon(monkeypatch):

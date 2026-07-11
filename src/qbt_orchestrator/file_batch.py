@@ -15,7 +15,9 @@ from .models import BatchReservation
 from .observability import redact
 from .policies.batching import compute_batch_reservation
 from .runtime import ObservabilityStore, TorrentJobRepository
+from .scheduler_engine import SchedulerEngine
 from .scheduler_intents import SchedulerIntent, SchedulerIntentRepository
+from .work_items import WorkItem, build_batch_delivery_work_item
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,22 @@ class FileBatchResult:
     batches_created: int = 0
     batches_blocked: int = 0
     blocked_reasons: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _BatchCandidate:
+    item: WorkItem
+    files: tuple[Mapping[str, Any], ...]
+    selected: tuple[Mapping[str, Any], ...]
+    reservation: BatchReservation
+    piece_size: int
+    protected_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _BatchInventory:
+    files: tuple[Mapping[str, Any], ...]
+    piece_size: int
 
 
 def _connect(path) -> sqlite3.Connection:
@@ -92,6 +110,8 @@ class FileBatchService:
         batch_allow_tag: str | None = None,
         batch_max_new_per_tick: int | None = None,
         batch_max_live_batch_bytes: int | None = None,
+        batch_inventory_limit: int = 8,
+        scheduler_engine: SchedulerEngine | None = None,
         now=None,
     ):
         self.state_db = state_db
@@ -116,7 +136,8 @@ class FileBatchService:
             batch_max_new_per_tick = 1 if self.batch_live_verify and (self.batch_allow_hashes or self.batch_allow_tag) else 1_000_000
         self.batch_max_new_per_tick = max(0, int(batch_max_new_per_tick))
         self.batch_max_live_batch_bytes = None if batch_max_live_batch_bytes in (None, 0) else max(0, int(batch_max_live_batch_bytes))
-        self._new_batches_created_this_tick = 0
+        self.batch_inventory_limit = max(0, int(batch_inventory_limit))
+        self.scheduler_engine = scheduler_engine or SchedulerEngine()
         self.now = now or (lambda: int(time.time()))
         self.jobs = TorrentJobRepository(state_db)
         self.obs = ObservabilityStore(state_db, now=self.now)
@@ -161,7 +182,6 @@ class FileBatchService:
         sync_healthy: bool,
         scheduler_mode: str,
     ) -> FileBatchResult:
-        self._new_batches_created_this_tick = 0
         scanned = len(snapshots)
         eligible = 0
         enqueued = 0
@@ -169,11 +189,21 @@ class FileBatchService:
         batches_created = 0
         batches_blocked = 0
         blocked_reasons: dict[str, int] = {}
+        batch_candidates: list[_BatchCandidate] = []
 
         # Evaluate global admission once.  Under disk pressure this keeps the
         # whole scan on snapshot/SQLite data and avoids per-torrent qBT calls.
         batch_admitted, admission_reason = self._batch_admission_allowed(free_bytes, scheduler_mode)
-        for h, raw in snapshots.items():
+        batch_inventories: dict[str, _BatchInventory] = {}
+        if batch_admitted and sync_healthy:
+            inventory_torrents: dict[str, Mapping[str, Any]] = {}
+            for fallback_hash, raw in sorted(snapshots.items(), key=lambda pair: str(pair[0])):
+                torrent = dict(raw)
+                torrent.setdefault("hash", fallback_hash)
+                if self._batch_inventory_candidate_allowed(torrent):
+                    inventory_torrents[str(torrent.get("hash") or fallback_hash)] = torrent
+            batch_inventories = self._prepare_batch_inventories(inventory_torrents)
+        for h, raw in sorted(snapshots.items(), key=lambda pair: str(pair[0])):
             torrent = dict(raw)
             torrent.setdefault("hash", h)
             if _is_managed(torrent) and not _is_completed(torrent):
@@ -187,8 +217,14 @@ class FileBatchService:
                         {"free_bytes": free_bytes, "scheduler_mode": scheduler_mode},
                     )
                 else:
-                    batch_result = self._maybe_create_pipeline_batch(torrent, free_bytes=free_bytes, sync_healthy=sync_healthy)
-                    batches_created += int(batch_result.get("created") or 0)
+                    candidate, batch_result = self._discover_pipeline_batch_candidate(
+                        torrent,
+                        free_bytes=free_bytes,
+                        sync_healthy=sync_healthy,
+                        inventory=batch_inventories.get(str(torrent.get("hash") or h)),
+                    )
+                    if candidate is not None:
+                        batch_candidates.append(candidate)
                     batches_blocked += int(batch_result.get("blocked") or 0)
                     enqueued += int(batch_result.get("upload_queued") or 0)
             if not (_is_managed(torrent) and _is_completed(torrent)):
@@ -214,6 +250,38 @@ class FileBatchService:
             job_id = self.jobs.enqueue(torrent_hash, None, "upload", payload, priority=50)
             enqueued += 1
             self.obs.event("info", "file_batch", "upload_queued", f"upload job {job_id} queued", {"job_id": job_id, **payload}, hash=torrent_hash, job_id=job_id)
+
+        if batch_candidates:
+            available = self._safe_batch_budget(int(free_bytes or 0))
+            plan = self.scheduler_engine.select(
+                [candidate.item for candidate in batch_candidates],
+                mode=scheduler_mode,
+                available_growth_bytes=available,
+                max_slots=self.batch_max_new_per_tick,
+            )
+            selected_ids = {item.id for item in plan.selected}
+            by_id = {candidate.item.id: candidate for candidate in batch_candidates}
+            for item in plan.selected:
+                applied = self._apply_pipeline_batch_candidate(by_id[item.id])
+                batches_created += int(applied.get("created") or 0)
+                batches_blocked += int(applied.get("blocked") or 0)
+            for candidate in batch_candidates:
+                if candidate.item.id in selected_ids:
+                    continue
+                batches_blocked += 1
+                blocked_reasons["global_batch_selection_not_selected"] = (
+                    blocked_reasons.get("global_batch_selection_not_selected", 0) + 1
+                )
+                self._decision(
+                    candidate.item.hash,
+                    "prefetch_blocked",
+                    "global_batch_selection_not_selected",
+                    {
+                        "candidate_id": candidate.item.id,
+                        "reserved_bytes": candidate.item.incremental_growth_bytes,
+                        "scheduler_rejections": plan.rejection_counts,
+                    },
+                )
         return FileBatchResult(
             scanned,
             eligible,
@@ -240,17 +308,166 @@ class FileBatchService:
             return False, "global_batch_budget_below_minimum"
         return True, "ok"
 
-    def _maybe_create_pipeline_batch(self, torrent: Mapping[str, Any], *, free_bytes: int | None, sync_healthy: bool) -> dict[str, int]:
+    def _batch_inventory_candidate_allowed(self, torrent: Mapping[str, Any]) -> bool:
+        h = str(torrent.get("hash") or "")
+        tags = _tags(torrent)
+        if (
+            not self.batch_pipeline_enabled
+            or self.qbt is None
+            or not h
+            or not _is_managed(torrent)
+            or _is_completed(torrent)
+            or "no-batch" in tags
+            or self._has_suspect_batch(h)
+        ):
+            return False
+        return self._live_verify_canary_allowed(h, tags) or self._inflight_batch_count(h) > 0
+
+    @staticmethod
+    def _batch_inventory_fingerprint(torrent: Mapping[str, Any]) -> str:
+        return json.dumps(
+            {
+                "state": str(torrent.get("state") or ""),
+                "progress": float(torrent.get("progress") or 0.0),
+                "amount_left": max(0, int(torrent.get("amount_left") or 0)),
+                "completed_bytes": max(
+                    0,
+                    int(torrent.get("completed_bytes") or torrent.get("completed") or 0),
+                ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _prepare_batch_inventories(
+        self,
+        torrents: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, _BatchInventory]:
+        """Refresh a bounded rotating inventory and reuse stable cached rows."""
+        if not torrents or self.qbt is None:
+            return {}
+        now = int(self.now())
+        hashes = sorted(str(h) for h in torrents)
+        fingerprints = {
+            h: self._batch_inventory_fingerprint(torrents[h])
+            for h in hashes
+        }
+        con = _connect(self.state_db)
+        try:
+            cache_rows = {
+                str(row["hash"]): dict(row)
+                for row in con.execute(
+                    "select hash,snapshot_fingerprint,files_json,piece_size,refreshed_at "
+                    "from batch_inventory_cache where hash in ("
+                    + ",".join("?" for _ in hashes)
+                    + ")",
+                    tuple(hashes),
+                ).fetchall()
+            }
+            state_row = con.execute(
+                "select cursor_hash,window_started_at,probes_in_window from batch_inventory_state where id=1"
+            ).fetchone()
+        finally:
+            con.close()
+
+        cursor = str(state_row["cursor_hash"] or "") if state_row else ""
+        window_started_at = int(state_row["window_started_at"] or now) if state_row else now
+        probes_in_window = int(state_row["probes_in_window"] or 0) if state_row else 0
+        if now < window_started_at or now - window_started_at >= 60:
+            window_started_at = now
+            probes_in_window = 0
+
+        start = next((index for index, h in enumerate(hashes) if h > cursor), 0)
+        rotated = hashes[start:] + hashes[:start]
+        changed = {
+            h
+            for h in hashes
+            if h not in cache_rows or str(cache_rows[h]["snapshot_fingerprint"]) != fingerprints[h]
+        }
+        refresh_order = [h for h in rotated if h in changed] + [h for h in rotated if h not in changed]
+        remaining = max(0, self.batch_inventory_limit - probes_in_window)
+        to_refresh = refresh_order[:remaining]
+
+        inventories: dict[str, _BatchInventory] = {}
+        for h, row in cache_rows.items():
+            if str(row["snapshot_fingerprint"]) != fingerprints[h]:
+                continue
+            try:
+                files = tuple(dict(item) for item in json.loads(row["files_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            inventories[h] = _BatchInventory(files=files, piece_size=max(0, int(row["piece_size"] or 0)))
+
+        refreshed_rows: list[tuple[str, str, str, int, int]] = []
+        for h in to_refresh:
+            cached_piece_size = max(0, int((cache_rows.get(h) or {}).get("piece_size") or 0))
+            try:
+                files = [dict(row) for row in self.qbt.torrent_files(h)]
+                piece_size = cached_piece_size or self._piece_size(h, torrents[h])
+            except Exception as exc:
+                self.obs.event(
+                    "error",
+                    "file_batch",
+                    "batch_file_probe_failed",
+                    str(redact(str(exc))),
+                    {"hash": h},
+                    hash=h,
+                )
+                continue
+            inventory = _BatchInventory(files=tuple(files), piece_size=max(0, int(piece_size)))
+            inventories[h] = inventory
+            refreshed_rows.append(
+                (
+                    h,
+                    fingerprints[h],
+                    json.dumps(files, sort_keys=True, separators=(",", ":")),
+                    inventory.piece_size,
+                    now,
+                )
+            )
+
+        attempted = len(to_refresh)
+        next_cursor = to_refresh[-1] if to_refresh else cursor
+
+        def txn(write_con: sqlite3.Connection) -> None:
+            if refreshed_rows:
+                write_con.executemany(
+                    "insert into batch_inventory_cache(hash,snapshot_fingerprint,files_json,piece_size,refreshed_at) "
+                    "values(?,?,?,?,?) on conflict(hash) do update set "
+                    "snapshot_fingerprint=excluded.snapshot_fingerprint,files_json=excluded.files_json,"
+                    "piece_size=excluded.piece_size,refreshed_at=excluded.refreshed_at",
+                    refreshed_rows,
+                )
+            write_con.execute(
+                "insert into batch_inventory_state(id,cursor_hash,window_started_at,probes_in_window,updated_at) "
+                "values(1,?,?,?,?) on conflict(id) do update set cursor_hash=excluded.cursor_hash,"
+                "window_started_at=excluded.window_started_at,probes_in_window=excluded.probes_in_window,"
+                "updated_at=excluded.updated_at",
+                (next_cursor, window_started_at, probes_in_window + attempted, now),
+            )
+
+        write_transaction(self.state_db, txn)
+        return inventories
+
+    def _discover_pipeline_batch_candidate(
+        self,
+        torrent: Mapping[str, Any],
+        *,
+        free_bytes: int | None,
+        sync_healthy: bool,
+        inventory: _BatchInventory | None,
+    ) -> tuple[_BatchCandidate | None, dict[str, int]]:
+        """Discover one batch without mutating qBT priorities or capacity state."""
         h = str(torrent.get("hash") or "")
         tags = _tags(torrent)
         if not self.batch_pipeline_enabled or not h or "no-batch" in tags or self.qbt is None or free_bytes is None:
-            return {"created": 0, "blocked": 0}
+            return None, {"created": 0, "blocked": 0}
         if not sync_healthy:
             self._decision(h, "prefetch_blocked", "sync_unhealthy", {"free_bytes": free_bytes})
-            return {"created": 0, "blocked": 1}
+            return None, {"created": 0, "blocked": 1}
         if self._has_suspect_batch(h):
             self._decision(h, "prefetch_blocked", "suspect_batch_requires_reconcile", {})
-            return {"created": 0, "blocked": 1}
+            return None, {"created": 0, "blocked": 1}
         live_allowed = self._live_verify_canary_allowed(h, tags)
         if not live_allowed and self._inflight_batch_count(h) == 0:
             self._decision(
@@ -259,32 +476,19 @@ class FileBatchService:
                 "live_verify_no_canary_match",
                 {"batch_live_verify": True, "allow_hashes": sorted(self.batch_allow_hashes), "allow_tag": self.batch_allow_tag},
             )
-            return {"created": 0, "blocked": 1}
-        tick_cap_reached = self._new_batches_created_this_tick >= self.batch_max_new_per_tick
-        if tick_cap_reached and self._inflight_batch_count(h) == 0:
+            return None, {"created": 0, "blocked": 1}
+        if inventory is None:
             self._decision(
                 h,
                 "prefetch_blocked",
-                "live_verify_new_batch_tick_cap",
-                {"batch_live_verify": self.batch_live_verify, "max_new_per_tick": self.batch_max_new_per_tick},
+                "batch_inventory_deferred",
+                {"inventory_limit": self.batch_inventory_limit},
             )
-            return {"created": 0, "blocked": 1}
-        try:
-            files = self.qbt.torrent_files(h)
-        except Exception as exc:
-            self.obs.event("error", "file_batch", "batch_file_probe_failed", str(redact(str(exc))), {"hash": h}, hash=h)
-            return {"created": 0, "blocked": 1}
+            return None, {"created": 0, "blocked": 1}
+        files = [dict(row) for row in inventory.files]
         queued = self._queue_downloaded_pipeline_batches(torrent, files)
         if self._reconcile_pipeline_batch_state(torrent, files):
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
-        if tick_cap_reached:
-            self._decision(
-                h,
-                "prefetch_blocked",
-                "live_verify_new_batch_tick_cap",
-                {"batch_live_verify": self.batch_live_verify, "max_new_per_tick": self.batch_max_new_per_tick, "upload_queued": queued},
-            )
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
+            return None, {"created": 0, "blocked": 1, "upload_queued": queued}
         if not live_allowed:
             self._decision(
                 h,
@@ -292,15 +496,11 @@ class FileBatchService:
                 "live_verify_no_canary_match",
                 {"batch_live_verify": True, "allow_hashes": sorted(self.batch_allow_hashes), "allow_tag": self.batch_allow_tag, "upload_queued": queued},
             )
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
+            return None, {"created": 0, "blocked": 1, "upload_queued": queued}
         if self._inflight_batch_count(h) >= self.max_inflight_batches_per_torrent:
             self._decision(h, "prefetch_blocked", "inflight_batch_cap", {"limit": self.max_inflight_batches_per_torrent})
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
-        try:
-            piece_size = self._piece_size(h, torrent)
-        except Exception as exc:
-            self.obs.event("error", "file_batch", "batch_file_probe_failed", str(redact(str(exc))), {"hash": h}, hash=h)
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
+            return None, {"created": 0, "blocked": 1, "upload_queued": queued}
+        piece_size = int(inventory.piece_size)
         already_selected_indices = self._inflight_batch_indices(h)
         selected, reservation = self._select_batch_files(files, piece_size, free_bytes, already_selected_indices=already_selected_indices)
         if not selected or reservation is None:
@@ -316,7 +516,7 @@ class FileBatchService:
                     "batch_max_live_batch_bytes": self.batch_max_live_batch_bytes,
                 },
             )
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
+            return None, {"created": 0, "blocked": 1, "upload_queued": queued}
         if self._live_batch_size_cap_exceeded(reservation.reserved_bytes):
             self._decision(
                 h,
@@ -327,7 +527,7 @@ class FileBatchService:
                     "batch_max_live_batch_bytes": self.batch_max_live_batch_bytes,
                 },
             )
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
+            return None, {"created": 0, "blocked": 1, "upload_queued": queued}
         if reservation.payload_efficiency < self.min_payload_efficiency:
             self._decision(
                 h,
@@ -335,14 +535,14 @@ class FileBatchService:
                 "payload_efficiency_too_low",
                 {"payload_efficiency": reservation.payload_efficiency, "min_payload_efficiency": self.min_payload_efficiency},
             )
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
+            return None, {"created": 0, "blocked": 1, "upload_queued": queued}
         indices = [int(f["index"]) for f in selected]
         if self.backpressure_policy is not None:
             decision = self.backpressure_policy.evaluate(self.state_db, candidate_bytes=int(reservation.reserved_bytes))
             self.backpressure_policy.record(self.state_db, decision, torrent_hash=h)
             if not decision.allow_new_upload_jobs:
                 self._decision(h, "prefetch_blocked", decision.reason, {"reserved_bytes": reservation.reserved_bytes})
-                return {"created": 0, "blocked": 1, "upload_queued": queued}
+                return None, {"created": 0, "blocked": 1, "upload_queued": queued}
         payload = {
             "hash": h,
             "indices": indices,
@@ -353,31 +553,60 @@ class FileBatchService:
             "filesystem_slack_bytes": reservation.filesystem_slack_bytes,
             "payload_efficiency": reservation.payload_efficiency,
         }
+        candidate_id = "batch:" + h + ":" + ",".join(str(index) for index in indices)
+        item = build_batch_delivery_work_item(
+            torrent,
+            candidate_id=candidate_id,
+            incremental_growth_bytes=reservation.reserved_bytes,
+            payload_bytes=reservation.payload_bytes,
+            data=payload,
+            now=int(self.now()),
+        )
+        return (
+            _BatchCandidate(
+                item=item,
+                files=tuple(dict(row) for row in files),
+                selected=tuple(dict(row) for row in selected),
+                reservation=reservation,
+                piece_size=int(piece_size),
+                protected_indices=tuple(sorted(already_selected_indices)),
+            ),
+            {"created": 0, "blocked": 0, "upload_queued": queued},
+        )
+
+    def _apply_pipeline_batch_candidate(self, candidate: _BatchCandidate) -> dict[str, int]:
+        h = candidate.item.hash
+        payload = dict(candidate.item.data)
+        indices = [int(row["index"]) for row in candidate.selected]
         if self.dry_run:
             self.obs.action(h, None, "batch_pipeline", "torrent_batches", payload, "dry_run", True)
             self._decision(h, "prefetch_allowed", "dry_run", payload)
-            return {"created": 0, "blocked": 0, "upload_queued": queued}
+            return {"created": 0, "blocked": 0}
         initial_progress_bytes = sum(
             max(0, int(row.get("size") or 0) - self._remaining_file_bytes(row))
-            for row in selected
+            for row in candidate.selected
         )
         batch_id = self._create_batch_and_reservation(
             h,
             indices,
-            reservation,
-            piece_size,
+            candidate.reservation,
+            candidate.piece_size,
             initial_progress_bytes=initial_progress_bytes,
         )
         try:
-            self._apply_batch_to_qbt(h, indices, files, protected_indices=already_selected_indices)
+            self._apply_batch_to_qbt(
+                h,
+                indices,
+                list(candidate.files),
+                protected_indices=set(candidate.protected_indices),
+            )
         except Exception as exc:
             self._mark_batch_failed(batch_id, str(exc))
-            return {"created": 0, "blocked": 1, "upload_queued": queued}
+            return {"created": 0, "blocked": 1}
         self._mark_batch_applied(batch_id)
         self._decision(h, "prefetch_allowed", "batch_pipeline_reserved", {"batch_id": batch_id, **payload})
         self.obs.event("info", "file_batch", "batch_applied", f"batch {batch_id} applied", {"batch_id": batch_id, **payload}, hash=h)
-        self._new_batches_created_this_tick += 1
-        return {"created": 1, "blocked": 0, "upload_queued": queued}
+        return {"created": 1, "blocked": 0}
 
     def _reconcile_pipeline_batch_state(self, torrent: Mapping[str, Any], files: list[Mapping[str, Any]]) -> bool:
         h = str(torrent.get("hash") or "")

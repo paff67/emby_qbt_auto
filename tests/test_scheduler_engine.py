@@ -140,7 +140,7 @@ def test_migration_backfills_active_batch_lease_as_protect_intent():
         )
 
 
-def _item(item_id, torrent_hash, kind, growth, *, release=0, priority=0, hold=False, probability=0.5):
+def _item(item_id, torrent_hash, kind, growth, *, release=0, pinned=0, priority=0, hold=False, probability=0.5):
     from qbt_orchestrator.work_items import WorkItem
 
     return WorkItem(
@@ -149,7 +149,7 @@ def _item(item_id, torrent_hash, kind, growth, *, release=0, priority=0, hold=Fa
         kind=kind,
         incremental_growth_bytes=growth,
         releasable_bytes=release,
-        pinned_after_success_bytes=0,
+        pinned_after_success_bytes=pinned,
         completion_probability=probability,
         throughput_bps=0,
         wait_age_sec=0,
@@ -165,7 +165,7 @@ def test_drain_selects_finish_and_release_work_not_probe_or_batch():
     items = [
         _item("finish", "a", WorkKind.FULL_FINISH, 300 * MIB, release=6 * GIB, probability=0.8),
         _item("probe", "b", WorkKind.SOAK_PROBE, 128 * MIB, probability=0.9),
-        _item("batch", "c", WorkKind.BATCH_DELIVERY, 200 * MIB, probability=0.9),
+        _item("batch", "c", WorkKind.BATCH_DELIVERY, 200 * MIB, pinned=200 * MIB, probability=0.9),
     ]
 
     plan = SchedulerEngine(unit_bytes=64 * MIB).select(
@@ -177,6 +177,42 @@ def test_drain_selects_finish_and_release_work_not_probe_or_batch():
 
     assert [item.id for item in plan.selected] == ["finish"]
     assert plan.rejection_counts == {"mode_disallowed": 2}
+
+
+def test_batch_delivery_work_item_is_non_releasing_and_remains_pinned_after_success():
+    from qbt_orchestrator.scheduler_engine import SchedulerEngine
+    from qbt_orchestrator.work_items import WorkKind, build_batch_delivery_work_item
+
+    item = build_batch_delivery_work_item(
+        torrent={"hash": "delivery", "operator_priority": 7, "num_seeds": 3},
+        candidate_id="batch:delivery:0",
+        incremental_growth_bytes=256 * MIB,
+        payload_bytes=224 * MIB,
+    )
+
+    assert item.kind is WorkKind.BATCH_DELIVERY
+    assert item.releasable_bytes == 0
+    assert item.pinned_after_success_bytes == 224 * MIB
+    assert SchedulerEngine().select([item], "drain", GIB, 1).selected == []
+
+
+def test_scheduler_rejects_batch_with_invalid_delivery_semantics():
+    from qbt_orchestrator.scheduler_engine import SchedulerEngine
+    from qbt_orchestrator.work_items import WorkKind
+
+    invalid = _item(
+        "invalid-batch",
+        "bad",
+        WorkKind.BATCH_DELIVERY,
+        64 * MIB,
+        release=GIB,
+        pinned=0,
+    )
+
+    plan = SchedulerEngine().select([invalid], "normal", GIB, 1)
+
+    assert plan.selected == []
+    assert plan.rejection_counts == {"invalid_delivery_semantics": 1}
 
 
 def test_hold_is_never_selected_automatically_and_emergency_selects_nothing():
