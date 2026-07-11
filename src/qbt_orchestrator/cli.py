@@ -100,9 +100,19 @@ def _explore_enter_bytes_from_env(env=os.environ) -> int:
 
 def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
     hot_bps = int(env.get("QBT_ORCH_SOAK_HOT_BPS", str(1024**2)))
+    allowed_modes = tuple(
+        mode.strip().lower()
+        for mode in str(env.get("QBT_ORCH_SOAK_ALLOWED_MODES", "normal,explore")).split(",")
+        if mode.strip()
+    )
     return SoakQueueConfig(
         enabled=(_truthy(env.get("QBT_ORCH_SOAK_ENABLED")) is not False),
         resident_slots=int(env.get("QBT_ORCH_SOAK_RESIDENT_SLOTS", "8")),
+        allowed_modes=allowed_modes,
+        require_swarm=(_truthy(env.get("QBT_ORCH_SOAK_REQUIRE_SWARM", "1")) is not False),
+        max_cold_partial_bytes=int(float(env.get("QBT_ORCH_MAX_COLD_PARTIAL_GB", "4")) * 1024**3),
+        max_cold_partial_torrents=int(env.get("QBT_ORCH_MAX_COLD_PARTIAL_TORRENTS", "8")),
+        max_new_per_hour=int(env.get("QBT_ORCH_SOAK_MAX_NEW_PER_HOUR", "4")),
         min_free_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_FREE_GB", "0")) * 1024**3),
         disk_floor_bytes=_disk_floor_bytes_from_env(env),
         emergency_floor_bytes=_emergency_floor_bytes_from_env(env),

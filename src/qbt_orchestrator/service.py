@@ -375,6 +375,7 @@ class DaemonRuntime:
                 snapshots,
                 free_bytes=free_bytes,
                 sync_healthy=sync_healthy,
+                scheduler_mode=scheduler_mode,
             )
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)

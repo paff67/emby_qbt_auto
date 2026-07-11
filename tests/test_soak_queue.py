@@ -170,6 +170,255 @@ def test_soak_queue_emits_probe_intents_without_direct_qbt_or_allocation_writes(
         ]
 
 
+def test_soak_never_starts_new_resident_in_drain_mode():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        svc = SoakQueueService(
+            db,
+            RecordingExecutor(),
+            dry_run=False,
+            config=SoakQueueConfig(disk_floor_bytes=0),
+            now=lambda: 1_000,
+        )
+
+        result = svc.run_once(
+            {
+                "candidate": {
+                    "hash": "candidate",
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "stoppedDL",
+                    "amount_left": 1024**3,
+                    "size": 1024**3,
+                    "num_seeds": 2,
+                    "num_peers": 3,
+                }
+            },
+            free_bytes=4 * 1024**3,
+            sync_healthy=True,
+            scheduler_mode="drain",
+        )
+
+        assert result.started == []
+        assert result.blocked_reason == "mode_disallows_new_probe"
+        assert _rows(db, "select * from scheduler_intents") == []
+
+
+def test_soak_requires_swarm_and_selects_only_observed_swarm_candidate():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        svc = SoakQueueService(
+            db,
+            RecordingExecutor(),
+            dry_run=False,
+            config=SoakQueueConfig(
+                resident_slots=2,
+                disk_floor_bytes=0,
+                require_swarm=True,
+                max_cold_partial_bytes=10 * 1024**3,
+                max_cold_partial_torrents=10,
+            ),
+            now=lambda: 1_000,
+        )
+        snapshots = {
+            "zero": {"hash": "zero", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1024**3, "size": 1024**3, "num_seeds": 0, "num_peers": 0},
+            "swarm": {"hash": "swarm", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1024**3, "size": 1024**3, "num_seeds": 2, "num_peers": 3},
+        }
+
+        result = svc.run_once(snapshots, free_bytes=10 * 1024**3, sync_healthy=True)
+
+        assert result.started == ["swarm"]
+        assert _rows(db, "select hash from scheduler_intents") == [{"hash": "swarm"}]
+        assert {row["reason_code"] for row in _rows(db, "select reason_code from decision_log where hash='zero'")} == {"swarm_required"}
+
+
+def test_soak_blocks_new_probe_at_cold_partial_debt_cap_and_records_metric():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        svc = SoakQueueService(
+            db,
+            RecordingExecutor(),
+            dry_run=False,
+            config=SoakQueueConfig(
+                disk_floor_bytes=0,
+                max_cold_partial_bytes=gib,
+                max_cold_partial_torrents=8,
+            ),
+            now=lambda: 1_000,
+        )
+
+        result = svc.run_once(
+            {
+                "partial": {
+                    "hash": "partial",
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "stoppedDL",
+                    "amount_left": gib,
+                    "size": 2 * gib,
+                    "completed_bytes": gib,
+                    "progress": 0.5,
+                    "num_seeds": 2,
+                    "num_peers": 3,
+                }
+            },
+            free_bytes=10 * gib,
+            sync_healthy=True,
+        )
+
+        assert result.started == []
+        assert result.blocked_reason == "cold_partial_debt_cap_reached"
+        metric = json.loads(
+            _rows(
+                db,
+                "select metrics_json from metrics_snapshots where component='soak_partial_debt' order by id desc limit 1",
+            )[0]["metrics_json"]
+        )
+        assert metric["cold_partial_bytes"] == gib
+        assert metric["cold_partial_torrents"] == 1
+        assert metric["blocked_new_probes"] is True
+        assert _rows(db, "select * from scheduler_intents") == []
+
+
+def test_soak_respects_max_new_probes_per_hour():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        for index in range(4):
+            con.execute(
+                "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
+                (900 + index, "soak_queue", f"old-{index}", "resident_start", "budget_fit", "{}"),
+            )
+        con.commit()
+        con.close()
+        svc = SoakQueueService(
+            db,
+            RecordingExecutor(),
+            dry_run=False,
+            config=SoakQueueConfig(disk_floor_bytes=0, max_new_per_hour=4),
+            now=lambda: 1_000,
+        )
+
+        result = svc.run_once(
+            {"new": {"hash": "new", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1, "size": 1, "num_seeds": 1}},
+            free_bytes=10 * 1024**3,
+            sync_healthy=True,
+        )
+
+        assert result.started == []
+        assert result.blocked_reason == "hourly_probe_cap_reached"
+
+
+def test_planner_created_soak_state_does_not_consume_probe_hourly_cap():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into soak_state(hash,state,last_started_at,updated_at,reason) values(?,?,?,?,?)",
+            ("planner-demoted", "soak_resident", 900, 900, "recovery_active_slow"),
+        )
+        con.commit()
+        con.close()
+        svc = SoakQueueService(
+            db,
+            RecordingExecutor(),
+            dry_run=False,
+            config=SoakQueueConfig(disk_floor_bytes=0, max_new_per_hour=1),
+            now=lambda: 1_000,
+        )
+
+        result = svc.run_once(
+            {"new": {"hash": "new", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1, "size": 1, "num_seeds": 1}},
+            free_bytes=10 * 1024**3,
+            sync_healthy=True,
+        )
+
+        assert result.started == ["new"]
+        assert result.blocked_reason is None
+
+
+def test_soak_config_reads_mode_swarm_and_partial_debt_env():
+    from qbt_orchestrator.cli import _build_soak_config_from_env
+
+    config = _build_soak_config_from_env(
+        {
+            "QBT_ORCH_SOAK_ALLOWED_MODES": "normal,explore,custom",
+            "QBT_ORCH_SOAK_REQUIRE_SWARM": "0",
+            "QBT_ORCH_MAX_COLD_PARTIAL_GB": "2.5",
+            "QBT_ORCH_MAX_COLD_PARTIAL_TORRENTS": "6",
+            "QBT_ORCH_SOAK_MAX_NEW_PER_HOUR": "3",
+        }
+    )
+
+    assert config.allowed_modes == ("normal", "explore", "custom")
+    assert config.require_swarm is False
+    assert config.max_cold_partial_bytes == int(2.5 * 1024**3)
+    assert config.max_cold_partial_torrents == 6
+    assert config.max_new_per_hour == 3
+
+
+def test_soak_dry_run_never_emits_actionable_intent_or_reservation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        svc = SoakQueueService(
+            db,
+            RecordingExecutor(),
+            dry_run=True,
+            config=SoakQueueConfig(resident_slots=1, disk_floor_bytes=0),
+            now=lambda: 1_000,
+        )
+
+        result = svc.run_once(
+            {"preview": {"hash": "preview", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1, "size": 1, "num_seeds": 1}},
+            free_bytes=10 * 1024**3,
+            sync_healthy=True,
+        )
+
+        assert result.started == ["preview"]
+        assert result.dry_run is True
+        assert _rows(db, "select * from scheduler_intents") == []
+        assert _rows(db, "select * from resource_reservations") == []
+
+        live = SoakQueueService(
+            db,
+            RecordingExecutor(),
+            dry_run=False,
+            config=SoakQueueConfig(resident_slots=1, disk_floor_bytes=0, max_new_per_hour=1),
+            now=lambda: 1_001,
+        )
+        live_result = live.run_once(
+            {"live": {"hash": "live", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1, "size": 1, "num_seeds": 1}},
+            free_bytes=10 * 1024**3,
+            sync_healthy=True,
+        )
+        assert live_result.started == ["live"]
+
+
 def test_soak_queue_ignores_legacy_min_free_gate_and_uses_disk_floor_budget():
     from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
     from qbt_orchestrator.db import migrate
@@ -193,7 +442,7 @@ def test_soak_queue_ignores_legacy_min_free_gate_and_uses_disk_floor_budget():
         )
 
         result = svc.run_once(
-            {"h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": gib, "piece_size": 4 * 1024**2, "progress": 0.1}},
+            {"h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": gib, "piece_size": 4 * 1024**2, "progress": 0.1, "num_seeds": 1}},
             free_bytes=6 * gib,
             sync_healthy=True,
         )
@@ -232,7 +481,7 @@ def test_soak_queue_blocks_new_resident_only_when_disk_floor_budget_is_exhausted
         )
 
         result = svc.run_once(
-            {"h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": gib, "piece_size": 4 * 1024**2, "progress": 0.1}},
+            {"h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": gib, "piece_size": 4 * 1024**2, "progress": 0.1, "num_seeds": 1}},
             free_bytes=3 * gib + 64 * 1024**2,
             sync_healthy=True,
         )
@@ -256,8 +505,8 @@ def test_soak_queue_respects_resident_slots_and_qbt_active_cap():
         snapshots = {
             "a1": {"hash": "a1", "category": "auto", "tags": "auto", "state": "downloading", "amount_left": 1024**3, "progress": 0.1},
             "a2": {"hash": "a2", "category": "auto", "tags": "auto", "state": "stalledDL", "amount_left": 1024**3, "progress": 0.1},
-            "h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1024**3, "progress": 0.9},
-            "h2": {"hash": "h2", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1024**3, "progress": 0.8},
+            "h1": {"hash": "h1", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1024**3, "progress": 0.9, "num_seeds": 1},
+            "h2": {"hash": "h2", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1024**3, "progress": 0.8, "num_seeds": 1},
         }
 
         result = svc.run_once(snapshots, free_bytes=20 * 1024**3, sync_healthy=True)
@@ -447,7 +696,7 @@ def test_soak_queue_throttles_hot_resident_near_disk_floor_instead_of_stopping_i
         assert row == {"reason": "low_capacity_throttled"}
 
 
-def test_soak_queue_recovery_mode_keeps_existing_resident_running_and_throttles_instead_of_stopping():
+def test_soak_queue_recovery_never_preserves_resident_with_zero_growth_claim():
     from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
     from qbt_orchestrator.db import migrate
 
@@ -500,17 +749,19 @@ def test_soak_queue_recovery_mode_keeps_existing_resident_running_and_throttles_
 
         result = svc.run_once(snapshots, free_bytes=2 * gib, sync_healthy=True)
 
-        assert result.stopped == []
-        assert result.resident_hashes == ["soak-hot"]
-        assert all(path != "/api/v2/torrents/stop" for path, _payload in executor.posts)
-        assert ("soak-hot", 256 * 1024) in executor.download_limits
+        assert result.stopped == ["soak-hot"]
+        assert result.resident_hashes == []
+        assert executor.download_limits == []
         reservations = _rows(db, "select hash,state,bytes,reason from resource_reservations where hash='soak-hot' and kind='soak_probe' order by id")
         assert reservations[-1] == {
             "hash": "soak-hot",
-            "state": "active",
-            "bytes": 0,
-            "reason": "soak_resident_recovery_preserve",
+            "state": "released",
+            "bytes": 536870912,
+            "reason": "soak_reallocated",
         }
+        assert _rows(db, "select hash,intent from scheduler_intents where hash='soak-hot'") == [
+            {"hash": "soak-hot", "intent": "cooldown"}
+        ]
 
 
 def test_soak_queue_clears_previous_low_capacity_limit_after_capacity_recovers():

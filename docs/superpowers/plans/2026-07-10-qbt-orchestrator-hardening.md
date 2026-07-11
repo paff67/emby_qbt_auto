@@ -935,7 +935,7 @@ git commit -m "refactor: centralize scheduler allocation ownership"
 - Modify: `deploy/systemd/qbt-orchestrator-daemon.env.example`
 - Test: `tests/test_soak_queue.py`
 
-- [ ] **Step 1: Add tests**
+- [x] **Step 1: Add tests**
 
 ```python
 def test_soak_never_starts_new_resident_in_drain_mode(db):
@@ -950,7 +950,7 @@ def test_soak_blocks_zero_swarm_candidate_and_respects_partial_debt_cap(db):
     assert result.started == []
 ```
 
-- [ ] **Step 2: Add configuration**
+- [x] **Step 2: Add configuration**
 
 ```text
 QBT_ORCH_SOAK_ALLOWED_MODES=normal,explore
@@ -960,15 +960,15 @@ QBT_ORCH_MAX_COLD_PARTIAL_TORRENTS=8
 QBT_ORCH_SOAK_MAX_NEW_PER_HOUR=4
 ```
 
-- [ ] **Step 3: Track debt but never delete**
+- [x] **Step 3: Track debt but never delete**
 
 Estimate cold partial bytes from stopped incomplete snapshots using `completed_bytes`, persist the aggregate metric, and block new probes when either cap is reached. Existing data remains untouched.
 
-- [ ] **Step 4: Remove recovery exposure zeroing**
+- [x] **Step 4: Remove recovery exposure zeroing**
 
 Existing residents kept in recovery must retain a future-growth claim. If the claim does not fit, emit an intent to stop; never preserve a running resident with `exposure_bytes=0`.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_soak_queue.py tests/test_daemon_runtime.py -q
