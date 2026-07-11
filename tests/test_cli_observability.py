@@ -329,7 +329,7 @@ def test_cli_wires_qbt_preferences_guard_into_maintenance_loop():
         con.close()
         result = json.loads(loop_json)["result"]
         assert result["qbt_preferences"]["would_set"] == {"preallocate_all": False}
-        assert result["qbt_preferences"]["drift"]["incomplete_files_ext"]["desired"] is None
+        assert result["qbt_preferences"]["observed"]["incomplete_files_ext"] is False
         assert action == ("qbt_preferences", "dry_run", 1)
 
 

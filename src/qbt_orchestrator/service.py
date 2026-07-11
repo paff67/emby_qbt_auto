@@ -386,7 +386,10 @@ class DaemonRuntime:
     def maintenance_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
         present_hashes = set(snapshots) if self.monitor.sync.high_risk_actions_allowed else None
-        result = self.maintenance_service.run_once(present_hashes=present_hashes)
+        result = self.maintenance_service.run_once(
+            present_hashes=present_hashes,
+            torrent_snapshots=snapshots if self.monitor.sync.high_risk_actions_allowed else None,
+        )
         if self.path_reconciler is not None:
             result["path_reconcile"] = self.path_reconciler.reconcile(snapshots)
         if self.orphan_janitor is not None:
@@ -753,13 +756,11 @@ class DaemonRuntime:
         if not hasattr(self.qbt, "torrent_files"):
             return {}
         out: dict[str, list[dict]] = {}
-        for h, torrent in snapshots.items():
-            if len(out) >= self.junk_file_refresh_limit:
-                break
-            tags = {p.strip() for p in str(torrent.get("tags") or "").split(",") if p.strip()}
-            managed = (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
-            if not managed:
-                continue
+        if self.junk_janitor is not None and hasattr(self.junk_janitor, "select_scan_hashes"):
+            selected_hashes = self.junk_janitor.select_scan_hashes(snapshots, self.junk_file_refresh_limit)
+        else:
+            selected_hashes = sorted(snapshots)[: self.junk_file_refresh_limit]
+        for h in selected_hashes:
             try:
                 out[h] = list(self.qbt.torrent_files(h))
             except Exception as exc:

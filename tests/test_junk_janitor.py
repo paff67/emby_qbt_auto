@@ -152,6 +152,31 @@ def test_junk_janitor_keeps_informational_txt_files_downloadable():
         assert _rows(db, "select * from junk_janitor_events") == []
 
 
+def test_junk_janitor_persists_round_robin_cursor_and_dedupes_unchanged_skip():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.junk_janitor import JunkJanitorService
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        janitor = JunkJanitorService(db, FakeExecutor(), dry_run=True, now=lambda: 100)
+        snapshots = {
+            h: {"hash": h, "category": "auto", "tags": "auto"}
+            for h in ["c", "a", "b"]
+        }
+
+        assert janitor.select_scan_hashes(snapshots, 2) == ["a", "b"]
+        assert janitor.select_scan_hashes(snapshots, 2) == ["c", "a"]
+
+        missing = Path(td) / "missing-ad.txt"
+        janitor._record_event("a", 1, missing, 1, "skipped", "mtime_unstable", 0, None, {})
+        janitor._record_event("a", 1, missing, 1, "skipped", "mtime_unstable", 0, None, {})
+        assert _rows(db, "select action,reason from junk_janitor_events") == [
+            {"action": "skipped", "reason": "mtime_unstable"}
+        ]
+
+
 def test_junk_janitor_skips_unhealthy_current_batch_large_unstable_and_fast_active():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.junk_janitor import JunkJanitorService

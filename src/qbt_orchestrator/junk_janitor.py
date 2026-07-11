@@ -69,6 +69,31 @@ class JunkJanitorService:
         self.host_downloads = host_downloads.rstrip("/") if host_downloads else None
         self.container_downloads = container_downloads.rstrip("/") if container_downloads else None
 
+    def select_scan_hashes(self, snapshots: Mapping[str, Any], limit: int) -> list[str]:
+        hashes = sorted(str(h) for h, torrent in snapshots.items() if _is_managed(dict(torrent)))
+        limit = max(0, int(limit))
+        if not hashes or limit == 0:
+            return []
+        con = _connect(self.state_db)
+        try:
+            row = con.execute("select last_hash from scan_cursors where scanner='junk_janitor'").fetchone()
+        finally:
+            con.close()
+        last_hash = str(row[0] or "") if row else ""
+        start = next((index for index, h in enumerate(hashes) if h > last_hash), 0)
+        rotated = hashes[start:] + hashes[:start]
+        selected = rotated[:limit]
+        now = int(self.now())
+        write_transaction(
+            self.state_db,
+            lambda wcon: wcon.execute(
+                "insert into scan_cursors(scanner,last_hash,updated_at) values('junk_janitor',?,?) "
+                "on conflict(scanner) do update set last_hash=excluded.last_hash,updated_at=excluded.updated_at",
+                (selected[-1], now),
+            ),
+        )
+        return selected
+
     def reconcile(
         self,
         snapshots: Mapping[str, Any],
@@ -234,6 +259,13 @@ class JunkJanitorService:
         rule_id: int | None = None,
     ) -> None:
         def txn(con: sqlite3.Connection) -> None:
+            if action == "skipped":
+                previous = con.execute(
+                    "select reason from junk_janitor_events where hash=? and file_index=? and action='skipped' order by id desc limit 1",
+                    (h, index),
+                ).fetchone()
+                if previous and str(previous[0] or "") == str(reason):
+                    return
             con.execute(
                 "insert into junk_janitor_events(ts,hash,file_index,path,size,action,reason,rule_id,qbt_priority,mtime,data_json) values(?,?,?,?,?,?,?,?,?,?,?)",
                 (int(self.now()), h, index, str(path), size, action, reason, rule_id, priority, mtime, json.dumps(redact(data), ensure_ascii=False)),

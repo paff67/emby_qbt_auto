@@ -64,14 +64,14 @@ class CarouselService:
             result = {"suspended": True, "reason": "unhealthy_sync", "started": [], "promoted": [], "stopped": [], "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency}
             self._metrics(result)
             return result
+        promoted, stopped = self._reconcile_active_probes(snapshots, now)
         if free_bytes is not None and int(free_bytes) < self.min_free_bytes:
             data = {"free_bytes": int(free_bytes), "min_free_bytes": self.min_free_bytes, "dry_run": self.dry_run}
             self._event("warning", "suspended_disk_guard", "carousel suspended because disk free space is below live guard", data)
-            result = {"suspended": True, "reason": "disk_guard", "started": [], "promoted": [], "stopped": [], "active_probes": self._active_probe_count(), "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency, **data}
+            result = {"suspended": True, "reason": "disk_guard", "started": [], "promoted": promoted, "stopped": stopped, "active_probes": self._active_probe_count(), "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency, **data}
             self._metrics(result)
             return result
 
-        promoted, stopped = self._reconcile_active_probes(snapshots, now)
         active_count = self._active_probe_count()
         capacity = max(0, effective_concurrency - active_count)
         started = self._start_new_probes(snapshots, now, capacity)

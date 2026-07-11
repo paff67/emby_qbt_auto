@@ -4,7 +4,7 @@ import sqlite3
 import time
 import json
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from .db import write_transaction
 from .observability import redact
@@ -44,12 +44,17 @@ class SQLiteMaintenanceService:
         self.journal_size_limit_bytes = int(journal_size_limit_bytes)
         self.preferences_guard = preferences_guard
 
-    def run_once(self, present_hashes: set[str] | None = None) -> dict:
+    def run_once(
+        self,
+        present_hashes: set[str] | None = None,
+        torrent_snapshots: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict:
         job_reconcile = reconcile_jobs(self.state_db, now=int(self.now()), dry_run=False)
         cutoff = int(self.now()) - self.retention_days * 86400
         deleted: dict[str, int] = {}
         batch_sources_absent = [0]
         batch_suspect_expired = [0]
+        missing_files_audit: dict[str, Any] = {"count": 0, "sample_hashes": []}
         def txn(con: sqlite3.Connection) -> int:
             con.execute("pragma busy_timeout=5000")
             con.execute(f"pragma journal_size_limit={self.journal_size_limit_bytes}")
@@ -62,6 +67,8 @@ class SQLiteMaintenanceService:
                     int(self.now()),
                 )
             batch_suspect_expired[0] = self._mark_suspect_expired_batches(con, int(self.now()))
+            if torrent_snapshots is not None:
+                missing_files_audit.update(self._audit_unmanaged_missing_files(con, torrent_snapshots, int(self.now())))
             reservations_expired[0] = self._expire_resource_reservations(con, int(self.now()))
             journal_size_limit = int(con.execute("pragma journal_size_limit").fetchone()[0])
             return journal_size_limit
@@ -80,10 +87,39 @@ class SQLiteMaintenanceService:
             "batch_sources_absent": batch_sources_absent[0],
             "batch_suspect_expired": batch_suspect_expired[0],
             "job_reconcile": job_reconcile,
+            "unmanaged_missing_files": missing_files_audit,
         }
         if self.preferences_guard is not None:
             result["qbt_preferences"] = self.preferences_guard.reconcile()
         return result
+
+    @staticmethod
+    def _audit_unmanaged_missing_files(
+        con: sqlite3.Connection,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        now: int,
+    ) -> dict[str, Any]:
+        hashes: list[str] = []
+        for fallback_hash, raw in snapshots.items():
+            torrent = dict(raw)
+            tags = {part.strip() for part in str(torrent.get("tags") or "").split(",") if part.strip()}
+            managed = str(torrent.get("category") or "") == "auto" or "auto" in tags
+            if managed or str(torrent.get("state") or "").lower() != "missingfiles":
+                continue
+            hashes.append(str(torrent.get("hash") or fallback_hash))
+        audit = {"count": len(hashes), "sample_hashes": sorted(hashes)[:20]}
+        payload = json.dumps(audit, ensure_ascii=False, sort_keys=True)
+        row = con.execute(
+            "select id from metrics_snapshots where component='unmanaged_missing_files' order by id desc limit 1"
+        ).fetchone()
+        if row:
+            con.execute("update metrics_snapshots set ts=?,metrics_json=? where id=?", (now, payload, int(row["id"])))
+        else:
+            con.execute(
+                "insert into metrics_snapshots(ts,component,metrics_json) values(?,?,?)",
+                (now, "unmanaged_missing_files", payload),
+            )
+        return audit
 
     def _delete_old_rows(self, con: sqlite3.Connection, table: str, cutoff: int) -> int:
         total = 0

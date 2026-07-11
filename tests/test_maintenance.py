@@ -221,6 +221,27 @@ def test_maintenance_automatically_recovers_expired_job_lease_and_fails_exhauste
         ]
 
 
+def test_maintenance_audits_unmanaged_missing_files_without_mutation_or_row_growth():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.maintenance import SQLiteMaintenanceService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        service = SQLiteMaintenanceService(db, now=lambda: 200)
+        snapshots = {
+            "u1": {"hash": "u1", "state": "missingFiles", "category": "", "tags": ""},
+            "managed": {"hash": "managed", "state": "missingFiles", "category": "auto", "tags": "auto"},
+        }
+
+        first = service.run_once(torrent_snapshots=snapshots)
+        second = service.run_once(torrent_snapshots=snapshots)
+
+        assert first["unmanaged_missing_files"] == {"count": 1, "sample_hashes": ["u1"]}
+        assert second["unmanaged_missing_files"] == first["unmanaged_missing_files"]
+        assert _maintenance_rows(db, "select count(*) as n from metrics_snapshots where component='unmanaged_missing_files'") == [{"n": 1}]
+
+
 def test_daemon_default_maintenance_loop_runs_retention_not_not_configured():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.maintenance import SQLiteMaintenanceService

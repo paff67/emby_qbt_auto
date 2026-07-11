@@ -60,6 +60,7 @@ Major modified files:
 ### Task 1: Add a global fast gate before batch inventory calls
 
 **Files:**
+- Modify: `src/qbt_orchestrator/db.py`
 - Modify: `src/qbt_orchestrator/file_batch.py`
 - Modify: `src/qbt_orchestrator/service.py`
 - Test: `tests/test_file_batch_service.py`
@@ -551,6 +552,7 @@ git commit -m "perf: batch scheduler sqlite writes"
 - Modify: `src/qbt_orchestrator/observe_promotion.py`
 - Modify: `src/qbt_orchestrator/junk_janitor.py`
 - Modify: `src/qbt_orchestrator/maintenance.py`
+- Modify: `src/qbt_orchestrator/service.py`
 - Test: `tests/test_production_invariants.py`
 
 - [ ] **Step 1: Add schema and failing transition test**
@@ -1313,19 +1315,25 @@ Implemented verification: focused runtime/maintenance/media regression `38 passe
 ### Task 18: Remove repetitive preference/path/janitor noise
 
 **Files:**
+- Modify: `src/qbt_orchestrator/db.py`
 - Modify: `src/qbt_orchestrator/preferences.py`
 - Modify: `src/qbt_orchestrator/path_reconcile.py`
 - Modify: `src/qbt_orchestrator/junk_janitor.py`
 - Modify: `src/qbt_orchestrator/maintenance.py`
+- Modify: `src/qbt_orchestrator/carousel.py`
+- Modify: `src/qbt_orchestrator/service.py`
 - Test: `tests/test_qbt_preferences_guard.py`
 - Test: `tests/test_qbt_path_reconcile.py`
 - Test: `tests/test_junk_janitor.py`
+- Test: `tests/test_maintenance.py`
+- Test: `tests/test_carousel.py`
+- Test: `tests/test_cli_observability.py`
 
-- [ ] **Step 1: Treat desired `None` as unmanaged**
+- [x] **Step 1: Treat desired `None` as unmanaged**
 
 When `desired_incomplete_files_ext is None`, return an `observed` field but do not add drift or warning.
 
-- [ ] **Step 2: Stabilize path-drift identity**
+- [x] **Step 2: Stabilize path-drift identity**
 
 ```python
 def drift_identity(drift: Mapping[str, Any]) -> tuple[str, str, str, str]:
@@ -1339,7 +1347,7 @@ def drift_identity(drift: Mapping[str, Any]) -> tuple[str, str, str, str]:
 
 Exclude progress and free-space fields from dedupe identity.
 
-- [ ] **Step 3: Persist a round-robin junk cursor**
+- [x] **Step 3: Persist a round-robin junk cursor**
 
 ```sql
 create table if not exists scan_cursors(
@@ -1351,22 +1359,26 @@ create table if not exists scan_cursors(
 
 Select the next N sorted hashes after `last_hash`, wrapping once. Repeated skipped junk events use transition logging.
 
-- [ ] **Step 4: Add a read-only missing-files audit**
+- [x] **Step 4: Add a read-only missing-files audit**
 
 Maintenance records aggregate unmanaged `missingFiles` counts and hash samples. It must not remove torrents or files.
 
-- [ ] **Step 5: Reconcile carousel before applying disk guard**
+- [x] **Step 5: Reconcile carousel before applying disk guard**
 
 Always expire/stop existing carousel probes first; disk guard only prevents starting new probes.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_qbt_preferences_guard.py tests/test_qbt_path_reconcile.py tests/test_junk_janitor.py tests/test_carousel.py -q
 python -m pytest -q
-git add src/qbt_orchestrator/preferences.py src/qbt_orchestrator/path_reconcile.py src/qbt_orchestrator/junk_janitor.py src/qbt_orchestrator/maintenance.py src/qbt_orchestrator/carousel.py tests/test_qbt_preferences_guard.py tests/test_qbt_path_reconcile.py tests/test_junk_janitor.py tests/test_carousel.py
+git add src/qbt_orchestrator/db.py src/qbt_orchestrator/preferences.py src/qbt_orchestrator/path_reconcile.py src/qbt_orchestrator/junk_janitor.py src/qbt_orchestrator/maintenance.py src/qbt_orchestrator/carousel.py src/qbt_orchestrator/service.py tests/test_qbt_preferences_guard.py tests/test_qbt_path_reconcile.py tests/test_junk_janitor.py tests/test_carousel.py tests/test_maintenance.py tests/test_cli_observability.py docs/
 git commit -m "fix: dedupe drift events and rotate maintenance scans"
 ```
+
+Implementation notes: unmanaged qBT preference values are returned under `observed` without drift; identical preference events/actions are transition-deduped. Path identity excludes progress and other volatile fields. Migration 10 adds a persisted junk round-robin cursor; unchanged skip reasons emit one transition row. Maintenance updates one read-only unmanaged-`missingFiles` aggregate metric and never mutates torrents/files. Carousel always reconciles existing probes before disk guard blocks new starts.
+
+Implemented verification: focused preference/path/janitor/carousel/maintenance regression `28 passed`; full suite `314 passed`; `compileall` and `git diff --check` passed.
 
 ---
 

@@ -195,6 +195,41 @@ def test_carousel_live_probe_suspends_below_min_free_bytes_without_qbt_writes():
         assert _rows(db, "select * from carousel_state") == []
 
 
+def test_carousel_reconciles_expired_probe_before_disk_guard_blocks_new_starts():
+    from qbt_orchestrator.carousel import CarouselService
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_level,updated_at) "
+            "values('h1','probing',100,100,0,100)"
+        )
+        con.commit()
+        con.close()
+        svc = CarouselService(
+            db,
+            RecordingExecutor(),
+            dry_run=False,
+            concurrency=1,
+            probe_duration_sec=100,
+            min_free_bytes=5 * 1024**3,
+            now=lambda: 1_000,
+        )
+
+        result = svc.run_once(
+            {"h1": {"hash": "h1", "category": "auto", "amount_left": 10, "num_seeds": 0, "num_peers": 0}},
+            sync_healthy=True,
+            free_bytes=4 * 1024**3,
+        )
+
+        assert result["suspended"] is True
+        assert result["stopped"] == ["h1"]
+        assert _rows(db, "select state from carousel_state where hash='h1'") == [{"state": "dead"}]
+
+
 def test_daemon_default_carousel_loop_uses_sync_cache_not_not_configured():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime
