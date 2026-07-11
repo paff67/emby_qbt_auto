@@ -8,6 +8,7 @@ from typing import Callable
 
 from .db import write_transaction
 from .observability import redact
+from .runtime import reconcile_jobs
 
 RETENTION_TABLES = (
     "events_v2",
@@ -44,6 +45,7 @@ class SQLiteMaintenanceService:
         self.preferences_guard = preferences_guard
 
     def run_once(self, present_hashes: set[str] | None = None) -> dict:
+        job_reconcile = reconcile_jobs(self.state_db, now=int(self.now()), dry_run=False)
         cutoff = int(self.now()) - self.retention_days * 86400
         deleted: dict[str, int] = {}
         batch_sources_absent = [0]
@@ -77,6 +79,7 @@ class SQLiteMaintenanceService:
             "reservations_expired": reservations_expired[0],
             "batch_sources_absent": batch_sources_absent[0],
             "batch_suspect_expired": batch_suspect_expired[0],
+            "job_reconcile": job_reconcile,
         }
         if self.preferences_guard is not None:
             result["qbt_preferences"] = self.preferences_guard.reconcile()

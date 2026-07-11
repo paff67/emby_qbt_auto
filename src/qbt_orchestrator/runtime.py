@@ -182,7 +182,8 @@ class TorrentJobRepository:
         now = int(self.now())
         def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
             row = con.execute(
-                "select * from torrent_jobs where job_type=? and state in ('queued','verify_pending','retry_wait') "
+                "select * from torrent_jobs where job_type=? and attempts<max_attempts "
+                "and state in ('queued','verify_pending','retry_wait') "
                 "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by priority,id limit 1",
                 (job_type, now),
             ).fetchone()
@@ -200,7 +201,8 @@ class TorrentJobRepository:
         placeholders = ",".join("?" for _ in job_types)
         def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
             row = con.execute(
-                f"select * from torrent_jobs where job_type in ({placeholders}) and state in ('queued','verify_pending','retry_wait') "
+                f"select * from torrent_jobs where job_type in ({placeholders}) and attempts<max_attempts "
+                "and state in ('queued','verify_pending','retry_wait') "
                 "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) order by priority,id limit 1",
                 (*tuple(job_types), now),
             ).fetchone()
@@ -923,26 +925,45 @@ class CleanupRequestRunner:
         return out
 
 
-def reconcile_jobs(state_db: str | Path, now: int | None = None, dry_run: bool = True, retry_delay_sec: int = 60) -> dict[str, int]:
+def reconcile_jobs(
+    state_db: str | Path,
+    now: int | None = None,
+    dry_run: bool = True,
+    retry_delay_sec: int = 60,
+    max_retry_delay_sec: int = 21_600,
+) -> dict[str, int]:
     now = int(now if now is not None else time.time())
     con = _connect(state_db)
     rows = [dict(r) for r in con.execute("select * from torrent_jobs where state='running' and lease_until is not null and lease_until<?", (now,))]
-    exhausted_retry_wait = [
+    exhausted_attempts = [
         dict(r)
         for r in con.execute(
-            "select * from torrent_jobs where state='retry_wait' and attempts>=max_attempts"
+            "select * from torrent_jobs where state in ('queued','verify_pending','retry_wait') and attempts>=max_attempts"
         )
     ]
     con.close()
-    if (rows or exhausted_retry_wait) and not dry_run:
+    if (rows or exhausted_attempts) and not dry_run:
         def txn(wcon: sqlite3.Connection) -> None:
             for row in rows:
+                if int(row.get("attempts") or 0) >= int(row.get("max_attempts") or 1):
+                    previous = str(row.get("last_stderr_tail") or "").strip()
+                    message = "lease expired and attempts exhausted"
+                    if previous:
+                        message = f"{message}; last error: {previous}"
+                    wcon.execute(
+                        "update torrent_jobs set state='failed',lease_owner=null,lease_until=null,next_run_at=null,"
+                        "last_stderr_tail=?,last_exit_code=coalesce(last_exit_code,1),updated_at=? where id=?",
+                        (redact(message)[:1000], now, row["id"]),
+                    )
+                    continue
+                exponent = max(0, int(row.get("attempts") or 1) - 1)
+                delay = min(max(1, int(max_retry_delay_sec)), max(1, int(retry_delay_sec)) * (2**exponent))
                 wcon.execute(
                     "update torrent_jobs set state='retry_wait', lease_owner=null, lease_until=null, next_run_at=?, "
                     "last_stderr_tail=?, last_exit_code=coalesce(last_exit_code,1), updated_at=? where id=?",
-                    (now + retry_delay_sec, "lease expired during reconcile", now, row["id"]),
+                    (now + delay, "lease expired during reconcile", now, row["id"]),
                 )
-            for row in exhausted_retry_wait:
+            for row in exhausted_attempts:
                 previous = str(row.get("last_stderr_tail") or "").strip()
                 message = "retry attempts exhausted"
                 if previous:
@@ -954,7 +975,12 @@ def reconcile_jobs(state_db: str | Path, now: int | None = None, dry_run: bool =
                 )
 
         write_transaction(state_db, txn)
-    return {"expired_running": len(rows), "exhausted_retry_wait": len(exhausted_retry_wait), "dry_run": 1 if dry_run else 0}
+    return {
+        "expired_running": len(rows),
+        "exhausted_retry_wait": len(exhausted_attempts),
+        "exhausted_attempts": len(exhausted_attempts),
+        "dry_run": 1 if dry_run else 0,
+    }
 
 
 class BotCommandRepository:

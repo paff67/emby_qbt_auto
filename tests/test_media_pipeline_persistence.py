@@ -345,6 +345,47 @@ def test_emby_refresh_worker_calls_precise_media_updated_and_rejects_root_path()
         assert "too broad" in states[1]["last_error"]
 
 
+def test_transient_emby_failure_retries_with_backoff_and_attempt_limit():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker
+
+    class TransientEmby:
+        def __init__(self):
+            self.calls = 0
+
+        def media_updated(self, path):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("emby timeout")
+            return {"ok": True}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) "
+            "values('/media/gcrypt/ABC-123','queued',100,500,'{}',1,1)"
+        )
+        con.commit()
+        con.close()
+        clock = [200]
+        emby = TransientEmby()
+        worker = EmbyRefreshWorker(db, emby, now=lambda: clock[0], retry_delay_sec=60)
+
+        assert worker.run_next() == 1
+        assert rows(db, "select state,attempts,next_run_at from emby_refresh_tasks") == [
+            {"state": "retry_wait", "attempts": 1, "next_run_at": 260}
+        ]
+        assert worker.run_next() is None
+
+        clock[0] = 261
+        assert worker.run_next() == 1
+        assert rows(db, "select state,attempts,next_run_at from emby_refresh_tasks") == [
+            {"state": "done", "attempts": 2, "next_run_at": 260}
+        ]
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):

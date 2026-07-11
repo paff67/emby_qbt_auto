@@ -1254,13 +1254,14 @@ Implemented verification: focused cleanup/batch/governor regression `61 passed`;
 ### Task 17: Automatically recover leases and enforce attempts
 
 **Files:**
+- Modify: `src/qbt_orchestrator/db.py`
 - Modify: `src/qbt_orchestrator/runtime.py`
 - Modify: `src/qbt_orchestrator/maintenance.py`
 - Modify: `src/qbt_orchestrator/media.py`
 - Test: `tests/test_runtime_repositories.py`
 - Test: `tests/test_maintenance.py`
 
-- [ ] **Step 1: Restrict claim queries**
+- [x] **Step 1: Restrict claim queries**
 
 ```sql
 select * from torrent_jobs
@@ -1272,15 +1273,15 @@ order by priority,id
 limit 1;
 ```
 
-- [ ] **Step 2: Run job reconcile during maintenance**
+- [x] **Step 2: Run job reconcile during maintenance**
 
 Expired `running` leases move to `retry_wait` with bounded exponential backoff. Exhausted attempts move to `failed`. This logic must execute automatically every maintenance tick.
 
-- [ ] **Step 3: Make Emby errors retryable**
+- [x] **Step 3: Make Emby errors retryable**
 
 Classify path validation errors as permanent `blocked`; HTTP timeout, connection error and 5xx become `retry_wait` with backoff and max attempts.
 
-- [ ] **Step 4: Add tests**
+- [x] **Step 4: Add tests**
 
 ```python
 def test_transient_emby_failure_retries_but_invalid_root_is_blocked(db):
@@ -1292,14 +1293,18 @@ def test_transient_emby_failure_retries_but_invalid_root_is_blocked(db):
     assert refresh_state(db) == "blocked"
 ```
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_runtime_repositories.py tests/test_maintenance.py tests/test_media_pipeline_persistence.py -q
 python -m pytest -q
-git add src/qbt_orchestrator/runtime.py src/qbt_orchestrator/maintenance.py src/qbt_orchestrator/media.py tests/test_runtime_repositories.py tests/test_maintenance.py tests/test_media_pipeline_persistence.py
+git add src/qbt_orchestrator/db.py src/qbt_orchestrator/runtime.py src/qbt_orchestrator/maintenance.py src/qbt_orchestrator/media.py tests/test_runtime_repositories.py tests/test_maintenance.py tests/test_media_pipeline_persistence.py docs/
 git commit -m "fix: recover job leases and retry transient emby failures"
 ```
+
+Implementation notes: all torrent-job claim queries require `attempts < max_attempts`. Maintenance automatically invokes job reconciliation: expired running leases use bounded exponential backoff and exhausted queued/verify/retry/running jobs become failed. Migration 9 adds Emby attempts/max-attempts/next-run state. Emby path validation remains permanently blocked, while timeout, connection failure and HTTP 5xx retry with exponential backoff and stop at max attempts.
+
+Implemented verification: focused runtime/maintenance/media regression `38 passed`; full suite `311 passed`; `compileall` and `git diff --check` passed.
 
 ---
 

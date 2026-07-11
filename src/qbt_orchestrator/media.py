@@ -437,11 +437,12 @@ class MediaPipelineJobRunner:
 
 
 class EmbyRefreshWorker:
-    def __init__(self, state_db, emby, *, now=None, media_prefix: str = "/media/gcrypt"):
+    def __init__(self, state_db, emby, *, now=None, media_prefix: str = "/media/gcrypt", retry_delay_sec: int = 60):
         self.state_db = state_db
         self.emby = emby
         self.now = now or (lambda: int(time.time()))
         self.media_prefix = media_prefix.rstrip("/")
+        self.retry_delay_sec = max(1, int(retry_delay_sec))
 
     def run_next(self) -> int | None:
         row = self._claim_next()
@@ -451,24 +452,37 @@ class EmbyRefreshWorker:
         path = str(row["emby_media_dir"] or "").rstrip("/")
         try:
             self._validate_path(path)
+        except ValueError as exc:
+            self._finish(task_id, "blocked", redact(str(exc))[:500])
+            return task_id
+        try:
             self.emby.media_updated(path)
             self._finish(task_id, "done", None)
         except Exception as exc:
-            self._finish(task_id, "blocked", redact(str(exc))[:500])
+            error = redact(str(exc))[:500]
+            if self._is_transient(exc):
+                self._retry_or_fail(row, error)
+            else:
+                self._finish(task_id, "blocked", error)
         return task_id
 
     def _claim_next(self) -> dict | None:
         now = int(self.now())
         def txn(con: sqlite3.Connection) -> dict | None:
             row = con.execute(
-                "select * from emby_refresh_tasks where state='queued' and "
-                "((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)) "
+                "select * from emby_refresh_tasks where attempts<max_attempts and state in ('queued','retry_wait') and "
+                "((state='retry_wait' and (next_run_at is null or next_run_at<=?)) or "
+                "(state='queued' and ((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)))) "
                 "order by coalesce(max_run_at, earliest_run_at, created_at), id limit 1",
-                (now, now),
+                (now, now, now),
             ).fetchone()
             if not row:
                 return None
-            con.execute("update emby_refresh_tasks set state='running', updated_at=? where id=? and state='queued'", (now, row["id"]))
+            con.execute(
+                "update emby_refresh_tasks set state='running',attempts=attempts+1,updated_at=? "
+                "where id=? and state in ('queued','retry_wait')",
+                (now, row["id"]),
+            )
             return dict(con.execute("select * from emby_refresh_tasks where id=?", (row["id"],)).fetchone())
 
         return write_transaction(self.state_db, txn)
@@ -477,10 +491,11 @@ class EmbyRefreshWorker:
         now = int(self.now())
         con = _connect(self.state_db)
         row = con.execute(
-            "select * from emby_refresh_tasks where state='queued' and "
-            "((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)) "
+            "select * from emby_refresh_tasks where attempts<max_attempts and state in ('queued','retry_wait') and "
+            "((state='retry_wait' and (next_run_at is null or next_run_at<=?)) or "
+            "(state='queued' and ((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)))) "
             "order by coalesce(max_run_at, earliest_run_at, created_at), id limit 1",
-            (now, now),
+            (now, now, now),
         ).fetchone()
         out = dict(row) if row else None
         con.close()
@@ -498,3 +513,31 @@ class EmbyRefreshWorker:
     def _validate_path(self, path: str) -> None:
         if path == self.media_prefix or not path.startswith(self.media_prefix + "/"):
             raise ValueError("refresh path too broad or outside media prefix")
+
+    def _retry_or_fail(self, row: dict, error: str) -> None:
+        attempts = int(row.get("attempts") or 0)
+        max_attempts = int(row.get("max_attempts") or 1)
+        now = int(self.now())
+        if attempts >= max_attempts:
+            self._finish(int(row["id"]), "failed", error)
+            return
+        delay = min(3600, self.retry_delay_sec * (2 ** max(0, attempts - 1)))
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update emby_refresh_tasks set state='retry_wait',next_run_at=?,last_error=?,updated_at=? where id=?",
+                (now + delay, error, now, int(row["id"])),
+            ),
+        )
+
+    @staticmethod
+    def _is_transient(exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        status = getattr(exc, "status_code", None)
+        if status is not None:
+            try:
+                return int(status) >= 500
+            except (TypeError, ValueError):
+                pass
+        return bool(re.search(r"\b5\d\d\b", str(exc)))

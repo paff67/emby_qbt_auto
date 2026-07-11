@@ -192,6 +192,35 @@ def test_maintenance_marks_absent_batch_source_and_releases_only_logical_state()
         ]
 
 
+def test_maintenance_automatically_recovers_expired_job_lease_and_fails_exhausted_attempts():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.maintenance import SQLiteMaintenanceService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state,attempts,max_attempts,lease_until,payload_json,created_at,updated_at) "
+            "values('expired','upload','running',2,6,100,'{}',1,1)"
+        )
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state,attempts,max_attempts,payload_json,created_at,updated_at) "
+            "values('exhausted','upload','queued',6,6,'{}',1,1)"
+        )
+        con.commit()
+        con.close()
+
+        result = SQLiteMaintenanceService(db, now=lambda: 200).run_once()
+
+        assert result["job_reconcile"]["expired_running"] == 1
+        assert result["job_reconcile"]["exhausted_attempts"] == 1
+        assert _maintenance_rows(db, "select hash,state,next_run_at from torrent_jobs order by id") == [
+            {"hash": "expired", "state": "retry_wait", "next_run_at": 320},
+            {"hash": "exhausted", "state": "failed", "next_run_at": None},
+        ]
+
+
 def test_daemon_default_maintenance_loop_runs_retention_not_not_configured():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.maintenance import SQLiteMaintenanceService
