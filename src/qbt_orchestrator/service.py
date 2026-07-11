@@ -29,7 +29,13 @@ from .observability import redact
 from .planner import DownloadPlanner
 from .policies.disk import classify_disk
 from .periodic import PeriodicTask, PeriodicWorker
-from .runtime import BotCommandRepository, BotNotificationRepository, ObservabilityStore
+from .runtime import (
+    BotCommandRepository,
+    BotNotificationRepository,
+    FullTorrentCleanupRunner,
+    ObservabilityStore,
+    TorrentJobRepository,
+)
 from .scheduler_engine import SchedulerEngine
 from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
 from .telegram_control import TelegramAuthorizer
@@ -168,6 +174,11 @@ class DaemonRuntime:
         upload_dry_run: bool = True,
         cleanup_runner=None,
         cleanup_dry_run: bool = True,
+        full_cleanup_runner=None,
+        full_cleanup_enabled: bool = False,
+        full_cleanup_dry_run: bool = True,
+        cleanup_min_seed_sec: int = 900,
+        cleanup_min_ratio: float = 1.0,
         file_batch_dry_run: bool = True,
         upload_backpressure_policy=None,
         host_downloads: str = "/data/downloads",
@@ -247,6 +258,11 @@ class DaemonRuntime:
         self.upload_dry_run = upload_dry_run or dry_run
         self.cleanup_runner = cleanup_runner
         self.cleanup_dry_run = cleanup_dry_run or dry_run
+        self.full_cleanup_dry_run = full_cleanup_dry_run or dry_run
+        self._configured_full_cleanup_runner = full_cleanup_runner
+        self.full_cleanup_enabled = bool(full_cleanup_enabled or full_cleanup_runner is not None)
+        self.cleanup_min_seed_sec = max(0, int(cleanup_min_seed_sec))
+        self.cleanup_min_ratio = max(0.0, float(cleanup_min_ratio))
         self.file_batch_dry_run = file_batch_dry_run or dry_run
         self.upload_backpressure_policy = upload_backpressure_policy
         self.host_downloads = host_downloads
@@ -312,6 +328,18 @@ class DaemonRuntime:
             sync_degraded_interval_sec=sync_degraded_interval_sec,
             monotonic=monotonic,
         )
+        if self._configured_full_cleanup_runner is not None:
+            self.full_cleanup_runner = self._configured_full_cleanup_runner
+        elif self.full_cleanup_enabled:
+            self.full_cleanup_runner = FullTorrentCleanupRunner(
+                TorrentJobRepository(self.state_db),
+                self.executor,
+                torrent_provider=lambda h: self.monitor.sync.snapshots.get(str(h)),
+                min_seed_sec=self.cleanup_min_seed_sec,
+                min_ratio=self.cleanup_min_ratio,
+            )
+        else:
+            self.full_cleanup_runner = None
         self.obs = ObservabilityStore(self.state_db)
         self.mode_controller = ModeController(
             emergency_enter=self.emergency_floor_bytes,
@@ -880,6 +908,33 @@ class DaemonRuntime:
             self.obs.event("info", "cleanup", "cleanup_request_processed", f"cleanup request {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
         return processed
 
+    def process_full_cleanup_jobs(self, max_jobs: int = 1) -> int:
+        if self.full_cleanup_runner is None:
+            return 0
+        if not self.monitor.sync.high_risk_actions_allowed:
+            return 0
+        if self.full_cleanup_dry_run:
+            row = self.full_cleanup_runner.repo.peek_next("cleanup_full_torrent")
+            if not row:
+                return 0
+            self.obs.action(
+                hash=row.get("hash"),
+                job_id=int(row["id"]),
+                action_type="cleanup_full_torrent",
+                path="torrent_jobs/cleanup_full_torrent",
+                payload={"job_id": row["id"], "state": row.get("state")},
+                status="dry_run",
+                dry_run=True,
+            )
+            return 1
+        processed = 0
+        for _ in range(max_jobs):
+            job_id = self.full_cleanup_runner.run_next()
+            if job_id is None:
+                break
+            processed += 1
+        return processed
+
     def process_media_pipeline_jobs(self, max_jobs: int = 1) -> int:
         if self.media_pipeline_runner is None:
             return 0
@@ -939,6 +994,7 @@ class DaemonRuntime:
             ("telegram", self.process_bot_notifications),
             ("upload", self.process_upload_jobs),
             ("cleanup", self.process_cleanup_requests),
+            ("full_cleanup", self.process_full_cleanup_jobs),
             ("media_pipeline", self.process_media_pipeline_jobs),
             ("emby", self.process_emby_refresh_tasks),
         ]
@@ -1131,6 +1187,10 @@ class DaemonRuntime:
                         self.process_cleanup_requests()
                     except Exception as exc:
                         self.obs.event("error", "cleanup", "cleanup_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                    try:
+                        self.process_full_cleanup_jobs()
+                    except Exception as exc:
+                        self.obs.event("error", "cleanup", "full_cleanup_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                     try:
                         self.process_media_pipeline_jobs()
                     except Exception as exc:

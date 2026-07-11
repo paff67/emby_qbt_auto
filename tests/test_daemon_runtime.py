@@ -1331,7 +1331,7 @@ def test_daemon_drain_file_batch_does_not_call_torrent_files():
         assert junk_janitor.file_lists == {}
 
 
-def test_daemon_file_batch_live_respects_upload_backpressure_policy():
+def test_daemon_file_batch_live_bypasses_backpressure_for_disk_releasing_upload():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.io_governor import UploadBackpressurePolicy
     from qbt_orchestrator.maintenance import SQLiteMaintenanceService
@@ -1387,8 +1387,8 @@ def test_daemon_file_batch_live_respects_upload_backpressure_policy():
         jobs = con.execute("select hash from torrent_jobs order by id").fetchall()
         event = con.execute("select component,event_type from events_v2 where component='upload_backpressure' order by id desc limit 1").fetchone()
         con.close()
-        assert jobs == [("old",)]
-        assert event == ("upload_backpressure", "new_upload_blocked")
+        assert jobs == [("old",), ("new",)]
+        assert event is None
 
 
 

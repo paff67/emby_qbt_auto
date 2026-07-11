@@ -4,11 +4,21 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable
 
 from .db import readonly_connect, write_transaction
 from .observability import redact
+
+
+class JobPriority(IntEnum):
+    EMERGENCY_CONTROL = 0
+    FULL_TORRENT_RELEASE_UPLOAD = 10
+    PREEMPTION_RELEASE_UPLOAD = 15
+    BATCH_DELIVERY_UPLOAD = 50
+    SIDECAR_UPLOAD = 70
+    MEDIA_PIPELINE = 80
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -114,7 +124,13 @@ class UploadBackpressurePolicy:
         self.max_oldest_pending_sec = int(max_oldest_pending_sec)
         self.now = now or (lambda: int(time.time()))
 
-    def evaluate(self, state_db: str | Path, candidate_bytes: int = 0) -> UploadBackpressureDecision:
+    def evaluate(
+        self,
+        state_db: str | Path,
+        candidate_bytes: int = 0,
+        *,
+        disk_releasing: bool = False,
+    ) -> UploadBackpressureDecision:
         now = int(self.now())
         con = _connect(state_db)
         rows = [
@@ -145,6 +161,9 @@ class UploadBackpressurePolicy:
         elif oldest > self.max_oldest_pending_sec:
             allow = False
             reason = "oldest_upload_pending_over_limit"
+        if disk_releasing and not allow:
+            allow = True
+            reason = "disk_releasing_bypass"
         return UploadBackpressureDecision(
             allow_new_upload_jobs=allow,
             reason=reason,

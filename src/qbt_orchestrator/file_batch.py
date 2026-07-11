@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from .budget import future_growth_by_hash, resource_claims_from_rows
 from .db import readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
+from .io_governor import JobPriority
 from .models import BatchReservation
 from .observability import redact
 from .policies.batching import compute_batch_reservation
@@ -238,7 +239,11 @@ class FileBatchService:
                 skipped_existing += 1
                 continue
             if self.backpressure_policy is not None:
-                decision = self.backpressure_policy.evaluate(self.state_db, candidate_bytes=int(payload.get("size") or 0))
+                decision = self.backpressure_policy.evaluate(
+                    self.state_db,
+                    candidate_bytes=int(payload.get("size") or 0),
+                    disk_releasing=True,
+                )
                 if not decision.allow_new_upload_jobs:
                     self.backpressure_policy.record(self.state_db, decision, torrent_hash=torrent_hash)
                     continue
@@ -247,7 +252,13 @@ class FileBatchService:
                 self.obs.action(torrent_hash, None, "enqueue_upload", "torrent_jobs/upload", payload, "dry_run", True)
                 self.obs.event("info", "file_batch", "upload_queue_dry_run", f"would enqueue upload for {torrent_hash[:8]}", payload, hash=torrent_hash)
                 continue
-            job_id = self.jobs.enqueue(torrent_hash, None, "upload", payload, priority=50)
+            job_id = self.jobs.enqueue(
+                torrent_hash,
+                None,
+                "upload",
+                payload,
+                priority=int(JobPriority.FULL_TORRENT_RELEASE_UPLOAD),
+            )
             enqueued += 1
             self.obs.event("info", "file_batch", "upload_queued", f"upload job {job_id} queued", {"job_id": job_id, **payload}, hash=torrent_hash, job_id=job_id)
 
@@ -836,7 +847,13 @@ class FileBatchService:
             except Exception as exc:
                 self.obs.event("error", "file_batch", "batch_pause_files_failed", str(redact(str(exc))), {"batch_id": batch_id}, hash=h)
                 continue
-            job_id = self.jobs.enqueue(h, batch_id, "upload", payload, priority=40)
+            job_id = self.jobs.enqueue(
+                h,
+                batch_id,
+                "upload",
+                payload,
+                priority=int(JobPriority.BATCH_DELIVERY_UPLOAD),
+            )
             self._mark_batch_upload_queued(batch_id, job_id, int(payload["size"]))
             queued += 1
             self.obs.event("info", "file_batch", "batch_upload_queued", f"batch {batch_id} upload job {job_id} queued", {"batch_id": batch_id, "job_id": job_id, **payload}, hash=h, job_id=job_id)
@@ -1519,6 +1536,11 @@ class FileBatchService:
             "size": int(torrent.get("size") or 0),
             "full_torrent": True,
             "source": "file_batch_completed_full_torrent",
+            "cleanup_policy_snapshot": {
+                "tags": str(torrent.get("tags") or ""),
+                "seeding_time": int(torrent.get("seeding_time") or 0),
+                "ratio": float(torrent.get("ratio") or 0.0),
+            },
         }
         manifest = self._manifest_for(local, remote_dir, selected_qbt_files=qbt_selected_files)
         if manifest is None and qbt_selected_files is not None:

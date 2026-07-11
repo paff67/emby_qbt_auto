@@ -1185,10 +1185,16 @@ Implemented verification: focused runtime/upload regression `45 passed`; full su
 - Modify: `src/qbt_orchestrator/file_batch.py`
 - Modify: `src/qbt_orchestrator/runtime.py`
 - Modify: `src/qbt_orchestrator/io_governor.py`
+- Modify: `src/qbt_orchestrator/service.py`
+- Modify: `src/qbt_orchestrator/cli.py`
+- Modify: `src/qbt_orchestrator/media.py`
+- Modify: `src/qbt_orchestrator/seeding_preemption.py`
 - Test: `tests/test_runtime_repositories.py`
 - Test: `tests/test_file_batch_service.py`
+- Test: `tests/test_io_governor.py`
+- Test: `tests/test_daemon_runtime.py`
 
-- [ ] **Step 1: Define cleanup eligibility**
+- [x] **Step 1: Define cleanup eligibility**
 
 ```python
 @dataclass(frozen=True)
@@ -1209,7 +1215,7 @@ def cleanup_eligibility(torrent, *, remote_verified: bool, min_seed_sec: int, mi
     return CleanupEligibility(True, "policy_satisfied", None)
 ```
 
-- [ ] **Step 2: Assign explicit priorities**
+- [x] **Step 2: Assign explicit priorities**
 
 ```python
 class JobPriority(IntEnum):
@@ -1223,7 +1229,7 @@ class JobPriority(IntEnum):
 
 Upload backpressure may block batch/sidecar work but must not block a verified disk-releasing full-torrent upload.
 
-- [ ] **Step 3: Test seed-long and transient seed wait**
+- [x] **Step 3: Test seed-long and transient seed wait**
 
 ```python
 def test_verified_seed_long_torrent_is_never_auto_deleted():
@@ -1232,14 +1238,18 @@ def test_verified_seed_long_torrent_is_never_auto_deleted():
     assert decision.reason == "seed_long"
 ```
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_runtime_repositories.py tests/test_file_batch_service.py -q
 python -m pytest -q
-git add src/qbt_orchestrator/cleanup_policy.py src/qbt_orchestrator/file_batch.py src/qbt_orchestrator/runtime.py src/qbt_orchestrator/io_governor.py tests/test_runtime_repositories.py tests/test_file_batch_service.py
+git add src/qbt_orchestrator/cleanup_policy.py src/qbt_orchestrator/file_batch.py src/qbt_orchestrator/runtime.py src/qbt_orchestrator/io_governor.py src/qbt_orchestrator/service.py src/qbt_orchestrator/cli.py src/qbt_orchestrator/media.py src/qbt_orchestrator/seeding_preemption.py tests/test_runtime_repositories.py tests/test_file_batch_service.py tests/test_io_governor.py tests/test_daemon_runtime.py docs/
 git commit -m "feat: enforce cleanup seed policy and release priorities"
 ```
+
+Implementation notes: `FullTorrentCleanupRunner` is the only automatic full-torrent delete path. It fails closed when sync is unhealthy or the source is absent, permanently blocks unverified/`seed-long`, retries seed-time or ratio shortfalls after 300 seconds, and marks the parent upload done only after qBT delete succeeds. Rollout is disabled and dry-run by default (`QBT_ORCH_FULL_CLEANUP=0`, `QBT_ORCH_FULL_CLEANUP_DRY_RUN=1`). Priorities are explicit: emergency 0, full release 10, preemption 15, batch 50, sidecar 70, media 80. Backpressure bypass applies only to disk-releasing full uploads; batch delivery remains gated.
+
+Implemented verification: focused cleanup/batch/governor regression `61 passed`; full suite `309 passed`; `compileall` and `git diff --check` passed. Delete-call audit found only the guarded runner call and its action-log path.
 
 ### Task 17: Automatically recover leases and enforce attempts
 

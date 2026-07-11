@@ -197,6 +197,8 @@ def test_file_batch_service_enqueues_completed_managed_torrent_once_with_vps_pat
                 "size": 123,
                 "progress": 1.0,
                 "content_path": "/downloads/active/Movie One",
+                "seeding_time": 1_200,
+                "ratio": 1.5,
             },
             "holdhash": {"hash": "holdhash", "name": "Hold", "category": "auto", "tags": "hold", "amount_left": 0, "size": 50, "progress": 1.0},
             "incomplete": {"hash": "incomplete", "name": "Inc", "category": "auto", "tags": "auto", "amount_left": 1, "size": 50, "progress": 0.9},
@@ -207,15 +209,17 @@ def test_file_batch_service_enqueues_completed_managed_torrent_once_with_vps_pat
 
         assert result1.enqueued == 1
         assert result2.enqueued == 0
-        jobs = _rows(db, "select hash,job_type,state,payload_json from torrent_jobs order by id")
+        jobs = _rows(db, "select hash,job_type,state,priority,payload_json from torrent_jobs order by id")
         assert len(jobs) == 1
         assert jobs[0]["hash"] == "abcdef1234567890"
+        assert jobs[0]["priority"] == 10
         payload = json.loads(jobs[0]["payload_json"])
         assert payload["local"] == "/data/downloads/active/Movie One"
         assert payload["remote"] == "gcrypt:/Movie_One-abcdef123456"
         assert payload["size"] == 123
         assert payload["full_torrent"] is True
         assert payload["source"] == "file_batch_completed_full_torrent"
+        assert payload["cleanup_policy_snapshot"] == {"tags": "auto", "seeding_time": 1_200, "ratio": 1.5}
         events = _rows(db, "select component,event_type,hash from events_v2 order by id")
         assert events[-1] == {"component": "file_batch", "event_type": "upload_queued", "hash": "abcdef1234567890"}
 

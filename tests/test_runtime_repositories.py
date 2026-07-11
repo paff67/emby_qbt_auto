@@ -63,6 +63,102 @@ def test_upload_job_runner_claims_job_updates_done_and_verify_pending():
         assert repo.get(bad)["last_stderr_tail"] == "remote size mismatch"
 
 
+def test_cleanup_policy_blocks_unverified_seed_long_and_transient_seed_wait():
+    from qbt_orchestrator.io_governor import JobPriority
+    from qbt_orchestrator.cleanup_policy import cleanup_eligibility
+
+    assert [int(value) for value in JobPriority] == [0, 10, 15, 50, 70, 80]
+
+    assert cleanup_eligibility(
+        {"tags": "auto", "seeding_time": 99_999, "ratio": 9.0},
+        remote_verified=False,
+        min_seed_sec=900,
+        min_ratio=1.0,
+        now=1_000,
+    ).reason == "remote_not_verified"
+    seed_long = cleanup_eligibility(
+        {"tags": "auto,seed-long", "seeding_time": 99_999, "ratio": 9.0},
+        remote_verified=True,
+        min_seed_sec=900,
+        min_ratio=1.0,
+        now=1_000,
+    )
+    assert seed_long.allowed is False
+    assert seed_long.reason == "seed_long"
+    assert seed_long.next_check_at is None
+    waiting = cleanup_eligibility(
+        {"tags": "auto", "seeding_time": 899, "ratio": 9.0},
+        remote_verified=True,
+        min_seed_sec=900,
+        min_ratio=1.0,
+        now=1_000,
+    )
+    assert waiting.reason == "seed_time"
+    assert waiting.next_check_at == 1_300
+
+
+def test_full_cleanup_runner_never_deletes_seed_long_and_retries_transient_seed_policy():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import FullTorrentCleanupRunner, TorrentJobRepository
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = [1_000]
+        repo = TorrentJobRepository(db, now=lambda: clock[0])
+        executor = FakeExecutor()
+
+        held_parent = repo.enqueue("held", None, "upload", {}, priority=10)
+        repo.update_state(held_parent, "cleanup_wait")
+        held_cleanup = repo.enqueue(
+            "held",
+            None,
+            "cleanup_full_torrent",
+            {"remote_verified": True, "cleanup_policy_snapshot": {"tags": "auto,seed-long", "seeding_time": 99_999, "ratio": 9.0}},
+            priority=10,
+            parent_job_id=held_parent,
+        )
+        held_runner = FullTorrentCleanupRunner(repo, executor, min_seed_sec=900, min_ratio=1.0)
+        assert held_runner.run_next() == held_cleanup
+        assert repo.get(held_cleanup)["state"] == "blocked"
+        assert repo.get(held_parent)["state"] == "cleanup_wait"
+        assert executor.posts == []
+
+        parent = repo.enqueue("ready-later", None, "upload", {}, priority=10)
+        repo.update_state(parent, "cleanup_wait")
+        cleanup = repo.enqueue(
+            "ready-later",
+            None,
+            "cleanup_full_torrent",
+            {"remote_verified": True, "cleanup_policy_snapshot": {}},
+            priority=10,
+            parent_job_id=parent,
+        )
+        live = {"tags": "auto", "seeding_time": 899, "ratio": 0.5}
+        runner = FullTorrentCleanupRunner(
+            repo,
+            executor,
+            torrent_provider=lambda _hash: dict(live),
+            min_seed_sec=900,
+            min_ratio=1.0,
+        )
+
+        assert runner.run_next() == cleanup
+        assert repo.get(cleanup)["state"] == "retry_wait"
+        assert repo.get(cleanup)["next_run_at"] == 1_300
+        assert executor.posts == []
+
+        clock[0] = 1_301
+        live.update({"seeding_time": 1_000, "ratio": 1.0})
+        assert runner.run_next() == cleanup
+        assert repo.get(cleanup)["state"] == "done"
+        assert repo.get(parent)["state"] == "done"
+        assert executor.posts == [
+            ("/api/v2/torrents/delete", {"hashes": "ready-later", "deleteFiles": "true"})
+        ]
+
+
 def test_upload_phase_schema_and_verify_retry_does_not_repeat_copy_or_delete():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner

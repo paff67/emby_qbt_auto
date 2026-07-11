@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 from typing import Iterable, Protocol
 
 from .db import readonly_connect, write_transaction
+from .io_governor import JobPriority
 from .runtime import TorrentJobRepository
 from .observability import redact
 @dataclass(frozen=True)
@@ -380,7 +381,7 @@ class MediaPipelineService:
                 "sidecar_manifest_id": sidecar_manifest_id,
                 "allow_unrecognized_passthrough": self.allow_unrecognized_passthrough,
             }
-            self.jobs.enqueue(None, None, "sidecar_upload", payload, priority=20)
+            self.jobs.enqueue(None, None, "sidecar_upload", payload, priority=int(JobPriority.SIDECAR_UPLOAD))
 
     def _queue_emby_refresh(self, emby_dir: str, key: str, manifest_id: str, state: str) -> None:
         if not emby_dir.startswith(self.emby_prefix + "/"):

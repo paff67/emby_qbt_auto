@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .db import readonly_connect, write_transaction
+from .cleanup_policy import cleanup_eligibility
+from .io_governor import JobPriority
 from .observability import redact
 from .upload import RcloneUploadWorker, UploadJob, UploadResult
 
@@ -303,6 +305,7 @@ class TorrentJobRepository:
                 "remote": payload.get("remote"),
                 "verification_method": result.method,
                 "remote_verified": True,
+                "cleanup_policy_snapshot": dict(payload.get("cleanup_policy_snapshot") or {}),
             }
             con.execute(
                 "insert or ignore into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,parent_job_id,created_at,updated_at) "
@@ -312,7 +315,7 @@ class TorrentJobRepository:
                     row.get("batch_id"),
                     "cleanup_full_torrent",
                     "queued",
-                    int(row.get("priority") or 100),
+                    int(JobPriority.FULL_TORRENT_RELEASE_UPLOAD),
                     json.dumps(cleanup_payload, ensure_ascii=False),
                     job_id,
                     now,
@@ -499,7 +502,13 @@ class UploadJobRunner:
             "upload_manifest_id": manifest_id,
             "files": media_files,
         }
-        self.repo.enqueue(row.get("hash"), row.get("batch_id"), "media_pipeline", media_payload, priority=30)
+        self.repo.enqueue(
+            row.get("hash"),
+            row.get("batch_id"),
+            "media_pipeline",
+            media_payload,
+            priority=int(JobPriority.MEDIA_PIPELINE),
+        )
 
     def _update_sidecar_upload_state(self, row: dict[str, Any], payload: dict[str, Any]) -> None:
         sidecar_manifest_id = self._sidecar_manifest_id(payload)
@@ -699,6 +708,101 @@ class UploadJobRunner:
             return 60
         idx = max(0, min(int(attempt) - 1, len(self.backoff_schedule) - 1))
         return self.backoff_schedule[idx]
+
+
+class FullTorrentCleanupRunner:
+    """Execute verified full-torrent cleanup only after seed policy approval."""
+
+    def __init__(
+        self,
+        repo: TorrentJobRepository,
+        executor,
+        torrent_provider=None,
+        *,
+        min_seed_sec: int = 900,
+        min_ratio: float = 1.0,
+    ):
+        self.repo = repo
+        self.executor = executor
+        self.torrent_provider = torrent_provider
+        self.min_seed_sec = max(0, int(min_seed_sec))
+        self.min_ratio = max(0.0, float(min_ratio))
+
+    def run_next(self) -> int | None:
+        row = self.repo.claim_next("cleanup_full_torrent")
+        if not row:
+            return None
+        payload = json.loads(row["payload_json"] or "{}")
+        h = str(row.get("hash") or payload.get("hash") or "")
+        torrent = None
+        if self.torrent_provider is not None and h:
+            torrent = self.torrent_provider(h)
+            if not torrent:
+                self.repo.update_state(int(row["id"]), "blocked", "source_absent", exit_code=1)
+                return int(row["id"])
+        if torrent is None:
+            torrent = dict(payload.get("cleanup_policy_snapshot") or {})
+        now = int(self.repo.now())
+        decision = cleanup_eligibility(
+            torrent,
+            remote_verified=bool(payload.get("remote_verified")),
+            min_seed_sec=self.min_seed_sec,
+            min_ratio=self.min_ratio,
+            now=now,
+        )
+        if not decision.allowed:
+            if decision.next_check_at is None:
+                self.repo.update_state(int(row["id"]), "blocked", decision.reason, exit_code=1)
+            else:
+                self.repo.schedule_retry(
+                    int(row["id"]),
+                    decision.reason,
+                    exit_code=1,
+                    delay_sec=max(1, int(decision.next_check_at) - now),
+                )
+            return int(row["id"])
+        try:
+            self.executor.qbt_post(
+                "/api/v2/torrents/delete",
+                {"hashes": h, "deleteFiles": "true"},
+            )
+        except Exception as exc:
+            self.repo.schedule_retry(
+                int(row["id"]),
+                str(redact(str(exc)))[:500],
+                exit_code=1,
+                delay_sec=60,
+            )
+            return int(row["id"])
+
+        parent_job_id = row.get("parent_job_id") or payload.get("upload_job_id")
+
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
+                "update torrent_jobs set state='done',phase='done',last_exit_code=0,lease_owner=null,lease_until=null,updated_at=? where id=?",
+                (now, int(row["id"])),
+            )
+            if parent_job_id is not None:
+                con.execute(
+                    "update torrent_jobs set state='done',phase='done',last_exit_code=0,updated_at=? where id=? and state='cleanup_wait'",
+                    (now, int(parent_job_id)),
+                )
+            con.execute(
+                "insert into action_log(ts,hash,job_id,action_type,path,payload_json,status,dry_run) values(?,?,?,?,?,?,?,?)",
+                (
+                    now,
+                    h,
+                    int(row["id"]),
+                    "cleanup_full_torrent",
+                    "/api/v2/torrents/delete",
+                    json.dumps({"hash": h, "deleteFiles": True, "policy": decision.reason}, ensure_ascii=False),
+                    "done",
+                    0,
+                ),
+            )
+
+        write_transaction(self.repo.state_db, txn)
+        return int(row["id"])
 
 
 class CleanupRequestRunner:
