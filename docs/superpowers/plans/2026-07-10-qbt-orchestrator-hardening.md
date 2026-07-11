@@ -990,7 +990,7 @@ git commit -m "fix: bound soak partial debt and disable probes in drain mode"
 - Test: `tests/test_file_batch_service.py`
 - Test: `tests/test_maintenance.py`
 
-- [ ] **Step 1: Add schema**
+- [x] **Step 1: Add schema**
 
 ```sql
 alter table torrent_batches add column lease_until integer;
@@ -1011,7 +1011,7 @@ on batch_file_claims(hash,file_index)
 where state='active';
 ```
 
-- [ ] **Step 2: Test lease renewal and expiry semantics**
+- [x] **Step 2: Test lease renewal and expiry semantics**
 
 ```python
 def test_batch_progress_renews_lease_and_expiry_never_silently_releases(db):
@@ -1023,7 +1023,7 @@ def test_batch_progress_renews_lease_and_expiry_never_silently_releases(db):
     assert active_claim_count(db, batch) == 1
 ```
 
-- [ ] **Step 3: Reconcile before release**
+- [x] **Step 3: Reconcile before release**
 
 Rules:
 
@@ -1033,7 +1033,7 @@ Rules:
 - expired without observation: mark `suspect_expired`, block new batch work for that hash;
 - paused batch retains historical file ownership until priorities are confirmed reset.
 
-- [ ] **Step 4: Fix piece spill accounting**
+- [x] **Step 4: Fix piece spill accounting**
 
 ```python
 def compute_batch_reservation(files, piece_size, filesystem_slack, selected_extents):
@@ -1043,18 +1043,20 @@ def compute_batch_reservation(files, piece_size, filesystem_slack, selected_exte
     return BatchReservation(payload, spill, filesystem_slack, reserved, payload / reserved if reserved else 1.0)
 ```
 
-- [ ] **Step 5: Clean stale DB rows without touching disk**
+- [x] **Step 5: Clean stale DB rows without touching disk**
 
 Maintenance may mark absent-qBT nonterminal batches `source_absent` and release logical claims. It must not call qBT delete, unlink or move files.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_file_batch_service.py tests/test_maintenance.py -q
 python -m pytest -q
-git add src/qbt_orchestrator/db.py src/qbt_orchestrator/file_batch.py src/qbt_orchestrator/maintenance.py tests/test_file_batch_service.py tests/test_maintenance.py
+git add src/qbt_orchestrator/db.py src/qbt_orchestrator/file_batch.py src/qbt_orchestrator/maintenance.py src/qbt_orchestrator/policies/batching.py src/qbt_orchestrator/service.py tests/test_file_batch_service.py tests/test_maintenance.py docs/
 git commit -m "fix: make batch leases renewable and reconcile ownership"
 ```
+
+Implemented verification: targeted batch/maintenance regression `37 passed`; full suite `300 passed`; `compileall` and `git diff --check` passed. Legacy batches lazily backfill file-index claims on first observation. Terminal reservation history is never reactivated. Source-absence maintenance is enabled only from a healthy complete qBT snapshot and performs logical state release only.
 
 ### Task 14: Build batch candidates globally and treat them as delivery-only work
 

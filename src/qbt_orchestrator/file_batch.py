@@ -248,6 +248,9 @@ class FileBatchService:
         if not sync_healthy:
             self._decision(h, "prefetch_blocked", "sync_unhealthy", {"free_bytes": free_bytes})
             return {"created": 0, "blocked": 1}
+        if self._has_suspect_batch(h):
+            self._decision(h, "prefetch_blocked", "suspect_batch_requires_reconcile", {})
+            return {"created": 0, "blocked": 1}
         live_allowed = self._live_verify_canary_allowed(h, tags)
         if not live_allowed and self._inflight_batch_count(h) == 0:
             self._decision(
@@ -354,7 +357,17 @@ class FileBatchService:
             self.obs.action(h, None, "batch_pipeline", "torrent_batches", payload, "dry_run", True)
             self._decision(h, "prefetch_allowed", "dry_run", payload)
             return {"created": 0, "blocked": 0, "upload_queued": queued}
-        batch_id = self._create_batch_and_reservation(h, indices, reservation, piece_size)
+        initial_progress_bytes = sum(
+            max(0, int(row.get("size") or 0) - self._remaining_file_bytes(row))
+            for row in selected
+        )
+        batch_id = self._create_batch_and_reservation(
+            h,
+            indices,
+            reservation,
+            piece_size,
+            initial_progress_bytes=initial_progress_bytes,
+        )
         try:
             self._apply_batch_to_qbt(h, indices, files, protected_indices=already_selected_indices)
         except Exception as exc:
@@ -373,6 +386,32 @@ class FileBatchService:
         rows = self._pipeline_batch_rows(h)
         if not rows:
             return False
+        files_by_index = {int(row.get("index") or 0): row for row in files}
+        for row in rows:
+            try:
+                indices = [int(value) for value in json.loads(row.get("indices_json") or "[]")]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                indices = []
+            observed_progress = sum(
+                max(
+                    0,
+                    int(files_by_index[index].get("size") or 0)
+                    - self._remaining_file_bytes(files_by_index[index]),
+                )
+                for index in indices
+                if index in files_by_index
+            )
+            observation = self.reconcile_batch_observation(
+                int(row["id"]),
+                observed_progress_bytes=observed_progress,
+                source_present=True,
+            )
+            if observation == "suspect_expired":
+                self._decision(h, "prefetch_blocked", "suspect_batch_requires_reconcile", {"batch_id": int(row["id"])})
+                return True
+        rows = self._pipeline_batch_rows(h)
+        if not rows:
+            return True
         write_transaction(
             self.state_db,
             lambda con: self._refresh_batch_intent_in_transaction(con, h, int(self.now())),
@@ -423,24 +462,53 @@ class FileBatchService:
         finally:
             con.close()
 
-    def _pause_pipeline_batches(self, batch_ids: list[int], h: str, reservation_reason: str, decision_reason: str) -> None:
+    def _pause_pipeline_batches(self, batch_ids: list[int], h: str, reservation_reason: str, decision_reason: str) -> bool:
         if not batch_ids:
-            return
+            return False
         now = int(self.now())
         placeholders = ",".join("?" for _ in batch_ids)
-        decision_data = {"batch_ids": batch_ids, "released_reservation": True}
+        decision_data = {"batch_ids": batch_ids, "released_reservation": False}
         self._track_decision(h, decision_reason)
         transitioned = [False]
+
+        indices = self._claimed_indices_for_batches(batch_ids)
+        if self.dry_run:
+            self._decision(h, "batch_pause_preview", "dry_run", {"batch_ids": batch_ids, "indices": indices})
+            return False
+        if indices:
+            try:
+                self._qbt_post(
+                    "/api/v2/torrents/filePrio",
+                    {"hash": h, "id": "|".join(str(index) for index in indices), "priority": "0"},
+                    h,
+                )
+            except Exception as exc:
+                self.obs.event(
+                    "error",
+                    "file_batch",
+                    "batch_priority_reset_failed",
+                    str(redact(str(exc))),
+                    {"hash": h, "batch_ids": batch_ids, "indices": indices},
+                    hash=h,
+                )
+                self._decision(h, "batch_pause_blocked", "priority_reset_failed", {"batch_ids": batch_ids})
+                return False
 
         def txn(con: sqlite3.Connection) -> None:
             con.execute(
                 f"update torrent_batches set state='paused_by_planner', updated_at=? where id in ({placeholders})",
                 (now, *batch_ids),
             )
-            con.execute(
+            released = con.execute(
                 f"update resource_reservations set state='released', released_at=?, reason=? "
                 f"where kind='batch' and state='active' and batch_id in ({placeholders})",
                 (now, reservation_reason, *batch_ids),
+            )
+            decision_data["released_reservation"] = released.rowcount > 0
+            con.execute(
+                f"update batch_file_claims set state='released',released_at=? "
+                f"where state='active' and batch_id in ({placeholders})",
+                (now, *batch_ids),
             )
             self._refresh_batch_intent_in_transaction(con, h, now)
             transitioned[0] = self.decision_recorder.record_many_in_transaction(
@@ -459,6 +527,36 @@ class FileBatchService:
                 {"batch_ids": batch_ids, "reason": reservation_reason},
                 hash=h,
             )
+        return bool(transitioned[0])
+
+    def _claimed_indices_for_batches(self, batch_ids: list[int]) -> list[int]:
+        if not batch_ids:
+            return []
+        placeholders = ",".join("?" for _ in batch_ids)
+        con = _connect(self.state_db)
+        try:
+            claimed = {
+                int(row["file_index"])
+                for row in con.execute(
+                    f"select file_index from batch_file_claims where state='active' and batch_id in ({placeholders})",
+                    tuple(batch_ids),
+                ).fetchall()
+            }
+            rows = con.execute(
+                f"select indices_json from torrent_batches where id in ({placeholders})",
+                tuple(batch_ids),
+            ).fetchall()
+        finally:
+            con.close()
+        if claimed:
+            return sorted(claimed)
+        legacy: set[int] = set()
+        for row in rows:
+            try:
+                legacy.update(int(value) for value in json.loads(row["indices_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return sorted(legacy)
 
     def _live_verify_canary_allowed(self, h: str, tags: set[str]) -> bool:
         if not self.batch_live_verify:
@@ -741,8 +839,13 @@ class FileBatchService:
             remaining = self._remaining_file_bytes(row)
             if remaining <= 0:
                 continue
-            reservation_rows.append({"size": remaining})
-        reservation = compute_batch_reservation(reservation_rows, piece_size=piece_size, filesystem_slack=self.filesystem_slack_bytes)
+            reservation_rows.append({"index": int(row.get("index") or 0), "remaining_bytes": remaining})
+        reservation = compute_batch_reservation(
+            reservation_rows,
+            piece_size=piece_size,
+            filesystem_slack=self.filesystem_slack_bytes,
+            selected_extents=self._selected_extents([int(row.get("index") or 0) for row in selected]),
+        )
         payload_bytes = sum(int(row.get("size") or 0) for row in selected)
         return BatchReservation(
             payload_bytes=payload_bytes,
@@ -813,7 +916,7 @@ class FileBatchService:
             con.close()
 
     def _inflight_batch_count(self, h: str) -> int:
-        states = ("reserved", "applied_to_qbt", "downloading", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_deferred")
+        states = ("reserved", "applied_to_qbt", "downloading", "suspect_expired", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_deferred")
         placeholders = ",".join("?" for _ in states)
         con = _connect(self.state_db)
         try:
@@ -823,14 +926,25 @@ class FileBatchService:
             con.close()
 
     def _inflight_batch_indices(self, h: str) -> set[int]:
-        states = ("reserved", "applied_to_qbt", "downloading", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_deferred")
+        con = _connect(self.state_db)
+        try:
+            claimed = {
+                int(row["file_index"])
+                for row in con.execute(
+                    "select file_index from batch_file_claims where hash=? and state='active'",
+                    (h,),
+                ).fetchall()
+            }
+        finally:
+            con.close()
+        states = ("reserved", "applied_to_qbt", "downloading", "suspect_expired", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_deferred")
         placeholders = ",".join("?" for _ in states)
         con = _connect(self.state_db)
         try:
             rows = con.execute(f"select indices_json from torrent_batches where hash=? and state in ({placeholders})", (h, *states)).fetchall()
         finally:
             con.close()
-        out: set[int] = set()
+        out: set[int] = set(claimed)
         for row in rows:
             try:
                 values = json.loads(row["indices_json"] or "[]")
@@ -842,6 +956,16 @@ class FileBatchService:
                 except (TypeError, ValueError):
                     continue
         return out
+
+    def _has_suspect_batch(self, h: str) -> bool:
+        con = _connect(self.state_db)
+        try:
+            return con.execute(
+                "select 1 from torrent_batches where hash=? and state='suspect_expired' limit 1",
+                (str(h),),
+            ).fetchone() is not None
+        finally:
+            con.close()
 
     def _next_batch_no(self, con: sqlite3.Connection, h: str) -> int:
         row = con.execute("select coalesce(max(batch_no),0)+1 from torrent_batches where hash=?", (h,)).fetchone()
@@ -856,12 +980,21 @@ class FileBatchService:
                 extents += 1
         return extents
 
-    def _create_batch_and_reservation(self, h: str, indices: list[int], reservation, piece_size: int) -> int:
+    def _create_batch_and_reservation(
+        self,
+        h: str,
+        indices: list[int],
+        reservation,
+        piece_size: int,
+        *,
+        initial_progress_bytes: int = 0,
+    ) -> int:
         now = int(self.now())
+        lease_until = now + self.reservation_ttl_sec
         def txn(con: sqlite3.Connection) -> int:
             batch_no = self._next_batch_no(con, h)
             cur = con.execute(
-                "insert into torrent_batches(hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,piece_size,selected_extents,piece_spill_overhead_bytes,payload_efficiency,priority_applied,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "insert into torrent_batches(hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,piece_size,selected_extents,piece_spill_overhead_bytes,payload_efficiency,priority_applied,lease_until,last_progress_at,last_progress_bytes,source_present,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     h,
                     batch_no,
@@ -875,11 +1008,19 @@ class FileBatchService:
                     int(reservation.piece_spill_overhead_bytes),
                     float(reservation.payload_efficiency),
                     0,
+                    lease_until,
+                    now,
+                    int(initial_progress_bytes),
+                    1,
                     now,
                     now,
                 ),
             )
             batch_id = int(cur.lastrowid)
+            con.executemany(
+                "insert into batch_file_claims(batch_id,hash,file_index,state,created_at) values(?,?,?,?,?)",
+                [(batch_id, h, int(index), "active", now) for index in sorted(set(indices))],
+            )
             con.execute(
                 "insert into resource_reservations("
                 "hash,batch_id,kind,accounting_class,owner,bytes,state,created_at,expires_at,last_observed_at,reason) "
@@ -893,7 +1034,7 @@ class FileBatchService:
                     int(reservation.reserved_bytes),
                     "active",
                     now,
-                    now + self.reservation_ttl_sec,
+                    lease_until,
                     now,
                     "batch_pipeline_reserved",
                 ),
@@ -902,6 +1043,117 @@ class FileBatchService:
             return batch_id
 
         return int(write_transaction(self.state_db, txn))
+
+    def reconcile_batch_observation(
+        self,
+        batch_id: int,
+        *,
+        observed_progress_bytes: int,
+        source_present: bool,
+    ) -> str:
+        """Reconcile one durable batch lease from observed qBT state only."""
+        now = int(self.now())
+
+        def txn(con: sqlite3.Connection) -> str:
+            row = con.execute("select * from torrent_batches where id=?", (int(batch_id),)).fetchone()
+            if row is None:
+                return "missing"
+            h = str(row["hash"] or "")
+            self._ensure_legacy_batch_claims_in_transaction(con, row, now)
+            if not source_present:
+                con.execute(
+                    "update torrent_batches set state='source_absent',source_present=0,updated_at=? where id=?",
+                    (now, int(batch_id)),
+                )
+                con.execute(
+                    "update resource_reservations set state='released',released_at=?,last_observed_at=?,reason='batch_source_absent' "
+                    "where batch_id=? and kind='batch' and state='active'",
+                    (now, now, int(batch_id)),
+                )
+                con.execute(
+                    "update batch_file_claims set state='released',released_at=? where batch_id=? and state='active'",
+                    (now, int(batch_id)),
+                )
+                self._refresh_batch_intent_in_transaction(con, h, now)
+                return "source_absent"
+
+            observed = max(0, int(observed_progress_bytes))
+            previous = max(0, int(row["last_progress_bytes"] or 0))
+            lease_until = row["lease_until"]
+            if observed > previous:
+                renewed_until = now + self.reservation_ttl_sec
+                con.execute(
+                    "update torrent_batches set state=case when state='suspect_expired' then 'downloading' else state end,"
+                    "source_present=1,lease_until=?,last_progress_at=?,last_progress_bytes=?,updated_at=? where id=?",
+                    (renewed_until, now, observed, now, int(batch_id)),
+                )
+                con.execute(
+                    "update resource_reservations set state='active',expires_at=?,released_at=null,last_observed_at=?,"
+                    "lease_generation=lease_generation+1,reason='batch_progress_renewed' "
+                    "where batch_id=? and kind='batch' and state='active'",
+                    (renewed_until, now, int(batch_id)),
+                )
+                self._refresh_batch_intent_in_transaction(con, h, now)
+                return "renewed"
+
+            if lease_until is None:
+                initialized_until = now + self.reservation_ttl_sec
+                con.execute(
+                    "update torrent_batches set source_present=1,lease_until=?,last_progress_at=coalesce(last_progress_at,?),"
+                    "last_progress_bytes=max(last_progress_bytes,?),updated_at=? where id=?",
+                    (initialized_until, now, observed, now, int(batch_id)),
+                )
+                con.execute(
+                    "update resource_reservations set expires_at=?,last_observed_at=?,reason='batch_lease_initialized' "
+                    "where batch_id=? and kind='batch' and state='active'",
+                    (initialized_until, now, int(batch_id)),
+                )
+                self._refresh_batch_intent_in_transaction(con, h, now)
+                return "initialized"
+
+            if now >= int(lease_until):
+                con.execute(
+                    "update torrent_batches set state='suspect_expired',source_present=1,updated_at=? where id=?",
+                    (now, int(batch_id)),
+                )
+                con.execute(
+                    "update resource_reservations set state='active',expires_at=null,released_at=null,last_observed_at=?,"
+                    "reason='batch_suspect_expired' where batch_id=? and kind='batch' and state='active'",
+                    (now, int(batch_id)),
+                )
+                self._refresh_batch_intent_in_transaction(con, h, now)
+                return "suspect_expired"
+
+            con.execute(
+                "update torrent_batches set source_present=1,updated_at=? where id=?",
+                (now, int(batch_id)),
+            )
+            con.execute(
+                "update resource_reservations set last_observed_at=? where batch_id=? and kind='batch' and state='active'",
+                (now, int(batch_id)),
+            )
+            return "observed"
+
+        return str(write_transaction(self.state_db, txn))
+
+    @staticmethod
+    def _ensure_legacy_batch_claims_in_transaction(
+        con: sqlite3.Connection,
+        batch: sqlite3.Row,
+        now: int,
+    ) -> None:
+        """Lazily migrate pre-claim batches without reactivating released history."""
+        batch_id = int(batch["id"])
+        if con.execute("select 1 from batch_file_claims where batch_id=? limit 1", (batch_id,)).fetchone():
+            return
+        try:
+            indices = sorted({int(value) for value in json.loads(batch["indices_json"] or "[]")})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        con.executemany(
+            "insert or ignore into batch_file_claims(batch_id,hash,file_index,state,created_at) values(?,?,?,?,?)",
+            [(batch_id, str(batch["hash"] or ""), index, "active", now) for index in indices],
+        )
 
     def _mark_batch_applied(self, batch_id: int) -> None:
         now = int(self.now())

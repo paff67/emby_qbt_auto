@@ -354,8 +354,9 @@ class DaemonRuntime:
         ]
 
     def maintenance_tick(self) -> dict:
-        result = self.maintenance_service.run_once()
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        present_hashes = set(snapshots) if self.monitor.sync.high_risk_actions_allowed else None
+        result = self.maintenance_service.run_once(present_hashes=present_hashes)
         if self.path_reconciler is not None:
             result["path_reconcile"] = self.path_reconciler.reconcile(snapshots)
         if self.orphan_janitor is not None:

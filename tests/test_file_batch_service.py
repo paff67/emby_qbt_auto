@@ -20,6 +20,154 @@ def _rows(db: Path, sql: str):
     return rows
 
 
+def test_batch_schema_tracks_renewable_lease_and_file_index_claims():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+
+        batch_columns = {row["name"] for row in _rows(db, "pragma table_info(torrent_batches)")}
+        claim_columns = [row["name"] for row in _rows(db, "pragma table_info(batch_file_claims)")]
+        indexes = {row["name"] for row in _rows(db, "pragma index_list(batch_file_claims)")}
+
+        assert {"lease_until", "last_progress_at", "last_progress_bytes", "source_present"} <= batch_columns
+        assert claim_columns == ["batch_id", "hash", "file_index", "state", "created_at", "released_at"]
+        assert "idx_batch_file_claim_active" in indexes
+
+
+def test_batch_progress_renews_lease_and_expiry_becomes_suspect_without_release():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,indices_json,lease_until,last_progress_at,last_progress_bytes,created_at,updated_at) "
+            "values(1,'lease',1,'downloading','[0]',100,10,10,1,10)"
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) "
+            "values('lease',1,'batch',100,'active',1,100,'batch_pipeline_reserved')"
+        )
+        con.execute(
+            "insert into batch_file_claims(batch_id,hash,file_index,state,created_at) values(1,'lease',0,'active',1)"
+        )
+        con.commit()
+        con.close()
+        clock = [90]
+        service = FileBatchService(db, dry_run=False, reservation_ttl_sec=100, now=lambda: clock[0])
+
+        assert hasattr(service, "reconcile_batch_observation")
+        first = service.reconcile_batch_observation(1, observed_progress_bytes=20, source_present=True)
+
+        assert first == "renewed"
+        assert _rows(db, "select state,lease_until,last_progress_at,last_progress_bytes from torrent_batches where id=1") == [
+            {"state": "downloading", "lease_until": 190, "last_progress_at": 90, "last_progress_bytes": 20}
+        ]
+        assert _rows(db, "select state,expires_at,last_observed_at from resource_reservations where batch_id=1 and kind='batch'") == [
+            {"state": "active", "expires_at": 190, "last_observed_at": 90}
+        ]
+
+        clock[0] = 200
+        second = service.reconcile_batch_observation(1, observed_progress_bytes=20, source_present=True)
+
+        assert second == "suspect_expired"
+        assert _rows(db, "select state,source_present from torrent_batches where id=1") == [
+            {"state": "suspect_expired", "source_present": 1}
+        ]
+        assert _rows(db, "select state,expires_at,reason from resource_reservations where batch_id=1 and kind='batch'") == [
+            {"state": "active", "expires_at": None, "reason": "batch_suspect_expired"}
+        ]
+        assert _rows(db, "select state from batch_file_claims where batch_id=1") == [{"state": "active"}]
+
+
+def test_batch_source_absent_releases_only_logical_claims_and_reservation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,indices_json,lease_until,created_at,updated_at) "
+            "values(2,'absent',1,'downloading','[3]',100,1,1)"
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) "
+            "values('absent',2,'batch',100,'active',1,100,'batch_pipeline_reserved')"
+        )
+        con.execute(
+            "insert into batch_file_claims(batch_id,hash,file_index,state,created_at) values(2,'absent',3,'active',1)"
+        )
+        con.commit()
+        con.close()
+        service = FileBatchService(db, dry_run=False, now=lambda: 50)
+
+        result = service.reconcile_batch_observation(2, observed_progress_bytes=10, source_present=False)
+
+        assert result == "source_absent"
+        assert _rows(db, "select state,source_present from torrent_batches where id=2") == [
+            {"state": "source_absent", "source_present": 0}
+        ]
+        assert _rows(db, "select state,reason from resource_reservations where batch_id=2") == [
+            {"state": "released", "reason": "batch_source_absent"}
+        ]
+        assert _rows(db, "select state,released_at from batch_file_claims where batch_id=2") == [
+            {"state": "released", "released_at": 50}
+        ]
+
+
+def test_batch_observation_lazily_backfills_legacy_file_claims_without_reviving_expired_reservation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,created_at,updated_at) "
+            "values(3,'legacy',1,'downloading','pipeline','[2,4]',100,80,1,1)"
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,released_at,reason) "
+            "values('legacy',3,'batch',80,'expired',1,10,10,'reservation_expired')"
+        )
+        con.commit()
+        con.close()
+        service = FileBatchService(db, dry_run=False, reservation_ttl_sec=100, now=lambda: 50)
+
+        assert service.reconcile_batch_observation(3, observed_progress_bytes=20, source_present=True) == "renewed"
+
+        assert _rows(db, "select file_index,state from batch_file_claims where batch_id=3 order by file_index") == [
+            {"file_index": 2, "state": "active"},
+            {"file_index": 4, "state": "active"},
+        ]
+        assert _rows(db, "select state,released_at,reason from resource_reservations where batch_id=3") == [
+            {"state": "expired", "released_at": 10, "reason": "reservation_expired"}
+        ]
+
+
+def test_batch_reservation_charges_piece_spill_per_selected_extent():
+    from qbt_orchestrator.policies.batching import compute_batch_reservation
+
+    mib = 1024**2
+    reservation = compute_batch_reservation(
+        [{"remaining_bytes": 100}, {"remaining_bytes": 200}],
+        piece_size=16 * mib,
+        filesystem_slack=0,
+        selected_extents=2,
+    )
+
+    assert reservation.payload_bytes == 300
+    assert reservation.piece_spill_overhead_bytes == 64 * mib
+    assert reservation.reserved_bytes == 300 + 64 * mib
+
+
 def test_file_batch_service_enqueues_completed_managed_torrent_once_with_vps_path_mapping():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
@@ -487,6 +635,13 @@ def test_file_batch_service_creates_pipeline_batch_with_reservation_and_file_pri
             "expires_at": 13_600,
             "data": {"batch_id": 1},
         }
+        assert _rows(
+            db,
+            "select batch_id,hash,file_index,state from batch_file_claims order by file_index",
+        ) == [
+            {"batch_id": 1, "hash": "big", "file_index": 0, "state": "active"},
+            {"batch_id": 1, "hash": "big", "file_index": 1, "state": "active"},
+        ]
 
 
 def test_file_batch_service_blocks_pipeline_batch_when_reservation_budget_is_insufficient():
@@ -1147,6 +1302,9 @@ def test_file_batch_service_reconciles_stopped_cooldown_batch_by_releasing_reser
             ("stale", 7, "batch", gib, "active", 900, 4600, "batch_pipeline_reserved"),
         )
         con.execute(
+            "insert into batch_file_claims(batch_id,hash,file_index,state,created_at) values(7,'stale',0,'active',900)"
+        )
+        con.execute(
             "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) values(?,?,?,?,?,?)",
             ("stale", "soak_cooldown", "soak_cooldown", "soak_cooldown", 900, "active_slow_3min"),
         )
@@ -1163,12 +1321,60 @@ def test_file_batch_service_reconciles_stopped_cooldown_batch_by_releasing_reser
         assert result.batches_created == 0
         assert result.batches_blocked == 1
         assert not any(call[0] == "/api/v2/torrents/start" for call in qbt.calls)
+        assert ("/api/v2/torrents/filePrio", {"hash": "stale", "id": "0", "priority": "0"}) in qbt.calls
         batch = _rows(db, "select state,updated_at from torrent_batches where id=7")[0]
         assert batch == {"state": "paused_by_planner", "updated_at": 1_000}
         reservation = _rows(db, "select state,released_at,reason from resource_reservations where batch_id=7 and kind='batch'")[0]
         assert reservation == {"state": "released", "released_at": 1_000, "reason": "batch_reconcile_planner_stopped"}
+        assert _rows(db, "select state,released_at from batch_file_claims where batch_id=7") == [
+            {"state": "released", "released_at": 1_000}
+        ]
         decision = _rows(db, "select decision,reason_code from decision_log where component='file_batch' and hash='stale' order by id desc limit 1")[0]
         assert decision == {"decision": "batch_reconciled", "reason_code": "planner_stopped_batch"}
+
+
+def test_batch_pause_keeps_claim_and_reservation_when_priority_reset_fails():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,lease_until,created_at,updated_at) "
+            "values(9,'reset-fail',1,'downloading','pipeline','[0]',4600,900,900)"
+        )
+        con.execute(
+            "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) "
+            "values('reset-fail',9,'batch',?,'active',900,4600,'batch_pipeline_reserved')",
+            (gib,),
+        )
+        con.execute(
+            "insert into batch_file_claims(batch_id,hash,file_index,state,created_at) values(9,'reset-fail',0,'active',900)"
+        )
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) "
+            "values('reset-fail','soak_cooldown','soak_cooldown','soak_cooldown',900,'cooldown')"
+        )
+        con.commit()
+        con.close()
+        qbt = BatchQbt(
+            [{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.4, "priority": 1}],
+            fail_on_post=True,
+        )
+        service = FileBatchService(db, dry_run=False, qbt=qbt, disk_floor_bytes=2 * gib, now=lambda: 1_000)
+
+        service.sync_completed(
+            {"reset-fail": {"hash": "reset-fail", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 3 * gib, "size": 5 * gib, "progress": 0.4}},
+            free_bytes=6 * gib,
+            sync_healthy=True,
+        )
+
+        assert _rows(db, "select state from torrent_batches where id=9") == [{"state": "downloading"}]
+        assert _rows(db, "select state from resource_reservations where batch_id=9 and kind='batch'") == [{"state": "active"}]
+        assert _rows(db, "select state from batch_file_claims where batch_id=9") == [{"state": "active"}]
 
 
 def test_file_batch_service_reconciles_stopped_cooldown_batch_even_after_reservation_expired():

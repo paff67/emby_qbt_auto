@@ -43,14 +43,23 @@ class SQLiteMaintenanceService:
         self.journal_size_limit_bytes = int(journal_size_limit_bytes)
         self.preferences_guard = preferences_guard
 
-    def run_once(self) -> dict:
+    def run_once(self, present_hashes: set[str] | None = None) -> dict:
         cutoff = int(self.now()) - self.retention_days * 86400
         deleted: dict[str, int] = {}
+        batch_sources_absent = [0]
+        batch_suspect_expired = [0]
         def txn(con: sqlite3.Connection) -> int:
             con.execute("pragma busy_timeout=5000")
             con.execute(f"pragma journal_size_limit={self.journal_size_limit_bytes}")
             for table in RETENTION_TABLES:
                 deleted[table] = self._delete_old_rows(con, table, cutoff)
+            if present_hashes is not None:
+                batch_sources_absent[0] = self._reconcile_absent_batch_sources(
+                    con,
+                    {str(value) for value in present_hashes},
+                    int(self.now()),
+                )
+            batch_suspect_expired[0] = self._mark_suspect_expired_batches(con, int(self.now()))
             reservations_expired[0] = self._expire_resource_reservations(con, int(self.now()))
             journal_size_limit = int(con.execute("pragma journal_size_limit").fetchone()[0])
             return journal_size_limit
@@ -66,6 +75,8 @@ class SQLiteMaintenanceService:
             "wal_checkpoint": checkpoint,
             "journal_size_limit_bytes": journal_size_limit,
             "reservations_expired": reservations_expired[0],
+            "batch_sources_absent": batch_sources_absent[0],
+            "batch_suspect_expired": batch_suspect_expired[0],
         }
         if self.preferences_guard is not None:
             result["qbt_preferences"] = self.preferences_guard.reconcile()
@@ -87,7 +98,7 @@ class SQLiteMaintenanceService:
             dict(r)
             for r in con.execute(
                 "select id,hash,kind,bytes,expires_at from resource_reservations "
-                "where state='active' and expires_at is not null and expires_at<=?",
+                "where state='active' and coalesce(kind,'')!='batch' and expires_at is not null and expires_at<=?",
                 (now,),
             ).fetchall()
         ]
@@ -111,4 +122,72 @@ class SQLiteMaintenanceService:
                 json.dumps(redact(data), ensure_ascii=False),
             ),
         )
+        return len(ids)
+
+    @staticmethod
+    def _reconcile_absent_batch_sources(
+        con: sqlite3.Connection,
+        present_hashes: set[str],
+        now: int,
+    ) -> int:
+        states = ("reserved", "applied_to_qbt", "downloading", "suspect_expired")
+        placeholders = ",".join("?" for _ in states)
+        rows = con.execute(
+            f"select id,hash from torrent_batches where state in ({placeholders})",
+            states,
+        ).fetchall()
+        absent = [(int(row["id"]), str(row["hash"] or "")) for row in rows if str(row["hash"] or "") not in present_hashes]
+        if not absent:
+            return 0
+        ids = [batch_id for batch_id, _hash in absent]
+        id_placeholders = ",".join("?" for _ in ids)
+        con.execute(
+            f"update torrent_batches set state='source_absent',source_present=0,updated_at=? where id in ({id_placeholders})",
+            (now, *ids),
+        )
+        con.execute(
+            f"update resource_reservations set state='released',released_at=?,last_observed_at=?,reason='batch_source_absent' "
+            f"where kind='batch' and state='active' and batch_id in ({id_placeholders})",
+            (now, now, *ids),
+        )
+        con.execute(
+            f"update batch_file_claims set state='released',released_at=? where state='active' and batch_id in ({id_placeholders})",
+            (now, *ids),
+        )
+        hashes = sorted({torrent_hash for _batch_id, torrent_hash in absent if torrent_hash})
+        if hashes:
+            hash_placeholders = ",".join("?" for _ in hashes)
+            con.execute(
+                f"delete from scheduler_intents where component='batch' and hash in ({hash_placeholders})",
+                hashes,
+            )
+        return len(ids)
+
+    @staticmethod
+    def _mark_suspect_expired_batches(con: sqlite3.Connection, now: int) -> int:
+        rows = con.execute(
+            "select id,hash from torrent_batches where state in ('reserved','applied_to_qbt','downloading') "
+            "and source_present=1 and lease_until is not null and lease_until<=?",
+            (now,),
+        ).fetchall()
+        if not rows:
+            return 0
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        con.execute(
+            f"update torrent_batches set state='suspect_expired',updated_at=? where id in ({placeholders})",
+            (now, *ids),
+        )
+        con.execute(
+            f"update resource_reservations set state='active',expires_at=null,released_at=null,last_observed_at=?,"
+            f"reason='batch_suspect_expired' where kind='batch' and state='active' and batch_id in ({placeholders})",
+            (now, *ids),
+        )
+        hashes = sorted({str(row["hash"] or "") for row in rows if str(row["hash"] or "")})
+        if hashes:
+            hash_placeholders = ",".join("?" for _ in hashes)
+            con.execute(
+                f"delete from scheduler_intents where component='batch' and hash in ({hash_placeholders})",
+                hashes,
+            )
         return len(ids)
