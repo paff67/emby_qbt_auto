@@ -66,7 +66,7 @@ Major modified files:
 - Test: `tests/test_file_batch_service.py`
 - Test: `tests/test_daemon_runtime.py`
 
-- [ ] **Step 1: Write a failing test proving insufficient global budget makes zero heavy qBT calls**
+- [x] **Step 1: Write a failing test proving insufficient global budget makes zero heavy qBT calls**
 
 ```python
 def test_file_batch_skips_all_inventory_calls_when_global_budget_is_below_minimum(db):
@@ -91,13 +91,13 @@ def test_file_batch_skips_all_inventory_calls_when_global_budget_is_below_minimu
     assert result.blocked_reasons == {"mode_disallows_batch": 1}
 ```
 
-- [ ] **Step 2: Run the test and confirm it fails**
+- [x] **Step 2: Run the test and confirm it fails**
 
 Run: `python -m pytest tests/test_file_batch_service.py::test_file_batch_skips_all_inventory_calls_when_global_budget_is_below_minimum -v`
 
 Expected: FAIL because `scheduler_mode` and `blocked_reasons` do not exist and qBT inventory is called.
 
-- [ ] **Step 3: Add the fast gate**
+- [x] **Step 3: Add the fast gate**
 
 ```python
 @dataclass(frozen=True)
@@ -122,7 +122,7 @@ def _batch_admission_allowed(self, free_bytes: int, scheduler_mode: str) -> tupl
 
 Call this once at the start of `sync_completed()`. Continue scanning completed full torrents for disk-releasing uploads, but skip `_maybe_create_pipeline_batch()` for incomplete torrents when admission is false.
 
-- [ ] **Step 4: Add a daemon test proving the Safety thread is not delayed by batch inventory when drain mode is active**
+- [x] **Step 4: Add a daemon test proving the Safety thread is not delayed by batch inventory when drain mode is active**
 
 ```python
 def test_daemon_drain_file_batch_does_not_call_torrent_files(db):
@@ -133,7 +133,7 @@ def test_daemon_drain_file_batch_does_not_call_torrent_files(db):
     assert result["batches_blocked"] >= 1
 ```
 
-- [ ] **Step 5: Run focused and full tests**
+- [x] **Step 5: Run focused and full tests**
 
 Run:
 
@@ -144,7 +144,7 @@ python -m pytest -q
 
 Expected: all tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/qbt_orchestrator/file_batch.py src/qbt_orchestrator/service.py tests/test_file_batch_service.py tests/test_daemon_runtime.py
@@ -158,7 +158,7 @@ git commit -m "fix: short-circuit batch inventory under disk pressure"
 - Modify: `src/qbt_orchestrator/db.py`
 - Test: `tests/test_daemon_runtime.py`
 
-- [ ] **Step 1: Write a failing test for duration and overrun recording**
+- [x] **Step 1: Write a failing test for duration and overrun recording**
 
 ```python
 def test_loop_task_records_duration_and_deadline_miss(db):
@@ -172,13 +172,13 @@ def test_loop_task_records_duration_and_deadline_miss(db):
     assert row["deadline_missed"] is True
 ```
 
-- [ ] **Step 2: Run the test and confirm it fails**
+- [x] **Step 2: Run the test and confirm it fails**
 
 Run: `python -m pytest tests/test_daemon_runtime.py::test_loop_task_records_duration_and_deadline_miss -v`
 
 Expected: FAIL because `max_runtime_sec` and loop runtime metrics are absent.
 
-- [ ] **Step 3: Implement bounded metrics**
+- [x] **Step 3: Implement bounded metrics**
 
 ```python
 @dataclass
@@ -202,7 +202,7 @@ def _loop_metric(self, task: LoopTask, duration: float) -> None:
 
 Set limits: planner 2s, file_batch 5s, maintenance 5s, carousel 2s. Do not insert one metric per Safety tick; keep a rolling aggregate row or one sample per minute.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_daemon_runtime.py -q
@@ -223,7 +223,7 @@ git commit -m "feat: record scheduler deadline misses"
 - Test: `tests/test_snapshot_store.py`
 - Test: `tests/test_new_system_behaviors.py`
 
-- [ ] **Step 1: Write the regression test reproducing the current category/size loss**
+- [x] **Step 1: Write the regression test reproducing the current category/size loss**
 
 ```python
 def test_partial_delta_preserves_unchanged_torrent_fields():
@@ -237,13 +237,13 @@ def test_partial_delta_preserves_unchanged_torrent_fields():
     assert snap.dlspeed_bps == 123
 ```
 
-- [ ] **Step 2: Run and confirm failure**
+- [x] **Step 2: Run and confirm failure**
 
 Run: `python -m pytest tests/test_snapshot_store.py::test_partial_delta_preserves_unchanged_torrent_fields -v`
 
 Expected: FAIL because `TorrentRawSnapshotStore` does not exist.
 
-- [ ] **Step 3: Implement the raw merge store**
+- [x] **Step 3: Implement the raw merge store**
 
 ```python
 class TorrentRawSnapshotStore:
@@ -270,7 +270,7 @@ class TorrentRawSnapshotStore:
 
 Update `QbtSyncCache.poll_once()` to call `replace_full()` or `apply_delta()` and then publish snapshots.
 
-- [ ] **Step 4: Test removal, full replacement, and suspect-full behavior**
+- [x] **Step 4: Test removal, full replacement, and suspect-full behavior**
 
 Add tests proving:
 
@@ -280,7 +280,7 @@ assert store.replace_full({"new": {"size": 1}}) is None
 assert set(store.snapshots()) == {"new"}
 ```
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_snapshot_store.py tests/test_new_system_behaviors.py -q
@@ -298,7 +298,7 @@ git commit -m "fix: merge qbt partial sync deltas"
 - Test: `tests/test_runtime_integrations.py`
 - Test: `tests/test_cli_observability.py`
 
-- [ ] **Step 1: Write a failing session test**
+- [x] **Step 1: Write a failing session test**
 
 ```python
 def test_qbt_sync_session_reuses_sid_and_observes_delta():
@@ -316,7 +316,7 @@ def test_qbt_sync_session_reuses_sid_and_observes_delta():
     assert transport.request_cookies == ["SID=abc", "SID=abc"]
 ```
 
-- [ ] **Step 2: Add sync-session health tracking**
+- [x] **Step 2: Add sync-session health tracking**
 
 ```python
 @dataclass
@@ -336,7 +336,7 @@ class SyncSessionStats:
 
 After three consecutive full updates with nonzero previous rid, emit `sync_session_degraded`. If credentials/session are unavailable, keep correctness by accepting full snapshots but increase sync interval to a configured degraded interval rather than claiming delta operation.
 
-- [ ] **Step 3: Add explicit configuration**
+- [x] **Step 3: Add explicit configuration**
 
 ```text
 QBT_ORCH_QBT_AUTH_MODE=required
@@ -346,7 +346,7 @@ QBT_ORCH_SYNC_REPEATED_FULL_LIMIT=3
 
 Do not log username, password, SID or cookie values.
 
-- [ ] **Step 4: Make the token bucket thread-safe**
+- [x] **Step 4: Make the token bucket thread-safe**
 
 ```python
 class TokenBucket:
@@ -361,7 +361,7 @@ class TokenBucket:
 
 The lock must cover token calculation; release it while sleeping, then reacquire and recompute tokens to avoid blocking unrelated callers for the full sleep duration.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_runtime_integrations.py tests/test_cli_observability.py -q
@@ -384,7 +384,7 @@ git commit -m "fix: maintain qbt sync session and expose degradation"
 - Test: `tests/test_periodic_runtime.py`
 - Test: `tests/test_daemon_runtime.py`
 
-- [ ] **Step 1: Write a test proving a 40-second file batch cannot delay Safety**
+- [x] **Step 1: Write a test proving a 40-second file batch cannot delay Safety**
 
 ```python
 def test_blocking_inventory_worker_does_not_delay_safety_ticks():
@@ -400,7 +400,7 @@ def test_blocking_inventory_worker_does_not_delay_safety_ticks():
     assert safety.call_times == [0, 2, 4, 6, 8, 10]
 ```
 
-- [ ] **Step 2: Implement fixed-rate scheduling**
+- [x] **Step 2: Implement fixed-rate scheduling**
 
 ```python
 @dataclass(frozen=True)
@@ -424,7 +424,7 @@ class PeriodicWorker:
 
 Missed periods are skipped, not replayed in a burst.
 
-- [ ] **Step 3: Separate workers**
+- [x] **Step 3: Separate workers**
 
 Create worker groups:
 
@@ -437,7 +437,7 @@ Create worker groups:
 
 All workers read a copied immutable snapshot from `TorrentRawSnapshotStore`; no worker directly mutates the shared dict.
 
-- [ ] **Step 4: Serialize qBT writes with emergency priority**
+- [x] **Step 4: Serialize qBT writes with emergency priority**
 
 ```python
 class ActionPriority(IntEnum):
@@ -455,7 +455,7 @@ class DispatchedAction:
 
 Emergency stop bypasses normal queue backlog by priority but still uses the same single qBT write dispatcher.
 
-- [ ] **Step 5: Run concurrency tests**
+- [x] **Step 5: Run concurrency tests**
 
 Run:
 
@@ -466,7 +466,7 @@ python -m pytest -q
 
 Expected: Safety cadence remains correct while inventory and maintenance block.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/qbt_orchestrator/periodic.py src/qbt_orchestrator/action_dispatcher.py src/qbt_orchestrator/service.py src/qbt_orchestrator/executor.py tests/test_periodic_runtime.py tests/test_daemon_runtime.py
@@ -486,7 +486,7 @@ git commit -m "refactor: isolate safety from periodic workers"
 - Test: `tests/test_db_actor_full_write_queue.py`
 - Test: `tests/test_download_planner.py`
 
-- [ ] **Step 1: Write a test proving one connection serves multiple transactions**
+- [x] **Step 1: Write a test proving one connection serves multiple transactions**
 
 ```python
 def test_sync_write_actor_reuses_one_connection(db, monkeypatch):
@@ -498,11 +498,11 @@ def test_sync_write_actor_reuses_one_connection(db, monkeypatch):
     assert len(opened) == 1
 ```
 
-- [ ] **Step 2: Refactor `_SyncWriteActor._run()`**
+- [x] **Step 2: Refactor `_SyncWriteActor._run()`**
 
 Open the connection once before the worker loop, set WAL/busy timeout once, use `commit()`/`rollback()` per transaction, and close in `finally` when the actor stops.
 
-- [ ] **Step 3: Add one atomic planner commit API**
+- [x] **Step 3: Add one atomic planner commit API**
 
 ```python
 @dataclass(frozen=True)
@@ -524,7 +524,7 @@ def persist_planner_batch(state_db: Path, batch: PlannerPersistenceBatch) -> Non
 
 Replace per-hash `_allocation()` and `_decision()` writes inside the planner loop with in-memory collection followed by one commit.
 
-- [ ] **Step 4: Add a test bounding planner write transactions**
+- [x] **Step 4: Add a test bounding planner write transactions**
 
 ```python
 def test_planner_uses_at_most_two_write_transactions_for_one_tick(db, write_counter):
@@ -533,7 +533,7 @@ def test_planner_uses_at_most_two_write_transactions_for_one_tick(db, write_coun
     assert write_counter.count <= 2
 ```
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_db_actor_full_write_queue.py tests/test_download_planner.py tests/test_soak_queue.py -q
@@ -555,7 +555,7 @@ git commit -m "perf: batch scheduler sqlite writes"
 - Modify: `src/qbt_orchestrator/service.py`
 - Test: `tests/test_production_invariants.py`
 
-- [ ] **Step 1: Add schema and failing transition test**
+- [x] **Step 1: Add schema and failing transition test**
 
 ```sql
 create table if not exists decision_state(
@@ -581,7 +581,7 @@ def test_same_decision_is_logged_once_until_transition(db):
     assert count_decisions(db) == 2
 ```
 
-- [ ] **Step 2: Implement stable fingerprinting**
+- [x] **Step 2: Implement stable fingerprinting**
 
 ```python
 def stable_fingerprint(data: Mapping[str, Any], ignored: set[str] = frozenset({"progress", "free_bytes", "budget_bytes"})) -> str:
@@ -589,7 +589,7 @@ def stable_fingerprint(data: Mapping[str, Any], ignored: set[str] = frozenset({"
     return hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 ```
 
-- [ ] **Step 3: Replace per-torrent repeated blocks with one aggregate metric**
+- [x] **Step 3: Replace per-torrent repeated blocks with one aggregate metric**
 
 For file batch and observe promotion, write one `metrics_snapshots` row per loop:
 
@@ -599,11 +599,11 @@ For file batch and observe promotion, write one `metrics_snapshots` row per loop
 
 Keep at most three sample hashes and write individual events only on state transition.
 
-- [ ] **Step 4: Extend retention**
+- [x] **Step 4: Extend retention**
 
 Add `junk_janitor_events` to bounded retention and delete in batches using its indexed `ts` column.
 
-- [ ] **Step 5: Run a virtual 24-hour test**
+- [x] **Step 5: Run a virtual 24-hour test**
 
 ```python
 def test_unchanged_100_torrent_day_produces_bounded_log_rows(db):
@@ -612,7 +612,7 @@ def test_unchanged_100_torrent_day_produces_bounded_log_rows(db):
     assert table_count(db, "metrics_snapshots") <= 8000
 ```
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_production_invariants.py tests/test_maintenance.py -q
@@ -634,7 +634,7 @@ git commit -m "perf: log scheduler transitions instead of repeated decisions"
 - Modify: `src/qbt_orchestrator/file_batch.py`
 - Test: `tests/test_budget_engine.py`
 
-- [ ] **Step 1: Add schema columns**
+- [x] **Step 1: Add schema columns**
 
 ```sql
 alter table resource_reservations add column accounting_class text not null default 'future_growth';
@@ -646,7 +646,7 @@ update resource_reservations set accounting_class='current_pinned' where kind='c
 
 Migration must tolerate columns already existing.
 
-- [ ] **Step 2: Write the double-count regression test**
+- [x] **Step 2: Write the double-count regression test**
 
 ```python
 def test_current_pinned_inventory_is_not_subtracted_from_df_free():
@@ -659,7 +659,7 @@ def test_current_pinned_inventory_is_not_subtracted_from_df_free():
     assert budget.current_pinned_bytes == 5 * GIB
 ```
 
-- [ ] **Step 3: Implement the budget types**
+- [x] **Step 3: Implement the budget types**
 
 ```python
 class AccountingClass(str, Enum):
@@ -685,7 +685,7 @@ class GrowthBudget:
 
 Preserve existing same-hash overlap rule only among future-growth `active_download` and `batch` claims.
 
-- [ ] **Step 4: Add dynamic guard**
+- [x] **Step 4: Add dynamic guard**
 
 ```python
 def dynamic_guard_bytes(
@@ -702,7 +702,7 @@ def dynamic_guard_bytes(
 
 If metrics are absent, use a configured conservative ingress rate rather than zero.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_budget_engine.py tests/test_runtime_repositories.py tests/test_file_batch_service.py -q
@@ -720,7 +720,7 @@ git commit -m "feat: separate future growth and pinned inventory accounting"
 - Modify: `src/qbt_orchestrator/alerts.py`
 - Test: `tests/test_capacity_state.py`
 
-- [ ] **Step 1: Add persistent state**
+- [x] **Step 1: Add persistent state**
 
 ```sql
 create table if not exists capacity_state(
@@ -734,7 +734,7 @@ create table if not exists capacity_state(
 );
 ```
 
-- [ ] **Step 2: Write hysteresis and deadlock tests**
+- [x] **Step 2: Write hysteresis and deadlock tests**
 
 ```python
 def test_drain_mode_requires_exit_watermark_to_recover():
@@ -749,7 +749,7 @@ def test_capacity_deadlock_never_creates_delete_or_hold_actions():
     assert result.actions == []
 ```
 
-- [ ] **Step 3: Implement deadlock detection**
+- [x] **Step 3: Implement deadlock detection**
 
 ```python
 def detect_capacity_state(*, mode: str, managed_incomplete: int, feasible_full_finish: int, disk_releasing_jobs: int) -> CapacityResult:
@@ -760,11 +760,11 @@ def detect_capacity_state(*, mode: str, managed_incomplete: int, feasible_full_f
 
 On transition into deadlock, enqueue one deduplicated Telegram notification containing only counts, required minimum growth and top manual candidates. Do not enqueue cleanup/delete/config commands.
 
-- [ ] **Step 4: Add startup effective-config snapshot**
+- [x] **Step 4: Add startup effective-config snapshot**
 
 Write a redacted event containing resolved thresholds and feature flags so live behavior can be audited without reading the root-only environment file.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_capacity_state.py tests/test_daemon_runtime.py -q
@@ -787,7 +787,7 @@ git commit -m "feat: detect capacity deadlock without automatic cleanup"
 - Test: `tests/test_scheduler_engine.py`
 - Test: `tests/test_download_planner.py`
 
-- [ ] **Step 1: Define work item types**
+- [x] **Step 1: Define work item types**
 
 ```python
 class WorkKind(str, Enum):
@@ -810,7 +810,7 @@ class WorkItem:
     hold: bool = False
 ```
 
-- [ ] **Step 2: Write selection tests**
+- [x] **Step 2: Write selection tests**
 
 ```python
 def test_drain_selects_finish_and_release_work_not_probe_or_batch():
@@ -827,7 +827,7 @@ def test_hold_is_never_selected_automatically():
     assert SchedulerEngine().select([item], "normal", 10*GIB, 5).selected == []
 ```
 
-- [ ] **Step 3: Implement deterministic bounded DP**
+- [x] **Step 3: Implement deterministic bounded DP**
 
 Use 64 MiB capacity units and state `(used_slots, used_units)`. Utility must be deterministic:
 
@@ -842,7 +842,7 @@ def utility(item: WorkItem) -> int:
 
 Tie-break by lower growth bytes, then stable hash. In drain mode filter to `FULL_FINISH`. In emergency mode select nothing.
 
-- [ ] **Step 4: Build candidates from snapshots**
+- [x] **Step 4: Build candidates from snapshots**
 
 For `FULL_FINISH`:
 
@@ -853,7 +853,7 @@ releasable_bytes = current_local_bytes + amount_left only when remote verify and
 
 Use `completed_bytes` as conservative current-local estimate until file inventory provides a better figure.
 
-- [ ] **Step 5: Add shadow mode**
+- [x] **Step 5: Add shadow mode**
 
 ```text
 QBT_ORCH_SCHEDULER_ENGINE=legacy|shadow|live
@@ -861,7 +861,7 @@ QBT_ORCH_SCHEDULER_ENGINE=legacy|shadow|live
 
 `shadow` computes and persists comparison metrics but applies only the legacy plan. Record selected hash differences, budget differences and unsafe-plan rejection counts.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_scheduler_engine.py tests/test_download_planner.py tests/test_daemon_runtime.py -q
@@ -1455,7 +1455,7 @@ Implemented verification: production invariant suite `8 passed` in 11.7 seconds;
 - Modify: `deploy/scripts/run-dry-run.sh`
 - Modify: `deploy/scripts/rollback.sh`
 
-- [ ] **Step 1: Define feature flags**
+- [x] **Step 1: Define feature flags**
 
 ```text
 QBT_ORCH_SCHEDULER_ENGINE=legacy
@@ -1466,7 +1466,7 @@ QBT_ORCH_UPLOAD_PHASES_V2=0
 QBT_ORCH_CAPACITY_DEADLOCK_ALERTS=1
 ```
 
-- [ ] **Step 2: Document staged rollout**
+- [x] **Step 2: Document staged rollout**
 
 Stages:
 
@@ -1480,11 +1480,11 @@ Stages:
 8. Enable soak/batch v2 only after planner metrics remain healthy.
 9. Enable upload phases v2 after copy/verify shadow comparison succeeds.
 
-- [ ] **Step 3: Define rollback checks**
+- [x] **Step 3: Define rollback checks**
 
 Rollback switches `QBT_ORCH_SCHEDULER_ENGINE=legacy` and disables new worker/ledger flags. Schema additions remain additive; no downgrade migration or state deletion is required.
 
-- [ ] **Step 4: Add release acceptance commands**
+- [x] **Step 4: Add release acceptance commands**
 
 ```bash
 python -m pytest -q
@@ -1500,12 +1500,24 @@ Expected:
 - once dry-run emits no qBT delete or filesystem mutation action;
 - status includes loop deadlines, sync full/delta counts, future-growth budget, pinned inventory and capacity state.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add deploy/systemd/qbt-orchestrator-daemon.env.example docs/operations/scheduler-v3-rollout.md deploy/scripts/run-dry-run.sh deploy/scripts/rollback.sh
 git commit -m "docs: add scheduler v3 rollout and rollback gates"
 ```
+
+**Final verification record (2026-07-11):**
+
+- `python -m pytest -q`: 316 passed; one upstream `pytest-asyncio` deprecation warning only.
+- `python -m compileall -q src tests`: passed.
+- Git Bash `bash -n deploy/scripts/run-dry-run.sh deploy/scripts/rollback.sh`: passed.
+- Environment example: 128 distinct keys; no duplicate assignments.
+- Rollback audit: retains additive SQLite state and performs no state deletion.
+- Destructive-action audit: the only qBT delete call remains inside the guarded `FullTorrentCleanupRunner`; automatic full cleanup is disabled and dry-run by default.
+- Workspace audit: no generated database, cache, log, backup, or temporary verification artifact is included.
+
+Implementation notes: the env example starts with legacy scheduler, exploratory/full-cleanup features off or dry-run, inventory limit 8, and deadlock alerts on. Reserved ledger/lease/upload markers are documented as rollout bookkeeping rather than downgrade switches because migrations remain additive. The dry-run gate uses a temporary SQLite DB, a finite three-tick daemon, status/trace inspection, and a destructive-action scan. Rollback backs up env, forces legacy/dry-run/off switches, optionally repoints the release symlink, retains SQLite state, and enables the legacy timer.
 
 ---
 
