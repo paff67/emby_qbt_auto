@@ -20,6 +20,10 @@ def _rows(db: Path, sql: str):
     return rows
 
 
+def _job_count(db: Path, job_type: str) -> int:
+    return int(_rows(db, f"select count(*) as count from torrent_jobs where job_type='{job_type}'")[0]["count"])
+
+
 def test_observability_store_persists_redacted_events_actions_and_trace():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import ObservabilityStore
@@ -52,10 +56,97 @@ def test_upload_job_runner_claims_job_updates_done_and_verify_pending():
 
         runner = UploadJobRunner(repo, FakeRclone(copy_ok=True, remote_sizes={"gcrypt:/A/a.mp4": 100, "gcrypt:/B/b.mp4": 99}), FakeExecutor())
         assert runner.run_next() == good
-        assert repo.get(good)["state"] == "done"
+        assert repo.get(good)["state"] == "cleanup_wait"
+        assert _job_count(db, "cleanup_full_torrent") == 1
         assert runner.run_next() == bad
         assert repo.get(bad)["state"] == "verify_pending"
         assert repo.get(bad)["last_stderr_tail"] == "remote size mismatch"
+
+
+def test_upload_phase_schema_and_verify_retry_does_not_repeat_copy_or_delete():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor
+
+    class RetryVerifyRclone:
+        def __init__(self):
+            self.copy_calls = 0
+            self.verify_calls = 0
+            self.verify_sizes = [99, 100]
+
+        def copyto(self, local, remote):
+            self.copy_calls += 1
+            return True
+
+        def lsjson_size(self, remote):
+            self.verify_calls += 1
+            return self.verify_sizes.pop(0)
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        columns = {row[1] for row in con.execute("pragma table_info(torrent_jobs)")}
+        con.close()
+        assert {"phase", "copy_completed_at", "verification_method", "verification_result_json", "verified_at", "parent_job_id"} <= columns
+
+        repo = TorrentJobRepository(db, now=lambda: 1_000)
+        upload_id = repo.enqueue(
+            "h1",
+            None,
+            "upload",
+            {"local": "/tmp/a.mp4", "remote": "gcrypt:/A/a.mp4", "size": 100, "full_torrent": True},
+            priority=1,
+        )
+        rclone = RetryVerifyRclone()
+        executor = FakeExecutor()
+        runner = UploadJobRunner(repo, rclone, executor)
+
+        assert repo.get(upload_id)["phase"] == "queued_copy"
+        assert runner.run_next() == upload_id
+        first = repo.get(upload_id)
+        assert first["state"] == "verify_pending"
+        assert first["phase"] == "verifying"
+        assert first["copy_completed_at"] == 1_000
+        assert _job_count(db, "cleanup_full_torrent") == 0
+
+        assert runner.run_next() == upload_id
+        second = repo.get(upload_id)
+        assert second["state"] == "cleanup_wait"
+        assert second["phase"] == "cleanup_wait"
+        assert second["verification_method"] == "single_size"
+        assert json.loads(second["verification_result_json"]) == {"mismatches": [], "verified": True}
+        assert second["verified_at"] == 1_000
+        assert rclone.copy_calls == 1
+        assert rclone.verify_calls == 2
+        assert executor.posts == []
+        assert _job_count(db, "cleanup_full_torrent") == 1
+        from qbt_orchestrator.service import DaemonRuntime
+
+        runtime = object.__new__(DaemonRuntime)
+        runtime.state_db = db
+        assert runtime._disk_releasing_job_count() == 1
+
+
+def test_migration_backfills_legacy_verify_pending_phase_without_recopying():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state,phase,payload_json,created_at,updated_at) "
+            "values('legacy','upload','verify_pending',null,'{}',1,1)"
+        )
+        con.commit()
+        con.close()
+
+        migrate(db, dry_run=False)
+
+        assert _rows(db, "select state,phase from torrent_jobs where hash='legacy'") == [
+            {"state": "verify_pending", "phase": "verifying"}
+        ]
 
 
 def test_upload_verified_enqueues_media_pipeline_and_sidecar_upload_uses_upload_worker():
@@ -95,7 +186,8 @@ def test_upload_verified_enqueues_media_pipeline_and_sidecar_upload_uses_upload_
         )
 
         assert runner.run_next() == upload_id
-        assert repo.get(upload_id)["state"] == "done"
+        assert repo.get(upload_id)["state"] == "cleanup_wait"
+        assert _job_count(db, "cleanup_full_torrent") == 1
         media_job = repo.claim_next("media_pipeline")
         assert media_job is not None
         media_payload = json.loads(media_job["payload_json"])

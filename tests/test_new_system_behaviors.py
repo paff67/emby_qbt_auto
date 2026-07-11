@@ -268,6 +268,9 @@ def test_sqlite_migration_db_actor_readonly_and_job_recovery():
             return job_id
 
         job_id = asyncio.run(run_actor())
+        con = sqlite3.connect(db)
+        assert con.execute("select phase from torrent_jobs where id=?", (job_id,)).fetchone()[0] == "queued_copy"
+        con.close()
         assert job_id >= 1
         assert readonly_counts(db)["torrent_jobs"] == 1
         recovered = recover_jobs(db)
@@ -307,7 +310,7 @@ def test_daemon_safety_loop_only_uses_allowed_operations_and_pauses_below_floor(
     assert qbt.heavy_calls == []
 
 
-def test_rclone_upload_worker_verify_failure_does_not_cleanup_and_success_full_allows_delete():
+def test_rclone_upload_worker_verify_failure_blocks_cleanup_and_success_returns_cleanup_intent():
     from qbt_orchestrator.upload import RcloneUploadWorker, UploadJob
     from tests.fakes import FakeExecutor, FakeRclone
 
@@ -319,8 +322,9 @@ def test_rclone_upload_worker_verify_failure_does_not_cleanup_and_success_full_a
     executor = FakeExecutor()
     ok = RcloneUploadWorker(FakeRclone(copy_ok=True, remote_sizes={"gcrypt:/A/a.mp4": 100}), executor)
     result = ok.run_once(UploadJob(hash="h1", batch_id=1, local="/tmp/a.mp4", remote="gcrypt:/A/a.mp4", size=100, full_torrent=True))
-    assert result.state == "done"
-    assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
+    assert result.state == "cleanup_wait"
+    assert result.cleanup_allowed is True
+    assert executor.posts == []
 
 
 def test_rclone_upload_worker_directory_manifest_verify_gates_cleanup():
@@ -353,10 +357,10 @@ def test_rclone_upload_worker_directory_manifest_verify_gates_cleanup():
 
     result = ok.run_once(UploadJob(hash="h1", batch_id=1, local="/tmp/ABC", remote="gcrypt:/ABC", size=110, full_torrent=True, files=files))
 
-    assert result.state == "done"
+    assert result.state == "cleanup_wait"
     assert ok.rclone.copies == [("/tmp/ABC", "gcrypt:/ABC")]
     assert ok.rclone.copytos == []
-    assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
+    assert executor.posts == []
 
     bad_executor = FakeExecutor()
     bad = RcloneUploadWorker(
@@ -367,6 +371,32 @@ def test_rclone_upload_worker_directory_manifest_verify_gates_cleanup():
 
     assert bad_result.state == "verify_pending"
     assert bad_executor.posts == []
+
+
+def test_manifest_verification_prefers_compatible_hashes_and_rejects_extra_paths():
+    from qbt_orchestrator.integrations.rclone import verify_manifest_listing
+
+    expected_hash = [
+        {"relative_path": "A.mp4", "size": 100, "hashes": {"MD5": "abc"}},
+        {"relative_path": "extras/B.nfo", "size": 10, "hashes": {"MD5": "def"}},
+    ]
+    actual_hash = [
+        {"Path": "A.mp4", "Size": 100, "Hashes": {"MD5": "abc"}},
+        {"Path": "extras/B.nfo", "Size": 10, "Hashes": {"MD5": "def"}},
+    ]
+
+    hashed = verify_manifest_listing(expected_hash, actual_hash)
+    assert hashed.verified is True
+    assert hashed.method == "hash:md5"
+    assert hashed.mismatches == []
+
+    extra = verify_manifest_listing(
+        [{"relative_path": "A.mp4", "size": 100}],
+        [{"Path": "A.mp4", "Size": 100}, {"Path": "unexpected.txt", "Size": 1}],
+    )
+    assert extra.verified is False
+    assert extra.method == "path_size"
+    assert extra.mismatches == ["unexpected:unexpected.txt"]
 
 
 def test_rclone_upload_worker_single_file_manifest_uses_copyto():
@@ -401,11 +431,11 @@ def test_rclone_upload_worker_single_file_manifest_uses_copyto():
         )
     )
 
-    assert result.state == "done"
+    assert result.state == "cleanup_wait"
     assert worker.rclone.copytos == [("/tmp/A.mp4", "gcrypt:/A/A.mp4")]
     assert worker.rclone.copies == []
     assert worker.rclone.lsjson_calls == [("gcrypt:/A/A.mp4", False)]
-    assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
+    assert executor.posts == []
 
 
 def test_rclone_upload_worker_copy_files_copies_each_file_and_defers_cleanup_without_delete():
@@ -547,6 +577,3 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
-
-
-

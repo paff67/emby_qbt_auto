@@ -1118,10 +1118,12 @@ Implemented verification: focused batch/scheduler/CLI regression `63 passed`; fu
 - Modify: `src/qbt_orchestrator/runtime.py`
 - Modify: `src/qbt_orchestrator/upload.py`
 - Modify: `src/qbt_orchestrator/integrations/rclone.py`
+- Modify: `src/qbt_orchestrator/file_batch.py`
+- Modify: `src/qbt_orchestrator/service.py`
 - Test: `tests/test_runtime_repositories.py`
 - Test: `tests/test_new_system_behaviors.py`
 
-- [ ] **Step 1: Add upload phase and cleanup job types**
+- [x] **Step 1: Add upload phase and cleanup job types**
 
 ```sql
 alter table torrent_jobs add column phase text;
@@ -1135,7 +1137,7 @@ queued_copy → copying → copied → verifying → verified → cleanup_wait �
 
 Use a distinct `cleanup_full_torrent` job for destructive qBT deletion.
 
-- [ ] **Step 2: Test verify retry does not copy again**
+- [x] **Step 2: Test verify retry does not copy again**
 
 ```python
 def test_verify_retry_does_not_repeat_copy(db):
@@ -1147,7 +1149,7 @@ def test_verify_retry_does_not_repeat_copy(db):
     assert rclone.verify_calls == 2
 ```
 
-- [ ] **Step 3: Add manifest verification**
+- [x] **Step 3: Add manifest verification**
 
 ```python
 @dataclass(frozen=True)
@@ -1163,14 +1165,18 @@ def verify_manifest(self, files: list[dict[str, Any]], remote_root: str) -> Veri
 
 Persist the verification method and result. Cleanup cannot be enqueued unless verification is true.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 python -m pytest tests/test_runtime_repositories.py tests/test_new_system_behaviors.py -q
 python -m pytest -q
-git add src/qbt_orchestrator/db.py src/qbt_orchestrator/runtime.py src/qbt_orchestrator/upload.py src/qbt_orchestrator/integrations/rclone.py tests/test_runtime_repositories.py tests/test_new_system_behaviors.py
+git add src/qbt_orchestrator/db.py src/qbt_orchestrator/runtime.py src/qbt_orchestrator/upload.py src/qbt_orchestrator/integrations/rclone.py src/qbt_orchestrator/file_batch.py src/qbt_orchestrator/service.py tests/test_runtime_repositories.py tests/test_new_system_behaviors.py docs/
 git commit -m "refactor: separate upload copy verify and cleanup phases"
 ```
+
+Implementation notes: migration 8 adds durable phase/copy/verification fields plus an idempotent parent-child relation for `cleanup_full_torrent`. Both repository and DbActor upload entrypoints start at `queued_copy`; legacy `verify_pending` rows backfill to `verifying`. Copy completion is durable, so verification retries and verification exceptions never repeat copy. Manifest verification prefers one compatible backend hash across every expected file, otherwise requires an exact relative-path set and size match. Full-torrent verification only queues a dormant cleanup job; UploadWorker never calls qBT delete, and Task 16 owns cleanup policy/execution.
+
+Implemented verification: focused runtime/upload regression `45 passed`; full suite `307 passed`; `compileall`, `git diff --check`, and upload delete-call scan passed.
 
 ### Task 16: Enforce seed policy and make disk-releasing uploads highest priority
 

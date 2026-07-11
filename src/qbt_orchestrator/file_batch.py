@@ -1145,7 +1145,7 @@ class FileBatchService:
             con.close()
 
     def _inflight_batch_count(self, h: str) -> int:
-        states = ("reserved", "applied_to_qbt", "downloading", "suspect_expired", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_deferred")
+        states = ("reserved", "applied_to_qbt", "downloading", "suspect_expired", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_wait", "cleanup_deferred")
         placeholders = ",".join("?" for _ in states)
         con = _connect(self.state_db)
         try:
@@ -1166,7 +1166,7 @@ class FileBatchService:
             }
         finally:
             con.close()
-        states = ("reserved", "applied_to_qbt", "downloading", "suspect_expired", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_deferred")
+        states = ("reserved", "applied_to_qbt", "downloading", "suspect_expired", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_wait", "cleanup_deferred")
         placeholders = ",".join("?" for _ in states)
         con = _connect(self.state_db)
         try:

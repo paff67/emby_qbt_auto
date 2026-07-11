@@ -8,7 +8,7 @@ from typing import Any
 
 from .db import readonly_connect, write_transaction
 from .observability import redact
-from .upload import RcloneUploadWorker, UploadJob
+from .upload import RcloneUploadWorker, UploadJob, UploadResult
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -144,10 +144,34 @@ class TorrentJobRepository:
         self.state_db = Path(state_db)
         self.now = now or (lambda: int(time.time()))
 
-    def enqueue(self, hash: str | None, batch_id: int | None, job_type: str, payload: dict[str, Any], priority: int = 100) -> int:
+    def enqueue(
+        self,
+        hash: str | None,
+        batch_id: int | None,
+        job_type: str,
+        payload: dict[str, Any],
+        priority: int = 100,
+        parent_job_id: int | None = None,
+    ) -> int:
         now = int(self.now())
+        phase = "queued_copy" if job_type in {"upload", "sidecar_upload"} else None
         def txn(con: sqlite3.Connection) -> int:
-            cur = con.execute("insert into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?)", (hash, batch_id, job_type, "queued", priority, json.dumps(payload, ensure_ascii=False), now, now))
+            cur = con.execute(
+                "insert into torrent_jobs(hash,batch_id,job_type,state,phase,priority,payload_json,parent_job_id,created_at,updated_at) "
+                "values(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    hash,
+                    batch_id,
+                    job_type,
+                    "queued",
+                    phase,
+                    priority,
+                    json.dumps(payload, ensure_ascii=False),
+                    parent_job_id,
+                    now,
+                    now,
+                ),
+            )
             return int(cur.lastrowid)
 
         return int(write_transaction(self.state_db, txn))
@@ -208,6 +232,97 @@ class TorrentJobRepository:
             ),
         )
 
+    def set_phase(self, job_id: int, phase: str) -> None:
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update torrent_jobs set phase=?,updated_at=? where id=?",
+                (str(phase), int(self.now()), int(job_id)),
+            ),
+        )
+
+    def mark_copy_completed(self, job_id: int) -> None:
+        now = int(self.now())
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update torrent_jobs set phase='copied',copy_completed_at=coalesce(copy_completed_at,?),updated_at=? where id=?",
+                (now, now, int(job_id)),
+            ),
+        )
+
+    def record_verification_failure(self, job_id: int, result) -> None:
+        now = int(self.now())
+        details = json.dumps(
+            {"verified": False, "mismatches": list(result.mismatches)},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        message = (
+            "remote size mismatch"
+            if list(result.mismatches) == ["size:remote"]
+            else (",".join(result.mismatches)[:500] or "remote verification failed")
+        )
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update torrent_jobs set state='verify_pending',phase='verifying',lease_owner=null,lease_until=null,"
+                "verification_method=?,verification_result_json=?,last_stderr_tail=?,updated_at=? where id=?",
+                (result.method, details, message, now, int(job_id)),
+            ),
+        )
+
+    def finalize_verified(self, row: dict[str, Any], payload: dict[str, Any], result) -> str:
+        """Persist verification and idempotently enqueue destructive cleanup work."""
+        now = int(self.now())
+        job_id = int(row["id"])
+        is_sidecar = str(row.get("job_type") or "") == "sidecar_upload"
+        full_torrent = bool(payload.get("full_torrent")) and not is_sidecar
+        state = "cleanup_wait" if full_torrent else ("done" if is_sidecar else "cleanup_deferred")
+        phase = "cleanup_wait" if full_torrent else "done"
+        details = json.dumps(
+            {"verified": True, "mismatches": []},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
+                "update torrent_jobs set state=?,phase=?,verification_method=?,verification_result_json=?,verified_at=?,"
+                "lease_owner=null,lease_until=null,last_exit_code=0,updated_at=? where id=?",
+                (state, phase, result.method, details, now, now, job_id),
+            )
+            if not full_torrent:
+                return
+            cleanup_payload = {
+                "upload_job_id": job_id,
+                "hash": row.get("hash"),
+                "batch_id": row.get("batch_id"),
+                "remote": payload.get("remote"),
+                "verification_method": result.method,
+                "remote_verified": True,
+            }
+            con.execute(
+                "insert or ignore into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,parent_job_id,created_at,updated_at) "
+                "values(?,?,?,?,?,?,?,?,?)",
+                (
+                    row.get("hash"),
+                    row.get("batch_id"),
+                    "cleanup_full_torrent",
+                    "queued",
+                    int(row.get("priority") or 100),
+                    json.dumps(cleanup_payload, ensure_ascii=False),
+                    job_id,
+                    now,
+                    now,
+                ),
+            )
+
+        write_transaction(self.state_db, txn)
+        return state
+
     def get(self, job_id: int) -> dict[str, Any]:
         con = _connect(self.state_db); row = dict(con.execute("select * from torrent_jobs where id=?", (job_id,)).fetchone()); con.close(); return row
 
@@ -231,43 +346,90 @@ class UploadJobRunner:
             files=payload.get("files"),
             copy_mode=str(payload.get("copy_mode") or "copy"),
         )
+        phase = str(row.get("phase") or "queued_copy")
+        if phase in {"queued_copy", "copying"}:
+            self.repo.set_phase(int(row["id"]), "copying")
+            try:
+                copied = self.worker.copy(job)
+            except Exception as exc:
+                self._handle_upload_exception(row, payload, is_sidecar, exc)
+                return int(row["id"])
+            if not copied:
+                if is_sidecar and self._attempts_exhausted(row):
+                    self.repo.update_state(row["id"], "failed", "retry requested", exit_code=1)
+                    self._mark_sidecar_upload_failed(row, payload, "sidecar_upload_failed")
+                else:
+                    self.repo.schedule_retry(
+                        row["id"],
+                        "retry requested",
+                        exit_code=1,
+                        delay_sec=self._delay_for_attempt(int(row.get("attempts") or 1)),
+                    )
+                return int(row["id"])
+            self.repo.mark_copy_completed(int(row["id"]))
+
+        self.repo.set_phase(int(row["id"]), "verifying")
         try:
-            result = self.worker.run_once(job)
+            verification = self.worker.verify(job)
         except Exception as exc:
-            error = redact(str(exc))[:500]
-            if is_sidecar and self._attempts_exhausted(row):
-                self.repo.update_state(row["id"], "failed", error, exit_code=1)
-                self._mark_sidecar_upload_failed(row, payload, "sidecar_upload_failed")
-            else:
-                delay = self._delay_for_attempt(int(row.get("attempts") or 1))
-                self.repo.schedule_retry(row["id"], error, exit_code=1, delay_sec=delay)
+            self._handle_upload_exception(row, payload, is_sidecar, exc)
             return int(row["id"])
-        if is_sidecar and result.remote_verified:
-            self.repo.update_state(row["id"], "done", exit_code=0)
+        if not verification.verified:
+            self.repo.record_verification_failure(int(row["id"]), verification)
+            result = UploadResult(
+                "verify_pending",
+                False,
+                False,
+                verification.method,
+                tuple(verification.mismatches),
+            )
+            if is_sidecar and self._attempts_exhausted(row):
+                self.repo.update_state(row["id"], "failed", "remote verification failed", exit_code=1)
+                self._mark_sidecar_upload_failed(row, payload, "sidecar_upload_failed")
+            if row["job_type"] == "upload" and row.get("batch_id") is not None:
+                self._update_batch_upload_state(row, payload, result)
+            return int(row["id"])
+
+        final_state = self.repo.finalize_verified(row, payload, verification)
+        result = UploadResult(
+            final_state,
+            True,
+            bool(payload.get("full_torrent")) and not is_sidecar,
+            verification.method,
+            (),
+        )
+        if is_sidecar:
             self._update_sidecar_upload_state(row, payload)
-        elif is_sidecar and result.state in {"verify_pending", "retry_wait"} and self._attempts_exhausted(row):
-            message = "remote size mismatch" if result.state == "verify_pending" else "retry requested"
-            self.repo.update_state(row["id"], "failed", message, exit_code=1)
-            self._mark_sidecar_upload_failed(row, payload, "sidecar_upload_failed")
-        elif result.state == "done": self.repo.update_state(row["id"], "done", exit_code=0)
-        elif result.state == "verify_pending": self.repo.update_state(row["id"], "verify_pending", "remote size mismatch")
-        elif result.state == "retry_wait": self.repo.schedule_retry(row["id"], "retry requested", exit_code=1, delay_sec=self._delay_for_attempt(int(row.get("attempts") or 1)))
-        else: self.repo.update_state(row["id"], result.state)
         if row["job_type"] == "upload" and row.get("batch_id") is not None:
             self._update_batch_upload_state(row, payload, result)
         if row["job_type"] == "upload" and result.remote_verified:
             self._enqueue_media_pipeline_if_present(row, payload)
         return int(row["id"])
 
+    def _handle_upload_exception(
+        self,
+        row: dict[str, Any],
+        payload: dict[str, Any],
+        is_sidecar: bool,
+        exc: Exception,
+    ) -> None:
+        error = redact(str(exc))[:500]
+        if is_sidecar and self._attempts_exhausted(row):
+            self.repo.update_state(row["id"], "failed", error, exit_code=1)
+            self._mark_sidecar_upload_failed(row, payload, "sidecar_upload_failed")
+            return
+        delay = self._delay_for_attempt(int(row.get("attempts") or 1))
+        self.repo.schedule_retry(row["id"], error, exit_code=1, delay_sec=delay)
+
     def _update_batch_upload_state(self, row: dict[str, Any], payload: dict[str, Any], result) -> None:
         batch_id = int(row["batch_id"])
         job_id = int(row["id"])
         now = int(self.repo.now())
         size = int(payload.get("size") or 0)
-        if result.state == "cleanup_deferred" and result.remote_verified:
-            state = "cleanup_deferred"
+        if result.state in {"cleanup_deferred", "cleanup_wait"} and result.remote_verified:
+            state = str(result.state)
             cleanup_deferred_at = now
-            reservation_reason = "batch_cleanup_deferred"
+            reservation_reason = "batch_cleanup_deferred" if state == "cleanup_deferred" else "batch_cleanup_wait"
         elif result.state == "verify_pending":
             state = "verify_pending"
             cleanup_deferred_at = None
@@ -278,8 +440,12 @@ class UploadJobRunner:
             reservation_reason = None
         else:
             state = str(result.state)
-            cleanup_deferred_at = now if state == "cleanup_deferred" else None
-            reservation_reason = "batch_cleanup_deferred" if state == "cleanup_deferred" else None
+            cleanup_deferred_at = now if state in {"cleanup_deferred", "cleanup_wait"} else None
+            reservation_reason = (
+                "batch_cleanup_deferred"
+                if state == "cleanup_deferred"
+                else ("batch_cleanup_wait" if state == "cleanup_wait" else None)
+            )
 
         def txn(con: sqlite3.Connection) -> None:
             con.execute(

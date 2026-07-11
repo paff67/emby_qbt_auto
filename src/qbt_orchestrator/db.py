@@ -381,6 +381,19 @@ def migration_sql() -> list[str]:
         "create table if not exists disk_state(id integer primary key check(id=1), sampled_at integer, free_bytes integer, pressure_state text, previous_state text, state_since integer, resume_allowed integer default 1)",
         "create table if not exists capacity_state(id integer primary key check(id=1), scheduler_mode text not null, state text not null, entered_at integer not null, last_evaluated_at integer not null, reason text, details_json text not null default '{}')",
         "create table if not exists torrent_jobs(id integer primary key autoincrement, hash text, batch_id integer, job_type text, state text default 'queued', priority integer default 100, payload_json text, payload_schema_version integer default 1, lease_owner text, lease_until integer, attempts integer default 0, max_attempts integer default 6, next_run_at integer, last_exit_code integer, last_stderr_tail text, cancel_requested integer default 0, cancel_requested_at integer, created_at integer, updated_at integer)",
+        "alter table torrent_jobs add column phase text",
+        "alter table torrent_jobs add column copy_completed_at integer",
+        "alter table torrent_jobs add column verification_method text",
+        "alter table torrent_jobs add column verification_result_json text",
+        "alter table torrent_jobs add column verified_at integer",
+        "alter table torrent_jobs add column parent_job_id integer",
+        "create unique index if not exists idx_torrent_jobs_cleanup_parent on torrent_jobs(job_type,parent_job_id) where job_type='cleanup_full_torrent' and parent_job_id is not null",
+        "update torrent_jobs set phase=case "
+        "when state='verify_pending' then 'verifying' "
+        "when state='cleanup_wait' then 'cleanup_wait' "
+        "when state in ('done','cleanup_deferred') then 'done' "
+        "else 'queued_copy' end "
+        "where phase is null and job_type in ('upload','sidecar_upload')",
         "create table if not exists action_log(id integer primary key autoincrement, ts integer, correlation_id text, hash text, job_id integer, action_type text, path text, payload_json text, status text, dry_run integer default 0, error text)",
         "create table if not exists events_v2(id integer primary key autoincrement, ts integer, level text, component text, event_type text, hash text, job_id integer, correlation_id text, message text, data_json text)",
         "create table if not exists decision_log(id integer primary key autoincrement, ts integer, component text, hash text, decision text, reason_code text, data_json text)",
@@ -429,6 +442,7 @@ def migration_sql() -> list[str]:
         "insert or ignore into schema_migrations(version,name,applied_at) values(5,'scheduler_intents_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(6,'batch_lease_claims_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(7,'batch_inventory_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(8,'upload_phases_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:
@@ -488,9 +502,10 @@ class DbActor:
                 try:
                     if op == "enqueue_job":
                         now = int(time.time())
+                        phase = "queued_copy" if payload["job_type"] in {"upload", "sidecar_upload"} else None
                         cur = con.execute(
-                            "insert into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
-                            (payload["hash"], payload["batch_id"], payload["job_type"], "queued", payload["priority"], json.dumps(payload["payload"], ensure_ascii=False), now, now),
+                            "insert into torrent_jobs(hash,batch_id,job_type,state,phase,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+                            (payload["hash"], payload["batch_id"], payload["job_type"], "queued", phase, payload["priority"], json.dumps(payload["payload"], ensure_ascii=False), now, now),
                         )
                         con.commit()
                         self._writes_completed += 1

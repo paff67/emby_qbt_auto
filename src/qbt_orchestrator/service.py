@@ -589,11 +589,16 @@ class DaemonRuntime:
         con = readonly_connect(self.state_db)
         try:
             rows = con.execute(
-                "select job_type,payload_json from torrent_jobs "
+                "select id,job_type,payload_json,parent_job_id from torrent_jobs "
                 "where state in ('queued','running','verify_pending','retry_wait','cleanup_wait')"
             ).fetchall()
         finally:
             con.close()
+        cleanup_parent_ids = {
+            int(row["parent_job_id"])
+            for row in rows
+            if str(row["job_type"] or "") == "cleanup_full_torrent" and row["parent_job_id"] is not None
+        }
         count = 0
         for row in rows:
             job_type = str(row["job_type"] or "")
@@ -601,6 +606,8 @@ class DaemonRuntime:
                 count += 1
                 continue
             if job_type != "upload":
+                continue
+            if int(row["id"]) in cleanup_parent_ids:
                 continue
             try:
                 payload = json.loads(row["payload_json"] or "{}")
