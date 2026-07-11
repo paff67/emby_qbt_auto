@@ -1391,7 +1391,7 @@ Implemented verification: focused preference/path/janitor/carousel/maintenance r
 - Modify: `tests/fakes.py`
 - Modify: `docs/traceability/requirements-map.md`
 
-- [ ] **Step 1: Add hard invariants**
+- [x] **Step 1: Add hard invariants**
 
 ```python
 def assert_plan_invariants(plan, budget):
@@ -1401,7 +1401,7 @@ def assert_plan_invariants(plan, budget):
     assert not (plan.capacity_state == "capacity_deadlock" and plan.actions)
 ```
 
-- [ ] **Step 2: Simulate 24 hours with 100 torrents**
+- [x] **Step 2: Simulate 24 hours with 100 torrents**
 
 The virtual-time simulation must cover:
 
@@ -1424,7 +1424,7 @@ assert simulation.unowned_active_batch_claims == 0
 assert simulation.automatic_delete_actions_in_deadlock == 0
 ```
 
-- [ ] **Step 3: Add qBT API call budgets**
+- [x] **Step 3: Add qBT API call budgets**
 
 Steady-state expectation for 100 unchanged torrents:
 
@@ -1434,7 +1434,7 @@ assert fake_qbt.calls_per_minute("torrents/properties") <= 8
 assert fake_qbt.delta_ratio >= 0.99
 ```
 
-- [ ] **Step 4: Run full test suite and commit**
+- [x] **Step 4: Run full test suite and commit**
 
 ```bash
 python -m pytest tests/test_production_invariants.py -v
@@ -1442,6 +1442,10 @@ python -m pytest -q
 git add tests/test_production_invariants.py tests/fakes.py docs/traceability/requirements-map.md
 git commit -m "test: add production scheduler invariants"
 ```
+
+Implementation notes: the existing virtual-day transition test runs all 5,760 planner ticks for 100 unchanged torrents. New hard-invariant coverage shuffles 100 mixed work items across emergency/drain/normal/explore and asserts deterministic order, budget, hold and mode rules. A virtual-time qBT fake measures 100 maindata calls plus real FileBatch inventory cycles, enforcing files/properties <=8 calls per minute and delta ratio >=0.99. The invariant DB finishes with no unowned active batch claims and no delete actions.
+
+Implemented verification: production invariant suite `8 passed` in 11.7 seconds; full suite `316 passed`; `compileall` and `git diff --check` passed.
 
 ### Task 20: Add shadow/canary rollout and rollback documentation
 

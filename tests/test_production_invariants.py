@@ -217,3 +217,88 @@ def test_virtual_unchanged_day_keeps_decision_rows_bounded():
 
         assert _count(db, "decision_log") <= 500
         assert _count(db, "metrics_snapshots") <= 8_000
+
+
+def test_scheduler_engine_hard_invariants_across_modes_and_orderings():
+    import random
+
+    from qbt_orchestrator.scheduler_engine import SchedulerEngine
+    from qbt_orchestrator.work_items import WorkItem, WorkKind
+
+    mib = 1024**2
+    items = [
+        WorkItem(
+            id=f"item-{index:03d}",
+            hash=f"h{index:03d}",
+            kind=[WorkKind.FULL_FINISH, WorkKind.BATCH_DELIVERY, WorkKind.SOAK_PROBE][index % 3],
+            incremental_growth_bytes=(1 + index % 8) * 64 * mib,
+            releasable_bytes=(index % 5) * 512 * mib if index % 3 == 0 else 0,
+            pinned_after_success_bytes=256 * mib if index % 3 == 1 else 0,
+            completion_probability=0.1 + (index % 9) / 10,
+            throughput_bps=index * 1024,
+            wait_age_sec=index * 60,
+            operator_priority=index % 4,
+            hold=index % 17 == 0,
+        )
+        for index in range(100)
+    ]
+    engine = SchedulerEngine(unit_bytes=64 * mib)
+    budget = 2 * 1024**3
+    for mode in ["emergency", "drain", "normal", "explore"]:
+        shuffled = list(items)
+        random.Random(100 + len(mode)).shuffle(shuffled)
+        first = engine.select(items, mode, budget, 5)
+        second = engine.select(shuffled, mode, budget, 5)
+        assert [item.id for item in first.selected] == [item.id for item in second.selected]
+        assert sum(item.incremental_growth_bytes for item in first.selected) <= budget
+        assert all(not item.hold for item in first.selected)
+        if mode == "drain":
+            assert all(item.kind is WorkKind.FULL_FINISH for item in first.selected)
+        if mode == "emergency":
+            assert first.selected == []
+
+
+def test_steady_state_100_torrent_inventory_and_delta_calls_stay_in_budget():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+    from tests.fakes import BudgetedQbtFake
+
+    gib = 1024**3
+    clock = [0]
+    snapshots = {
+        f"h{index:03d}": {
+            "hash": f"h{index:03d}",
+            "category": "auto",
+            "tags": "auto",
+            "state": "stoppedDL",
+            "amount_left": gib,
+            "size": gib,
+            "progress": 0.0,
+        }
+        for index in range(100)
+    }
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BudgetedQbtFake(snapshots, now=lambda: clock[0])
+        rid = 0
+        for _ in range(100):
+            response = qbt.get_maindata(rid)
+            rid = int(response["rid"])
+        for minute in range(3):
+            clock[0] = minute * 60
+            FileBatchService(
+                db,
+                dry_run=True,
+                qbt=qbt,
+                batch_inventory_limit=8,
+                batch_max_new_per_tick=0,
+                disk_floor_bytes=2 * gib,
+                now=lambda: clock[0],
+            ).sync_completed(snapshots, free_bytes=8 * gib, sync_healthy=True)
+
+        assert qbt.calls_per_minute("torrents/files") <= 8
+        assert qbt.calls_per_minute("torrents/properties") <= 8
+        assert qbt.delta_ratio >= 0.99
+        assert _count(db, "batch_file_claims", "state='active'") == 0
+        assert _count(db, "action_log", "action_type like '%delete%'") == 0

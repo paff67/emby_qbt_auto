@@ -56,6 +56,50 @@ class FakeRclone:
         return self.remote_listing
 
 
+class BudgetedQbtFake:
+    """Virtual-time qBT fake for steady-state API budget assertions."""
+
+    def __init__(self, snapshots, now):
+        self.snapshots = snapshots
+        self.now = now
+        self.calls = []
+        self.maindata_calls = 0
+        self.delta_calls = 0
+
+    def get_maindata(self, rid):
+        self.maindata_calls += 1
+        full = int(rid) == 0
+        if not full:
+            self.delta_calls += 1
+        return {
+            "rid": int(rid) + 1,
+            "full_update": full,
+            "torrents": self.snapshots if full else {},
+            "server_state": {},
+        }
+
+    def torrent_files(self, torrent_hash):
+        self.calls.append((int(self.now()), "torrents/files", str(torrent_hash)))
+        return [{"index": 0, "name": f"{torrent_hash}.mp4", "size": 1024**3, "progress": 0.0, "priority": 0}]
+
+    def torrent_properties(self, torrent_hash):
+        self.calls.append((int(self.now()), "torrents/properties", str(torrent_hash)))
+        return {"piece_size": 16 * 1024**2}
+
+    def calls_per_minute(self, endpoint):
+        buckets = {}
+        for ts, called_endpoint, _hash in self.calls:
+            if called_endpoint != endpoint:
+                continue
+            bucket = int(ts) // 60
+            buckets[bucket] = buckets.get(bucket, 0) + 1
+        return max(buckets.values(), default=0)
+
+    @property
+    def delta_ratio(self):
+        return self.delta_calls / self.maindata_calls if self.maindata_calls else 0.0
+
+
 class FakeBackfill:
     def __init__(self):
         self.calls = []
