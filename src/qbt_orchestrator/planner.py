@@ -177,7 +177,7 @@ class DownloadPlanner:
                 cooldown_hashes.add(h)
         previous_allocations = self._allocation_rows()
         dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
-        carousel_states = self._carousel_state_rows()
+        carousel_states = self._carousel_state_rows(now)
         dead_hashes |= {h for h, state in carousel_states.items() if state == "dead"}
         dead_hashes -= {h for h, state in carousel_states.items() if state in {"probing", "soak"}}
         dead_hashes -= forced_active_hashes
@@ -204,7 +204,7 @@ class DownloadPlanner:
             self._reconcile_absent_allocations(set(str(h) for h in snapshots.keys()), now)
             previous_allocations = self._allocation_rows()
             dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
-            carousel_states = self._carousel_state_rows()
+            carousel_states = self._carousel_state_rows(now)
             dead_hashes |= {h for h, state in carousel_states.items() if state == "dead"}
             dead_hashes -= {h for h, state in carousel_states.items() if state in {"probing", "soak"}}
             dead_hashes -= forced_active_hashes
@@ -409,12 +409,21 @@ class DownloadPlanner:
         finally:
             con.close()
 
-    def _carousel_state_rows(self) -> dict[str, str]:
+    def _carousel_state_rows(self, now: int | None = None) -> dict[str, str]:
+        observed_at = int(self.now()) if now is None else int(now)
         con = _connect(self.state_db)
         try:
+            rows = con.execute(
+                "select hash,state,backoff_until from carousel_state"
+            ).fetchall()
             return {
                 str(row["hash"]): str(row["state"])
-                for row in con.execute("select hash,state from carousel_state").fetchall()
+                for row in rows
+                if not (
+                    str(row["state"]) == "dead"
+                    and row["backoff_until"] is not None
+                    and int(row["backoff_until"]) <= observed_at
+                )
             }
         finally:
             con.close()

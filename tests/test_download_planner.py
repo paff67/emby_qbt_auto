@@ -992,6 +992,67 @@ def test_planner_allowed_active_hashes_prevents_legacy_slot_backfill():
         ]
 
 
+def test_planner_does_not_let_expired_carousel_dead_override_live_selection():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) "
+            "values('nearly-done','soak_cooldown','soak_cooldown','soak_cooldown',10,'legacy_cooldown')"
+        )
+        con.execute(
+            "insert into carousel_state(hash,state,last_probe_at,backoff_until,backoff_level,updated_at) "
+            "values('nearly-done','dead',10,20,1,10)"
+        )
+        con.commit()
+        con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(
+            db,
+            executor,
+            dry_run=False,
+            active_slots=1,
+            disk_floor_bytes=0,
+            now=lambda: 100,
+        )
+        snapshots = {
+            "nearly-done": {
+                "hash": "nearly-done",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": 8 * 1024**2,
+                "size": 6 * 1024**3,
+                "progress": 0.99,
+                "num_seeds": 0,
+                "num_peers": 1,
+            }
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=1024**3,
+            sync_healthy=True,
+            allowed_active_hashes={"nearly-done"},
+        )
+
+        assert result.selected_hashes == ["nearly-done"]
+        assert executor.posts == [
+            ("/api/v2/torrents/start", {"hashes": "nearly-done"})
+        ]
+        assert _rows(
+            db,
+            "select desired_state,owner,reason from scheduler_allocations where hash='nearly-done'",
+        ) == [
+            {"desired_state": "active", "owner": "central", "reason": "budget_fit"}
+        ]
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):
