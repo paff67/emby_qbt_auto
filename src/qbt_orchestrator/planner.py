@@ -89,6 +89,7 @@ class DownloadPlanner:
         active_slots: int = 5,
         disk_floor_bytes: int = 3 * 1024**3,
         slow_active_demote_sec: int = 180,
+        finish_resident_max_remaining_bytes: int = 0,
         recovery_enabled: bool = False,
         recovery_enter_bytes: int | None = None,
         emergency_floor_bytes: int | None = None,
@@ -103,6 +104,9 @@ class DownloadPlanner:
         self.active_slots = int(active_slots)
         self.disk_floor_bytes = int(disk_floor_bytes)
         self.slow_active_demote_sec = int(slow_active_demote_sec)
+        self.finish_resident_max_remaining_bytes = max(
+            0, int(finish_resident_max_remaining_bytes)
+        )
         self.recovery_enabled = bool(recovery_enabled)
         self.recovery_enter_bytes = int(recovery_enter_bytes if recovery_enter_bytes is not None else self.disk_floor_bytes)
         self.emergency_floor_bytes = int(emergency_floor_bytes if emergency_floor_bytes is not None else min(2 * 1024**3, max(0, self.disk_floor_bytes)))
@@ -496,6 +500,15 @@ class DownloadPlanner:
             con.close()
 
     def _should_demote_active(self, hash: str, torrent: Mapping[str, Any], health: dict[str, Any] | None, now: int) -> bool:
+        amount_left = max(0, int(torrent.get("amount_left") or 0))
+        if (
+            self.finish_resident_max_remaining_bytes > 0
+            and amount_left <= self.finish_resident_max_remaining_bytes
+        ):
+            # Near-complete torrents may wait a long time for rare final
+            # pieces.  If the global engine still selects one, keep its peer
+            # connection resident instead of forcing a 30-minute cooldown.
+            return False
         if not health:
             return False
         active_since = health.get("active_since")

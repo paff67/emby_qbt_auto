@@ -158,6 +158,7 @@ class DaemonRuntime:
         planner_dry_run: bool = True,
         planner_active_slots: int = 5,
         planner_slow_active_demote_sec: int = 180,
+        finish_resident_max_remaining_bytes: int = 0,
         scheduler_engine_mode: str = "legacy",
         scheduler_engine=None,
         scheduler_unit_bytes: int = 64 * 1024**2,
@@ -237,6 +238,9 @@ class DaemonRuntime:
         self.planner_dry_run = planner_dry_run or dry_run
         self.planner_active_slots = int(planner_active_slots)
         self.planner_slow_active_demote_sec = int(planner_slow_active_demote_sec)
+        self.finish_resident_max_remaining_bytes = max(
+            0, int(finish_resident_max_remaining_bytes)
+        )
         self.scheduler_engine_mode = str(scheduler_engine_mode or "legacy").strip().lower()
         if self.scheduler_engine_mode not in {"legacy", "shadow", "live"}:
             raise ValueError("scheduler_engine_mode must be legacy, shadow, or live")
@@ -441,6 +445,7 @@ class DaemonRuntime:
             dry_run=self.planner_dry_run,
             active_slots=self.planner_active_slots,
             slow_active_demote_sec=self.planner_slow_active_demote_sec,
+            finish_resident_max_remaining_bytes=self.finish_resident_max_remaining_bytes,
             disk_floor_bytes=self.disk_floor_bytes,
             recovery_enabled=self.recovery_enabled,
             recovery_enter_bytes=self.recovery_enter_bytes,
@@ -733,6 +738,7 @@ class DaemonRuntime:
                 "planner_active_slots": self.planner_active_slots,
                 "recovery_active_slots": self.recovery_active_slots,
                 "recovery_max_remaining_bytes": self.recovery_max_remaining_bytes,
+                "finish_resident_max_remaining_bytes": self.finish_resident_max_remaining_bytes,
             },
             "feature_flags": {
                 "dry_run": bool(self.dry_run),
