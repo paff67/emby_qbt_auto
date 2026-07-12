@@ -485,6 +485,27 @@ def test_qbt_http_client_host_proxy_noauth_does_not_login_even_if_credentials_ex
     assert [c[0] for c in calls] == ["GET", "GET"]
 
 
+def test_qbt_client_builder_host_proxy_can_require_sid_authentication():
+    from qbt_orchestrator.cli import _build_qbt_client_from_env
+
+    client = _build_qbt_client_from_env(
+        env={
+            "QBT_ORCH_QBT_API_MODE": "host-proxy",
+            "QBT_ORCH_QBT_API_BASE": "http://127.0.0.1:18081",
+            "QBT_ORCH_QBT_HTTP_HOST_HEADER": "127.0.0.1:8080",
+            "QBT_ORCH_QBT_AUTH_MODE": "required",
+            "QBT_ORCH_QBT_USERNAME": "admin",
+            "QBT_ORCH_QBT_PASSWORD": "secret",
+        }
+    )
+
+    assert client.auth_mode == "required"
+    assert client.auth_enabled is True
+    assert client.username == "admin"
+    assert client.password == "secret"
+    assert client.default_headers == {"Host": "127.0.0.1:8080"}
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):

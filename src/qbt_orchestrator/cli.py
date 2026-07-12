@@ -150,13 +150,24 @@ def _build_qbt_client_from_env(qbt_cfg=None, env=os.environ):
         return headers
 
     if mode in {"host-proxy", "localhost-bridge", "bridge", "host-noauth"}:
+        proxy_auth_mode = (
+            "none"
+            if mode == "host-noauth"
+            else env.get("QBT_ORCH_QBT_AUTH_MODE", "none")
+        )
+        proxy_auth_enabled = str(proxy_auth_mode).strip().lower() not in {
+            "none",
+            "noauth",
+            "disabled",
+            "off",
+        }
         return QbtHttpClient(
             api_base=env.get("QBT_ORCH_QBT_API_BASE", "http://127.0.0.1:18081"),
-            username="",
-            password="",
+            username=env.get("QBT_ORCH_QBT_USERNAME", "") if proxy_auth_enabled else "",
+            password=env.get("QBT_ORCH_QBT_PASSWORD", "") if proxy_auth_enabled else "",
             timeout=timeout,
             api_max_requests_per_sec=max_rps,
-            auth_mode="none",
+            auth_mode=proxy_auth_mode,
             default_headers=http_headers("127.0.0.1:8080"),
         )
     if mode in {"host", "http", "host-http"}:
