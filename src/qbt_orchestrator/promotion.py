@@ -217,6 +217,17 @@ class MediaPromotionRunner:
                 self.repo.record_failed(promotion_id, "source_absent")
             return promotion_id
 
+        if source == target:
+            if self._size(source_row) == expected:
+                self.repo.record_verified(
+                    promotion_id,
+                    method="path_size",
+                    details={"verified": True, "mismatches": []},
+                )
+            else:
+                self.repo.record_failed(promotion_id, "source_size_mismatch")
+            return promotion_id
+
         if self._size(source_row) != expected:
             self.repo.record_failed(promotion_id, "source_size_mismatch")
             return promotion_id

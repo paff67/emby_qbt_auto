@@ -182,6 +182,92 @@ def test_persistent_media_pipeline_uses_filename_normalizer_for_grouping_and_scr
         assert rows(db, "select count(*) as n from emby_refresh_tasks")[0]["n"] == 0
 
 
+def test_verified_ingest_enqueues_canonical_promotion_and_colocated_sidecars():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        staging = "/var/lib/qbt-orchestrator/sidecar-staging/WAAA-614"
+        normalizer = RecordingNormalizer(
+            {
+                "normalized_id": "WAAA-614",
+                "confidence": 0.95,
+                "raw_basename": "489155.com@WAAA-614",
+                "reason": "domain_prefix_removed_and_standard_jav_id_matched",
+            }
+        )
+        backfill = RecordingBackfill(
+            {
+                "status": "sidecar_verified",
+                "staging_dir": staging,
+                "normalized_id": "WAAA-614",
+                "metadata_title": "影片名称",
+                "display_title": "WAAA-614 影片名称",
+                "canonical_basename": "WAAA-614 影片名称",
+                "canonical_remote_dir": "gcrypt:/WAAA-614",
+                "artifacts": [
+                    {"local": f"{staging}/WAAA-614 影片名称.nfo", "remote": "gcrypt:/WAAA-614/WAAA-614 影片名称.nfo", "size": 100},
+                    {"local": f"{staging}/WAAA-614 影片名称-poster.jpg", "remote": "gcrypt:/WAAA-614/WAAA-614 影片名称-poster.jpg", "size": 200},
+                    {"local": f"{staging}/WAAA-614 影片名称-fanart.jpg", "remote": "gcrypt:/WAAA-614/WAAA-614 影片名称-fanart.jpg", "size": 300},
+                ],
+            }
+        )
+        service = MediaPipelineService(
+            db,
+            backfill=backfill,
+            normalizer=normalizer,
+            now=lambda: 4_200,
+        )
+
+        result = service.handle_upload_verified(
+            "upload-job-7",
+            [
+                UploadedFile(
+                    "gcrypt:/WAAA-614-8cfce204ec0e/489155.com@WAAA-614.mp4",
+                    size=5_542_877_598,
+                    duration_sec=120,
+                )
+            ],
+            upload_job_id=7,
+            torrent_hash="8cfce204",
+        )
+
+        assert result.media_group_key == "WAAA-614"
+        assert result.state == "SidecarUploadQueued"
+        promotion = rows(db, "select * from media_promotions")[0]
+        assert promotion["source_remote"] == "gcrypt:/WAAA-614-8cfce204ec0e/489155.com@WAAA-614.mp4"
+        assert promotion["target_remote"] == "gcrypt:/WAAA-614/WAAA-614 影片名称.mp4"
+        assert promotion["expected_size"] == 5_542_877_598
+
+        payloads = [
+            json.loads(row["payload_json"])
+            for row in rows(
+                db,
+                "select payload_json from torrent_jobs where job_type='sidecar_upload' order by id",
+            )
+        ]
+        assert [payload["remote"] for payload in payloads] == [
+            "gcrypt:/WAAA-614/WAAA-614 影片名称.nfo",
+            "gcrypt:/WAAA-614/WAAA-614 影片名称-poster.jpg",
+            "gcrypt:/WAAA-614/WAAA-614 影片名称-fanart.jpg",
+        ]
+        run = rows(
+            db,
+            "select canonical_remote_dir,canonical_basename,canonical_video_manifest_json from media_pipeline_runs",
+        )[0]
+        assert run["canonical_remote_dir"] == "gcrypt:/WAAA-614"
+        assert run["canonical_basename"] == "WAAA-614 影片名称"
+        assert json.loads(run["canonical_video_manifest_json"]) == [
+            {
+                "remote_path": "gcrypt:/WAAA-614/WAAA-614 影片名称.mp4",
+                "size": 5_542_877_598,
+            }
+        ]
+        assert rows(db, "select * from emby_refresh_tasks") == []
+
+
 def test_media_pipeline_propagates_passthrough_policy_to_sidecar_upload_jobs():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.media import MediaPipelineService, UploadedFile

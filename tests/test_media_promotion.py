@@ -136,3 +136,31 @@ def test_promotion_never_overwrites_conflicting_destination():
         row = repo.get(promotion_id)
         assert row["state"] == "failed"
         assert row["last_error"] == "target_conflict"
+
+
+def test_promotion_accepts_already_canonical_source_without_move():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = MediaPromotionRepository(db, now=lambda: 1_000)
+        canonical = "gcrypt:/BBAN-582/BBAN-582 影片名称.mp4"
+        promotion_id = repo.enqueue(
+            upload_job_id=7,
+            hash="abc",
+            media_group_id=3,
+            normalized_id="BBAN-582",
+            metadata_title="影片名称",
+            display_title="BBAN-582 影片名称",
+            source_remote=canonical,
+            target_remote=canonical,
+            expected_size=123,
+        )
+        rclone = FakeRclone(remote_sizes={canonical: 123})
+
+        assert MediaPromotionRunner(repo, rclone).run_next() == promotion_id
+        assert rclone.movetos == []
+        assert repo.get(promotion_id)["state"] == "verified"

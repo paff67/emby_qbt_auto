@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -39,6 +40,19 @@ def test_gdrive_backfill_scraper_runs_script_only_in_local_staging_and_returns_u
             assert (work / "manifest.json").exists()
             (work / "BBAN-582.nfo").write_text("<movie/>", encoding="utf-8")
             (work / "BBAN-582-poster.jpg").write_bytes(b"poster")
+            (work / "media_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "normalized_id": "BBAN-582",
+                        "metadata_title": "影片名称",
+                        "display_title": "BBAN-582 影片名称",
+                        "canonical_basename": "BBAN-582 影片名称",
+                        "canonical_remote_dir": "gcrypt:/BBAN-582",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             (work / ".javinizer_result").write_text("[javinizer] ok\n", encoding="utf-8")
             return Proc(0, "scraped")
 
@@ -64,6 +78,10 @@ def test_gdrive_backfill_scraper_runs_script_only_in_local_staging_and_returns_u
             "gcrypt:/BBAN-582/BBAN-582.nfo",
         ]
         assert all(a["size"] > 0 for a in artifacts)
+        assert result["metadata_title"] == "影片名称"
+        assert result["display_title"] == "BBAN-582 影片名称"
+        assert result["canonical_basename"] == "BBAN-582 影片名称"
+        assert result["canonical_remote_dir"] == "gcrypt:/BBAN-582"
 
 
 def test_gdrive_backfill_scraper_reports_not_found_without_remote_or_rclone_bypass():
