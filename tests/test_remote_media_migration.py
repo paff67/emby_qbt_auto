@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import time
 
 
 class FakeRemote:
@@ -111,7 +113,7 @@ def test_failed_verification_rolls_move_back(tmp_path: Path):
     assert source in remote.objects
     assert remote.objects[source] == 101
     states = [json.loads(line)["state"] for line in (tmp_path / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert states == ["moving", "rollback_wait", "rolled_back", "failed"]
+    assert states == ["moving", "rollback_wait", "failed"]
 
 
 def test_bounded_parallel_apply_verifies_independent_actions(tmp_path: Path):
@@ -141,6 +143,97 @@ def test_bounded_parallel_apply_verifies_independent_actions(tmp_path: Path):
     assert result.verified == 2
     assert result.failed == 0
     assert len((tmp_path / "journal.jsonl").read_text().splitlines()) == 4
+
+
+def test_parallel_apply_serializes_actions_within_same_id_directory(tmp_path: Path):
+    from qbt_orchestrator.remote_migration import apply_migration, build_migration_plan
+
+    class DetectingRemote(FakeRemote):
+        def __init__(self, objects):
+            super().__init__(objects)
+            self.active = set()
+            self.overlap = False
+            self.lock = threading.Lock()
+
+        def moveto(self, source, target):
+            target_id = target.split(":/", 1)[1].split("/", 1)[0]
+            with self.lock:
+                if target_id in self.active:
+                    self.overlap = True
+                self.active.add(target_id)
+            time.sleep(0.01)
+            try:
+                super().moveto(source, target)
+            finally:
+                with self.lock:
+                    self.active.remove(target_id)
+
+    remote = DetectingRemote(
+        {
+            "gcrypt:/ABC-123-old/ABC-123.mp4": 100,
+            "gcrypt:/ABC-123-old/ABC-123.nfo": 20,
+            "gcrypt:/DEF-456-old/DEF-456.mp4": 200,
+        }
+    )
+    plan = build_migration_plan(
+        remote.inventory(),
+        {
+            "ABC-123": {"title": "One", "confidence": 1.0},
+            "DEF-456": {"title": "Two", "confidence": 1.0},
+        },
+    )
+
+    result = apply_migration(
+        plan,
+        remote,
+        journal_path=tmp_path / "journal.jsonl",
+        workers=3,
+    )
+
+    assert result.verified == 3
+    assert remote.overlap is False
+
+
+def test_apply_retries_eventually_consistent_target_before_rollback(tmp_path: Path):
+    from qbt_orchestrator.remote_migration import apply_migration, build_migration_plan
+
+    class EventuallyConsistentRemote(FakeRemote):
+        def __init__(self, objects):
+            super().__init__(objects)
+            self.hidden = {}
+
+        def moveto(self, source, target):
+            super().moveto(source, target)
+            self.hidden[target] = 2
+
+        def stat(self, remote):
+            if self.hidden.get(remote, 0) > 0:
+                self.hidden[remote] -= 1
+                return None
+            return super().stat(remote)
+
+    source = "gcrypt:/ABC-123-old/ABC-123.mp4"
+    remote = EventuallyConsistentRemote({source: 100})
+    plan = build_migration_plan(
+        remote.inventory(), {"ABC-123": {"title": "One", "confidence": 1.0}}
+    )
+
+    result = apply_migration(
+        plan,
+        remote,
+        journal_path=tmp_path / "journal.jsonl",
+        verify_attempts=4,
+        verify_delay_sec=0,
+    )
+
+    assert result.verified == 1
+    assert result.failed == 0
+    assert len(remote.movetos) == 1
+    states = [
+        json.loads(line)["state"]
+        for line in (tmp_path / "journal.jsonl").read_text().splitlines()
+    ]
+    assert states == ["moving", "verified"]
 
 
 def test_render_canonical_nfo_updates_emby_identity_fields():

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
@@ -554,16 +555,36 @@ def apply_migration(
     journal_path: str | Path,
     batch_size: int | None = None,
     workers: int = 1,
+    verify_attempts: int = 6,
+    verify_delay_sec: float = 0.0,
 ) -> MigrationResult:
     actions = plan.actions[: max(0, int(batch_size))] if batch_size is not None else plan.actions
+    attempts = max(1, int(verify_attempts))
+    base_delay = max(0.0, float(verify_delay_sec))
+
+    def verified_stat(
+        action: MigrationAction, path: str
+    ) -> Mapping[str, Any] | None:
+        row = None
+        for attempt in range(attempts):
+            row = remote_client.stat(path)
+            if _verified(action, row):
+                return row
+            if attempt + 1 < attempts and base_delay > 0:
+                time.sleep(base_delay * (2 ** min(attempt, 4)))
+        return row
 
     def process(action: MigrationAction) -> tuple[int, int, int]:
         source_row = remote_client.stat(action.source)
         target_row = remote_client.stat(action.target)
-        if source_row is None and _verified(action, target_row):
-            _append_journal(journal_path, action, "verified", idempotent=True)
-            return 1, 0, 0
-        if source_row is None or not _verified(action, source_row):
+        if source_row is None:
+            target_row = verified_stat(action, action.target)
+            if _verified(action, target_row):
+                _append_journal(journal_path, action, "verified", idempotent=True)
+                return 1, 0, 0
+            _append_journal(journal_path, action, "failed", error="source_absent_or_mismatch")
+            return 0, 1, 0
+        if not _verified(action, source_row):
             _append_journal(journal_path, action, "failed", error="source_absent_or_mismatch")
             return 0, 1, 0
         if target_row is not None:
@@ -572,14 +593,27 @@ def apply_migration(
         _append_journal(journal_path, action, "moving")
         try:
             remote_client.moveto(action.source, action.target)
-            target_row = remote_client.stat(action.target)
+            target_row = verified_stat(action, action.target)
             if not _verified(action, target_row):
                 raise RuntimeError("destination_verification_failed")
         except Exception as exc:
             _append_journal(journal_path, action, "rollback_wait", error=str(exc))
+            target_row = verified_stat(action, action.target)
+            if _verified(action, target_row):
+                _append_journal(
+                    journal_path,
+                    action,
+                    "verified",
+                    recovered_after_verification_delay=True,
+                )
+                return 1, 0, 0
             try:
-                if remote_client.stat(action.target) is not None and remote_client.stat(action.source) is None:
+                source_row = verified_stat(action, action.source)
+                if target_row is not None and not _verified(action, source_row):
                     remote_client.moveto(action.target, action.source)
+                    source_row = verified_stat(action, action.source)
+                if not _verified(action, source_row):
+                    raise RuntimeError("rollback_source_verification_failed")
                 _append_journal(journal_path, action, "rolled_back")
             except Exception as rollback_exc:
                 _append_journal(
@@ -599,10 +633,20 @@ def apply_migration(
     if worker_count == 1:
         results = [process(action) for action in actions]
     else:
+        action_groups: dict[str, list[MigrationAction]] = {}
+        for action in actions:
+            remote_path = action.target.split(":/", 1)[-1]
+            target_root = remote_path.split("/", 1)[0]
+            action_groups.setdefault(target_root, []).append(action)
+
+        def process_group(group: list[MigrationAction]) -> list[tuple[int, int, int]]:
+            return [process(action) for action in group]
+
         with ThreadPoolExecutor(
             max_workers=worker_count, thread_name_prefix="remote-migration"
         ) as pool:
-            results = list(pool.map(process, actions))
+            grouped_results = list(pool.map(process_group, action_groups.values()))
+        results = [result for group in grouped_results for result in group]
     verified = sum(result[0] for result in results)
     failed = sum(result[1] for result in results)
     skipped = sum(result[2] for result in results)
