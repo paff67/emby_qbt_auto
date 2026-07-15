@@ -330,6 +330,28 @@ def test_full_finish_candidate_uses_piece_uncertainty_and_conservative_release_e
     assert by_hash["held"].hold is True
 
 
+def test_completion_probability_does_not_drop_when_one_seed_connects():
+    from qbt_orchestrator.work_items import build_full_finish_work_items
+
+    def probability(connected_seeds: int) -> float:
+        return build_full_finish_work_items(
+            {
+                "h": {
+                    "hash": "h",
+                    "category": "auto",
+                    "amount_left": GIB,
+                    "num_seeds": connected_seeds,
+                    "num_complete": 12,
+                    "num_peers": 0,
+                    "num_incomplete": 47,
+                }
+            },
+            now=1_000,
+        )[0].completion_probability
+
+    assert probability(0) == probability(1) == 0.77
+
+
 class _SchedulerQbt:
     def __init__(self):
         self.rids = []

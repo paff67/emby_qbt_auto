@@ -48,8 +48,16 @@ def _completion_probability(torrent: Mapping[str, Any]) -> float:
     explicit = torrent.get("completion_probability")
     if explicit is not None:
         return max(0.0, min(1.0, float(explicit)))
-    seeds = max(0, int(torrent.get("num_seeds") or torrent.get("num_complete") or 0))
-    peers = max(0, int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0))
+    seeds = max(
+        0,
+        int(torrent.get("num_seeds") or 0),
+        int(torrent.get("num_complete") or 0),
+    )
+    peers = max(
+        0,
+        int(torrent.get("num_peers") or 0),
+        int(torrent.get("num_incomplete") or 0),
+    )
     if seeds > 0:
         return min(0.99, 0.65 + min(seeds, 34) * 0.01)
     if peers > 0:
