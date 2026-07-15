@@ -1,10 +1,53 @@
 from __future__ import annotations
 
 import json
-from typing import Callable
+import re
+import subprocess
+from typing import Callable, Sequence
 from urllib import request
 
 Transport = Callable[[str, dict, dict, int], dict]
+CommandRunner = Callable[[Sequence[str], int], tuple[int, str, str]]
+
+
+def default_command_runner(argv: Sequence[str], timeout: int) -> tuple[int, str, str]:
+    process = subprocess.run(
+        list(argv), text=True, capture_output=True, timeout=timeout
+    )
+    return process.returncode, process.stdout, process.stderr
+
+
+class RcloneMountCacheFlusher:
+    """Flush the configured rclone mount directory cache with SIGHUP."""
+
+    _SERVICE = re.compile(r"^[A-Za-z0-9_.@-]+$")
+
+    def __init__(
+        self,
+        service_name: str = "rclone-gcrypt-emby.service",
+        *,
+        runner: CommandRunner = default_command_runner,
+        timeout: int = 15,
+    ):
+        if not self._SERVICE.fullmatch(str(service_name)):
+            raise ValueError("invalid rclone mount service name")
+        self.service_name = str(service_name)
+        self.runner = runner
+        self.timeout = max(1, int(timeout))
+
+    def flush(self, _path: str) -> None:
+        argv = [
+            "systemctl",
+            "kill",
+            "--kill-who=main",
+            "--signal=HUP",
+            self.service_name,
+        ]
+        rc, _stdout, stderr = self.runner(argv, self.timeout)
+        if rc != 0:
+            raise ConnectionError(
+                f"rclone mount cache flush failed rc={rc}: {stderr[-300:]}"
+            )
 
 
 def default_transport(url: str, payload: dict, headers: dict, timeout: int) -> dict:

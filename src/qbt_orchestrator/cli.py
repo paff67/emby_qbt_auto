@@ -8,7 +8,7 @@ from .db import migrate, readonly_connect, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient, QbtHttpClient
 from .integrations.rclone import RcloneClient
-from .integrations.emby import EmbyClient
+from .integrations.emby import EmbyClient, RcloneMountCacheFlusher
 from .integrations.telegram import TelegramHttpApi, TelegramNotificationSender
 from .integrations.gdrive_backfill import GDriveBackfillScraper
 from .integrations.filename_normalize import FilenameNormalizeScript
@@ -377,7 +377,22 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         api_key=os.environ.get("EMBY_API_KEY", ""),
         media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt",
     )
-    emby_worker = EmbyRefreshWorker(state_db, emby_client, media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt")
+    flush_env = _truthy(os.environ.get("QBT_ORCH_EMBY_RCLONE_CACHE_FLUSH"))
+    cache_flusher = None
+    if flush_env is not False:
+        cache_flusher = RcloneMountCacheFlusher(
+            service_name=os.environ.get(
+                "QBT_ORCH_EMBY_RCLONE_MOUNT_SERVICE",
+                "rclone-gcrypt-emby.service",
+            ),
+            timeout=int(os.environ.get("QBT_ORCH_EMBY_RCLONE_CACHE_FLUSH_TIMEOUT_SEC", "15")),
+        )
+    emby_worker = EmbyRefreshWorker(
+        state_db,
+        emby_client,
+        cache_flusher=cache_flusher,
+        media_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt",
+    )
     preferences_guard = None
     prefs_guard_enabled = _truthy(os.environ.get("QBT_ORCH_QBT_PREFERENCES_GUARD"))
     if prefs_guard_enabled is None:

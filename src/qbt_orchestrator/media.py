@@ -646,9 +646,10 @@ class MediaPipelineJobRunner:
 
 
 class EmbyRefreshWorker:
-    def __init__(self, state_db, emby, *, now=None, media_prefix: str = "/media/gcrypt", retry_delay_sec: int = 60):
+    def __init__(self, state_db, emby, *, cache_flusher=None, now=None, media_prefix: str = "/media/gcrypt", retry_delay_sec: int = 60):
         self.state_db = state_db
         self.emby = emby
+        self.cache_flusher = cache_flusher
         self.now = now or (lambda: int(time.time()))
         self.media_prefix = media_prefix.rstrip("/")
         self.retry_delay_sec = max(1, int(retry_delay_sec))
@@ -665,6 +666,8 @@ class EmbyRefreshWorker:
             self._finish(task_id, "blocked", redact(str(exc))[:500])
             return task_id
         try:
+            if self.cache_flusher is not None:
+                self.cache_flusher.flush(path)
             self.emby.media_updated(path)
             self._finish(task_id, "done", None)
         except Exception as exc:

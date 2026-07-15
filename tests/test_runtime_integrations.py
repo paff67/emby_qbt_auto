@@ -95,6 +95,35 @@ def test_emby_client_posts_precise_media_updated_payload_and_blocks_root():
         raise AssertionError("library root refresh must be blocked")
 
 
+def test_rclone_mount_cache_flusher_signals_only_configured_service():
+    from qbt_orchestrator.integrations.emby import RcloneMountCacheFlusher
+
+    calls = []
+
+    def runner(argv, timeout):
+        calls.append((list(argv), timeout))
+        return 0, "", ""
+
+    flusher = RcloneMountCacheFlusher(
+        service_name="rclone-gcrypt-emby.service", runner=runner
+    )
+
+    flusher.flush("/media/gcrypt/WAAA-614")
+
+    assert calls == [
+        (
+            [
+                "systemctl",
+                "kill",
+                "--kill-who=main",
+                "--signal=HUP",
+                "rclone-gcrypt-emby.service",
+            ],
+            15,
+        )
+    ]
+
+
 def test_telegram_polling_writes_commands_and_rejects_unauthorized_users():
     from qbt_orchestrator.integrations.telegram import TelegramPollingService
     from qbt_orchestrator.telegram_control import TelegramAuthorizer

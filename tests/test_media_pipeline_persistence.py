@@ -472,6 +472,49 @@ def test_emby_refresh_worker_calls_precise_media_updated_and_rejects_root_path()
         assert "too broad" in states[1]["last_error"]
 
 
+def test_emby_refresh_flushes_mount_cache_before_notifying_emby():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker
+
+    class RecordingFlusher:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def flush(self, path):
+            self.calls.append(("flush", path))
+
+    class RecordingEmby:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def media_updated(self, path):
+            self.calls.append(("emby", path))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            ("/media/gcrypt/WAAA-614", "queued", 1, 1, "{}", 1, 1),
+        )
+        con.commit()
+        con.close()
+        calls = []
+        worker = EmbyRefreshWorker(
+            db,
+            RecordingEmby(calls),
+            cache_flusher=RecordingFlusher(calls),
+            now=lambda: 100,
+        )
+
+        assert worker.run_next() == 1
+        assert calls == [
+            ("flush", "/media/gcrypt/WAAA-614"),
+            ("emby", "/media/gcrypt/WAAA-614"),
+        ]
+
+
 def test_transient_emby_failure_retries_with_backoff_and_attempt_limit():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.media import EmbyRefreshWorker
