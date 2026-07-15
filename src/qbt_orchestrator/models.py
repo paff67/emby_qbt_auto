@@ -126,8 +126,14 @@ class TorrentSnapshot:
             progress=float(payload.get("progress") or 0),
             content_path=str(payload.get("content_path") or ""),
             save_path=str(payload.get("save_path") or ""),
-            num_seeds=int(payload.get("num_seeds") or payload.get("num_complete") or 0),
-            num_peers=int(payload.get("num_peers") or payload.get("num_incomplete") or 0),
+            num_seeds=max(
+                int(payload.get("num_seeds") or 0),
+                int(payload.get("num_complete") or 0),
+            ),
+            num_peers=max(
+                int(payload.get("num_peers") or 0),
+                int(payload.get("num_incomplete") or 0),
+            ),
             dlspeed_bps=int(payload.get("dlspeed_bps") or payload.get("dlspeed") or 0),
             upspeed_bps=int(payload.get("upspeed_bps") or payload.get("upspeed") or 0),
             completed_bytes=int(payload.get("completed_bytes") or payload.get("completed") or payload.get("downloaded") or 0),

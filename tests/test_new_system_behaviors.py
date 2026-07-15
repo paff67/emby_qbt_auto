@@ -205,6 +205,23 @@ def test_torrent_snapshot_preserves_speed_and_completed_for_health_planner():
     assert snap.share_limit_reached is True
 
 
+def test_torrent_snapshot_keeps_tracker_swarm_totals_when_peers_connect():
+    from qbt_orchestrator.models import TorrentSnapshot
+
+    snap = TorrentSnapshot.from_qbt(
+        {
+            "hash": "h1",
+            "num_seeds": 1,
+            "num_complete": 13,
+            "num_peers": 2,
+            "num_incomplete": 45,
+        }
+    )
+
+    assert snap.num_seeds == 13
+    assert snap.num_peers == 45
+
+
 def test_disk_pressure_and_emergency_action_do_not_need_db():
     from qbt_orchestrator.models import DiskPressureState
     from qbt_orchestrator.policies.disk import classify_disk, emergency_pause_action
