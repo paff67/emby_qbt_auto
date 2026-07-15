@@ -172,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--journal", required=True)
     apply.add_argument("--report-dir", required=True)
     apply.add_argument("--batch-size", type=int)
+    apply.add_argument("--workers", type=int, default=1)
     apply.add_argument("--state-db")
 
     rollback = sub.add_parser("rollback")
@@ -207,6 +208,7 @@ def main(argv=None) -> int:
             remote,
             journal_path=ns.journal,
             batch_size=ns.batch_size,
+            workers=ns.workers,
         )
         nfo_ids = rewrite_verified_nfos(
             plan, _load_json(ns.titles), remote, report_dir=Path(ns.report_dir)

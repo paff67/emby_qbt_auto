@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
 import re
+import threading
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
@@ -531,14 +533,18 @@ def reconcile_verified_migrations(
     return changed
 
 
+_JOURNAL_LOCK = threading.Lock()
+
+
 def _append_journal(path: str | Path, action: MigrationAction, state: str, **extra: Any) -> None:
     journal = Path(path)
     journal.parent.mkdir(parents=True, exist_ok=True)
     record = {**asdict(action), "state": state, **redact(extra)}
-    with journal.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    with _JOURNAL_LOCK:
+        with journal.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def apply_migration(
@@ -547,24 +553,22 @@ def apply_migration(
     *,
     journal_path: str | Path,
     batch_size: int | None = None,
+    workers: int = 1,
 ) -> MigrationResult:
     actions = plan.actions[: max(0, int(batch_size))] if batch_size is not None else plan.actions
-    verified = failed = skipped = 0
-    for action in actions:
+
+    def process(action: MigrationAction) -> tuple[int, int, int]:
         source_row = remote_client.stat(action.source)
         target_row = remote_client.stat(action.target)
         if source_row is None and _verified(action, target_row):
             _append_journal(journal_path, action, "verified", idempotent=True)
-            verified += 1
-            continue
+            return 1, 0, 0
         if source_row is None or not _verified(action, source_row):
             _append_journal(journal_path, action, "failed", error="source_absent_or_mismatch")
-            failed += 1
-            continue
+            return 0, 1, 0
         if target_row is not None:
             _append_journal(journal_path, action, "failed", error="target_conflict")
-            failed += 1
-            continue
+            return 0, 1, 0
         _append_journal(journal_path, action, "moving")
         try:
             remote_client.moveto(action.source, action.target)
@@ -587,10 +591,21 @@ def apply_migration(
                 )
             else:
                 _append_journal(journal_path, action, "failed", error=str(exc))
-            failed += 1
-            continue
+            return 0, 1, 0
         _append_journal(journal_path, action, "verified")
-        verified += 1
+        return 1, 0, 0
+
+    worker_count = max(1, int(workers))
+    if worker_count == 1:
+        results = [process(action) for action in actions]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="remote-migration"
+        ) as pool:
+            results = list(pool.map(process, actions))
+    verified = sum(result[0] for result in results)
+    failed = sum(result[1] for result in results)
+    skipped = sum(result[2] for result in results)
     return MigrationResult(len(actions), verified, failed, skipped)
 
 

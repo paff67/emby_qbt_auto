@@ -114,6 +114,35 @@ def test_failed_verification_rolls_move_back(tmp_path: Path):
     assert states == ["moving", "rollback_wait", "rolled_back", "failed"]
 
 
+def test_bounded_parallel_apply_verifies_independent_actions(tmp_path: Path):
+    from qbt_orchestrator.remote_migration import apply_migration, build_migration_plan
+
+    remote = FakeRemote(
+        {
+            "gcrypt:/ABC-123-old/ABC-123.mp4": 100,
+            "gcrypt:/DEF-456-old/DEF-456.mp4": 200,
+        }
+    )
+    plan = build_migration_plan(
+        remote.inventory(),
+        {
+            "ABC-123": {"title": "One", "confidence": 1.0},
+            "DEF-456": {"title": "Two", "confidence": 1.0},
+        },
+    )
+
+    result = apply_migration(
+        plan,
+        remote,
+        journal_path=tmp_path / "journal.jsonl",
+        workers=2,
+    )
+
+    assert result.verified == 2
+    assert result.failed == 0
+    assert len((tmp_path / "journal.jsonl").read_text().splitlines()) == 4
+
+
 def test_render_canonical_nfo_updates_emby_identity_fields():
     from qbt_orchestrator.remote_migration import render_canonical_nfo
 
