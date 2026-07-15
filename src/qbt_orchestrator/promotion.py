@@ -91,6 +91,21 @@ class MediaPromotionRepository:
 
         return write_transaction(self.state_db, txn)
 
+    def peek_next(self) -> dict[str, Any] | None:
+        now = int(self.now())
+        con = readonly_connect(self.state_db)
+        try:
+            row = con.execute(
+                "select * from media_promotions where attempts<max_attempts "
+                "and state in ('planned','retry_wait') "
+                "and (state!='retry_wait' or next_run_at is null or next_run_at<=?) "
+                "order by id limit 1",
+                (now,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            con.close()
+
     def schedule_retry(self, promotion_id: int, error: str, *, delay_sec: int = 60) -> None:
         now = int(self.now())
         write_transaction(
@@ -315,6 +330,53 @@ def finalize_canonical_upload(
                 upload_payload.get("cleanup_policy_snapshot") or {}
             ),
         }
+        group = con.execute(
+            "select media_group_key,emby_media_dir from media_groups where id=?",
+            (int(run["media_group_id"]),),
+        ).fetchone()
+        if group:
+            emby_dir = str(group["emby_media_dir"] or "").rstrip("/")
+            group_key = str(group["media_group_key"] or "")
+            if emby_dir and group_key and emby_dir not in {"/media", "/media/gcrypt"}:
+                refresh_payload = json.dumps(
+                    {
+                        "media_group_key": group_key,
+                        "upload_manifest_id": str(run["upload_manifest_id"] or ""),
+                        "trigger_state": "CanonicalRemoteVerified",
+                    },
+                    ensure_ascii=False,
+                )
+                earliest = observed_at + 300
+                max_run = observed_at + 900
+                existing = con.execute(
+                    "select * from emby_refresh_tasks where emby_media_dir=? and state='queued' order by id limit 1",
+                    (emby_dir,),
+                ).fetchone()
+                if existing:
+                    con.execute(
+                        "update emby_refresh_tasks set earliest_run_at=?,max_run_at=?,payload_json=?,updated_at=? where id=?",
+                        (
+                            min(int(existing["max_run_at"]), earliest),
+                            max(int(existing["max_run_at"]), max_run),
+                            refresh_payload,
+                            observed_at,
+                            int(existing["id"]),
+                        ),
+                    )
+                else:
+                    con.execute(
+                        "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) "
+                        "values(?,?,?,?,?,?,?)",
+                        (
+                            emby_dir,
+                            "queued",
+                            earliest,
+                            max_run,
+                            refresh_payload,
+                            observed_at,
+                            observed_at,
+                        ),
+                    )
         con.execute(
             "insert or ignore into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,parent_job_id,created_at,updated_at) "
             "values(?,?,?,?,?,?,?,?,?)",

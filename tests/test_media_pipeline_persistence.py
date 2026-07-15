@@ -331,6 +331,47 @@ def test_persistent_media_pipeline_low_confidence_normalize_passthrough_skips_sc
         assert rows(db, "select emby_media_dir from emby_refresh_tasks") == [{"emby_media_dir": "/media/gcrypt/raw-upload"}]
 
 
+def test_low_confidence_live_upload_uses_verified_identity_promotion_barrier():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        normalizer = RecordingNormalizer(
+            {"normalized_id": "", "confidence": 0.2, "reason": "no_jav_id"}
+        )
+        service = MediaPipelineService(
+            db,
+            backfill=RecordingBackfill({"status": "not_found", "artifacts": []}),
+            normalizer=normalizer,
+            now=lambda: 5100,
+        )
+        source = "gcrypt:/raw-upload/random_home_video.mp4"
+
+        result = service.handle_upload_verified(
+            "upload-job-99",
+            [UploadedFile(source, size=1024**3, duration_sec=120)],
+            upload_job_id=99,
+            torrent_hash="h99",
+        )
+
+        assert result.state == "PassthroughAllowed"
+        promotion = rows(db, "select * from media_promotions")[0]
+        assert promotion["source_remote"] == source
+        assert promotion["target_remote"] == source
+        run = rows(
+            db,
+            "select canonical_remote_dir,canonical_basename,canonical_video_manifest_json from media_pipeline_runs",
+        )[0]
+        assert run["canonical_remote_dir"] == "gcrypt:/raw-upload"
+        assert run["canonical_basename"] == "random_home_video"
+        assert json.loads(run["canonical_video_manifest_json"]) == [
+            {"remote_path": source, "size": 1024**3}
+        ]
+        assert rows(db, "select * from emby_refresh_tasks") == []
+
+
 def test_persistent_media_pipeline_requires_core_sidecar_artifacts_before_upload_job():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.media import MediaPipelineService, UploadedFile

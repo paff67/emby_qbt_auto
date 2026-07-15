@@ -10,6 +10,7 @@ from .db import readonly_connect, write_transaction
 from .cleanup_policy import cleanup_eligibility
 from .io_governor import JobPriority
 from .observability import redact
+from .promotion import finalize_canonical_upload
 from .upload import RcloneUploadWorker, UploadJob, UploadResult
 
 
@@ -491,14 +492,14 @@ class UploadJobRunner:
             return
         now = int(self.repo.now())
 
-        def txn(con: sqlite3.Connection) -> None:
+        def txn(con: sqlite3.Connection) -> list[int]:
             manifest = con.execute(
                 "select sm.*, mg.media_group_key, mg.emby_media_dir from sidecar_manifests sm "
                 "left join media_groups mg on mg.id=sm.media_group_id where sm.id=?",
                 (sidecar_manifest_id,),
             ).fetchone()
             if not manifest:
-                return
+                return []
 
             pending = False
             terminal_failure = False
@@ -524,7 +525,7 @@ class UploadJobRunner:
                     break
 
             if terminal_failure:
-                self._apply_sidecar_upload_failure_txn(
+                return self._apply_sidecar_upload_failure_txn(
                     con,
                     manifest,
                     sidecar_manifest_id,
@@ -532,7 +533,6 @@ class UploadJobRunner:
                     allow_passthrough=self._payload_bool(payload, "allow_unrecognized_passthrough", True),
                     reason="sidecar_upload_failed",
                 )
-                return
 
             if pending or total == 0:
                 con.execute("update sidecar_manifests set state='sidecar_uploading', updated_at=? where id=?", (now, sidecar_manifest_id))
@@ -541,7 +541,7 @@ class UploadJobRunner:
                     "where media_group_id=? and state in ('SidecarUploadQueued','SidecarUploading')",
                     (now, int(manifest["media_group_id"])),
                 )
-                return
+                return []
 
             con.execute("update sidecar_manifests set state='sidecar_verified', updated_at=? where id=?", (now, sidecar_manifest_id))
             con.execute(
@@ -549,9 +549,20 @@ class UploadJobRunner:
                 "where media_group_id=? and state in ('SidecarUploadQueued','SidecarUploading')",
                 (now, int(manifest["media_group_id"])),
             )
-            self._queue_emby_refresh_for_sidecar_txn(con, manifest, sidecar_manifest_id, now, "SidecarVerified")
+            upload_ids = self._promotion_upload_ids_txn(
+                con, int(manifest["media_group_id"])
+            )
+            if not upload_ids:
+                self._queue_emby_refresh_for_sidecar_txn(
+                    con, manifest, sidecar_manifest_id, now, "SidecarVerified"
+                )
+            return upload_ids
 
-        write_transaction(self.repo.state_db, txn)
+        upload_ids = write_transaction(self.repo.state_db, txn)
+        for upload_id in upload_ids:
+            finalize_canonical_upload(
+                self.repo.state_db, upload_id=int(upload_id), now=now
+            )
 
     def _mark_sidecar_upload_failed(self, row: dict[str, Any], payload: dict[str, Any], reason: str) -> None:
         sidecar_manifest_id = self._sidecar_manifest_id(payload)
@@ -559,15 +570,15 @@ class UploadJobRunner:
             return
         now = int(self.repo.now())
 
-        def txn(con: sqlite3.Connection) -> None:
+        def txn(con: sqlite3.Connection) -> list[int]:
             manifest = con.execute(
                 "select sm.*, mg.media_group_key, mg.emby_media_dir from sidecar_manifests sm "
                 "left join media_groups mg on mg.id=sm.media_group_id where sm.id=?",
                 (sidecar_manifest_id,),
             ).fetchone()
             if not manifest:
-                return
-            self._apply_sidecar_upload_failure_txn(
+                return []
+            return self._apply_sidecar_upload_failure_txn(
                 con,
                 manifest,
                 sidecar_manifest_id,
@@ -576,7 +587,11 @@ class UploadJobRunner:
                 reason=reason,
             )
 
-        write_transaction(self.repo.state_db, txn)
+        upload_ids = write_transaction(self.repo.state_db, txn)
+        for upload_id in upload_ids:
+            finalize_canonical_upload(
+                self.repo.state_db, upload_id=int(upload_id), now=now
+            )
 
     def _apply_sidecar_upload_failure_txn(
         self,
@@ -587,7 +602,7 @@ class UploadJobRunner:
         *,
         allow_passthrough: bool,
         reason: str,
-    ) -> None:
+    ) -> list[int]:
         con.execute("update sidecar_manifests set state='sidecar_upload_failed', updated_at=? where id=?", (now, sidecar_manifest_id))
         if allow_passthrough:
             con.execute(
@@ -595,20 +610,38 @@ class UploadJobRunner:
                 "passthrough_reason=?, updated_at=? where media_group_id=? and state in ('SidecarUploadQueued','SidecarUploading')",
                 (reason, now, int(manifest["media_group_id"])),
             )
-            self._queue_emby_refresh_for_sidecar_txn(
-                con,
-                manifest,
-                sidecar_manifest_id,
-                now,
-                "PassthroughAllowed",
-                passthrough_reason=reason,
+            upload_ids = self._promotion_upload_ids_txn(
+                con, int(manifest["media_group_id"])
             )
+            if not upload_ids:
+                self._queue_emby_refresh_for_sidecar_txn(
+                    con,
+                    manifest,
+                    sidecar_manifest_id,
+                    now,
+                    "PassthroughAllowed",
+                    passthrough_reason=reason,
+                )
+            return upload_ids
         else:
             con.execute(
                 "update media_pipeline_runs set state='ManualReview', metadata_policy='manual_review', "
                 "passthrough_reason=?, updated_at=? where media_group_id=? and state in ('SidecarUploadQueued','SidecarUploading')",
                 (reason, now, int(manifest["media_group_id"])),
             )
+        return []
+
+    @staticmethod
+    def _promotion_upload_ids_txn(
+        con: sqlite3.Connection, media_group_id: int
+    ) -> list[int]:
+        return [
+            int(row["upload_job_id"])
+            for row in con.execute(
+                "select distinct upload_job_id from media_promotions where media_group_id=? order by upload_job_id",
+                (int(media_group_id),),
+            ).fetchall()
+        ]
 
     def _queue_emby_refresh_for_sidecar_txn(
         self,

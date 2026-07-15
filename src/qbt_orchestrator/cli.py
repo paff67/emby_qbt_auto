@@ -20,6 +20,7 @@ from .observe_promotion import ObservePromotionConfig, ObservePromotionService
 from .orphan_janitor import OrphanJanitorService
 from .path_reconcile import QbtPathReconciler
 from .preferences import QbtPreferencesGuard
+from .promotion import MediaPromotionRepository, MediaPromotionRunner
 from .runtime import BotCommandRepository, BotNotificationRepository, CleanupRequestRunner, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
 from .seeding_preemption import PreemptionConfig, SeedingPreemptionService
@@ -265,11 +266,18 @@ def _status_payload(db: Path, view: str | None) -> dict:
             soak_probe_reserved = con.execute(
                 "select coalesce(sum(bytes),0) from resource_reservations where kind='soak_probe' and state='active'"
             ).fetchone()[0]
+            promotion_rows = con.execute(
+                "select state,count(*) as count from media_promotions group by state"
+            ).fetchall()
+            promotions_by_state = {
+                str(r["state"]): int(r["count"]) for r in promotion_rows
+            }
             return {
                 "by_state": by_state,
                 "recoverable_jobs": len(recover_jobs(db)),
                 "scheduler_by_state": scheduler_by_state,
                 "soak_probe_reserved_bytes": int(soak_probe_reserved or 0),
+                "promotions_by_state": promotions_by_state,
             }
         if view == "db":
             return {"counts": readonly_counts(db), "recoverable_jobs": len(recover_jobs(db))}
@@ -326,6 +334,13 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     cleanup_dry_run = True if dry_run else (cleanup_env if cleanup_env is not None else False)
     cleanup_repo = TorrentJobRepository(state_db)
     upload_runner = UploadJobRunner(TorrentJobRepository(state_db), rclone, executor)
+    media_promotion_runner = MediaPromotionRunner(
+        MediaPromotionRepository(state_db), rclone
+    )
+    promotion_env = _truthy(os.environ.get("QBT_ORCH_MEDIA_PROMOTION_DRY_RUN"))
+    media_promotion_dry_run = True if dry_run else (
+        promotion_env if promotion_env is not None else True
+    )
     cleanup_runner = CleanupRequestRunner(cleanup_repo, executor)
     file_batch_env = _truthy(os.environ.get("QBT_ORCH_FILE_BATCH_DRY_RUN"))
     file_batch_dry_run = True if dry_run else (file_batch_env if file_batch_env is not None else True)
@@ -530,6 +545,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
         container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
         rclone_remote=rclone_cfg.remote if rclone_cfg else "gcrypt:",
+        media_promotion_runner=media_promotion_runner,
+        media_promotion_dry_run=media_promotion_dry_run,
         media_pipeline_runner=media_runner,
         media_pipeline_dry_run=media_pipeline_dry_run,
         emby_refresh_worker=emby_worker,

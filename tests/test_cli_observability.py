@@ -635,6 +635,27 @@ def test_status_queue_includes_soak_counts():
         assert payload["soak_probe_reserved_bytes"] == 384
 
 
+def test_status_queue_includes_media_promotion_counts():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into media_promotions(upload_job_id,normalized_id,metadata_title,display_title,"
+            "source_remote,target_remote,expected_size,expected_hashes_json,state,max_attempts,created_at,updated_at) "
+            "values(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (1, "ABC-123", "Title", "ABC-123 Title", "gcrypt:/old.mp4", "gcrypt:/ABC-123/ABC-123 Title.mp4", 10, "{}", "retry_wait", 6, 1, 1),
+        )
+        con.commit()
+        con.close()
+
+        payload = json.loads(run_cli(["status", "queue", "--state-db", str(db), "--json"])[1])
+
+        assert payload["promotions_by_state"] == {"retry_wait": 1}
+
+
 if __name__ == "__main__":
     inspect = __import__("inspect")
     for name, fn in sorted(globals().items()):

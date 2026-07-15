@@ -1116,6 +1116,148 @@ def test_daemon_media_pipeline_then_emby_refresh_live_path():
         assert ("emby", "emby_refresh_processed") in events
 
 
+def test_daemon_background_workers_include_media_promotion_worker():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(
+                MediaPromotionRepository(db), FakeRclone()
+            ),
+            media_promotion_dry_run=False,
+        )
+
+        worker_names = [name for name, _callback in daemon._background_event_worker_specs()]
+
+        assert "promotion" in worker_names
+
+
+def test_daemon_media_promotion_dry_run_does_not_claim_job():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = MediaPromotionRepository(db, now=lambda: 1000)
+        promotion_id = repo.enqueue(
+            upload_job_id=1,
+            hash="h1",
+            media_group_id=None,
+            normalized_id="ABC-123",
+            metadata_title="Title",
+            display_title="ABC-123 Title",
+            source_remote="gcrypt:/old.mp4",
+            target_remote="gcrypt:/ABC-123/ABC-123 Title.mp4",
+            expected_size=10,
+        )
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(repo, FakeRclone()),
+            media_promotion_dry_run=True,
+        )
+        daemon.tick_safety()
+
+        assert daemon.process_media_promotion_jobs() == 1
+        assert repo.get(promotion_id)["state"] == "planned"
+        assert repo.get(promotion_id)["attempts"] == 0
+
+
+def test_daemon_live_promotion_moves_media_and_opens_finalization_barrier():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.runtime import TorrentJobRepository
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        jobs = TorrentJobRepository(db, now=lambda: 1000)
+        upload_id = jobs.enqueue("h1", None, "upload", {"full_torrent": True}, priority=1)
+        con = sqlite3.connect(db)
+        con.execute(
+            "update torrent_jobs set state='promotion_wait',phase='promotion_wait' where id=?",
+            (upload_id,),
+        )
+        con.execute(
+            "insert into media_groups(id,media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?,?)",
+            (1, "ABC-123", "ABC-123", "/media/gcrypt/ABC-123", 100, 100),
+        )
+        con.execute(
+            "insert into media_pipeline_runs(upload_manifest_id,media_group_id,state,created_at,updated_at,canonical_remote_dir,canonical_basename,canonical_video_manifest_json) "
+            "values(?,?,?,?,?,?,?,?)",
+            (
+                f"upload-job-{upload_id}",
+                1,
+                "SidecarVerified",
+                100,
+                100,
+                "gcrypt:/ABC-123",
+                "ABC-123 Title",
+                '[{"remote_path":"gcrypt:/ABC-123/ABC-123 Title.mp4","size":10}]',
+            ),
+        )
+        con.commit()
+        con.close()
+        promotions = MediaPromotionRepository(db, now=lambda: 1000)
+        promotion_id = promotions.enqueue(
+            upload_job_id=upload_id,
+            hash="h1",
+            media_group_id=1,
+            normalized_id="ABC-123",
+            metadata_title="Title",
+            display_title="ABC-123 Title",
+            source_remote="gcrypt:/hash/raw.mp4",
+            target_remote="gcrypt:/ABC-123/ABC-123 Title.mp4",
+            expected_size=10,
+        )
+        rclone = FakeRclone(remote_sizes={"gcrypt:/hash/raw.mp4": 10})
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(promotions, rclone),
+            media_promotion_dry_run=False,
+        )
+        daemon.tick_safety()
+
+        assert daemon.process_media_promotion_jobs() == 1
+
+        assert rclone.movetos == [
+            ("gcrypt:/hash/raw.mp4", "gcrypt:/ABC-123/ABC-123 Title.mp4")
+        ]
+        assert promotions.get(promotion_id)["state"] == "verified"
+        assert jobs.get(upload_id)["state"] == "cleanup_wait"
+        con = sqlite3.connect(db)
+        assert con.execute(
+            "select count(*) from torrent_jobs where job_type='cleanup_full_torrent'"
+        ).fetchone()[0] == 1
+        assert con.execute("select count(*) from emby_refresh_tasks").fetchone()[0] == 1
+        con.close()
+
+
 def test_daemon_default_file_batch_loop_uses_sync_cache_and_dry_run_records_upload():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime

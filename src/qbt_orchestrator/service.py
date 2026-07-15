@@ -29,6 +29,7 @@ from .observability import redact
 from .planner import DownloadPlanner
 from .policies.disk import classify_disk
 from .periodic import PeriodicTask, PeriodicWorker
+from .promotion import finalize_canonical_upload
 from .runtime import (
     BotCommandRepository,
     BotNotificationRepository,
@@ -185,6 +186,8 @@ class DaemonRuntime:
         host_downloads: str = "/data/downloads",
         container_downloads: str = "/downloads",
         rclone_remote: str = "gcrypt:",
+        media_promotion_runner=None,
+        media_promotion_dry_run: bool = True,
         media_pipeline_runner=None,
         media_pipeline_dry_run: bool = True,
         emby_refresh_worker=None,
@@ -272,6 +275,8 @@ class DaemonRuntime:
         self.host_downloads = host_downloads
         self.container_downloads = container_downloads
         self.rclone_remote = rclone_remote
+        self.media_promotion_runner = media_promotion_runner
+        self.media_promotion_dry_run = media_promotion_dry_run or dry_run
         self.media_pipeline_runner = media_pipeline_runner
         self.media_pipeline_dry_run = media_pipeline_dry_run or dry_run
         self.emby_refresh_worker = emby_refresh_worker
@@ -969,6 +974,54 @@ class DaemonRuntime:
             self.obs.event("info", "media_pipeline", "media_pipeline_job_processed", f"media pipeline job {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
         return processed
 
+    def process_media_promotion_jobs(self, max_jobs: int = 1) -> int:
+        if self.media_promotion_runner is None:
+            return 0
+        if not self.monitor.sync.high_risk_actions_allowed:
+            return 0
+        if self.media_promotion_dry_run:
+            row = self.media_promotion_runner.repo.peek_next()
+            if row is None:
+                return 0
+            self.obs.action(
+                hash=row.get("hash"),
+                job_id=int(row["id"]),
+                action_type="media_promotion",
+                path=str(row.get("target_remote") or ""),
+                payload={"promotion_id": row["id"], "source": row.get("source_remote")},
+                status="dry_run",
+                dry_run=True,
+            )
+            return 1
+        processed = 0
+        for _ in range(max_jobs):
+            promotion_id = self.media_promotion_runner.run_next()
+            if promotion_id is None:
+                break
+            processed += 1
+            promotion = self.media_promotion_runner.repo.get(int(promotion_id))
+            finalized = False
+            if str(promotion.get("state") or "") == "verified":
+                finalized = finalize_canonical_upload(
+                    self.state_db,
+                    upload_id=int(promotion["upload_job_id"]),
+                    now=int(time.time()),
+                )
+            self.obs.event(
+                "info",
+                "promotion",
+                "media_promotion_processed",
+                f"media promotion {promotion_id} processed",
+                {
+                    "promotion_id": int(promotion_id),
+                    "state": promotion.get("state"),
+                    "canonical_upload_finalized": finalized,
+                },
+                hash=promotion.get("hash"),
+                job_id=int(promotion_id),
+            )
+        return processed
+
     def process_emby_refresh_tasks(self, max_tasks: int = 1) -> int:
         if self.emby_refresh_worker is None:
             return 0
@@ -1003,6 +1056,7 @@ class DaemonRuntime:
             ("cleanup", self.process_cleanup_requests),
             ("full_cleanup", self.process_full_cleanup_jobs),
             ("media_pipeline", self.process_media_pipeline_jobs),
+            ("promotion", self.process_media_promotion_jobs),
             ("emby", self.process_emby_refresh_tasks),
         ]
 
@@ -1202,6 +1256,10 @@ class DaemonRuntime:
                         self.process_media_pipeline_jobs()
                     except Exception as exc:
                         self.obs.event("error", "media_pipeline", "media_pipeline_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                    try:
+                        self.process_media_promotion_jobs()
+                    except Exception as exc:
+                        self.obs.event("error", "promotion", "media_promotion_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                     try:
                         self.process_emby_refresh_tasks()
                     except Exception as exc:

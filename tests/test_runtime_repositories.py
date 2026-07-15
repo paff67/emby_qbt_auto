@@ -175,6 +175,16 @@ def test_finalization_barrier_creates_one_cleanup_after_promotion_and_sidecars()
         assert cleanup_payload["canonical_remote_verified"] is True
         assert cleanup_payload["remote"] == "gcrypt:/BBAN-582"
         assert repo.get(upload_id)["state"] == "cleanup_wait"
+        refresh = _rows(
+            db,
+            "select emby_media_dir,state,earliest_run_at,max_run_at,payload_json from emby_refresh_tasks",
+        )
+        assert len(refresh) == 1
+        assert refresh[0]["emby_media_dir"] == "/media/gcrypt/BBAN-582"
+        assert refresh[0]["state"] == "queued"
+        assert refresh[0]["earliest_run_at"] == now + 300
+        assert refresh[0]["max_run_at"] == now + 900
+        assert json.loads(refresh[0]["payload_json"])["trigger_state"] == "CanonicalRemoteVerified"
 
 
 def test_cleanup_policy_blocks_unverified_seed_long_and_transient_seed_wait():
@@ -466,6 +476,101 @@ def test_sidecar_upload_verified_marks_manifest_and_only_then_queues_emby_refres
         assert refresh[0]["earliest_run_at"] == 1300
         assert refresh[0]["max_run_at"] == 1900
         assert json.loads(refresh[0]["payload_json"])["trigger_state"] == "SidecarVerified"
+
+
+def test_sidecar_completion_finalizes_already_promoted_upload_without_early_refresh():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.integrations.rclone import VerifyResult
+    from qbt_orchestrator.promotion import MediaPromotionRepository
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor, FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1000)
+        upload_payload = {
+            "local": "/tmp/ABC-123",
+            "remote": "gcrypt:/ABC-123-hash",
+            "size": 10,
+            "full_torrent": True,
+        }
+        upload_id = repo.enqueue("h1", None, "upload", upload_payload, priority=1)
+        repo.finalize_verified(
+            repo.get(upload_id), upload_payload, VerifyResult(True, "path_size", [])
+        )
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into media_groups(id,media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?,?)",
+            (1, "ABC-123", "ABC-123", "/media/gcrypt/ABC-123", 100, 100),
+        )
+        con.execute(
+            "insert into media_pipeline_runs(id,upload_manifest_id,media_group_id,state,metadata_policy,metadata_quality,created_at,updated_at,canonical_remote_dir,canonical_basename,canonical_video_manifest_json) "
+            "values(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                1,
+                f"upload-job-{upload_id}",
+                1,
+                "SidecarUploadQueued",
+                "sidecar",
+                "normalized",
+                100,
+                100,
+                "gcrypt:/ABC-123",
+                "ABC-123 Title",
+                '[{"remote_path":"gcrypt:/ABC-123/ABC-123 Title.mp4","size":10}]',
+            ),
+        )
+        con.execute(
+            "insert into sidecar_manifests(id,media_group_id,staging_dir,artifacts_json,state,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            (1, 1, "/staging/ABC-123", "[]", "local_sidecar_validated", 100, 100),
+        )
+        con.commit()
+        con.close()
+        promotions = MediaPromotionRepository(db, now=lambda: 1000)
+        promotion_id = promotions.enqueue(
+            upload_job_id=upload_id,
+            hash="h1",
+            media_group_id=1,
+            normalized_id="ABC-123",
+            metadata_title="Title",
+            display_title="ABC-123 Title",
+            source_remote="gcrypt:/ABC-123-hash/raw.mp4",
+            target_remote="gcrypt:/ABC-123/ABC-123 Title.mp4",
+            expected_size=10,
+        )
+        promotions.record_verified(
+            promotion_id, method="path_size", details={"verified": True}
+        )
+        sidecar_job = repo.enqueue(
+            None,
+            None,
+            "sidecar_upload",
+            {
+                "local": "/staging/ABC-123/movie.nfo",
+                "remote": "gcrypt:/ABC-123/ABC-123 Title.nfo",
+                "size": 5,
+                "full_torrent": False,
+                "sidecar_manifest_id": 1,
+            },
+            priority=1,
+        )
+        runner = UploadJobRunner(
+            repo,
+            FakeRclone(
+                copy_ok=True,
+                remote_sizes={"gcrypt:/ABC-123/ABC-123 Title.nfo": 5},
+            ),
+            FakeExecutor(),
+        )
+
+        assert runner.run_next() == sidecar_job
+
+        assert repo.get(upload_id)["state"] == "cleanup_wait"
+        assert _job_count(db, "cleanup_full_torrent") == 1
+        refresh = _rows(db, "select payload_json from emby_refresh_tasks")
+        assert len(refresh) == 1
+        assert json.loads(refresh[0]["payload_json"])["trigger_state"] == "CanonicalRemoteVerified"
 
 
 def test_sidecar_upload_verify_failure_at_max_attempts_uses_passthrough_not_verified():

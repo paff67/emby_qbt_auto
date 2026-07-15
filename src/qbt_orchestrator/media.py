@@ -147,6 +147,8 @@ class MediaPipelineService:
         run_id = self._ensure_pipeline_run(str(manifest_id), group_id)
         canonical_name: CanonicalMediaName | None = None
         canonical_manifest: list[dict] = []
+        canonical_remote_dir: str | None = None
+        canonical_basename: str | None = None
 
         existing_sidecar_state = self._sidecar_manifest_state(group_id)
         queue_refresh = False
@@ -201,6 +203,8 @@ class MediaPipelineService:
                     "canonical_basename": canonical_name.canonical_basename,
                     "canonical_remote_dir": canonical_name.remote_dir("gcrypt:"),
                 }
+                canonical_remote_dir = canonical_name.remote_dir("gcrypt:")
+                canonical_basename = canonical_name.canonical_basename
             valid_artifacts, missing_outputs = self._validate_sidecar_artifacts(scrape.get("artifacts") or [])
             if scrape.get("status") == "sidecar_verified" and valid_artifacts:
                 manifest_row_id = self._record_sidecar_manifest(group_id, scrape, state="local_sidecar_validated", missing_outputs=[])
@@ -217,6 +221,22 @@ class MediaPipelineService:
                 passthrough_reason = "sidecar_verify_failed"
                 queue_refresh = True
 
+        if upload_job_id is not None and not canonical_manifest and state != "ManualReview":
+            identity = self._enqueue_identity_promotions(
+                upload_job_id=int(upload_job_id),
+                torrent_hash=torrent_hash,
+                group_id=group_id,
+                media_group_key=key,
+                files=valid,
+            )
+            if identity is None:
+                state = "ManualReview"
+                metadata_policy = "manual_review"
+                passthrough_reason = "media_spans_multiple_remote_directories"
+            else:
+                canonical_remote_dir, canonical_basename, canonical_manifest = identity
+                queue_refresh = False
+
         self._set_pipeline_state(
             run_id,
             state,
@@ -226,8 +246,8 @@ class MediaPipelineService:
             normalize_confidence=normalize_confidence,
             normalize_result=normalize_result,
             missing_outputs=missing_outputs,
-            canonical_remote_dir=(canonical_name.remote_dir("gcrypt:") if canonical_name else None),
-            canonical_basename=(canonical_name.canonical_basename if canonical_name else None),
+            canonical_remote_dir=canonical_remote_dir,
+            canonical_basename=canonical_basename,
             canonical_video_manifest=canonical_manifest,
         )
         if queue_refresh:
@@ -292,6 +312,40 @@ class MediaPipelineService:
             )
             manifest.append({"remote_path": target, "size": int(file.size)})
         return manifest
+
+    def _enqueue_identity_promotions(
+        self,
+        *,
+        upload_job_id: int,
+        torrent_hash: str | None,
+        group_id: int,
+        media_group_key: str,
+        files: list[UploadedFile],
+    ) -> tuple[str, str, list[dict]] | None:
+        parents = {_remote_parent(file.remote_path) for file in files}
+        if len(parents) != 1:
+            return None
+        remote_dir = next(iter(parents))
+        primary_name = PurePosixPath(
+            _remote_path_without_remote(files[0].remote_path)
+        ).stem
+        manifest: list[dict] = []
+        for file in files:
+            self.promotions.enqueue(
+                upload_job_id=int(upload_job_id),
+                hash=torrent_hash,
+                media_group_id=int(group_id),
+                normalized_id=str(media_group_key),
+                metadata_title=primary_name,
+                display_title=primary_name,
+                source_remote=file.remote_path,
+                target_remote=file.remote_path,
+                expected_size=int(file.size),
+            )
+            manifest.append(
+                {"remote_path": file.remote_path, "size": int(file.size)}
+            )
+        return remote_dir, primary_name, manifest
 
     @staticmethod
     def _retarget_sidecar_artifacts(
