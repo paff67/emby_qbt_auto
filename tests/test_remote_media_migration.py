@@ -81,6 +81,29 @@ def test_migration_preserves_unmatched_and_conflicting_objects():
     assert not any(action.normalized_id == "WAAA-614" for action in plan.actions)
 
 
+def test_migration_prefers_largest_video_when_sources_share_target():
+    from qbt_orchestrator.remote_migration import build_migration_plan
+
+    inventory = [
+        {"Path": "ABC-123-old/a-ad.mp4", "Size": 15_000_000, "Hashes": {}},
+        {"Path": "ABC-123-old/z-main.mp4", "Size": 5_000_000_000, "Hashes": {}},
+    ]
+
+    plan = build_migration_plan(
+        inventory,
+        {"ABC-123": {"title": "Title", "confidence": 1.0}},
+    )
+
+    video = next(action for action in plan.actions if action.kind == "video")
+    assert video.source == "gcrypt:/ABC-123-old/z-main.mp4"
+    assert video.expected_size == 5_000_000_000
+    assert any(
+        item.source == "gcrypt:/ABC-123-old/a-ad.mp4"
+        and item.reason == "target_conflict"
+        for item in plan.review
+    )
+
+
 def test_second_plan_is_empty_after_apply_and_verify(tmp_path: Path):
     from qbt_orchestrator.remote_migration import apply_migration, build_migration_plan
 

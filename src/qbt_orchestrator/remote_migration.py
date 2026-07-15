@@ -181,7 +181,13 @@ def build_migration_plan(
     review: list[MigrationReview] = []
     reserved_targets: set[str] = set()
 
-    for row in sorted(rows, key=_relative_path):
+    def row_order(row: Mapping[str, Any]) -> tuple[str, int, int, str]:
+        relative = _relative_path(row)
+        is_video = PurePosixPath(relative).suffix.lower() in _VIDEO_EXTS
+        size = int(row.get("Size") or row.get("size") or 0)
+        return _normalized_id(relative), 0 if is_video else 1, -size if is_video else 0, relative
+
+    for row in sorted(rows, key=row_order):
         relative = _relative_path(row)
         if not relative:
             continue
