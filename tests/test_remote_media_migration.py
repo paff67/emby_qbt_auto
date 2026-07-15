@@ -207,3 +207,39 @@ def test_audit_accepts_separately_verified_rewritten_nfo(tmp_path: Path):
 
     assert result.verified == 2
     assert audit == {"verified": 2, "pending": 0, "conflict": 0}
+
+
+def test_reconcile_historical_migration_queues_emby_without_pending_upload(tmp_path: Path):
+    import sqlite3
+
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.remote_migration import (
+        build_migration_plan,
+        reconcile_verified_migrations,
+    )
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    source = "gcrypt:/BBAN-582-old/BBAN-582.mp4"
+    target = "gcrypt:/BBAN-582/BBAN-582 Title.mp4"
+    plan = build_migration_plan(
+        [{"Path": source.split(":/", 1)[1], "Size": 100, "Hashes": {}}],
+        {"BBAN-582": {"title": "Title", "confidence": 1.0}},
+    )
+    remote = FakeRemote({target: 100})
+
+    changed = reconcile_verified_migrations(
+        db,
+        plan,
+        remote,
+        nfo_verified_ids={"BBAN-582"},
+        now=2000,
+    )
+
+    con = sqlite3.connect(db)
+    refresh = con.execute(
+        "select emby_media_dir,state from emby_refresh_tasks"
+    ).fetchall()
+    con.close()
+    assert changed == 0
+    assert refresh == [("/media/gcrypt/BBAN-582", "queued")]

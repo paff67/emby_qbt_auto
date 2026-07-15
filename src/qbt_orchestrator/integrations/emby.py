@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
+import time
 from typing import Callable, Sequence
 from urllib import request
 
@@ -28,12 +30,18 @@ class RcloneMountCacheFlusher:
         *,
         runner: CommandRunner = default_command_runner,
         timeout: int = 15,
+        min_interval_sec: float = 30.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         if not self._SERVICE.fullmatch(str(service_name)):
             raise ValueError("invalid rclone mount service name")
         self.service_name = str(service_name)
         self.runner = runner
         self.timeout = max(1, int(timeout))
+        self.min_interval_sec = max(0.0, float(min_interval_sec))
+        self.monotonic = monotonic
+        self._last_flush_at: float | None = None
+        self._lock = threading.Lock()
 
     def flush(self, _path: str) -> None:
         argv = [
@@ -43,11 +51,18 @@ class RcloneMountCacheFlusher:
             "--signal=HUP",
             self.service_name,
         ]
-        rc, _stdout, stderr = self.runner(argv, self.timeout)
-        if rc != 0:
-            raise ConnectionError(
-                f"rclone mount cache flush failed rc={rc}: {stderr[-300:]}"
-            )
+        with self._lock:
+            now = float(self.monotonic())
+            if self._last_flush_at is not None and (
+                now - self._last_flush_at < self.min_interval_sec
+            ):
+                return
+            rc, _stdout, stderr = self.runner(argv, self.timeout)
+            if rc != 0:
+                raise ConnectionError(
+                    f"rclone mount cache flush failed rc={rc}: {stderr[-300:]}"
+                )
+            self._last_flush_at = now
 
 
 def default_transport(url: str, payload: dict, headers: dict, timeout: int) -> dict:

@@ -105,10 +105,13 @@ def test_rclone_mount_cache_flusher_signals_only_configured_service():
         return 0, "", ""
 
     flusher = RcloneMountCacheFlusher(
-        service_name="rclone-gcrypt-emby.service", runner=runner
+        service_name="rclone-gcrypt-emby.service",
+        runner=runner,
+        monotonic=lambda: 100.0,
     )
 
     flusher.flush("/media/gcrypt/WAAA-614")
+    flusher.flush("/media/gcrypt/BBAN-582")
 
     assert calls == [
         (

@@ -296,11 +296,12 @@ def reconcile_verified_migrations(
             continue
         if not action_verified(action, remote_client):
             continue
-        match = _HASH_PREFIX.search(action.source)
-        if not match:
-            continue
         groups.setdefault(action.normalized_id, []).append(action)
-        prefixes.setdefault(action.normalized_id, set()).add(match.group(1).lower())
+        match = _HASH_PREFIX.search(action.source)
+        if match:
+            prefixes.setdefault(action.normalized_id, set()).add(
+                match.group(1).lower()
+            )
 
     changed = 0
     for media_id, actions in groups.items():
@@ -317,7 +318,7 @@ def reconcile_verified_migrations(
 
         def txn(con) -> int:
             group_rows = []
-            for hash_prefix in prefixes[media_id]:
+            for hash_prefix in prefixes.get(media_id, set()):
                 group_rows.extend(
                     con.execute(
                         "select * from torrent_jobs where job_type='upload' and lower(hash) like ? "
@@ -325,8 +326,6 @@ def reconcile_verified_migrations(
                         (f"{hash_prefix}%",),
                     ).fetchall()
                 )
-            if not group_rows:
-                return 0
             con.execute(
                 "insert or ignore into media_groups(media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?)",
                 (
@@ -491,18 +490,41 @@ def reconcile_verified_migrations(
                 },
                 ensure_ascii=False,
             )
-            con.execute(
-                "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
-                (
-                    f"/media/gcrypt/{media_id}",
-                    "queued",
-                    observed_at + 300,
-                    observed_at + 900,
-                    refresh_payload,
-                    observed_at,
-                    observed_at,
-                ),
-            )
+            emby_dir = f"/media/gcrypt/{media_id}"
+            existing_refresh = con.execute(
+                "select id,max_run_at from emby_refresh_tasks where emby_media_dir=? and state='queued' order by id limit 1",
+                (emby_dir,),
+            ).fetchone()
+            if existing_refresh:
+                con.execute(
+                    "update emby_refresh_tasks set earliest_run_at=?,max_run_at=?,payload_json=?,updated_at=? where id=?",
+                    (
+                        min(
+                            int(existing_refresh["max_run_at"] or observed_at + 900),
+                            observed_at + 300,
+                        ),
+                        max(
+                            int(existing_refresh["max_run_at"] or 0),
+                            observed_at + 900,
+                        ),
+                        refresh_payload,
+                        observed_at,
+                        int(existing_refresh["id"]),
+                    ),
+                )
+            else:
+                con.execute(
+                    "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+                    (
+                        emby_dir,
+                        "queued",
+                        observed_at + 300,
+                        observed_at + 900,
+                        refresh_payload,
+                        observed_at,
+                        observed_at,
+                    ),
+                )
             return count
 
         changed += int(write_transaction(state_db, txn))
