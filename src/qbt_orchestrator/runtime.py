@@ -4,7 +4,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .db import readonly_connect, write_transaction
 from .cleanup_policy import cleanup_eligibility
@@ -192,6 +192,53 @@ class TorrentJobRepository:
                 return None
             con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
             return dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone())
+
+        return write_transaction(self.state_db, txn)
+
+    def claim_next_cleanup(self, *, prefer_largest: bool) -> dict[str, Any] | None:
+        now = int(self.now())
+
+        def reclaimable_bytes(row: sqlite3.Row) -> int:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return 0
+            manifest = payload.get("final_manifest") or []
+            if isinstance(manifest, list):
+                return sum(
+                    max(0, int(item.get("size") or 0))
+                    for item in manifest
+                    if isinstance(item, dict)
+                )
+            snapshot = payload.get("cleanup_policy_snapshot") or {}
+            return max(0, int(snapshot.get("size") or 0))
+
+        def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
+            candidates = con.execute(
+                "select * from torrent_jobs where job_type='cleanup_full_torrent' and attempts<max_attempts "
+                "and state in ('queued','retry_wait') "
+                "and (state!='retry_wait' or next_run_at is null or next_run_at<=?)",
+                (now,),
+            ).fetchall()
+            if not candidates:
+                return None
+            row = min(
+                candidates,
+                key=lambda item: (
+                    int(item["priority"]),
+                    -reclaimable_bytes(item) if prefer_largest else int(item["id"]),
+                    int(item["id"]),
+                ),
+            )
+            con.execute(
+                "update torrent_jobs set state='running',lease_owner='local',lease_until=?,attempts=attempts+1,updated_at=? where id=?",
+                (now + 1800, now, int(row["id"])),
+            )
+            return dict(
+                con.execute(
+                    "select * from torrent_jobs where id=?", (int(row["id"]),)
+                ).fetchone()
+            )
 
         return write_transaction(self.state_db, txn)
 
@@ -727,17 +774,26 @@ class FullTorrentCleanupRunner:
         executor,
         torrent_provider=None,
         *,
+        free_bytes_provider=None,
+        pressure_free_bytes: int = 5 * 1024**3,
         min_seed_sec: int = 900,
         min_ratio: float = 1.0,
+        max_retention_sec: int = 7200,
     ):
         self.repo = repo
         self.executor = executor
         self.torrent_provider = torrent_provider
+        self.free_bytes_provider = free_bytes_provider or (lambda: 2**63 - 1)
+        self.pressure_free_bytes = max(0, int(pressure_free_bytes))
         self.min_seed_sec = max(0, int(min_seed_sec))
         self.min_ratio = max(0.0, float(min_ratio))
+        self.max_retention_sec = max(0, int(max_retention_sec))
 
     def run_next(self) -> int | None:
-        row = self.repo.claim_next("cleanup_full_torrent")
+        free_bytes = int(self.free_bytes_provider())
+        row = self.repo.claim_next_cleanup(
+            prefer_largest=free_bytes < self.pressure_free_bytes
+        )
         if not row:
             return None
         payload = json.loads(row["payload_json"] or "{}")
@@ -750,12 +806,20 @@ class FullTorrentCleanupRunner:
                 return int(row["id"])
         if torrent is None:
             torrent = dict(payload.get("cleanup_policy_snapshot") or {})
+        elif not isinstance(torrent, Mapping):
+            torrent = vars(torrent)
         now = int(self.repo.now())
         decision = cleanup_eligibility(
             torrent,
-            remote_verified=bool(payload.get("remote_verified")),
+            canonical_remote_verified=bool(
+                payload.get("canonical_remote_verified")
+            ),
+            promotion_conflict=bool(payload.get("promotion_conflict")),
+            free_bytes=free_bytes,
+            pressure_free_bytes=self.pressure_free_bytes,
             min_seed_sec=self.min_seed_sec,
             min_ratio=self.min_ratio,
+            max_retention_sec=self.max_retention_sec,
             now=now,
         )
         if not decision.allowed:

@@ -438,6 +438,36 @@ def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
         assert runtime.batch_inventory_limit == 6
 
 
+def test_cli_runtime_wires_disk_adaptive_cleanup_policy_env(monkeypatch):
+    from qbt_orchestrator.cli import _build_runtime
+    from qbt_orchestrator.db import migrate
+
+    class Ns:
+        config = None
+        dry_run = False
+        safety_interval = 0
+        cmd = "once"
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+        monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+        monkeypatch.setenv("QBT_ORCH_FULL_CLEANUP", "1")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_PRESSURE_FREE_GB", "5.5")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MIN_SEED_SEC", "901")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MIN_RATIO", "1.25")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MAX_RETENTION_SEC", "7300")
+
+        runtime, _ = _build_runtime(Ns(), db)
+
+        assert runtime.cleanup_pressure_free_bytes == int(5.5 * 1024**3)
+        assert runtime.cleanup_min_seed_sec == 901
+        assert runtime.cleanup_min_ratio == 1.25
+        assert runtime.cleanup_max_retention_sec == 7300
+        assert runtime.full_cleanup_runner.pressure_free_bytes == int(5.5 * 1024**3)
+
+
 def test_cli_runtime_enables_background_event_workers_only_for_live_daemon(monkeypatch):
     from qbt_orchestrator.cli import _build_runtime
     from qbt_orchestrator.db import migrate

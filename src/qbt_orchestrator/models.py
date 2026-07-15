@@ -106,6 +106,10 @@ class TorrentSnapshot:
     dlspeed_bps: int = 0
     upspeed_bps: int = 0
     completed_bytes: int = 0
+    ratio: float = 0.0
+    seeding_time: int = 0
+    completion_on: int = 0
+    share_limit_reached: bool = False
     has_metadata: bool | None = None
 
     @classmethod
@@ -127,6 +131,10 @@ class TorrentSnapshot:
             dlspeed_bps=int(payload.get("dlspeed_bps") or payload.get("dlspeed") or 0),
             upspeed_bps=int(payload.get("upspeed_bps") or payload.get("upspeed") or 0),
             completed_bytes=int(payload.get("completed_bytes") or payload.get("completed") or payload.get("downloaded") or 0),
+            ratio=float(payload.get("ratio") or 0.0),
+            seeding_time=int(payload.get("seeding_time") or 0),
+            completion_on=int(payload.get("completion_on") or 0),
+            share_limit_reached=bool(payload.get("share_limit_reached") or False),
             has_metadata=None if has_metadata is None else bool(has_metadata),
         )
 

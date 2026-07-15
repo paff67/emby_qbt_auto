@@ -195,16 +195,22 @@ def test_cleanup_policy_blocks_unverified_seed_long_and_transient_seed_wait():
 
     assert cleanup_eligibility(
         {"tags": "auto", "seeding_time": 99_999, "ratio": 9.0},
-        remote_verified=False,
+        canonical_remote_verified=False,
+        free_bytes=10 * 1024**3,
+        pressure_free_bytes=5 * 1024**3,
         min_seed_sec=900,
         min_ratio=1.0,
+        max_retention_sec=7200,
         now=1_000,
-    ).reason == "remote_not_verified"
+    ).reason == "remote_not_canonical"
     seed_long = cleanup_eligibility(
         {"tags": "auto,seed-long", "seeding_time": 99_999, "ratio": 9.0},
-        remote_verified=True,
+        canonical_remote_verified=True,
+        free_bytes=10 * 1024**3,
+        pressure_free_bytes=5 * 1024**3,
         min_seed_sec=900,
         min_ratio=1.0,
+        max_retention_sec=7200,
         now=1_000,
     )
     assert seed_long.allowed is False
@@ -212,13 +218,77 @@ def test_cleanup_policy_blocks_unverified_seed_long_and_transient_seed_wait():
     assert seed_long.next_check_at is None
     waiting = cleanup_eligibility(
         {"tags": "auto", "seeding_time": 899, "ratio": 9.0},
-        remote_verified=True,
+        canonical_remote_verified=True,
+        free_bytes=10 * 1024**3,
+        pressure_free_bytes=5 * 1024**3,
         min_seed_sec=900,
-        min_ratio=1.0,
+        min_ratio=10.0,
+        max_retention_sec=7200,
         now=1_000,
     )
-    assert waiting.reason == "seed_time"
+    assert waiting.reason == "policy_wait"
     assert waiting.next_check_at == 1_300
+
+
+def test_cleanup_releases_canonical_media_under_pressure_or_ratio_or_retention():
+    from qbt_orchestrator.cleanup_policy import cleanup_eligibility
+
+    base = {
+        "tags": "auto",
+        "seeding_time": 0,
+        "ratio": 0.0,
+        "completion_on": 9_900,
+        "state": "stoppedUP",
+    }
+    common = {
+        "canonical_remote_verified": True,
+        "pressure_free_bytes": 5 * 1024**3,
+        "min_seed_sec": 900,
+        "min_ratio": 1.0,
+        "max_retention_sec": 7200,
+        "now": 10_000,
+    }
+    pressure = cleanup_eligibility(
+        base, free_bytes=4 * 1024**3, **common
+    )
+    ratio = cleanup_eligibility(
+        {**base, "ratio": 3.13}, free_bytes=10 * 1024**3, **common
+    )
+    retention = cleanup_eligibility(
+        {**base, "completion_on": 1_000}, free_bytes=10 * 1024**3, **common
+    )
+
+    assert (pressure.allowed, pressure.reason) == (True, "disk_pressure")
+    assert (ratio.allowed, ratio.reason) == (True, "ratio")
+    assert (retention.allowed, retention.reason) == (True, "retention")
+
+
+def test_cleanup_hard_gates_override_disk_pressure():
+    from qbt_orchestrator.cleanup_policy import cleanup_eligibility
+
+    common = {
+        "free_bytes": 0,
+        "pressure_free_bytes": 5 * 1024**3,
+        "min_seed_sec": 0,
+        "min_ratio": 0,
+        "max_retention_sec": 0,
+        "now": 10_000,
+    }
+    cases = [
+        ({"tags": "hold"}, True, False, "hold"),
+        ({"tags": "seed-long"}, True, False, "seed_long"),
+        ({"tags": "auto"}, False, False, "remote_not_canonical"),
+        ({"tags": "auto"}, True, True, "promotion_conflict"),
+    ]
+    for torrent, verified, conflict, reason in cases:
+        decision = cleanup_eligibility(
+            torrent,
+            canonical_remote_verified=verified,
+            promotion_conflict=conflict,
+            **common,
+        )
+        assert decision.allowed is False
+        assert decision.reason == reason
 
 
 def test_full_cleanup_runner_never_deletes_seed_long_and_retries_transient_seed_policy():
@@ -239,7 +309,7 @@ def test_full_cleanup_runner_never_deletes_seed_long_and_retries_transient_seed_
             "held",
             None,
             "cleanup_full_torrent",
-            {"remote_verified": True, "cleanup_policy_snapshot": {"tags": "auto,seed-long", "seeding_time": 99_999, "ratio": 9.0}},
+            {"canonical_remote_verified": True, "cleanup_policy_snapshot": {"tags": "auto,seed-long", "seeding_time": 99_999, "ratio": 9.0}},
             priority=10,
             parent_job_id=held_parent,
         )
@@ -255,7 +325,7 @@ def test_full_cleanup_runner_never_deletes_seed_long_and_retries_transient_seed_
             "ready-later",
             None,
             "cleanup_full_torrent",
-            {"remote_verified": True, "cleanup_policy_snapshot": {}},
+            {"canonical_remote_verified": True, "cleanup_policy_snapshot": {}},
             priority=10,
             parent_job_id=parent,
         )
@@ -280,6 +350,53 @@ def test_full_cleanup_runner_never_deletes_seed_long_and_retries_transient_seed_
         assert repo.get(parent)["state"] == "done"
         assert executor.posts == [
             ("/api/v2/torrents/delete", {"hashes": "ready-later", "deleteFiles": "true"})
+        ]
+
+
+def test_full_cleanup_runner_reclaims_largest_canonical_job_first_under_pressure():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import FullTorrentCleanupRunner, TorrentJobRepository
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1_000)
+        executor = FakeExecutor()
+        for torrent_hash, size in [("small", 10), ("large", 100)]:
+            parent = repo.enqueue(torrent_hash, None, "upload", {}, priority=10)
+            repo.update_state(parent, "cleanup_wait")
+            repo.enqueue(
+                torrent_hash,
+                None,
+                "cleanup_full_torrent",
+                {
+                    "canonical_remote_verified": True,
+                    "final_manifest": [
+                        {"remote_path": f"gcrypt:/{torrent_hash}.mp4", "size": size}
+                    ],
+                },
+                priority=10,
+                parent_job_id=parent,
+            )
+        runner = FullTorrentCleanupRunner(
+            repo,
+            executor,
+            torrent_provider=lambda h: {
+                "hash": h,
+                "tags": "auto",
+                "seeding_time": 0,
+                "ratio": 0,
+            },
+            free_bytes_provider=lambda: 4 * 1024**3,
+            pressure_free_bytes=5 * 1024**3,
+            max_retention_sec=7200,
+        )
+
+        assert runner.run_next() is not None
+
+        assert executor.posts == [
+            ("/api/v2/torrents/delete", {"hashes": "large", "deleteFiles": "true"})
         ]
 
 

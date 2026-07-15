@@ -540,6 +540,13 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         full_cleanup_dry_run=full_cleanup_dry_run,
         cleanup_min_seed_sec=int(os.environ.get("QBT_ORCH_CLEANUP_MIN_SEED_SEC", "900")),
         cleanup_min_ratio=float(os.environ.get("QBT_ORCH_CLEANUP_MIN_RATIO", "1.0")),
+        cleanup_pressure_free_bytes=int(
+            float(os.environ.get("QBT_ORCH_CLEANUP_PRESSURE_FREE_GB", "5"))
+            * 1024**3
+        ),
+        cleanup_max_retention_sec=int(
+            os.environ.get("QBT_ORCH_CLEANUP_MAX_RETENTION_SEC", "7200")
+        ),
         file_batch_dry_run=file_batch_dry_run,
         upload_backpressure_policy=upload_backpressure_policy,
         host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),

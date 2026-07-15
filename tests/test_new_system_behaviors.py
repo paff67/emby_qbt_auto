@@ -182,11 +182,27 @@ def test_qbt_sync_detects_repeated_full_updates_and_backs_off_until_due():
 def test_torrent_snapshot_preserves_speed_and_completed_for_health_planner():
     from qbt_orchestrator.models import TorrentSnapshot
 
-    snap = TorrentSnapshot.from_qbt({"hash": "h1", "dlspeed": 123, "upspeed": 45, "completed": 678, "progress": 0.5})
+    snap = TorrentSnapshot.from_qbt(
+        {
+            "hash": "h1",
+            "dlspeed": 123,
+            "upspeed": 45,
+            "completed": 678,
+            "progress": 0.5,
+            "ratio": 3.13,
+            "seeding_time": 901,
+            "completion_on": 12_345,
+            "share_limit_reached": True,
+        }
+    )
 
     assert snap.dlspeed_bps == 123
     assert snap.upspeed_bps == 45
     assert snap.completed_bytes == 678
+    assert snap.ratio == 3.13
+    assert snap.seeding_time == 901
+    assert snap.completion_on == 12_345
+    assert snap.share_limit_reached is True
 
 
 def test_disk_pressure_and_emergency_action_do_not_need_db():

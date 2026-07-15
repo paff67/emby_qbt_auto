@@ -181,6 +181,8 @@ class DaemonRuntime:
         full_cleanup_dry_run: bool = True,
         cleanup_min_seed_sec: int = 900,
         cleanup_min_ratio: float = 1.0,
+        cleanup_pressure_free_bytes: int = 5 * 1024**3,
+        cleanup_max_retention_sec: int = 7200,
         file_batch_dry_run: bool = True,
         upload_backpressure_policy=None,
         host_downloads: str = "/data/downloads",
@@ -270,6 +272,8 @@ class DaemonRuntime:
         self.full_cleanup_enabled = bool(full_cleanup_enabled or full_cleanup_runner is not None)
         self.cleanup_min_seed_sec = max(0, int(cleanup_min_seed_sec))
         self.cleanup_min_ratio = max(0.0, float(cleanup_min_ratio))
+        self.cleanup_pressure_free_bytes = max(0, int(cleanup_pressure_free_bytes))
+        self.cleanup_max_retention_sec = max(0, int(cleanup_max_retention_sec))
         self.file_batch_dry_run = file_batch_dry_run or dry_run
         self.upload_backpressure_policy = upload_backpressure_policy
         self.host_downloads = host_downloads
@@ -344,12 +348,29 @@ class DaemonRuntime:
                 TorrentJobRepository(self.state_db),
                 self.executor,
                 torrent_provider=lambda h: self.monitor.sync.snapshots.get(str(h)),
+                free_bytes_provider=free_bytes_provider,
+                pressure_free_bytes=self.cleanup_pressure_free_bytes,
                 min_seed_sec=self.cleanup_min_seed_sec,
                 min_ratio=self.cleanup_min_ratio,
+                max_retention_sec=self.cleanup_max_retention_sec,
             )
         else:
             self.full_cleanup_runner = None
         self.obs = ObservabilityStore(self.state_db)
+        self.obs.event(
+            "info",
+            "cleanup",
+            "cleanup_policy_configured",
+            "disk-adaptive cleanup policy configured",
+            {
+                "pressure_free_bytes": self.cleanup_pressure_free_bytes,
+                "min_seed_sec": self.cleanup_min_seed_sec,
+                "min_ratio": self.cleanup_min_ratio,
+                "max_retention_sec": self.cleanup_max_retention_sec,
+                "enabled": self.full_cleanup_enabled,
+                "dry_run": self.full_cleanup_dry_run,
+            },
+        )
         self.mode_controller = ModeController(
             emergency_enter=self.emergency_floor_bytes,
             drain_enter=self.recovery_enter_bytes,
