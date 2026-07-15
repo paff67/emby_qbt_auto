@@ -32,6 +32,14 @@ def test_canonical_media_name_never_truncates_id_prefix():
     assert len(value.canonical_basename) == 40
 
 
+def test_canonical_media_name_limits_utf8_bytes_for_fuse_mounts():
+    value = canonical_media_name("BLK-694", "界" * 200)
+
+    assert value.canonical_basename.startswith("BLK-694 ")
+    assert len(value.canonical_basename.encode("utf-8")) <= 220
+    assert value.display_title == "BLK-694 " + ("界" * 200)
+
+
 def test_canonical_file_basename_preserves_multi_part_suffix_and_collision_digest():
     value = canonical_media_name("BBAN-582", "影片名称")
 

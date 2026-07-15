@@ -28,6 +28,7 @@ def canonical_media_name(
     metadata_title: str,
     *,
     max_basename_chars: int = 120,
+    max_basename_bytes: int = 220,
 ) -> CanonicalMediaName:
     media_id = _SPACE.sub(
         "-", unicodedata.normalize("NFKC", str(normalized_id)).strip()
@@ -42,6 +43,10 @@ def canonical_media_name(
     safe = _SPACE.sub(" ", _INVALID.sub("_", display)).strip(" .")
     limit = max(len(media_id) + 1, int(max_basename_chars))
     safe = safe[:limit].rstrip(" .")
+    byte_limit = max(len(media_id.encode("utf-8")) + 1, int(max_basename_bytes))
+    encoded = safe.encode("utf-8")
+    if len(encoded) > byte_limit:
+        safe = encoded[:byte_limit].decode("utf-8", errors="ignore").rstrip(" .")
     return CanonicalMediaName(media_id, title, display, safe)
 
 
