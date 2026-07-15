@@ -164,3 +164,91 @@ class MediaPromotionRepository:
             ]
         finally:
             con.close()
+
+
+class MediaPromotionRunner:
+    def __init__(
+        self,
+        repo: MediaPromotionRepository,
+        rclone,
+        *,
+        owner: str = "local",
+        retry_delay_sec: int = 60,
+    ):
+        self.repo = repo
+        self.rclone = rclone
+        self.owner = str(owner)
+        self.retry_delay_sec = int(retry_delay_sec)
+
+    @staticmethod
+    def _size(row: dict[str, Any] | None) -> int | None:
+        if not row:
+            return None
+        raw = row.get("Size", row.get("size"))
+        return int(raw) if raw is not None else None
+
+    def run_next(self) -> int | None:
+        row = self.repo.claim_next(owner=self.owner)
+        if not row:
+            return None
+        promotion_id = int(row["id"])
+        source = str(row["source_remote"])
+        target = str(row["target_remote"])
+        expected = int(row["expected_size"])
+
+        try:
+            source_row = self.rclone.stat(source)
+            target_row = self.rclone.stat(target)
+        except Exception as exc:
+            self.repo.schedule_retry(
+                promotion_id, str(exc), delay_sec=self.retry_delay_sec
+            )
+            return promotion_id
+
+        if source_row is None:
+            if self._size(target_row) == expected:
+                self.repo.record_verified(
+                    promotion_id,
+                    method="path_size",
+                    details={"verified": True, "mismatches": []},
+                )
+            else:
+                self.repo.record_failed(promotion_id, "source_absent")
+            return promotion_id
+
+        if self._size(source_row) != expected:
+            self.repo.record_failed(promotion_id, "source_size_mismatch")
+            return promotion_id
+        if target_row is not None:
+            self.repo.record_failed(promotion_id, "target_conflict")
+            return promotion_id
+
+        try:
+            self.rclone.moveto(source, target)
+            target_row = self.rclone.stat(target)
+        except Exception as exc:
+            self.repo.schedule_retry(
+                promotion_id, str(exc), delay_sec=self.retry_delay_sec
+            )
+            return promotion_id
+
+        if self._size(target_row) != expected:
+            rollback_error = ""
+            try:
+                if self.rclone.stat(source) is None and target_row is not None:
+                    self.rclone.moveto(target, source)
+            except Exception as exc:
+                rollback_error = f"; rollback failed: {redact(str(exc))}"
+            self.repo.schedule_retry(
+                promotion_id,
+                f"destination size mismatch{rollback_error}",
+                delay_sec=self.retry_delay_sec,
+            )
+            return promotion_id
+
+        self.repo.record_verified(
+            promotion_id,
+            method="path_size",
+            details={"verified": True, "mismatches": []},
+        )
+        return promotion_id

@@ -130,6 +130,29 @@ class RcloneClient:
             raise RuntimeError(f"rclone copy failed rc={rc}: {err[-400:]}")
         return True
 
+    def stat(self, remote: str) -> dict | None:
+        rc, out, err = self.runner(
+            self._base() + ["lsjson", "--stat", remote], None, 300
+        )
+        if rc != 0:
+            message = str(err or "").lower()
+            if "not found" in message:
+                return None
+            raise RuntimeError(f"rclone stat failed rc={rc}: {err[-400:]}")
+        data = json.loads(out or "null")
+        if isinstance(data, dict):
+            return dict(data)
+        if isinstance(data, list) and data:
+            return dict(data[0])
+        return None
+
+    def moveto(self, source: str, target: str) -> None:
+        rc, _out, err = self.runner(
+            self._base() + ["moveto", source, target], None, self.timeout
+        )
+        if rc != 0:
+            raise RuntimeError(f"rclone moveto failed rc={rc}: {err[-400:]}")
+
     def lsjson_size(self, remote: str) -> int | None:
         rc, out, err = self.runner(self._base() + ["lsjson", remote], None, 300)
         if rc != 0:

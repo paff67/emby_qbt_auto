@@ -34,12 +34,14 @@ class FakeExecutor:
 
 
 class FakeRclone:
-    def __init__(self, copy_ok=True, remote_sizes=None, remote_listing=None):
+    def __init__(self, copy_ok=True, remote_sizes=None, remote_listing=None, moved_size=None):
         self.copy_ok = copy_ok
         self.remote_sizes = remote_sizes or {}
         self.remote_listing = remote_listing or []
         self.copies = []
         self.dir_copies = []
+        self.movetos = []
+        self.moved_size = moved_size
 
     def copyto(self, local, remote):
         self.copies.append((local, remote))
@@ -54,6 +56,19 @@ class FakeRclone:
 
     def lsjson(self, remote, recursive=False):
         return self.remote_listing
+
+    def stat(self, remote):
+        size = self.remote_sizes.get(remote)
+        return {"Path": remote.rsplit("/", 1)[-1], "Size": size} if size is not None else None
+
+    def moveto(self, source, target):
+        self.movetos.append((source, target))
+        if source not in self.remote_sizes:
+            raise RuntimeError("source not found")
+        size = self.remote_sizes.pop(source)
+        if self.moved_size is not None and len(self.movetos) == 1:
+            size = self.moved_size
+        self.remote_sizes[target] = size
 
 
 class BudgetedQbtFake:

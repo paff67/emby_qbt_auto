@@ -69,3 +69,70 @@ def test_media_promotion_claim_retry_and_verification_are_durable():
         assert final["verified_at"] == 1_060
         assert final["lease_owner"] is None
         assert repo.pending_for_upload(7) == []
+
+
+def test_promotion_moves_and_verifies_exact_destination():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = MediaPromotionRepository(db, now=lambda: 1_000)
+        promotion_id = _enqueue(repo)
+        rclone = FakeRclone(remote_sizes={"gcrypt:/ingest/raw.mp4": 123})
+        runner = MediaPromotionRunner(repo, rclone)
+
+        assert runner.run_next() == promotion_id
+        assert rclone.movetos == [
+            (
+                "gcrypt:/ingest/raw.mp4",
+                "gcrypt:/BBAN-582/BBAN-582 影片名称.mp4",
+            )
+        ]
+        assert repo.get(promotion_id)["state"] == "verified"
+
+
+def test_promotion_reverses_move_when_destination_verification_fails():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = MediaPromotionRepository(db, now=lambda: 1_000)
+        promotion_id = _enqueue(repo)
+        source = "gcrypt:/ingest/raw.mp4"
+        target = "gcrypt:/BBAN-582/BBAN-582 影片名称.mp4"
+        rclone = FakeRclone(remote_sizes={source: 123}, moved_size=122)
+        runner = MediaPromotionRunner(repo, rclone)
+
+        assert runner.run_next() == promotion_id
+        assert rclone.movetos == [(source, target), (target, source)]
+        row = repo.get(promotion_id)
+        assert row["state"] == "retry_wait"
+        assert "destination size mismatch" in row["last_error"]
+
+
+def test_promotion_never_overwrites_conflicting_destination():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = MediaPromotionRepository(db, now=lambda: 1_000)
+        promotion_id = _enqueue(repo)
+        source = "gcrypt:/ingest/raw.mp4"
+        target = "gcrypt:/BBAN-582/BBAN-582 影片名称.mp4"
+        rclone = FakeRclone(remote_sizes={source: 123, target: 999})
+        runner = MediaPromotionRunner(repo, rclone)
+
+        assert runner.run_next() == promotion_id
+        assert rclone.movetos == []
+        row = repo.get(promotion_id)
+        assert row["state"] == "failed"
+        assert row["last_error"] == "target_conflict"
