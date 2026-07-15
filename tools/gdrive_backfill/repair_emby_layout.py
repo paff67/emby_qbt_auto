@@ -80,6 +80,12 @@ def rewrite_verified_nfos(
     backup_dir.mkdir(parents=True, exist_ok=True)
     generated_dir.mkdir(parents=True, exist_ok=True)
     journal = report_dir / "nfo-rewrite.jsonl"
+    latest: dict[str, dict] = {}
+    if journal.exists():
+        for line in journal.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                record = json.loads(line)
+                latest[str(record.get("normalized_id") or "")] = record
     verified_ids: set[str] = set()
     for media_id in sorted({a.normalized_id for a in plan.actions if a.kind == "video"}):
         videos = [a for a in plan.actions if a.kind == "video" and a.normalized_id == media_id]
@@ -91,6 +97,12 @@ def rewrite_verified_nfos(
         canonical = canonical_media_name(media_id, title)
         canonical_dir = videos[0].target.rsplit("/", 1)[0]
         nfo_target = f"{canonical_dir}/{canonical.canonical_basename}.nfo"
+        previous = latest.get(media_id)
+        if previous and previous.get("state") == "verified" and previous.get("target") == nfo_target:
+            current = remote.stat(nfo_target)
+            if current is not None and int(current.get("Size") or 0) == int(previous.get("size") or -1):
+                verified_ids.add(media_id)
+                continue
         nfo_actions = [a for a in plan.actions if a.kind == "nfo" and a.normalized_id == media_id]
         restore_remote = nfo_actions[0].source if nfo_actions else nfo_target
         existing = remote.stat(nfo_target)
@@ -100,7 +112,10 @@ def rewrite_verified_nfos(
             remote.copyto(nfo_target, str(backup_path))
             old_bytes = backup_path.read_bytes()
         rendered = render_canonical_nfo(old_bytes, media_id, title)
-        generated = generated_dir / f"{canonical.canonical_basename}.nfo"
+        # Keep the local staging component short. The remote canonical basename can
+        # legitimately exceed Linux's 255-byte filename limit when it contains
+        # multibyte titles, even though Google Drive accepts that target name.
+        generated = generated_dir / f"{media_id}.nfo"
         generated.write_bytes(rendered)
         _append_jsonl(
             journal,
