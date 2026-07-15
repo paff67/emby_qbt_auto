@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 import threading
 import time
@@ -234,6 +235,44 @@ def test_apply_retries_eventually_consistent_target_before_rollback(tmp_path: Pa
         for line in (tmp_path / "journal.jsonl").read_text().splitlines()
     ]
     assert states == ["moving", "verified"]
+
+
+def test_apply_resumes_verified_rewritten_nfo_from_journal(tmp_path: Path):
+    from qbt_orchestrator.remote_migration import apply_migration, build_migration_plan
+
+    class CountingRemote(FakeRemote):
+        def __init__(self, objects):
+            super().__init__(objects)
+            self.stats = []
+
+        def stat(self, remote):
+            self.stats.append(remote)
+            return super().stat(remote)
+
+    source = "gcrypt:/ABC-123-old/ABC-123.nfo"
+    plan = build_migration_plan(
+        [{"Path": source.split(":/", 1)[1], "Size": 20, "Hashes": {}}],
+        {"ABC-123": {"title": "One", "confidence": 1.0}},
+    )
+    action = plan.actions[0]
+    journal = tmp_path / "journal.jsonl"
+    journal.write_text(
+        json.dumps({**asdict(action), "state": "verified"}) + "\n",
+        encoding="utf-8",
+    )
+    remote = CountingRemote({action.target: 28})
+
+    result = apply_migration(
+        plan,
+        remote,
+        journal_path=journal,
+        verify_attempts=1,
+    )
+
+    assert result.verified == 1
+    assert result.failed == 0
+    assert remote.stats == [action.target]
+    assert len(journal.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_render_canonical_nfo_updates_emby_identity_fields():

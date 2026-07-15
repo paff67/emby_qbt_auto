@@ -561,6 +561,13 @@ def apply_migration(
     actions = plan.actions[: max(0, int(batch_size))] if batch_size is not None else plan.actions
     attempts = max(1, int(verify_attempts))
     base_delay = max(0.0, float(verify_delay_sec))
+    latest: dict[str, dict[str, Any]] = {}
+    journal = Path(journal_path)
+    if journal.exists():
+        for line in journal.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                record = json.loads(line)
+                latest[str(record.get("action_id") or "")] = record
 
     def verified_stat(
         action: MigrationAction, path: str
@@ -575,6 +582,13 @@ def apply_migration(
         return row
 
     def process(action: MigrationAction) -> tuple[int, int, int]:
+        previous = latest.get(action.action_id)
+        if previous and previous.get("state") == "verified":
+            target_row = remote_client.stat(action.target)
+            if _verified(action, target_row) or (
+                action.kind == "nfo" and target_row is not None
+            ):
+                return 1, 0, 0
         source_row = remote_client.stat(action.source)
         target_row = remote_client.stat(action.target)
         if source_row is None:
