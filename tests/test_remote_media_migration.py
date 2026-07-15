@@ -184,3 +184,26 @@ def test_reconcile_verified_migration_updates_only_matching_upload(tmp_path: Pat
         )
     ]
     assert json.loads(cleanup[0][0])["canonical_remote_verified"] is True
+
+
+def test_audit_accepts_separately_verified_rewritten_nfo(tmp_path: Path):
+    from qbt_orchestrator.remote_migration import (
+        apply_migration,
+        audit_migration,
+        build_migration_plan,
+    )
+
+    video = "gcrypt:/BBAN-582-hash/BBAN-582.mp4"
+    nfo = "gcrypt:/BBAN-582-hash/BBAN-582.nfo"
+    remote = FakeRemote({video: 100, nfo: 20})
+    plan = build_migration_plan(
+        remote.inventory(), {"BBAN-582": {"title": "Title", "confidence": 1.0}}
+    )
+    result = apply_migration(plan, remote, journal_path=tmp_path / "journal.jsonl")
+    nfo_target = next(action.target for action in plan.actions if action.kind == "nfo")
+    remote.objects[nfo_target] = 28  # canonical title prefix changed serialized XML size
+
+    audit = audit_migration(plan, remote)
+
+    assert result.verified == 2
+    assert audit == {"verified": 2, "pending": 0, "conflict": 0}

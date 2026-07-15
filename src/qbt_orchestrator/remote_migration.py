@@ -592,7 +592,10 @@ def rollback_migration(journal_path: str | Path, remote_client) -> MigrationResu
         if remote_client.stat(action.source) is not None:
             skipped += 1
             continue
-        if not _verified(action, remote_client.stat(action.target)):
+        target_row = remote_client.stat(action.target)
+        if not _verified(action, target_row) and not (
+            action.kind == "nfo" and target_row is not None
+        ):
             failed += 1
             continue
         try:
@@ -609,7 +612,9 @@ def audit_migration(plan: MigrationPlan, remote_client) -> dict[str, int]:
     for action in plan.actions:
         source = remote_client.stat(action.source)
         target = remote_client.stat(action.target)
-        if source is None and _verified(action, target):
+        if source is None and (
+            _verified(action, target) or (action.kind == "nfo" and target is not None)
+        ):
             result["verified"] += 1
         elif source is not None and target is None:
             result["pending"] += 1
