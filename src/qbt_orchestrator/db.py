@@ -412,6 +412,12 @@ def migration_sql() -> list[str]:
         "alter table media_pipeline_runs add column normalize_confidence real",
         "alter table media_pipeline_runs add column normalize_result_json text",
         "alter table media_pipeline_runs add column missing_outputs_json text",
+        "alter table media_pipeline_runs add column canonical_remote_dir text",
+        "alter table media_pipeline_runs add column canonical_basename text",
+        "alter table media_pipeline_runs add column canonical_video_manifest_json text",
+        "create table if not exists media_promotions(id integer primary key autoincrement, upload_job_id integer not null, hash text, media_group_id integer, normalized_id text not null, metadata_title text not null, display_title text not null, source_remote text not null, target_remote text not null, expected_size integer not null, expected_hashes_json text not null default '{}', state text not null default 'planned', verification_method text, verification_result_json text, attempts integer not null default 0, max_attempts integer not null default 6, lease_owner text, lease_until integer, next_run_at integer, last_error text, created_at integer not null, updated_at integer not null, verified_at integer)",
+        "create unique index if not exists idx_media_promotions_identity on media_promotions(upload_job_id,source_remote,target_remote)",
+        "create index if not exists idx_media_promotions_claim on media_promotions(state,next_run_at,id)",
         "create table if not exists sidecar_manifests(id integer primary key autoincrement, media_group_id integer, staging_dir text, artifacts_json text, state text, created_at integer, updated_at integer)",
         "alter table sidecar_manifests add column local_artifact_dir text",
         "alter table sidecar_manifests add column artifact_manifest_json text",
@@ -449,6 +455,7 @@ def migration_sql() -> list[str]:
         "insert or ignore into schema_migrations(version,name,applied_at) values(8,'upload_phases_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(9,'job_recovery_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(10,'scan_cursors_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(11,'canonical_media_promotions_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:
