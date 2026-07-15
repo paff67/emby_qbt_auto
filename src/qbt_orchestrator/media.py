@@ -668,7 +668,11 @@ class EmbyRefreshWorker:
         try:
             if self.cache_flusher is not None:
                 self.cache_flusher.flush(path)
-            self.emby.media_updated(path)
+            refresh_path = getattr(self.emby, "refresh_path", None)
+            if callable(refresh_path):
+                refresh_path(path)
+            else:
+                self.emby.media_updated(path)
             self._finish(task_id, "done", None)
         except Exception as exc:
             error = redact(str(exc))[:500]

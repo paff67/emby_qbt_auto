@@ -515,6 +515,38 @@ def test_emby_refresh_flushes_mount_cache_before_notifying_emby():
         ]
 
 
+def test_emby_refresh_worker_prefers_recursive_path_refresh():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker
+
+    class RecursiveEmby:
+        def __init__(self):
+            self.calls = []
+
+        def media_updated(self, path):
+            raise AssertionError("refresh_path should own the notification sequence")
+
+        def refresh_path(self, path):
+            self.calls.append(path)
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            ("/media/gcrypt/ABC-123", "queued", 1, 1, "{}", 1, 1),
+        )
+        con.commit()
+        con.close()
+        emby = RecursiveEmby()
+        worker = EmbyRefreshWorker(db, emby, now=lambda: 100)
+
+        assert worker.run_next() == 1
+        assert emby.calls == ["/media/gcrypt/ABC-123"]
+        assert rows(db, "select state from emby_refresh_tasks") == [{"state": "done"}]
+
+
 def test_transient_emby_failure_retries_with_backoff_and_attempt_limit():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.media import EmbyRefreshWorker

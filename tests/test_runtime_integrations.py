@@ -95,6 +95,49 @@ def test_emby_client_posts_precise_media_updated_payload_and_blocks_root():
         raise AssertionError("library root refresh must be blocked")
 
 
+def test_emby_client_notifies_then_recursively_refreshes_exact_folder():
+    from qbt_orchestrator.integrations.emby import EmbyClient
+
+    posts = []
+    gets = []
+
+    def transport(url, payload, headers, timeout):
+        posts.append((url, payload, headers, timeout))
+        return {}
+
+    def get_transport(url, headers, timeout):
+        gets.append((url, headers, timeout))
+        return {
+            "Items": [
+                {
+                    "Id": "folder-123",
+                    "Type": "Folder",
+                    "Path": "/media/gcrypt/ABC-123",
+                }
+            ]
+        }
+
+    client = EmbyClient(
+        base_url="http://127.0.0.1:8096",
+        api_key="secret",
+        media_prefix="/media/gcrypt",
+        transport=transport,
+        get_transport=get_transport,
+    )
+
+    result = client.refresh_path("/media/gcrypt/ABC-123")
+
+    assert result["refreshed_item_ids"] == ["folder-123"]
+    assert posts[0][0].endswith("/Library/Media/Updated")
+    assert "Path=%2Fmedia%2Fgcrypt%2FABC-123" in gets[0][0]
+    assert posts[1][0].startswith(
+        "http://127.0.0.1:8096/Items/folder-123/Refresh?"
+    )
+    assert "Recursive=true" in posts[1][0]
+    assert "MetadataRefreshMode=FullRefresh" in posts[1][0]
+    assert posts[1][1] == {"ReplaceThumbnailImages": False}
+
+
 def test_rclone_mount_cache_flusher_signals_only_configured_service():
     from qbt_orchestrator.integrations.emby import RcloneMountCacheFlusher
 

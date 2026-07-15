@@ -6,9 +6,10 @@ import subprocess
 import threading
 import time
 from typing import Callable, Sequence
-from urllib import request
+from urllib import parse, request
 
 Transport = Callable[[str, dict, dict, int], dict]
+GetTransport = Callable[[str, dict, int], dict]
 CommandRunner = Callable[[Sequence[str], int], tuple[int, str, str]]
 
 
@@ -73,12 +74,20 @@ def default_transport(url: str, payload: dict, headers: dict, timeout: int) -> d
     return json.loads(body) if body else {}
 
 
+def default_get_transport(url: str, headers: dict, timeout: int) -> dict:
+    req = request.Request(url, headers=headers, method="GET")
+    with request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+    return json.loads(body) if body else {}
+
+
 class EmbyClient:
-    def __init__(self, base_url: str, api_key: str, media_prefix: str = "/media/gcrypt", transport: Transport = default_transport, timeout: int = 30):
+    def __init__(self, base_url: str, api_key: str, media_prefix: str = "/media/gcrypt", transport: Transport = default_transport, get_transport: GetTransport = default_get_transport, timeout: int = 30):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.media_prefix = media_prefix.rstrip("/")
         self.transport = transport
+        self.get_transport = get_transport
         self.timeout = timeout
 
     def _validate_path(self, path: str) -> None:
@@ -90,3 +99,47 @@ class EmbyClient:
         self._validate_path(path)
         payload = {"Updates": [{"Path": path.rstrip("/"), "UpdateType": "Created"}]}
         return self.transport(f"{self.base_url}/Library/Media/Updated", payload, {"X-Emby-Token": self.api_key}, self.timeout)
+
+    def refresh_path(self, path: str) -> dict:
+        self._validate_path(path)
+        normalized = path.rstrip("/")
+        notified = self.media_updated(normalized)
+        headers = {"X-Emby-Token": self.api_key}
+        query = parse.urlencode(
+            {
+                "Path": normalized,
+                "Recursive": "true",
+                "Fields": "Path",
+                "Limit": "20",
+            }
+        )
+        response = self.get_transport(
+            f"{self.base_url}/Items?{query}", headers, self.timeout
+        )
+        item_ids = [
+            str(item.get("Id"))
+            for item in response.get("Items", [])
+            if item.get("Type") == "Folder"
+            and str(item.get("Path") or "").rstrip("/") == normalized
+            and item.get("Id")
+        ]
+        if not item_ids:
+            raise ConnectionError(f"emby folder item not ready for {normalized}")
+        refresh_query = parse.urlencode(
+            {
+                "Recursive": "true",
+                "MetadataRefreshMode": "FullRefresh",
+                "ImageRefreshMode": "Default",
+                "ReplaceAllMetadata": "false",
+                "ReplaceAllImages": "false",
+            }
+        )
+        payload = {"ReplaceThumbnailImages": False}
+        for item_id in item_ids:
+            self.transport(
+                f"{self.base_url}/Items/{parse.quote(item_id, safe='')}/Refresh?{refresh_query}",
+                payload,
+                headers,
+                self.timeout,
+            )
+        return {"notified": notified, "refreshed_item_ids": item_ids}
