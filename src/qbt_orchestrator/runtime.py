@@ -283,8 +283,8 @@ class TorrentJobRepository:
         job_id = int(row["id"])
         is_sidecar = str(row.get("job_type") or "") == "sidecar_upload"
         full_torrent = bool(payload.get("full_torrent")) and not is_sidecar
-        state = "cleanup_wait" if full_torrent else ("done" if is_sidecar else "cleanup_deferred")
-        phase = "cleanup_wait" if full_torrent else "done"
+        state = "promotion_wait" if full_torrent else ("done" if is_sidecar else "cleanup_deferred")
+        phase = "promotion_wait" if full_torrent else "done"
         details = json.dumps(
             {"verified": True, "mismatches": []},
             ensure_ascii=False,
@@ -298,33 +298,6 @@ class TorrentJobRepository:
                 "lease_owner=null,lease_until=null,last_exit_code=0,updated_at=? where id=?",
                 (state, phase, result.method, details, now, now, job_id),
             )
-            if not full_torrent:
-                return
-            cleanup_payload = {
-                "upload_job_id": job_id,
-                "hash": row.get("hash"),
-                "batch_id": row.get("batch_id"),
-                "remote": payload.get("remote"),
-                "verification_method": result.method,
-                "remote_verified": True,
-                "cleanup_policy_snapshot": dict(payload.get("cleanup_policy_snapshot") or {}),
-            }
-            con.execute(
-                "insert or ignore into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,parent_job_id,created_at,updated_at) "
-                "values(?,?,?,?,?,?,?,?,?)",
-                (
-                    row.get("hash"),
-                    row.get("batch_id"),
-                    "cleanup_full_torrent",
-                    "queued",
-                    int(JobPriority.FULL_TORRENT_RELEASE_UPLOAD),
-                    json.dumps(cleanup_payload, ensure_ascii=False),
-                    job_id,
-                    now,
-                    now,
-                ),
-            )
-
         write_transaction(self.state_db, txn)
         return state
 

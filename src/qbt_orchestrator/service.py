@@ -626,7 +626,7 @@ class DaemonRuntime:
         try:
             rows = con.execute(
                 "select id,job_type,payload_json,parent_job_id from torrent_jobs "
-                "where state in ('queued','running','verify_pending','retry_wait','cleanup_wait')"
+                "where state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait')"
             ).fetchall()
         finally:
             con.close()

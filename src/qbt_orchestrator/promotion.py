@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import readonly_connect, write_transaction
+from .io_governor import JobPriority
 from .observability import redact
 
 
@@ -252,3 +253,77 @@ class MediaPromotionRunner:
             details={"verified": True, "mismatches": []},
         )
         return promotion_id
+
+
+def finalize_canonical_upload(
+    state_db: str | Path,
+    *,
+    upload_id: int,
+    now: int | None = None,
+) -> bool:
+    observed_at = int(time.time()) if now is None else int(now)
+
+    def txn(con):
+        upload = con.execute(
+            "select * from torrent_jobs where id=? and job_type='upload'",
+            (int(upload_id),),
+        ).fetchone()
+        if not upload or str(upload["state"] or "") != "promotion_wait":
+            return False
+
+        promotions = con.execute(
+            "select * from media_promotions where upload_job_id=? order by id",
+            (int(upload_id),),
+        ).fetchall()
+        if not promotions or any(str(row["state"] or "") != "verified" for row in promotions):
+            return False
+
+        run = con.execute(
+            "select * from media_pipeline_runs where upload_manifest_id=? order by id desc limit 1",
+            (f"upload-job-{int(upload_id)}",),
+        ).fetchone()
+        if not run or str(run["state"] or "") not in {
+            "SidecarVerified",
+            "PassthroughAllowed",
+        }:
+            return False
+        if not run["canonical_remote_dir"] or not run["canonical_video_manifest_json"]:
+            return False
+
+        upload_payload = json.loads(upload["payload_json"] or "{}")
+        manifest = json.loads(run["canonical_video_manifest_json"] or "[]")
+        cleanup_payload = {
+            "upload_job_id": int(upload_id),
+            "hash": upload["hash"],
+            "batch_id": upload["batch_id"],
+            "remote": str(run["canonical_remote_dir"]),
+            "remote_verified": True,
+            "canonical_remote_verified": True,
+            "final_manifest": manifest,
+            "cleanup_policy_snapshot": dict(
+                upload_payload.get("cleanup_policy_snapshot") or {}
+            ),
+        }
+        con.execute(
+            "insert or ignore into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,parent_job_id,created_at,updated_at) "
+            "values(?,?,?,?,?,?,?,?,?)",
+            (
+                upload["hash"],
+                upload["batch_id"],
+                "cleanup_full_torrent",
+                "queued",
+                int(JobPriority.FULL_TORRENT_RELEASE_UPLOAD),
+                json.dumps(cleanup_payload, ensure_ascii=False),
+                int(upload_id),
+                observed_at,
+                observed_at,
+            ),
+        )
+        changed = con.execute(
+            "update torrent_jobs set state='cleanup_wait',phase='cleanup_wait',updated_at=? "
+            "where id=? and state='promotion_wait'",
+            (observed_at, int(upload_id)),
+        ).rowcount
+        return bool(changed)
+
+    return bool(write_transaction(state_db, txn))
