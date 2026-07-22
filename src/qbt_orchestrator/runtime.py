@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -23,6 +25,10 @@ def _nearest_rank(values: list[int], percentile: int) -> int:
     ordered = sorted(int(value) for value in values)
     rank = max(1, (len(ordered) * int(percentile) + 99) // 100)
     return ordered[min(len(ordered), rank) - 1]
+
+
+class LeaseLostError(RuntimeError):
+    """Raised when a worker no longer owns the fenced job lease."""
 
 
 class ObservabilityStore:
@@ -143,9 +149,51 @@ class ObservabilityStore:
 
 
 class TorrentJobRepository:
-    def __init__(self, state_db: str | Path, now=None):
+    def __init__(self, state_db: str | Path, now=None, lease_duration_sec: int = 1800):
         self.state_db = Path(state_db)
         self.now = now or (lambda: int(time.time()))
+        self.lease_duration_sec = max(1, int(lease_duration_sec))
+
+    @staticmethod
+    def _new_lease_owner() -> str:
+        return f"local:{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _fence_clause(
+        lease_owner: str | None, lease_generation: int | None, now: int
+    ) -> tuple[str, tuple[Any, ...]]:
+        if lease_owner is None and lease_generation is None:
+            return "", ()
+        if lease_owner is None or lease_generation is None:
+            raise ValueError("lease_owner and lease_generation must be supplied together")
+        return (
+            " and state='running' and lease_owner=? and lease_generation=? "
+            "and lease_until is not null and lease_until>=?",
+            (str(lease_owner), int(lease_generation), int(now)),
+        )
+
+    def _update_job(
+        self,
+        job_id: int,
+        set_sql: str,
+        values: tuple[Any, ...],
+        *,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        now = int(self.now())
+        fence_sql, fence_values = self._fence_clause(
+            lease_owner, lease_generation, now
+        )
+
+        def txn(con: sqlite3.Connection) -> bool:
+            cur = con.execute(
+                f"update torrent_jobs set {set_sql} where id=?{fence_sql}",
+                (*values, int(job_id), *fence_values),
+            )
+            return int(cur.rowcount or 0) == 1
+
+        return bool(write_transaction(self.state_db, txn))
 
     def enqueue(
         self,
@@ -181,6 +229,7 @@ class TorrentJobRepository:
 
     def claim_next(self, job_type: str) -> dict[str, Any] | None:
         now = int(self.now())
+        lease_owner = self._new_lease_owner()
         def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
             row = con.execute(
                 "select * from torrent_jobs where job_type=? and attempts<max_attempts "
@@ -190,13 +239,18 @@ class TorrentJobRepository:
             ).fetchone()
             if not row:
                 return None
-            con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
+            con.execute(
+                "update torrent_jobs set state='running',lease_owner=?,lease_until=?,"
+                "lease_generation=lease_generation+1,attempts=attempts+1,updated_at=? where id=?",
+                (lease_owner, now + self.lease_duration_sec, now, row["id"]),
+            )
             return dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone())
 
         return write_transaction(self.state_db, txn)
 
     def claim_next_cleanup(self, *, prefer_largest: bool) -> dict[str, Any] | None:
         now = int(self.now())
+        lease_owner = self._new_lease_owner()
 
         def reclaimable_bytes(row: sqlite3.Row) -> int:
             try:
@@ -231,8 +285,9 @@ class TorrentJobRepository:
                 ),
             )
             con.execute(
-                "update torrent_jobs set state='running',lease_owner='local',lease_until=?,attempts=attempts+1,updated_at=? where id=?",
-                (now + 1800, now, int(row["id"])),
+                "update torrent_jobs set state='running',lease_owner=?,lease_until=?,"
+                "lease_generation=lease_generation+1,attempts=attempts+1,updated_at=? where id=?",
+                (lease_owner, now + self.lease_duration_sec, now, int(row["id"])),
             )
             return dict(
                 con.execute(
@@ -246,6 +301,7 @@ class TorrentJobRepository:
         if not job_types:
             return None
         now = int(self.now())
+        lease_owner = self._new_lease_owner()
         placeholders = ",".join("?" for _ in job_types)
         def txn(con: sqlite3.Connection) -> dict[str, Any] | None:
             row = con.execute(
@@ -256,7 +312,11 @@ class TorrentJobRepository:
             ).fetchone()
             if not row:
                 return None
-            con.execute("update torrent_jobs set state='running', lease_owner='local', lease_until=?, attempts=attempts+1, updated_at=? where id=?", (now + 1800, now, row["id"]))
+            con.execute(
+                "update torrent_jobs set state='running',lease_owner=?,lease_until=?,"
+                "lease_generation=lease_generation+1,attempts=attempts+1,updated_at=? where id=?",
+                (lease_owner, now + self.lease_duration_sec, now, row["id"]),
+            )
             return dict(con.execute("select * from torrent_jobs where id=?", (row["id"],)).fetchone())
 
         return write_transaction(self.state_db, txn)
@@ -268,42 +328,121 @@ class TorrentJobRepository:
         con.close()
         return out
 
-    def update_state(self, job_id: int, state: str, stderr_tail: str | None = None, exit_code: int | None = None) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute("update torrent_jobs set state=?, last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?", (state, stderr_tail, exit_code, int(self.now()), job_id)),
-        )
-
-    def schedule_retry(self, job_id: int, stderr_tail: str | None = None, exit_code: int | None = None, delay_sec: int = 60) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                "update torrent_jobs set state='retry_wait', lease_owner=null, lease_until=null, next_run_at=?, "
-                "last_stderr_tail=coalesce(?,last_stderr_tail), last_exit_code=coalesce(?,last_exit_code), updated_at=? where id=?",
-                (int(self.now()) + int(delay_sec), stderr_tail, exit_code, int(self.now()), job_id),
-            ),
-        )
-
-    def set_phase(self, job_id: int, phase: str) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                "update torrent_jobs set phase=?,updated_at=? where id=?",
-                (str(phase), int(self.now()), int(job_id)),
-            ),
-        )
-
-    def mark_copy_completed(self, job_id: int) -> None:
+    def renew_lease(
+        self,
+        job_id: int,
+        lease_owner: str,
+        lease_generation: int,
+        *,
+        lease_duration_sec: int | None = None,
+    ) -> bool:
         now = int(self.now())
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                "update torrent_jobs set phase='copied',copy_completed_at=coalesce(copy_completed_at,?),updated_at=? where id=?",
-                (now, now, int(job_id)),
+        duration = max(
+            1,
+            int(
+                self.lease_duration_sec
+                if lease_duration_sec is None
+                else lease_duration_sec
             ),
         )
+        return self._update_job(
+            job_id,
+            "lease_until=?,updated_at=?",
+            (now + duration, now),
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
 
-    def record_verification_failure(self, job_id: int, result) -> None:
+    def update_state(
+        self,
+        job_id: int,
+        state: str,
+        stderr_tail: str | None = None,
+        exit_code: int | None = None,
+        *,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        terminal = str(state) in {
+            "done",
+            "failed",
+            "cancelled",
+            "cleanup_deferred",
+            "promotion_wait",
+        }
+        lease_reset = (
+            ",lease_owner=null,lease_until=null,next_run_at=null" if terminal else ""
+        )
+        return self._update_job(
+            job_id,
+            "state=?,last_stderr_tail=coalesce(?,last_stderr_tail),"
+            f"last_exit_code=coalesce(?,last_exit_code),updated_at=?{lease_reset}",
+            (state, stderr_tail, exit_code, int(self.now())),
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+
+    def schedule_retry(
+        self,
+        job_id: int,
+        stderr_tail: str | None = None,
+        exit_code: int | None = None,
+        delay_sec: int = 60,
+        *,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        now = int(self.now())
+        return self._update_job(
+            job_id,
+            "state='retry_wait',lease_owner=null,lease_until=null,next_run_at=?,"
+            "last_stderr_tail=coalesce(?,last_stderr_tail),"
+            "last_exit_code=coalesce(?,last_exit_code),updated_at=?",
+            (now + int(delay_sec), stderr_tail, exit_code, now),
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+
+    def set_phase(
+        self,
+        job_id: int,
+        phase: str,
+        *,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        return self._update_job(
+            job_id,
+            "phase=?,updated_at=?",
+            (str(phase), int(self.now())),
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+
+    def mark_copy_completed(
+        self,
+        job_id: int,
+        *,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
+        now = int(self.now())
+        return self._update_job(
+            job_id,
+            "phase='copied',copy_completed_at=coalesce(copy_completed_at,?),updated_at=?",
+            (now, now),
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+
+    def record_verification_failure(
+        self,
+        job_id: int,
+        result,
+        *,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> bool:
         now = int(self.now())
         details = json.dumps(
             {"verified": False, "mismatches": list(result.mismatches)},
@@ -316,13 +455,13 @@ class TorrentJobRepository:
             if list(result.mismatches) == ["size:remote"]
             else (",".join(result.mismatches)[:500] or "remote verification failed")
         )
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                "update torrent_jobs set state='verify_pending',phase='verifying',lease_owner=null,lease_until=null,"
-                "verification_method=?,verification_result_json=?,last_stderr_tail=?,updated_at=? where id=?",
-                (result.method, details, message, now, int(job_id)),
-            ),
+        return self._update_job(
+            job_id,
+            "state='verify_pending',phase='verifying',lease_owner=null,lease_until=null,"
+            "verification_method=?,verification_result_json=?,last_stderr_tail=?,updated_at=?",
+            (result.method, details, message, now),
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
         )
 
     def finalize_verified(self, row: dict[str, Any], payload: dict[str, Any], result) -> str:
@@ -340,22 +479,118 @@ class TorrentJobRepository:
             separators=(",", ":"),
         )
 
-        def txn(con: sqlite3.Connection) -> None:
-            con.execute(
-                "update torrent_jobs set state=?,phase=?,verification_method=?,verification_result_json=?,verified_at=?,"
-                "lease_owner=null,lease_until=null,last_exit_code=0,updated_at=? where id=?",
-                (state, phase, result.method, details, now, now, job_id),
+        lease_owner = row.get("lease_owner")
+        lease_generation = (
+            int(row.get("lease_generation") or 0)
+            if lease_owner is not None
+            else None
+        )
+        updated = self._update_job(
+            job_id,
+            "state=?,phase=?,verification_method=?,verification_result_json=?,verified_at=?,"
+            "lease_owner=null,lease_until=null,last_exit_code=0,last_stderr_tail=null,"
+            "next_run_at=null,updated_at=?",
+            (state, phase, result.method, details, now, now),
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+        if not updated:
+            raise LeaseLostError(
+                f"upload job {job_id} lost lease before verified completion"
             )
-        write_transaction(self.state_db, txn)
         return state
 
     def get(self, job_id: int) -> dict[str, Any]:
         con = _connect(self.state_db); row = dict(con.execute("select * from torrent_jobs where id=?", (job_id,)).fetchone()); con.close(); return row
 
 
+class UploadLeaseHeartbeat:
+    """Periodically extend one upload lease while blocking rclone work runs."""
+
+    def __init__(
+        self,
+        repo: TorrentJobRepository,
+        row: Mapping[str, Any],
+        *,
+        interval_sec: float = 60.0,
+    ):
+        self.repo = repo
+        self.job_id = int(row["id"])
+        self.lease_owner = str(row["lease_owner"])
+        self.lease_generation = int(row.get("lease_generation") or 0)
+        self.interval_sec = max(0.01, float(interval_sec))
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"upload-lease-{self.job_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_sec * 2))
+
+    def raise_if_lost(self) -> None:
+        if self._lost.is_set():
+            raise LeaseLostError(
+                f"upload job {self.job_id} lost lease generation {self.lease_generation}"
+            )
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_sec):
+            try:
+                renewed = self.repo.renew_lease(
+                    self.job_id,
+                    self.lease_owner,
+                    self.lease_generation,
+                )
+            except Exception:
+                renewed = False
+            if not renewed:
+                self._lost.set()
+                self._stop.set()
+                return
+
+
 class UploadJobRunner:
-    def __init__(self, repo: TorrentJobRepository, rclone, executor, backoff_schedule=(60, 180, 600, 1800, 7200, 21600), job_types=("upload", "sidecar_upload")):
-        self.repo = repo; self.worker = RcloneUploadWorker(rclone, executor); self.backoff_schedule = tuple(int(x) for x in backoff_schedule); self.job_types = tuple(job_types)
+    def __init__(
+        self,
+        repo: TorrentJobRepository,
+        rclone,
+        executor,
+        backoff_schedule=(60, 180, 600, 1800, 7200, 21600),
+        job_types=("upload", "sidecar_upload"),
+        lease_heartbeat_interval_sec: float = 60.0,
+    ):
+        self.repo = repo
+        self.worker = RcloneUploadWorker(rclone, executor)
+        self.backoff_schedule = tuple(int(x) for x in backoff_schedule)
+        self.job_types = tuple(job_types)
+        self.lease_heartbeat_interval_sec = max(
+            0.01, float(lease_heartbeat_interval_sec)
+        )
+
+    @staticmethod
+    def _lease_kwargs(row: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "lease_owner": str(row["lease_owner"]),
+            "lease_generation": int(row.get("lease_generation") or 0),
+        }
+
+    @staticmethod
+    def _require_lease(updated: bool, row: Mapping[str, Any], operation: str) -> None:
+        if not updated:
+            raise LeaseLostError(
+                f"upload job {int(row['id'])} lost lease before {operation}"
+            )
 
     def run_next(self) -> int | None:
         row = self.repo.claim_next_any(self.job_types)
@@ -373,35 +608,86 @@ class UploadJobRunner:
             copy_mode=str(payload.get("copy_mode") or "copy"),
         )
         phase = str(row.get("phase") or "queued_copy")
-        if phase in {"queued_copy", "copying"}:
-            self.repo.set_phase(int(row["id"]), "copying")
-            try:
-                copied = self.worker.copy(job)
-            except Exception as exc:
-                self._handle_upload_exception(row, payload, is_sidecar, exc)
-                return int(row["id"])
-            if not copied:
-                if is_sidecar and self._attempts_exhausted(row):
-                    self.repo.update_state(row["id"], "failed", "retry requested", exit_code=1)
-                    self._mark_sidecar_upload_failed(row, payload, "sidecar_upload_failed")
-                else:
-                    self.repo.schedule_retry(
-                        row["id"],
-                        "retry requested",
-                        exit_code=1,
-                        delay_sec=self._delay_for_attempt(int(row.get("attempts") or 1)),
-                    )
-                return int(row["id"])
-            self.repo.mark_copy_completed(int(row["id"]))
-
-        self.repo.set_phase(int(row["id"]), "verifying")
+        copied = True
+        verification = None
+        operation_error: Exception | None = None
+        lease_lost = False
+        heartbeat = UploadLeaseHeartbeat(
+            self.repo,
+            row,
+            interval_sec=self.lease_heartbeat_interval_sec,
+        )
+        heartbeat.start()
         try:
-            verification = self.worker.verify(job)
+            if phase in {"queued_copy", "copying"}:
+                self._require_lease(
+                    self.repo.set_phase(
+                        int(row["id"]), "copying", **self._lease_kwargs(row)
+                    ),
+                    row,
+                    "copy phase",
+                )
+                copied = self.worker.copy(job)
+                heartbeat.raise_if_lost()
+                if copied:
+                    self._require_lease(
+                        self.repo.mark_copy_completed(
+                            int(row["id"]), **self._lease_kwargs(row)
+                        ),
+                        row,
+                        "copy completion",
+                    )
+
+            if copied:
+                self._require_lease(
+                    self.repo.set_phase(
+                        int(row["id"]), "verifying", **self._lease_kwargs(row)
+                    ),
+                    row,
+                    "verification phase",
+                )
+                verification = self.worker.verify(job)
+                heartbeat.raise_if_lost()
+        except LeaseLostError:
+            lease_lost = True
         except Exception as exc:
-            self._handle_upload_exception(row, payload, is_sidecar, exc)
+            operation_error = exc
+        finally:
+            heartbeat.stop()
+
+        if lease_lost:
+            return int(row["id"])
+        if operation_error is not None:
+            self._handle_upload_exception(
+                row, payload, is_sidecar, operation_error
+            )
+            return int(row["id"])
+        if not copied:
+            if is_sidecar and self._attempts_exhausted(row):
+                updated = self.repo.update_state(
+                    row["id"],
+                    "failed",
+                    "retry requested",
+                    exit_code=1,
+                    **self._lease_kwargs(row),
+                )
+                if updated:
+                    self._mark_sidecar_upload_failed(
+                        row, payload, "sidecar_upload_failed"
+                    )
+            else:
+                self.repo.schedule_retry(
+                    row["id"],
+                    "retry requested",
+                    exit_code=1,
+                    delay_sec=self._delay_for_attempt(int(row.get("attempts") or 1)),
+                    **self._lease_kwargs(row),
+                )
+            return int(row["id"])
+
+        if verification is None:
             return int(row["id"])
         if not verification.verified:
-            self.repo.record_verification_failure(int(row["id"]), verification)
             result = UploadResult(
                 "verify_pending",
                 False,
@@ -410,13 +696,33 @@ class UploadJobRunner:
                 tuple(verification.mismatches),
             )
             if is_sidecar and self._attempts_exhausted(row):
-                self.repo.update_state(row["id"], "failed", "remote verification failed", exit_code=1)
-                self._mark_sidecar_upload_failed(row, payload, "sidecar_upload_failed")
+                updated = self.repo.update_state(
+                    row["id"],
+                    "failed",
+                    "remote verification failed",
+                    exit_code=1,
+                    **self._lease_kwargs(row),
+                )
+                if updated:
+                    self._mark_sidecar_upload_failed(
+                        row, payload, "sidecar_upload_failed"
+                    )
+            else:
+                updated = self.repo.record_verification_failure(
+                    int(row["id"]),
+                    verification,
+                    **self._lease_kwargs(row),
+                )
+                if not updated:
+                    return int(row["id"])
             if row["job_type"] == "upload" and row.get("batch_id") is not None:
                 self._update_batch_upload_state(row, payload, result)
             return int(row["id"])
 
-        final_state = self.repo.finalize_verified(row, payload, verification)
+        try:
+            final_state = self.repo.finalize_verified(row, payload, verification)
+        except LeaseLostError:
+            return int(row["id"])
         result = UploadResult(
             final_state,
             True,
@@ -441,11 +747,26 @@ class UploadJobRunner:
     ) -> None:
         error = redact(str(exc))[:500]
         if is_sidecar and self._attempts_exhausted(row):
-            self.repo.update_state(row["id"], "failed", error, exit_code=1)
-            self._mark_sidecar_upload_failed(row, payload, "sidecar_upload_failed")
+            updated = self.repo.update_state(
+                row["id"],
+                "failed",
+                error,
+                exit_code=1,
+                **self._lease_kwargs(row),
+            )
+            if updated:
+                self._mark_sidecar_upload_failed(
+                    row, payload, "sidecar_upload_failed"
+                )
             return
         delay = self._delay_for_attempt(int(row.get("attempts") or 1))
-        self.repo.schedule_retry(row["id"], error, exit_code=1, delay_sec=delay)
+        self.repo.schedule_retry(
+            row["id"],
+            error,
+            exit_code=1,
+            delay_sec=delay,
+            **self._lease_kwargs(row),
+        )
 
     def _update_batch_upload_state(self, row: dict[str, Any], payload: dict[str, Any], result) -> None:
         batch_id = int(row["batch_id"])

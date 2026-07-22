@@ -59,6 +59,28 @@ def _connect(path: str | Path) -> sqlite3.Connection:
     return readonly_connect(path)
 
 
+def active_soak_cooldown_hashes(state_db: str | Path, now: int) -> set[str]:
+    """Return durable soak cooldowns that have not expired yet.
+
+    The planner remains the final authority for qBT start/stop actions, so it
+    must not depend on the optional SoakQueue service being enabled in order to
+    honour cooldowns that a previous planner tick persisted.
+    """
+
+    con = readonly_connect(state_db)
+    try:
+        return {
+            str(row["hash"])
+            for row in con.execute(
+                "select hash from soak_state "
+                "where state='soak_cooldown' and cooldown_until is not null and cooldown_until>?",
+                (int(now),),
+            ).fetchall()
+        }
+    finally:
+        con.close()
+
+
 def _tags(torrent: Mapping[str, Any]) -> set[str]:
     raw = str(torrent.get("tags") or "")
     return {p.strip() for p in raw.split(",") if p.strip()}
@@ -167,6 +189,7 @@ class DownloadPlanner:
         )
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
         now = int(self.now())
+        cooldown_hashes |= active_soak_cooldown_hashes(self.state_db, now)
         active_intents = self.intent_repository.active(now)
         intent_priority: dict[str, int] = {}
         for intent in active_intents:

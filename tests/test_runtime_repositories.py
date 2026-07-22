@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 import sys
 
@@ -61,6 +62,118 @@ def test_upload_job_runner_claims_job_updates_promotion_wait_and_verify_pending(
         assert runner.run_next() == bad
         assert repo.get(bad)["state"] == "verify_pending"
         assert repo.get(bad)["last_stderr_tail"] == "remote size mismatch"
+
+
+def test_upload_heartbeat_renews_lease_and_success_clears_retry_diagnostics():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor
+
+    class SlowRclone:
+        def copyto(self, local, remote):
+            time.sleep(0.06)
+            return True
+
+        def lsjson_size(self, remote):
+            return 100
+
+    class CountingRepo(TorrentJobRepository):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.renew_count = 0
+
+        def renew_lease(self, *args, **kwargs):
+            renewed = super().renew_lease(*args, **kwargs)
+            if renewed:
+                self.renew_count += 1
+            return renewed
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = CountingRepo(db, now=lambda: 100, lease_duration_sec=2)
+        job_id = repo.enqueue(
+            "h1",
+            None,
+            "upload",
+            {
+                "local": "/tmp/a.mp4",
+                "remote": "gcrypt:/A/a.mp4",
+                "size": 100,
+                "full_torrent": False,
+            },
+            priority=1,
+        )
+        con = sqlite3.connect(db)
+        con.execute(
+            "update torrent_jobs set last_stderr_tail='old failure',next_run_at=99 where id=?",
+            (job_id,),
+        )
+        con.commit()
+        con.close()
+        runner = UploadJobRunner(
+            repo,
+            SlowRclone(),
+            FakeExecutor(),
+            lease_heartbeat_interval_sec=0.01,
+        )
+
+        assert runner.run_next() == job_id
+
+        row = repo.get(job_id)
+        assert repo.renew_count >= 1
+        assert row["state"] == "cleanup_deferred"
+        assert row["lease_owner"] is None
+        assert row["lease_until"] is None
+        assert row["last_stderr_tail"] is None
+        assert row["next_run_at"] is None
+
+
+def test_upload_completion_is_fenced_by_lease_owner_and_generation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.integrations.rclone import VerifyResult
+    from qbt_orchestrator.runtime import LeaseLostError, TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 100, lease_duration_sec=30)
+        payload = {
+            "local": "/tmp/a.mp4",
+            "remote": "gcrypt:/A/a.mp4",
+            "size": 100,
+            "full_torrent": False,
+        }
+        job_id = repo.enqueue("h1", None, "upload", payload, priority=1)
+        first = repo.claim_next("upload")
+        assert first is not None
+        assert first["lease_generation"] == 1
+
+        con = sqlite3.connect(db)
+        con.execute(
+            "update torrent_jobs set state='retry_wait',lease_owner=null,lease_until=null,next_run_at=100 where id=?",
+            (job_id,),
+        )
+        con.commit()
+        con.close()
+        second = repo.claim_next("upload")
+        assert second is not None
+        assert second["lease_generation"] == 2
+        assert second["lease_owner"] != first["lease_owner"]
+
+        try:
+            repo.finalize_verified(
+                first, payload, VerifyResult(True, "path_size", [])
+            )
+        except LeaseLostError:
+            pass
+        else:
+            raise AssertionError("stale lease generation finalized the upload")
+
+        current = repo.get(job_id)
+        assert current["state"] == "running"
+        assert current["lease_owner"] == second["lease_owner"]
+        assert current["lease_generation"] == 2
 
 
 def test_full_upload_verification_waits_for_promotion_without_cleanup():

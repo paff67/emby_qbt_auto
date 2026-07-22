@@ -607,6 +607,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         ),
         sync_repeated_full_limit=int(os.environ.get("QBT_ORCH_SYNC_REPEATED_FULL_LIMIT", "3")),
         sync_degraded_interval_sec=float(os.environ.get("QBT_ORCH_SYNC_DEGRADED_INTERVAL_SEC", "10")),
+        safety_event_sample_interval_sec=float(
+            os.environ.get("QBT_ORCH_SAFETY_EVENT_SAMPLE_SEC", "60")
+        ),
         background_periodic_workers=background_periodic_workers,
         periodic_worker_join_timeout=float(os.environ.get("QBT_ORCH_PERIODIC_WORKER_JOIN_TIMEOUT_SEC", "5")),
     )

@@ -397,6 +397,76 @@ def test_planner_demotes_slow_active_after_five_minutes_and_selects_replacement(
             "slow": ("soak", "active_slow_3min"),
         }
 
+        # The demotion persists its cooldown in soak_state.  A new planner
+        # instance must honour it even when SoakQueue is disabled and no
+        # cooldown_hashes argument is supplied by the caller.
+        executor.posts.clear()
+        snapshots["slow"]["state"] = "stoppedDL"
+        snapshots["fresh"]["state"] = "downloading"
+        next_tick = DownloadPlanner(
+            state_db=db,
+            executor=executor,
+            dry_run=False,
+            active_slots=2,
+            disk_floor_bytes=0,
+            now=lambda: 1215,
+        )
+        follow_up = next_tick.plan_and_apply(
+            snapshots, free_bytes=10, sync_healthy=True
+        )
+
+        assert "slow" not in follow_up.selected_hashes
+        assert all(
+            not (path == "/api/v2/torrents/start" and "slow" in payload["hashes"])
+            for path, payload in executor.posts
+        )
+
+
+def test_planner_reads_unexpired_soak_state_cooldown_without_queue_service():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into soak_state(hash,state,cooldown_until,updated_at,reason) "
+            "values('cool','soak_cooldown',1300,1000,'test')"
+        )
+        con.commit()
+        con.close()
+        executor = FakeExecutor()
+        snapshots = {
+            "cool": {
+                "hash": "cool",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": 1,
+                "size": 2,
+                "progress": 0.5,
+            }
+        }
+
+        result = DownloadPlanner(
+            db,
+            executor,
+            dry_run=False,
+            active_slots=1,
+            disk_floor_bytes=0,
+            now=lambda: 1200,
+        ).plan_and_apply(snapshots, free_bytes=10, sync_healthy=True)
+
+        assert result.selected_hashes == []
+        assert executor.posts == []
+        allocation = _rows(
+            db,
+            "select desired_state,reason from scheduler_allocations where hash='cool'",
+        )[0]
+        assert allocation == {"desired_state": "soak_cooldown", "reason": "cooldown"}
+
 
 def test_planner_demotes_stalled_zero_speed_active_after_three_minutes():
     from qbt_orchestrator.db import migrate

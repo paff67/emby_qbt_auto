@@ -55,7 +55,45 @@ def test_daemon_runtime_runs_safety_ticks_and_persists_disk_state():
         event_count = con.execute("select count(*) from events_v2 where component='daemon' and event_type='safety_tick'").fetchone()[0]
         con.close()
         assert row == ("ok", 6 * 1024**3)
-    assert event_count == 2
+    assert event_count == 1
+
+
+def test_daemon_safety_event_sampling_keeps_transitions_immediate():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = [0.0]
+        free_bytes = [6 * 1024**3]
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: free_bytes[0],
+            dry_run=True,
+            safety_interval=0,
+            monotonic=lambda: clock[0],
+            safety_event_sample_interval_sec=60,
+        )
+
+        daemon.tick_safety()
+        clock[0] = 1
+        daemon.tick_safety()
+        free_bytes[0] = 1024**3
+        clock[0] = 2
+        daemon.tick_safety()
+
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "select message,data_json from events_v2 "
+            "where component='daemon' and event_type='safety_tick' order by id"
+        ).fetchall()
+        con.close()
+        assert len(rows) == 2
+        assert "disk=emergency" in rows[-1][0]
+        assert json.loads(rows[-1][1])["state_changed"] is True
 
 
 def test_daemon_emits_one_event_when_sync_session_becomes_degraded():

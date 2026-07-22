@@ -26,7 +26,7 @@ from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .observe_promotion import ObservePromotionService
 from .observability import redact
-from .planner import DownloadPlanner
+from .planner import DownloadPlanner, active_soak_cooldown_hashes
 from .policies.disk import classify_disk
 from .periodic import PeriodicTask, PeriodicWorker
 from .promotion import finalize_canonical_upload
@@ -228,6 +228,7 @@ class DaemonRuntime:
         scheduler_alert_service=None,
         sync_repeated_full_limit: int = 3,
         sync_degraded_interval_sec: float = 10.0,
+        safety_event_sample_interval_sec: float = 60.0,
         background_periodic_workers: bool = False,
         periodic_worker_join_timeout: float = 5.0,
     ):
@@ -331,6 +332,11 @@ class DaemonRuntime:
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
+        self.safety_event_sample_interval_sec = max(
+            0.0, float(safety_event_sample_interval_sec)
+        )
+        self._last_safety_event_at: float | None = None
+        self._last_safety_event_fingerprint: tuple[object, ...] | None = None
         self.monitor = SafetyMonitor(
             qbt,
             executor,
@@ -443,10 +449,17 @@ class DaemonRuntime:
             )
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
+        cooldown_hashes = active_soak_cooldown_hashes(
+            self.state_db, int(time.time())
+        ) | {str(h) for h in soak_result.cooldown_hashes}
         engine_plan = None
         engine_budget = None
         if self.scheduler_engine_mode != "legacy":
-            engine_items = build_full_finish_work_items(snapshots)
+            engine_items = [
+                item
+                for item in build_full_finish_work_items(snapshots)
+                if item.hash not in cooldown_hashes
+            ]
             engine_budget = self._scheduler_growth_budget(
                 free_bytes,
                 reallocatable_hashes={item.hash for item in engine_items if not item.hold},
@@ -484,6 +497,10 @@ class DaemonRuntime:
             snapshots,
             free_bytes=free_bytes,
             sync_healthy=sync_healthy,
+            protected_running_hashes=soak_result.protected_hashes,
+            forced_active_hashes=soak_result.protected_hashes,
+            cooldown_hashes=cooldown_hashes,
+            external_reserved_bytes=soak_result.reserved_bytes,
             allowed_active_hashes=allowed_active_hashes,
         )
         scheduler_payload = self._scheduler_engine_payload(
@@ -832,19 +849,38 @@ class DaemonRuntime:
                 sync_stats,
             )
             self._sync_session_degraded_reported = False
-        self.obs.event(
-            "info",
-            "daemon",
-            "safety_tick",
-            f"disk={result.disk_state} sync={result.sync_health}",
-            {
-                "free_bytes": free_bytes,
-                "sync_health": result.sync_health,
-                "sync_skipped": result.sync_skipped,
-                "sync_session": sync_stats,
-                "dry_run": self.dry_run,
-            },
+        now_monotonic = float(self.monotonic())
+        fingerprint = (
+            str(result.disk_state),
+            str(result.sync_health),
+            bool(result.sync_skipped),
+            bool(self.monitor.sync.session_stats.degraded),
         )
+        state_changed = fingerprint != self._last_safety_event_fingerprint
+        sample_due = (
+            self._last_safety_event_at is None
+            or self.safety_event_sample_interval_sec <= 0
+            or now_monotonic - self._last_safety_event_at
+            >= self.safety_event_sample_interval_sec
+        )
+        if state_changed or sample_due:
+            self.obs.event(
+                "info",
+                "daemon",
+                "safety_tick",
+                f"disk={result.disk_state} sync={result.sync_health}",
+                {
+                    "free_bytes": free_bytes,
+                    "sync_health": result.sync_health,
+                    "sync_skipped": result.sync_skipped,
+                    "sync_session": sync_stats,
+                    "dry_run": self.dry_run,
+                    "sample_interval_sec": self.safety_event_sample_interval_sec,
+                    "state_changed": state_changed,
+                },
+            )
+            self._last_safety_event_at = now_monotonic
+            self._last_safety_event_fingerprint = fingerprint
 
     def process_bot_commands(self, max_commands: int = 20) -> int:
         if self.command_processor is None:

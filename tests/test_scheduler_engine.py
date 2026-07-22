@@ -469,6 +469,81 @@ def test_scheduler_live_applies_engine_selection_once():
         assert ("/api/v2/torrents/start", {"hashes": "small"}) not in executor.posts
 
 
+def test_runtime_passes_soak_budget_and_excludes_cooldowns_from_live_engine():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+    from qbt_orchestrator.soak_queue import SoakQueueResult
+
+    class SoakResultService:
+        def run_once(self, *args, **kwargs):
+            return SoakQueueResult(
+                resident_hashes=["resident"],
+                cooldown_hashes=["cool"],
+                reserved_bytes=9 * GIB,
+                dry_run=False,
+            )
+
+    class SoakQbt:
+        def get_maindata(self, rid):
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "resident": {
+                        "hash": "resident",
+                        "name": "resident",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": GIB,
+                        "size": 2 * GIB,
+                        "progress": 0.5,
+                        "dlspeed": 1,
+                    },
+                    "cool": {
+                        "hash": "cool",
+                        "name": "cool",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": GIB,
+                        "size": 2 * GIB,
+                        "progress": 0.9,
+                        "dlspeed": 100,
+                    },
+                },
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = _Executor()
+        daemon = DaemonRuntime(
+            db,
+            SoakQbt(),
+            executor,
+            free_bytes_provider=lambda: 10 * GIB,
+            dry_run=False,
+            safety_interval=0,
+            planner_dry_run=False,
+            planner_active_slots=1,
+            disk_floor_bytes=0,
+            emergency_floor_bytes=0,
+            scheduler_engine_mode="live",
+            soak_queue_service=SoakResultService(),
+        )
+
+        daemon.tick_safety()
+        result = daemon.planner_tick()
+
+        assert result["scheduler_engine"]["selected_hashes"] == ["resident"]
+        assert result["planner"]["selected_hashes"] == ["resident"]
+        assert result["planner"]["budget_bytes"] == GIB
+        assert ("/api/v2/torrents/start", {"hashes": "resident"}) in executor.posts
+        assert all("cool" not in payload.get("hashes", "") for _path, payload in executor.posts)
+
+
 def test_scheduler_budget_subtracts_external_future_claims_but_only_reports_pinned():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime
