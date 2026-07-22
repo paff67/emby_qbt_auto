@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from .alerts import SchedulerAlertConfig, SchedulerAlertService
 from .budget import calculate_growth_budget, resource_claims_from_rows
@@ -16,6 +16,7 @@ from .capacity_state import (
     ModeController,
     build_capacity_observation,
     detect_capacity_state,
+    finish_viability,
 )
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
@@ -160,6 +161,10 @@ class DaemonRuntime:
         planner_active_slots: int = 5,
         planner_slow_active_demote_sec: int = 180,
         finish_resident_max_remaining_bytes: int = 0,
+        finish_resident_max_stall_sec: int = 1_800,
+        capacity_viability_stale_sec: int = 1_800,
+        capacity_reclaimer=None,
+        capacity_reclaim_interval_sec: int = 300,
         scheduler_engine_mode: str = "legacy",
         scheduler_engine=None,
         scheduler_unit_bytes: int = 64 * 1024**2,
@@ -248,6 +253,17 @@ class DaemonRuntime:
         self.finish_resident_max_remaining_bytes = max(
             0, int(finish_resident_max_remaining_bytes)
         )
+        self.finish_resident_max_stall_sec = max(
+            0, int(finish_resident_max_stall_sec)
+        )
+        self.capacity_viability_stale_sec = max(
+            0, int(capacity_viability_stale_sec)
+        )
+        self.capacity_reclaimer = capacity_reclaimer
+        self.capacity_reclaim_interval_sec = max(
+            1, int(capacity_reclaim_interval_sec)
+        )
+        self._last_capacity_reclaim_at: int | None = None
         self.scheduler_engine_mode = str(scheduler_engine_mode or "legacy").strip().lower()
         if self.scheduler_engine_mode not in {"legacy", "shadow", "live"}:
             raise ValueError("scheduler_engine_mode must be legacy, shadow, or live")
@@ -454,6 +470,7 @@ class DaemonRuntime:
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
         planner_now = int(time.time())
+        capacity_health = self._capacity_health_by_hash()
         cooldown_hashes = active_soak_cooldown_hashes(
             self.state_db, planner_now
         ) | {str(h) for h in soak_result.cooldown_hashes}
@@ -466,6 +483,12 @@ class DaemonRuntime:
                 item
                 for item in build_full_finish_work_items(snapshots)
                 if item.hash not in cooldown_hashes
+                and finish_viability(
+                    snapshots.get(item.hash) or {},
+                    capacity_health.get(item.hash),
+                    observed_at=planner_now,
+                    stale_sec=self.capacity_viability_stale_sec,
+                )[0]
             ]
             engine_budget = self._scheduler_growth_budget(
                 free_bytes,
@@ -493,6 +516,7 @@ class DaemonRuntime:
             active_slots=self.planner_active_slots,
             slow_active_demote_sec=self.planner_slow_active_demote_sec,
             finish_resident_max_remaining_bytes=self.finish_resident_max_remaining_bytes,
+            finish_resident_max_stall_sec=self.finish_resident_max_stall_sec,
             disk_floor_bytes=self.disk_floor_bytes,
             recovery_enabled=self.recovery_enabled,
             recovery_enter_bytes=self.recovery_enter_bytes,
@@ -531,6 +555,9 @@ class DaemonRuntime:
             selected_hashes={str(item) for item in result.selected_hashes},
             disk_releasing_jobs=self._disk_releasing_job_count(),
             free_bytes=free_bytes,
+            health_by_hash=self._capacity_health_by_hash(),
+            observed_at=planner_now,
+            viability_stale_sec=self.capacity_viability_stale_sec,
         )
         capacity_details = capacity_observation.as_details()
         capacity_result = detect_capacity_state(
@@ -538,12 +565,31 @@ class DaemonRuntime:
             managed_incomplete=capacity_observation.managed_incomplete,
             feasible_full_finish=capacity_observation.feasible_full_finish,
             disk_releasing_jobs=capacity_observation.disk_releasing_jobs,
+            capacity_pressure=free_bytes < self.drain_exit_bytes,
         )
         capacity_transition = self.capacity_state_store.persist(
             scheduler_mode,
             capacity_result,
             capacity_details,
         )
+        capacity_reclaim_payload = None
+        if (
+            self.capacity_reclaimer is not None
+            and sync_healthy
+            and (
+                self._last_capacity_reclaim_at is None
+                or planner_now - self._last_capacity_reclaim_at
+                >= self.capacity_reclaim_interval_sec
+            )
+        ):
+            reclaim_result = self.capacity_reclaimer.run(
+                snapshots,
+                capacity_state=capacity_transition.state,
+                free_bytes=free_bytes,
+                target_free_bytes=self.drain_exit_bytes,
+            )
+            capacity_reclaim_payload = reclaim_result.as_dict()
+            self._last_capacity_reclaim_at = planner_now
         alert_ids = self.scheduler_alert_service.evaluate_and_enqueue(
             snapshots=snapshots,
             free_bytes=free_bytes,
@@ -593,6 +639,7 @@ class DaemonRuntime:
             "preemption": None if preemption_result is None else getattr(preemption_result, "__dict__", preemption_result),
             "scheduler_engine": scheduler_payload,
             "capacity": capacity_payload,
+            "capacity_reclaim": capacity_reclaim_payload,
             "alerts_enqueued": alert_ids,
         }
 
@@ -704,6 +751,19 @@ class DaemonRuntime:
                 count += 1
         return count
 
+    def _capacity_health_by_hash(self) -> dict[str, dict[str, Any]]:
+        con = readonly_connect(self.state_db)
+        try:
+            return {
+                str(row["hash"]): dict(row)
+                for row in con.execute(
+                    "select hash,no_progress_since,last_swarm_seen_at,no_swarm_since,"
+                    "dlspeed_bps,num_seeds,num_peers from torrent_health"
+                ).fetchall()
+            }
+        finally:
+            con.close()
+
     def _scheduler_growth_budget(
         self,
         free_bytes: int,
@@ -809,6 +869,8 @@ class DaemonRuntime:
                 "recovery_active_slots": self.recovery_active_slots,
                 "recovery_max_remaining_bytes": self.recovery_max_remaining_bytes,
                 "finish_resident_max_remaining_bytes": self.finish_resident_max_remaining_bytes,
+                "finish_resident_max_stall_sec": self.finish_resident_max_stall_sec,
+                "capacity_viability_stale_sec": self.capacity_viability_stale_sec,
                 "scheduler_min_residency_sec": self.scheduler_min_residency_sec,
             },
             "feature_flags": {
@@ -826,6 +888,12 @@ class DaemonRuntime:
                 if hasattr(self.scheduler_alert_service, "config")
                 else False,
                 "capacity_deadlock_alerts": bool(self.capacity_deadlock_alerts_enabled),
+                "capacity_reclaim": self.capacity_reclaimer is not None,
+                "capacity_reclaim_dry_run": (
+                    None
+                    if self.capacity_reclaimer is None
+                    else bool(getattr(self.capacity_reclaimer, "dry_run", True))
+                ),
             },
         }
 

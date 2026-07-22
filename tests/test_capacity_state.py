@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 import sys
 
@@ -13,6 +14,23 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 GIB = 1024**3
+
+
+def test_torrent_snapshot_preserves_capacity_viability_fields():
+    from qbt_orchestrator.models import TorrentSnapshot
+
+    snapshot = TorrentSnapshot.from_qbt(
+        {
+            "hash": "h1",
+            "availability": 0.996,
+            "last_activity": 123,
+            "seen_complete": 99,
+        }
+    )
+
+    assert snapshot.availability == 0.996
+    assert snapshot.last_activity == 123
+    assert snapshot.seen_complete == 99
 
 
 def test_drain_mode_requires_exit_watermark_to_recover():
@@ -84,6 +102,62 @@ def test_capacity_observation_excludes_hold_and_orders_manual_candidates():
     assert observation.feasible_full_finish == 1
     assert observation.required_minimum_growth_bytes == 2 * GIB
     assert [item["hash"] for item in observation.top_manual_candidates] == ["small", "big"]
+
+
+def test_capacity_observation_does_not_count_stale_unavailable_finish_as_feasible():
+    from qbt_orchestrator.capacity_state import build_capacity_observation
+
+    observation = build_capacity_observation(
+        {
+            "stuck": {
+                "hash": "stuck",
+                "category": "auto",
+                "tags": "auto",
+                "amount_left": 8 * 1024**2,
+                "availability": 0.996,
+                "num_seeds": 0,
+                "dlspeed_bps": 0,
+            },
+            "large-viable": {
+                "hash": "large-viable",
+                "category": "auto",
+                "tags": "auto",
+                "amount_left": 4 * GIB,
+                "availability": 1.0,
+                "num_seeds": 1,
+                "dlspeed_bps": 0,
+            },
+        },
+        available_growth_bytes=GIB,
+        selected_hashes={"stuck"},
+        disk_releasing_jobs=0,
+        free_bytes=3 * GIB,
+        health_by_hash={
+            "stuck": {"no_progress_since": 100},
+            "large-viable": {"no_progress_since": 100},
+        },
+        observed_at=4_000,
+        viability_stale_sec=1_800,
+    )
+
+    assert observation.managed_incomplete == 2
+    assert observation.viable_finish == 1
+    assert observation.feasible_full_finish == 0
+    assert observation.nonviable_finish == 1
+
+
+def test_capacity_deadlock_can_be_detected_under_pressure_before_drain_entry():
+    from qbt_orchestrator.capacity_state import detect_capacity_state
+
+    result = detect_capacity_state(
+        mode="normal",
+        managed_incomplete=10,
+        feasible_full_finish=0,
+        disk_releasing_jobs=0,
+        capacity_pressure=True,
+    )
+
+    assert result.state == "capacity_deadlock"
 
 
 def test_capacity_state_store_preserves_entered_at_until_real_transition():
@@ -305,6 +379,106 @@ def test_daemon_persists_deadlock_without_actions_and_alerts_once_until_recovery
         assert "manual intervention required" in notices[0]["message"]
 
 
+def test_daemon_marks_stale_unavailable_finish_deadlocked_under_capacity_pressure():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.test_daemon_runtime import FakeExecutor, FakeQbt
+
+    class StuckFinishQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "stuck": {
+                        "hash": "stuck",
+                        "name": "stuck",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stalledDL",
+                        "amount_left": 8 * 1024**2,
+                        "size": 6 * GIB,
+                        "completed": 6 * GIB - 8 * 1024**2,
+                        "progress": 0.999,
+                        "availability": 0.996,
+                        "num_seeds": 0,
+                        "num_incomplete": 2,
+                        "dlspeed": 0,
+                    }
+                },
+                "server_state": {},
+            }
+
+    now = int(time.time())
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,"
+            "num_seeds,num_peers,low_speed_since,no_progress_since,active_since,updated_at) "
+            "values('stuck',?,0,?,?,0.999,0,2,?,?,?,?)",
+            (
+                now - 3_600,
+                6 * GIB - 8 * 1024**2,
+                6 * GIB - 8 * 1024**2,
+                now - 3_600,
+                now - 3_600,
+                now - 3_600,
+                now - 3_600,
+            ),
+        )
+        con.commit()
+        con.close()
+        class RecordingReclaimer:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, snapshots, **kwargs):
+                self.calls.append((snapshots, kwargs))
+
+                class Result:
+                    def as_dict(self):
+                        return {"dry_run": True, "planned": 1, "candidates": [{"hash": "dead"}]}
+
+                return Result()
+
+        reclaimer = RecordingReclaimer()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=StuckFinishQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: int(3.25 * GIB),
+            dry_run=True,
+            safety_interval=0,
+            disk_floor_bytes=3 * GIB,
+            emergency_floor_bytes=2 * GIB,
+            recovery_enter_bytes=3 * GIB,
+            drain_exit_bytes=5 * GIB,
+            finish_resident_max_remaining_bytes=256 * 1024**2,
+            finish_resident_max_stall_sec=1_800,
+            capacity_viability_stale_sec=1_800,
+            capacity_reclaimer=reclaimer,
+            scheduler_engine_mode="live",
+        )
+
+        daemon.tick_safety()
+        result = daemon.planner_tick()
+
+        assert result["capacity"]["scheduler_mode"] == "normal"
+        assert result["capacity"]["state"] == "capacity_deadlock"
+        assert result["capacity"]["details"]["feasible_full_finish"] == 0
+        assert result["capacity"]["details"]["nonviable_finish"] == 1
+        assert result["planner"]["selected_hashes"] == []
+        assert result["capacity_reclaim"]["planned"] == 1
+        assert reclaimer.calls[0][1] == {
+            "capacity_state": "capacity_deadlock",
+            "free_bytes": int(3.25 * GIB),
+            "target_free_bytes": 5 * GIB,
+        }
+
+
 def test_daemon_records_redacted_effective_scheduler_config_at_startup():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime
@@ -345,4 +519,5 @@ def test_daemon_records_redacted_effective_scheduler_config_at_startup():
             "explore_enter_bytes": 8 * GIB,
         }
         assert config["feature_flags"]["capacity_deadlock_alerts"] is True
+        assert config["feature_flags"]["capacity_reclaim"] is False
         assert "token" not in row[0].lower()

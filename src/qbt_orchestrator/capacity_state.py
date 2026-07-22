@@ -60,8 +60,9 @@ class ModeController:
 class CapacityResult:
     state: str
     reason: str
-    # This list is intentionally always empty in V3. Capacity recovery remains
-    # a manual operator decision and cannot smuggle destructive commands.
+    # Detection remains side-effect free.  The separately configured dead
+    # partial reclaimer consumes the persisted transition behind its own path,
+    # age, ownership and dry-run gates.
     actions: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -71,9 +72,10 @@ def detect_capacity_state(
     managed_incomplete: int,
     feasible_full_finish: int,
     disk_releasing_jobs: int,
+    capacity_pressure: bool = False,
 ) -> CapacityResult:
     if (
-        str(mode) == "drain"
+        (str(mode) == "drain" or bool(capacity_pressure))
         and int(managed_incomplete) > 0
         and int(feasible_full_finish) == 0
         and int(disk_releasing_jobs) == 0
@@ -85,6 +87,8 @@ def detect_capacity_state(
 @dataclass(frozen=True)
 class CapacityObservation:
     managed_incomplete: int
+    viable_finish: int
+    nonviable_finish: int
     feasible_full_finish: int
     disk_releasing_jobs: int
     required_minimum_growth_bytes: int
@@ -95,6 +99,8 @@ class CapacityObservation:
     def as_details(self) -> dict[str, Any]:
         return {
             "managed_incomplete": int(self.managed_incomplete),
+            "viable_finish": int(self.viable_finish),
+            "nonviable_finish": int(self.nonviable_finish),
             "feasible_full_finish": int(self.feasible_full_finish),
             "disk_releasing_jobs": int(self.disk_releasing_jobs),
             "required_minimum_growth_bytes": int(self.required_minimum_growth_bytes),
@@ -104,6 +110,41 @@ class CapacityObservation:
         }
 
 
+def finish_viability(
+    torrent: Mapping[str, Any],
+    health: Mapping[str, Any] | None,
+    *,
+    observed_at: int,
+    stale_sec: int,
+) -> tuple[bool, str]:
+    health = health or {}
+    seeds = max(
+        0,
+        int(torrent.get("num_seeds") or 0),
+        int(torrent.get("num_complete") or 0),
+    )
+    dlspeed = max(
+        0,
+        int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or 0),
+    )
+    raw_availability = torrent.get("availability")
+    availability = None if raw_availability is None else float(raw_availability)
+    no_progress_since = health.get("no_progress_since")
+    has_complete_source = seeds > 0 or (
+        availability is not None and availability >= 0.999999
+    )
+    recently_progressing = (
+        dlspeed > 0
+        or no_progress_since is None
+        or int(observed_at) - int(no_progress_since) < max(0, int(stale_sec))
+    )
+    if has_complete_source:
+        return True, "complete_source"
+    if recently_progressing:
+        return True, "recent_progress"
+    return False, "stale_without_complete_source"
+
+
 def build_capacity_observation(
     snapshots: Mapping[str, Mapping[str, Any]],
     *,
@@ -111,10 +152,16 @@ def build_capacity_observation(
     selected_hashes: set[str],
     disk_releasing_jobs: int,
     free_bytes: int,
+    health_by_hash: Mapping[str, Mapping[str, Any]] | None = None,
+    observed_at: int | None = None,
+    viability_stale_sec: int = 1_800,
 ) -> CapacityObservation:
     """Build deterministic aggregate evidence without proposing any action."""
 
     candidates: list[dict[str, Any]] = []
+    health_by_hash = health_by_hash or {}
+    now = int(time.time()) if observed_at is None else int(observed_at)
+    stale_after = max(0, int(viability_stale_sec))
     for fallback_hash, raw in snapshots.items():
         torrent = dict(raw)
         torrent_hash = str(torrent.get("hash") or fallback_hash)
@@ -123,7 +170,20 @@ def build_capacity_observation(
         amount_left = max(0, int(torrent.get("amount_left") or 0))
         if not managed or amount_left <= 0:
             continue
-        candidates.append({"hash": torrent_hash, "required_growth_bytes": amount_left})
+        viable, viability_reason = finish_viability(
+            torrent,
+            health_by_hash.get(torrent_hash),
+            observed_at=now,
+            stale_sec=stale_after,
+        )
+        candidates.append(
+            {
+                "hash": torrent_hash,
+                "required_growth_bytes": amount_left,
+                "viable": viable,
+                "viability_reason": viability_reason,
+            }
+        )
     candidates.sort(key=lambda item: (item["required_growth_bytes"], item["hash"]))
 
     budget = max(0, int(available_growth_bytes))
@@ -131,10 +191,17 @@ def build_capacity_observation(
     feasible = sum(
         1
         for candidate in candidates
-        if candidate["hash"] in selected or candidate["required_growth_bytes"] <= budget
+        if candidate["viable"]
+        and (
+            candidate["hash"] in selected
+            or candidate["required_growth_bytes"] <= budget
+        )
     )
+    viable_finish = sum(1 for candidate in candidates if candidate["viable"])
     return CapacityObservation(
         managed_incomplete=len(candidates),
+        viable_finish=viable_finish,
+        nonviable_finish=len(candidates) - viable_finish,
         feasible_full_finish=feasible,
         disk_releasing_jobs=max(0, int(disk_releasing_jobs)),
         required_minimum_growth_bytes=candidates[0]["required_growth_bytes"] if candidates else 0,

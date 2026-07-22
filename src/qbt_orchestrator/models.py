@@ -57,6 +57,9 @@ class DiskConfig:
     guard_free_bytes: int = 3 * GIB
     critical_free_bytes: int = 2 * GIB
     emergency_free_bytes: int = 2 * GIB
+    drain_enter_bytes: int = 3 * GIB
+    drain_exit_bytes: int = 5 * GIB
+    explore_enter_bytes: int = 8 * GIB
 
 @dataclass(frozen=True)
 class EmbyConfig:
@@ -111,6 +114,9 @@ class TorrentSnapshot:
     completion_on: int = 0
     share_limit_reached: bool = False
     has_metadata: bool | None = None
+    availability: float | None = None
+    last_activity: int = 0
+    seen_complete: int = 0
 
     @classmethod
     def from_qbt(cls, payload: Dict[str, Any]) -> "TorrentSnapshot":
@@ -142,6 +148,13 @@ class TorrentSnapshot:
             completion_on=int(payload.get("completion_on") or 0),
             share_limit_reached=bool(payload.get("share_limit_reached") or False),
             has_metadata=None if has_metadata is None else bool(has_metadata),
+            availability=(
+                None
+                if payload.get("availability") is None
+                else float(payload.get("availability"))
+            ),
+            last_activity=int(payload.get("last_activity") or 0),
+            seen_complete=int(payload.get("seen_complete") or 0),
         )
 
 @dataclass(frozen=True)

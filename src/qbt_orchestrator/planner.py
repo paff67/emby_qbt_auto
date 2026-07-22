@@ -112,6 +112,7 @@ class DownloadPlanner:
         disk_floor_bytes: int = 3 * 1024**3,
         slow_active_demote_sec: int = 180,
         finish_resident_max_remaining_bytes: int = 0,
+        finish_resident_max_stall_sec: int = 1_800,
         recovery_enabled: bool = False,
         recovery_enter_bytes: int | None = None,
         emergency_floor_bytes: int | None = None,
@@ -128,6 +129,9 @@ class DownloadPlanner:
         self.slow_active_demote_sec = int(slow_active_demote_sec)
         self.finish_resident_max_remaining_bytes = max(
             0, int(finish_resident_max_remaining_bytes)
+        )
+        self.finish_resident_max_stall_sec = max(
+            0, int(finish_resident_max_stall_sec)
         )
         self.recovery_enabled = bool(recovery_enabled)
         self.recovery_enter_bytes = int(recovery_enter_bytes if recovery_enter_bytes is not None else self.disk_floor_bytes)
@@ -531,7 +535,14 @@ class DownloadPlanner:
             # Near-complete torrents may wait a long time for rare final
             # pieces.  If the global engine still selects one, keep its peer
             # connection resident instead of forcing a 30-minute cooldown.
-            return False
+            no_progress_since = (health or {}).get("no_progress_since")
+            if (
+                self.finish_resident_max_stall_sec <= 0
+                or no_progress_since is None
+                or int(now) - int(no_progress_since)
+                < self.finish_resident_max_stall_sec
+            ):
+                return False
         if not health:
             return False
         active_since = health.get("active_since")

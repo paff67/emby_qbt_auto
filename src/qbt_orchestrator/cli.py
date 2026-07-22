@@ -1,9 +1,11 @@
 from __future__ import annotations
 import argparse, json, os, shutil, sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 from .config import load_config
 from .carousel import CarouselService
+from .capacity_reclaim import DeadPartialReclaimer
 from .db import migrate, readonly_connect, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient, QbtHttpClient
@@ -99,7 +101,53 @@ def _explore_enter_bytes_from_env(env=os.environ) -> int:
     return int(float(env.get("QBT_ORCH_EXPLORE_ENTER_GB", "8")) * 1024**3)
 
 
-def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
+@dataclass(frozen=True)
+class ResolvedCapacityPolicy:
+    disk_floor_bytes: int
+    emergency_floor_bytes: int
+    recovery_enter_bytes: int
+    drain_exit_bytes: int
+    explore_enter_bytes: int
+
+
+def _resolve_capacity_policy(disk_config=None, env=os.environ) -> ResolvedCapacityPolicy:
+    if disk_config is None:
+        return ResolvedCapacityPolicy(
+            disk_floor_bytes=_disk_floor_bytes_from_env(env),
+            emergency_floor_bytes=_emergency_floor_bytes_from_env(env),
+            recovery_enter_bytes=_recovery_enter_bytes_from_env(env),
+            drain_exit_bytes=_drain_exit_bytes_from_env(env),
+            explore_enter_bytes=_explore_enter_bytes_from_env(env),
+        )
+
+    expected = {
+        "QBT_ORCH_DISK_FLOOR_GB": int(disk_config.guard_free_bytes),
+        "QBT_ORCH_EMERGENCY_FLOOR_GB": int(disk_config.emergency_free_bytes),
+        "QBT_ORCH_RECOVERY_ENTER_GB": int(disk_config.drain_enter_bytes),
+        "QBT_ORCH_DRAIN_EXIT_GB": int(disk_config.drain_exit_bytes),
+        "QBT_ORCH_EXPLORE_ENTER_GB": int(disk_config.explore_enter_bytes),
+    }
+    conflicts: list[str] = []
+    for key, configured_bytes in expected.items():
+        if key not in env:
+            continue
+        env_bytes = int(float(env[key]) * 1024**3)
+        if env_bytes != configured_bytes:
+            conflicts.append(
+                f"{key}={env[key]}GiB conflicts with config={configured_bytes / 1024**3:g}GiB"
+            )
+    if conflicts:
+        raise ValueError("capacity threshold conflict: " + "; ".join(conflicts))
+    return ResolvedCapacityPolicy(
+        disk_floor_bytes=int(disk_config.guard_free_bytes),
+        emergency_floor_bytes=int(disk_config.emergency_free_bytes),
+        recovery_enter_bytes=int(disk_config.drain_enter_bytes),
+        drain_exit_bytes=int(disk_config.drain_exit_bytes),
+        explore_enter_bytes=int(disk_config.explore_enter_bytes),
+    )
+
+
+def _build_soak_config_from_env(env=os.environ, capacity_policy: ResolvedCapacityPolicy | None = None) -> SoakQueueConfig:
     hot_bps = int(env.get("QBT_ORCH_SOAK_HOT_BPS", str(1024**2)))
     allowed_modes = tuple(
         mode.strip().lower()
@@ -115,8 +163,8 @@ def _build_soak_config_from_env(env=os.environ) -> SoakQueueConfig:
         max_cold_partial_torrents=int(env.get("QBT_ORCH_MAX_COLD_PARTIAL_TORRENTS", "8")),
         max_new_per_hour=int(env.get("QBT_ORCH_SOAK_MAX_NEW_PER_HOUR", "4")),
         min_free_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_FREE_GB", "0")) * 1024**3),
-        disk_floor_bytes=_disk_floor_bytes_from_env(env),
-        emergency_floor_bytes=_emergency_floor_bytes_from_env(env),
+        disk_floor_bytes=(capacity_policy.disk_floor_bytes if capacity_policy else _disk_floor_bytes_from_env(env)),
+        emergency_floor_bytes=(capacity_policy.emergency_floor_bytes if capacity_policy else _emergency_floor_bytes_from_env(env)),
         recovery_margin_bytes=int(float(env.get("QBT_ORCH_RECOVERY_MARGIN_MB", "256")) * 1024**2),
         max_total_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MAX_EXPOSURE_GB", "4")) * 1024**3),
         min_exposure_bytes=int(float(env.get("QBT_ORCH_SOAK_MIN_EXPOSURE_MB", "128")) * 1024**2),
@@ -297,12 +345,54 @@ def _status_payload(db: Path, view: str | None) -> dict:
 
 def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[DaemonRuntime, bool]:
     cfg = load_config(ns.config) if ns.config else None
+    capacity_policy = _resolve_capacity_policy(cfg.disk if cfg else None, os.environ)
     env_dry_run = _truthy(os.environ.get("QBT_ORCH_DRY_RUN"))
     dry_run = bool(ns.dry_run or (force_dry_run if force_dry_run is not None else (env_dry_run if env_dry_run is not None else (cfg.dry_run if cfg else True))))
     state_db = Path(os.environ.get("QBT_ORCH_STATE_DB") or (cfg.state_db if cfg else str(db)))
     qbt_cfg = cfg.qbt if cfg else None
     qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)
     executor = Executor(qbt, dry_run=dry_run)
+    capacity_reclaimer = None
+    capacity_reclaim_enabled = _truthy(
+        os.environ.get("QBT_ORCH_CAPACITY_RECLAIM")
+    )
+    if capacity_reclaim_enabled is True:
+        reclaim_dry_env = _truthy(
+            os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_DRY_RUN")
+        )
+        reclaim_dry_run = (
+            True
+            if dry_run
+            else (reclaim_dry_env if reclaim_dry_env is not None else True)
+        )
+        host_downloads = Path(
+            os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads")
+        )
+        capacity_reclaimer = DeadPartialReclaimer(
+            state_db,
+            executor,
+            host_downloads=host_downloads,
+            container_downloads=os.environ.get(
+                "QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"
+            ),
+            managed_root=os.environ.get(
+                "QBT_ORCH_CAPACITY_RECLAIM_ROOT",
+                str(host_downloads / "incomplete"),
+            ),
+            dry_run=reclaim_dry_run,
+            min_dead_age_sec=int(
+                os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MIN_DEAD_SEC", "21600")
+            ),
+            min_reclaim_bytes=int(
+                float(
+                    os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MIN_BYTES_MB", "64")
+                )
+                * 1024**2
+            ),
+            max_per_tick=int(
+                os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MAX_PER_TICK", "1")
+            ),
+        )
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
     telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
     notification_repo = BotNotificationRepository(state_db)
@@ -514,7 +604,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         soak_enabled = False
     soak_dry_env = _truthy(os.environ.get("QBT_ORCH_SOAK_DRY_RUN"))
     soak_dry_run = True if dry_run else (soak_dry_env if soak_dry_env is not None else False)
-    soak_config = _build_soak_config_from_env(os.environ)
+    soak_config = _build_soak_config_from_env(os.environ, capacity_policy)
     alert_chat_ids = _csv_list(os.environ.get("QBT_ORCH_TG_ALERT_CHAT_IDS")) or _csv_list(os.environ.get("QBT_ORCH_TG_ADMINS"))
     scheduler_alerts_env = _truthy(os.environ.get("QBT_ORCH_SCHEDULER_ALERTS"))
     scheduler_alerts_enabled = bool(scheduler_alerts_env if scheduler_alerts_env is not None else bool(alert_chat_ids))
@@ -537,16 +627,26 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             float(os.environ.get("QBT_ORCH_FINISH_RESIDENT_MAX_REMAINING_MB", "256"))
             * 1024**2
         ),
+        finish_resident_max_stall_sec=int(
+            os.environ.get("QBT_ORCH_FINISH_RESIDENT_MAX_STALL_SEC", "1800")
+        ),
+        capacity_viability_stale_sec=int(
+            os.environ.get("QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC", "1800")
+        ),
+        capacity_reclaimer=capacity_reclaimer,
+        capacity_reclaim_interval_sec=int(
+            os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_INTERVAL_SEC", "300")
+        ),
         scheduler_engine_mode=os.environ.get("QBT_ORCH_SCHEDULER_ENGINE", "legacy"),
         scheduler_min_residency_sec=int(
             os.environ.get("QBT_ORCH_SCHEDULER_MIN_RESIDENCY_SEC", "180")
         ),
-        disk_floor_bytes=_disk_floor_bytes_from_env(os.environ),
-        emergency_floor_bytes=_emergency_floor_bytes_from_env(os.environ),
+        disk_floor_bytes=capacity_policy.disk_floor_bytes,
+        emergency_floor_bytes=capacity_policy.emergency_floor_bytes,
         recovery_enabled=(_truthy(os.environ.get("QBT_ORCH_RECOVERY_MODE")) is not False),
-        recovery_enter_bytes=_recovery_enter_bytes_from_env(os.environ),
-        drain_exit_bytes=_drain_exit_bytes_from_env(os.environ),
-        explore_enter_bytes=_explore_enter_bytes_from_env(os.environ),
+        recovery_enter_bytes=capacity_policy.recovery_enter_bytes,
+        drain_exit_bytes=capacity_policy.drain_exit_bytes,
+        explore_enter_bytes=capacity_policy.explore_enter_bytes,
         recovery_margin_bytes=int(float(os.environ.get("QBT_ORCH_RECOVERY_MARGIN_MB", "256")) * 1024**2),
         recovery_active_slots=int(os.environ.get("QBT_ORCH_RECOVERY_ACTIVE_SLOTS", "4")),
         recovery_max_remaining_bytes=int(float(os.environ.get("QBT_ORCH_RECOVERY_MAX_REMAINING_GB", "1.5")) * 1024**3),

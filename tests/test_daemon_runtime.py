@@ -1701,6 +1701,7 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
         "QBT_ORCH_QBT_PREFERENCES_GUARD", "QBT_ORCH_PATH_RECONCILE",
         "QBT_ORCH_DRAIN_EXIT_GB", "QBT_ORCH_EXPLORE_ENTER_GB", "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS",
         "QBT_ORCH_SCHEDULER_ENGINE",
+        "QBT_ORCH_FINISH_RESIDENT_MAX_STALL_SEC", "QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC",
     ]
     old = {k: os.environ.get(k) for k in keys}
     try:
@@ -1735,6 +1736,8 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
                 "QBT_ORCH_EXPLORE_ENTER_GB": "9",
                 "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS": "0",
                 "QBT_ORCH_SCHEDULER_ENGINE": "shadow",
+                "QBT_ORCH_FINISH_RESIDENT_MAX_STALL_SEC": "2400",
+                "QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC": "2100",
             })
             ns = argparse.Namespace(cmd="daemon", dry_run=False, config=None, safety_interval=0, max_safety_ticks=1)
             runtime, dry_run = _build_runtime(ns, db)
@@ -1760,6 +1763,8 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
             assert runtime.explore_enter_bytes == 9 * 1024**3
             assert runtime.capacity_deadlock_alerts_enabled is False
             assert runtime.scheduler_engine_mode == "shadow"
+            assert runtime.finish_resident_max_stall_sec == 2400
+            assert runtime.capacity_viability_stale_sec == 2100
     finally:
         for k, v in old.items():
             if v is None:

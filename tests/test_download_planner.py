@@ -558,6 +558,67 @@ def test_planner_keeps_engine_selected_nearly_finished_torrent_resident_when_slo
         ) == [{"desired_state": "active", "reason": "budget_fit"}]
 
 
+def test_planner_demotes_nearly_finished_torrent_after_resident_stall_limit():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    mib = 1024**2
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) "
+            "values('stuck-finish','active','active','stable',100,'budget_fit')"
+        )
+        con.execute(
+            "insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,"
+            "num_seeds,num_peers,low_speed_since,no_progress_since,active_since,updated_at) "
+            "values('stuck-finish',3900,0,6000,6000,0.98,0,1,100,100,100,3900)"
+        )
+        con.commit()
+        con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(
+            state_db=db,
+            executor=executor,
+            dry_run=False,
+            active_slots=1,
+            disk_floor_bytes=0,
+            slow_active_demote_sec=180,
+            finish_resident_max_remaining_bytes=256 * mib,
+            finish_resident_max_stall_sec=1_800,
+            now=lambda: 4_000,
+        )
+        snapshots = {
+            "stuck-finish": {
+                "hash": "stuck-finish",
+                "name": "stuck-finish",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stalledDL",
+                "amount_left": 8 * mib,
+                "size": 6 * 1024**3,
+                "progress": 0.999,
+                "availability": 0.996,
+                "dlspeed": 0,
+                "num_seeds": 0,
+                "num_peers": 1,
+            }
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=1024**3,
+            sync_healthy=True,
+            allowed_active_hashes={"stuck-finish"},
+        )
+
+        assert result.selected_hashes == []
+        assert ("/api/v2/torrents/stop", {"hashes": "stuck-finish"}) in executor.posts
+
+
 def test_planner_only_starts_selected_torrents_that_are_stopped_or_paused():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner
