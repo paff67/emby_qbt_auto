@@ -6,6 +6,7 @@ import json
 import importlib.util
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 import sys
 
@@ -284,6 +285,50 @@ def test_selection_is_independent_of_input_order_and_ties_use_stable_hash():
     assert [item.id for item in second.selected] == [item.id for item in first.selected]
 
 
+def test_scheduler_prefers_recent_incumbent_over_instantaneous_throughput():
+    from qbt_orchestrator.scheduler_engine import SchedulerEngine
+    from qbt_orchestrator.work_items import WorkItem, WorkKind
+
+    incumbent = WorkItem(
+        id="full:incumbent",
+        hash="incumbent",
+        kind=WorkKind.FULL_FINISH,
+        incremental_growth_bytes=64 * MIB,
+        releasable_bytes=0,
+        pinned_after_success_bytes=GIB,
+        completion_probability=0.1,
+        throughput_bps=0,
+        wait_age_sec=0,
+        operator_priority=0,
+    )
+    challenger = WorkItem(
+        id="full:challenger",
+        hash="challenger",
+        kind=WorkKind.FULL_FINISH,
+        incremental_growth_bytes=64 * MIB,
+        releasable_bytes=0,
+        pinned_after_success_bytes=GIB,
+        completion_probability=0.9,
+        throughput_bps=50 * MIB,
+        wait_age_sec=10_000,
+        operator_priority=0,
+    )
+    engine = SchedulerEngine(unit_bytes=64 * MIB)
+
+    normal = engine.select([incumbent, challenger], "normal", GIB, 1)
+    sticky = engine.select(
+        [incumbent, challenger],
+        "normal",
+        GIB,
+        1,
+        incumbent_hashes={"incumbent"},
+    )
+
+    assert [item.hash for item in normal.selected] == ["challenger"]
+    assert [item.hash for item in sticky.selected] == ["incumbent"]
+    assert sticky.incumbent_hashes == ["incumbent"]
+
+
 def test_full_finish_candidate_uses_piece_uncertainty_and_conservative_release_evidence():
     from qbt_orchestrator.work_items import build_full_finish_work_items
 
@@ -542,6 +587,51 @@ def test_runtime_passes_soak_budget_and_excludes_cooldowns_from_live_engine():
         assert result["planner"]["budget_bytes"] == GIB
         assert ("/api/v2/torrents/start", {"hashes": "resident"}) in executor.posts
         assert all("cool" not in payload.get("hashes", "") for _path, payload in executor.posts)
+
+
+def test_runtime_live_engine_keeps_recent_active_incumbent_for_health_window():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        now = int(time.time())
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) "
+            "values('small','active','active','stable',?,'budget_fit')",
+            (now - 30,),
+        )
+        con.execute(
+            "insert into torrent_health(hash,sampled_at,dlspeed_bps,active_since,low_speed_since,updated_at) "
+            "values('small',?,0,?,?,?)",
+            (now - 15, now - 30, now - 30, now - 15),
+        )
+        con.commit()
+        con.close()
+        executor = _Executor()
+        daemon = DaemonRuntime(
+            db,
+            _SchedulerQbt(),
+            executor,
+            free_bytes_provider=lambda: 10 * GIB,
+            dry_run=False,
+            safety_interval=0,
+            planner_dry_run=False,
+            planner_active_slots=1,
+            disk_floor_bytes=2 * GIB,
+            scheduler_engine_mode="live",
+            scheduler_min_residency_sec=180,
+        )
+
+        daemon.tick_safety()
+        result = daemon.planner_tick()
+
+        assert result["scheduler_engine"]["selected_hashes"] == ["small"]
+        assert result["scheduler_engine"]["incumbent_hashes"] == ["small"]
+        assert result["planner"]["selected_hashes"] == ["small"]
+        assert ("/api/v2/torrents/start", {"hashes": "fast"}) not in executor.posts
 
 
 def test_scheduler_budget_subtracts_external_future_claims_but_only_reports_pinned():

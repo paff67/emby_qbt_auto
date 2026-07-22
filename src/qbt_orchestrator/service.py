@@ -163,6 +163,7 @@ class DaemonRuntime:
         scheduler_engine_mode: str = "legacy",
         scheduler_engine=None,
         scheduler_unit_bytes: int = 64 * 1024**2,
+        scheduler_min_residency_sec: int = 180,
         disk_floor_bytes: int = 3 * 1024**3,
         emergency_floor_bytes: int = int(1.5 * 1024**3),
         recovery_enabled: bool = True,
@@ -251,6 +252,9 @@ class DaemonRuntime:
         if self.scheduler_engine_mode not in {"legacy", "shadow", "live"}:
             raise ValueError("scheduler_engine_mode must be legacy, shadow, or live")
         self.scheduler_engine = scheduler_engine or SchedulerEngine(unit_bytes=int(scheduler_unit_bytes))
+        self.scheduler_min_residency_sec = max(
+            0, int(scheduler_min_residency_sec)
+        )
         self.disk_floor_bytes = int(disk_floor_bytes)
         self.emergency_floor_bytes = int(emergency_floor_bytes)
         self.recovery_enabled = bool(recovery_enabled)
@@ -449,9 +453,12 @@ class DaemonRuntime:
             )
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
+        planner_now = int(time.time())
         cooldown_hashes = active_soak_cooldown_hashes(
-            self.state_db, int(time.time())
+            self.state_db, planner_now
         ) | {str(h) for h in soak_result.cooldown_hashes}
+        incumbent_hashes = self._scheduler_incumbent_hashes(planner_now)
+        incumbent_hashes -= cooldown_hashes
         engine_plan = None
         engine_budget = None
         if self.scheduler_engine_mode != "legacy":
@@ -472,6 +479,7 @@ class DaemonRuntime:
                 scheduler_mode,
                 engine_budget.available_growth_bytes,
                 engine_slots,
+                incumbent_hashes=incumbent_hashes,
             )
         allowed_active_hashes = (
             {item.hash for item in engine_plan.selected}
@@ -726,6 +734,24 @@ class DaemonRuntime:
             claims=external_claims,
         )
 
+    def _scheduler_incumbent_hashes(self, now: int) -> set[str]:
+        if self.scheduler_min_residency_sec <= 0:
+            return set()
+        con = readonly_connect(self.state_db)
+        try:
+            return {
+                str(row["hash"])
+                for row in con.execute(
+                    "select sa.hash from scheduler_allocations sa "
+                    "join torrent_health th on th.hash=sa.hash "
+                    "where sa.desired_state='active' and th.active_since is not null "
+                    "and th.active_since>?",
+                    (int(now) - self.scheduler_min_residency_sec,),
+                ).fetchall()
+            }
+        finally:
+            con.close()
+
     def _scheduler_engine_payload(
         self,
         engine_plan,
@@ -763,6 +789,7 @@ class DaemonRuntime:
             "current_pinned_bytes": int(engine_budget.current_pinned_bytes),
             "unsafe_plan_rejection_count": unsafe_rejections,
             "rejection_counts": dict(engine_plan.rejection_counts),
+            "incumbent_hashes": list(engine_plan.incumbent_hashes),
         }
         # Persist one comparison sample; only shadow guarantees the Planner side
         # is an unconstrained legacy counterfactual.
@@ -782,6 +809,7 @@ class DaemonRuntime:
                 "recovery_active_slots": self.recovery_active_slots,
                 "recovery_max_remaining_bytes": self.recovery_max_remaining_bytes,
                 "finish_resident_max_remaining_bytes": self.finish_resident_max_remaining_bytes,
+                "scheduler_min_residency_sec": self.scheduler_min_residency_sec,
             },
             "feature_flags": {
                 "dry_run": bool(self.dry_run),

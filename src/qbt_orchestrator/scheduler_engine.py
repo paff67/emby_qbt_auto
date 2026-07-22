@@ -16,6 +16,7 @@ class SchedulerPlan:
     incremental_growth_bytes: int = 0
     available_growth_bytes: int = 0
     max_slots: int = 0
+    incumbent_hashes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class SchedulerEngine:
         mode: str,
         available_growth_bytes: int,
         max_slots: int,
+        incumbent_hashes: set[str] | None = None,
     ) -> SchedulerPlan:
         scheduler_mode = str(mode).lower()
         if scheduler_mode not in {"emergency", "drain", "normal", "explore"}:
@@ -73,6 +75,7 @@ class SchedulerEngine:
         slot_limit = max(0, int(max_slots))
         rejection_counts: dict[str, int] = {}
         eligible: list[WorkItem] = []
+        incumbents = {str(item) for item in (incumbent_hashes or set())}
 
         def reject(reason: str) -> None:
             rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
@@ -103,7 +106,13 @@ class SchedulerEngine:
         for item_index, item in enumerate(eligible):
             growth = max(0, int(item.incremental_growth_bytes))
             item_units = math.ceil(growth / self.unit_bytes) if growth > 0 else 0
-            item_utility = utility(item)
+            # A newly admitted download needs enough uninterrupted time for the
+            # Planner's health window to become meaningful.  Without this
+            # dominant, bounded preference the instantaneous throughput term
+            # can rotate a zero-speed incumbent out on the very next 15s tick.
+            item_utility = utility(item) + (
+                1_000_000_000_000 if item.hash in incumbents else 0
+            )
             previous_states = list(states.items())
             for (used_slots, used_units), previous in previous_states:
                 next_slots = used_slots + 1
@@ -139,4 +148,7 @@ class SchedulerEngine:
             incremental_growth_bytes=best.growth_bytes,
             available_growth_bytes=available,
             max_slots=slot_limit,
+            incumbent_hashes=sorted(
+                item.hash for item in eligible if item.hash in incumbents
+            ),
         )

@@ -538,6 +538,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             * 1024**2
         ),
         scheduler_engine_mode=os.environ.get("QBT_ORCH_SCHEDULER_ENGINE", "legacy"),
+        scheduler_min_residency_sec=int(
+            os.environ.get("QBT_ORCH_SCHEDULER_MIN_RESIDENCY_SEC", "180")
+        ),
         disk_floor_bytes=_disk_floor_bytes_from_env(os.environ),
         emergency_floor_bytes=_emergency_floor_bytes_from_env(os.environ),
         recovery_enabled=(_truthy(os.environ.get("QBT_ORCH_RECOVERY_MODE")) is not False),
