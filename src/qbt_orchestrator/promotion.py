@@ -393,7 +393,7 @@ def finalize_canonical_upload(
             ),
         )
         changed = con.execute(
-            "update torrent_jobs set state='cleanup_wait',phase='cleanup_wait',updated_at=? "
+            "update torrent_jobs set state='cleanup_wait',phase='cleanup_wait',last_stderr_tail=null,next_run_at=null,updated_at=? "
             "where id=? and state='promotion_wait'",
             (observed_at, int(upload_id)),
         ).rowcount

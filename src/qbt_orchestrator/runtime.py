@@ -363,21 +363,36 @@ class TorrentJobRepository:
         lease_owner: str | None = None,
         lease_generation: int | None = None,
     ) -> bool:
+        successful = str(state) in {
+            "done",
+            "cleanup_deferred",
+            "promotion_wait",
+            "cleanup_wait",
+        }
         terminal = str(state) in {
             "done",
             "failed",
             "cancelled",
             "cleanup_deferred",
             "promotion_wait",
+            "cleanup_wait",
         }
         lease_reset = (
             ",lease_owner=null,lease_until=null,next_run_at=null" if terminal else ""
         )
+        stderr_update = (
+            "last_stderr_tail=null," if successful else "last_stderr_tail=coalesce(?,last_stderr_tail),"
+        )
+        values: tuple[Any, ...] = (
+            (state, exit_code, int(self.now()))
+            if successful
+            else (state, stderr_tail, exit_code, int(self.now()))
+        )
         return self._update_job(
             job_id,
-            "state=?,last_stderr_tail=coalesce(?,last_stderr_tail),"
+            f"state=?,{stderr_update}"
             f"last_exit_code=coalesce(?,last_exit_code),updated_at=?{lease_reset}",
-            (state, stderr_tail, exit_code, int(self.now())),
+            values,
             lease_owner=lease_owner,
             lease_generation=lease_generation,
         )
@@ -1172,12 +1187,12 @@ class FullTorrentCleanupRunner:
 
         def txn(con: sqlite3.Connection) -> None:
             con.execute(
-                "update torrent_jobs set state='done',phase='done',last_exit_code=0,lease_owner=null,lease_until=null,updated_at=? where id=?",
+                "update torrent_jobs set state='done',phase='done',last_exit_code=0,last_stderr_tail=null,next_run_at=null,lease_owner=null,lease_until=null,updated_at=? where id=?",
                 (now, int(row["id"])),
             )
             if parent_job_id is not None:
                 con.execute(
-                    "update torrent_jobs set state='done',phase='done',last_exit_code=0,updated_at=? where id=? and state='cleanup_wait'",
+                    "update torrent_jobs set state='done',phase='done',last_exit_code=0,last_stderr_tail=null,next_run_at=null,updated_at=? where id=? and state='cleanup_wait'",
                     (now, int(parent_job_id)),
                 )
             con.execute(
@@ -1274,7 +1289,7 @@ class CleanupRequestRunner:
                 (now, "cleanup_requested_logical_only", *ids),
             )
             con.execute(
-                "update torrent_jobs set state='done', last_exit_code=0, lease_owner=null, lease_until=null, updated_at=? where id=?",
+                "update torrent_jobs set state='done',last_exit_code=0,last_stderr_tail=null,next_run_at=null,lease_owner=null,lease_until=null,updated_at=? where id=?",
                 (now, int(row["id"])),
             )
             con.execute(

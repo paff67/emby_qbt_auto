@@ -389,6 +389,9 @@ def migration_sql() -> list[str]:
         "alter table torrent_jobs add column verified_at integer",
         "alter table torrent_jobs add column parent_job_id integer",
         "alter table torrent_jobs add column lease_generation integer not null default 0",
+        "update torrent_jobs set last_stderr_tail=null,next_run_at=null "
+        "where state in ('done','cleanup_deferred','promotion_wait','cleanup_wait') "
+        "and (last_stderr_tail is not null or next_run_at is not null)",
         "create unique index if not exists idx_torrent_jobs_cleanup_parent on torrent_jobs(job_type,parent_job_id) where job_type='cleanup_full_torrent' and parent_job_id is not null",
         "update torrent_jobs set phase=case "
         "when state='verify_pending' then 'verifying' "
@@ -458,6 +461,7 @@ def migration_sql() -> list[str]:
         "insert or ignore into schema_migrations(version,name,applied_at) values(10,'scan_cursors_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(11,'canonical_media_promotions_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(12,'torrent_job_leases_v2',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(13,'successful_job_diagnostics_cleanup_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

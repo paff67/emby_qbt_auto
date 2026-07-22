@@ -176,6 +176,40 @@ def test_upload_completion_is_fenced_by_lease_owner_and_generation():
         assert current["lease_generation"] == 2
 
 
+def test_migration_clears_stale_diagnostics_from_successful_jobs():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_jobs(job_type,state,last_stderr_tail,next_run_at,created_at,updated_at) "
+            "values('upload','done','old lease error',123,1,1)"
+        )
+        con.execute(
+            "insert into torrent_jobs(job_type,state,last_stderr_tail,next_run_at,created_at,updated_at) "
+            "values('upload','retry_wait','current error',123,1,1)"
+        )
+        con.commit()
+        con.close()
+
+        migrate(db, dry_run=False)
+
+        rows = _rows(
+            db,
+            "select state,last_stderr_tail,next_run_at from torrent_jobs order by id",
+        )
+        assert rows == [
+            {"state": "done", "last_stderr_tail": None, "next_run_at": None},
+            {
+                "state": "retry_wait",
+                "last_stderr_tail": "current error",
+                "next_run_at": 123,
+            },
+        ]
+
+
 def test_full_upload_verification_waits_for_promotion_without_cleanup():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.integrations.rclone import VerifyResult

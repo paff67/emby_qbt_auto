@@ -362,7 +362,7 @@ def reconcile_verified_migrations(
                     }
                 )
                 con.execute(
-                    "update torrent_jobs set state='cleanup_wait',phase='cleanup_wait',payload_json=?,updated_at=? where id=?",
+                    "update torrent_jobs set state='cleanup_wait',phase='cleanup_wait',payload_json=?,last_stderr_tail=null,next_run_at=null,updated_at=? where id=?",
                     (
                         json.dumps(upload_payload, ensure_ascii=False),
                         observed_at,
