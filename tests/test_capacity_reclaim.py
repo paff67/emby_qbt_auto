@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat as statmod
 import sys
 import tempfile
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2571,12 +2574,12 @@ def test_partial_delete_exception_is_persisted_without_claiming_bytes(tmp_path):
     )
     delete_calls = []
 
-    def partial_delete(_path):
+    def partial_delete(_path, _identity):
         delete_calls.append(_path)
-        first_part.unlink()
+        (_path / "first.part").unlink()
         raise OSError("partial deletion")
 
-    reclaimer._delete_path = partial_delete
+    reclaimer._delete_quarantine_path = partial_delete
 
     first = reclaimer.run(
         {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
@@ -2590,12 +2593,15 @@ def test_partial_delete_exception_is_persisted_without_claiming_bytes(tmp_path):
     row = _capacity_reclaim_rows(db)[0]
     assert first.reclaimed == 0
     assert first.reclaimed_bytes == 0
-    assert second.rejection_counts["reclaim_already_recorded"] == 1
+    assert second.rejection_counts["path_missing"] == 1
     assert row["state"] == "partial_or_unknown"
     assert row["recheck_state"] == "not_requested"
     assert len(_capacity_reclaim_notifications(db)) == 1
-    assert delete_calls == [payload]
-    assert not first_part.exists() and second_part.exists()
+    quarantine_path = Path(row["quarantine_path"])
+    assert delete_calls == [quarantine_path]
+    assert not payload.exists()
+    assert not (quarantine_path / "first.part").exists()
+    assert (quarantine_path / "second.part").exists()
 
 
 def test_deleted_state_survives_completion_failure_and_reconciles(tmp_path):
@@ -2913,7 +2919,12 @@ def test_deleting_lease_fences_assessment_and_health_evidence_updates(tmp_path):
     db = tmp_path / "state.sqlite"
     migrate(db, dry_run=False)
     _capacity_health(db, "h")
-    candidate = _direct_reclaim_candidate(tmp_path)
+    metadata = tmp_path.lstat()
+    candidate = {
+        **_direct_reclaim_candidate(tmp_path),
+        "filesystem_dev": int(metadata.st_dev),
+        "filesystem_ino": int(metadata.st_ino),
+    }
     audit = CapacityReclaimAuditStore(db, now=lambda: 5_000)
     reservation = audit.reserve(candidate)
     assert audit.mark_deleting(reservation["reclaim_id"], candidate) is True
@@ -3044,7 +3055,12 @@ def test_mark_deleting_revalidates_protection_inside_final_transaction(tmp_path)
     db = tmp_path / "state.sqlite"
     migrate(db, dry_run=False)
     _capacity_health(db, "h")
-    candidate = _direct_reclaim_candidate(tmp_path)
+    metadata = tmp_path.lstat()
+    candidate = {
+        **_direct_reclaim_candidate(tmp_path),
+        "filesystem_dev": int(metadata.st_dev),
+        "filesystem_ino": int(metadata.st_ino),
+    }
     audit = CapacityReclaimAuditStore(db, now=lambda: 5_000)
     reservation = audit.reserve(candidate)
     con = sqlite3.connect(db)
@@ -3085,7 +3101,9 @@ def test_final_deleting_fence_blocks_reviewer_job_probe_before_unlink(tmp_path):
     )
     probe_errors = []
 
-    def reviewer_probe_then_delete(path):
+    original_delete = reclaimer._delete_quarantine_path
+
+    def reviewer_probe_then_delete(path, identity):
         con = sqlite3.connect(db)
         try:
             con.execute(
@@ -3096,9 +3114,9 @@ def test_final_deleting_fence_blocks_reviewer_job_probe_before_unlink(tmp_path):
             probe_errors.append(str(exc))
         finally:
             con.close()
-        reclaimer.__class__._delete_path(path)
+        original_delete(path, identity)
 
-    reclaimer._delete_path = reviewer_probe_then_delete
+    reclaimer._delete_quarantine_path = reviewer_probe_then_delete
 
     result = reclaimer.run(
         {"h": candidate},
@@ -3116,3 +3134,503 @@ def test_final_deleting_fence_blocks_reviewer_job_probe_before_unlink(tmp_path):
         "select count(*) from torrent_jobs where hash='h' and state='running'"
     ).fetchone()[0] == 0
     con.close()
+
+
+@pytest.mark.parametrize("payload_kind", ["file", "directory"])
+def test_live_reclaim_atomically_quarantines_identity_before_deletion(
+    tmp_path, payload_kind
+):
+    from qbt_orchestrator.capacity_reclaim import (
+        QUARANTINE_DIRNAME,
+        DeadPartialReclaimer,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    payload = managed / "h"
+    if payload_kind == "directory":
+        payload.mkdir()
+        (payload / "part").write_bytes(b"x" * 4096)
+    else:
+        payload.write_bytes(b"x" * 4096)
+    before = payload.lstat()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    executor = RecordingExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+    operations = []
+    original_rename = reclaimer._rename_to_quarantine
+    original_delete = reclaimer._delete_quarantine_path
+
+    def traced_rename(source, destination, identity):
+        assert source == payload.resolve()
+        assert source.exists() and not destination.exists()
+        original_rename(source, destination, identity)
+        assert not source.exists() and destination.exists()
+        operations.append(("renamed", destination))
+
+    def traced_delete(destination, identity):
+        assert operations == [("renamed", destination)]
+        assert destination.exists() and not payload.exists()
+        original_delete(destination, identity)
+        operations.append(("deleted", destination))
+
+    reclaimer._rename_to_quarantine = traced_rename
+    reclaimer._delete_quarantine_path = traced_delete
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    expected_quarantine = managed / QUARANTINE_DIRNAME / f"reclaim-{row['id']}"
+    assert result.reclaimed == 1
+    assert [item[0] for item in operations] == ["renamed", "deleted"]
+    assert not payload.exists() and not expected_quarantine.exists()
+    assert row["state"] == "reclaimed"
+    assert row["quarantine_path"] == str(expected_quarantine)
+    assert row["filesystem_dev"] == int(before.st_dev)
+    assert row["filesystem_ino"] == int(before.st_ino)
+    if os.name != "nt":
+        assert statmod.S_IMODE((managed / QUARANTINE_DIRNAME).stat().st_mode) == 0o700
+
+
+def test_identity_swap_between_capture_and_rename_is_restored_without_delete(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    original_part = payload / "original.part"
+    original_part.write_bytes(b"original")
+    displaced = tmp_path / "captured-original"
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    reclaimer = DeadPartialReclaimer(
+        db,
+        RecordingExecutor({"h": candidate}),
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+    original_rename = reclaimer._rename_to_quarantine
+    delete_calls = []
+
+    def swap_then_rename(source, destination, identity):
+        source.rename(displaced)
+        source.mkdir()
+        (source / "replacement.part").write_bytes(b"replacement")
+        original_rename(source, destination, identity)
+
+    reclaimer._rename_to_quarantine = swap_then_rename
+    reclaimer._delete_quarantine_path = lambda *_args: delete_calls.append(_args)
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert _capacity_reclaim_rows(db)[0]["state"] == "partial_or_unknown"
+    assert (payload / "replacement.part").read_bytes() == b"replacement"
+    assert (displaced / "original.part").read_bytes() == b"original"
+    assert delete_calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real symlink coverage runs on POSIX CI")
+def test_symlink_swap_between_capture_and_rename_never_deletes_external_target(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "original.part").write_bytes(b"original")
+    displaced = tmp_path / "captured-original"
+    external = tmp_path / "external"
+    external.mkdir()
+    external_marker = external / "keep"
+    external_marker.write_bytes(b"keep")
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    reclaimer = DeadPartialReclaimer(
+        db,
+        RecordingExecutor({"h": candidate}),
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+    original_rename = reclaimer._rename_to_quarantine
+
+    def symlink_swap(source, destination, identity):
+        source.rename(displaced)
+        source.symlink_to(external, target_is_directory=True)
+        original_rename(source, destination, identity)
+
+    reclaimer._rename_to_quarantine = symlink_swap
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert _capacity_reclaim_rows(db)[0]["state"] == "partial_or_unknown"
+    assert payload.is_symlink()
+    assert external_marker.read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize(
+    "unsafe_kind",
+    ["candidate_mount", "child_reparse", "child_cross_device"],
+)
+def test_payload_tree_fence_rejects_unsafe_filesystem_objects_before_rename(
+    tmp_path, monkeypatch, unsafe_kind
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    child = payload / "part"
+    child.write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    reclaimer = DeadPartialReclaimer(
+        db,
+        RecordingExecutor({"h": candidate}),
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+    if unsafe_kind == "candidate_mount":
+        original_ismount = os.path.ismount
+        monkeypatch.setattr(
+            os.path,
+            "ismount",
+            lambda value: Path(value) == payload.resolve() or original_ismount(value),
+        )
+    elif unsafe_kind == "child_reparse":
+        original_reparse = reclaimer._is_reparse_point
+        reclaimer._is_reparse_point = (
+            lambda path, metadata: Path(path) == child.resolve()
+            or original_reparse(path, metadata)
+        )
+    else:
+        original_lstat = reclaimer._lstat
+
+        def cross_device_lstat(path):
+            metadata = original_lstat(path)
+            if Path(path) != child.resolve():
+                return metadata
+            return SimpleNamespace(
+                st_mode=metadata.st_mode,
+                st_dev=int(metadata.st_dev) + 1,
+                st_ino=metadata.st_ino,
+                st_file_attributes=getattr(metadata, "st_file_attributes", 0),
+            )
+
+        reclaimer._lstat = cross_device_lstat
+    rename_calls = []
+    reclaimer._rename_to_quarantine = lambda *_args: rename_calls.append(_args)
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["unsafe_filesystem_object"] == 1
+    assert _capacity_reclaim_rows(db)[0]["state"] == "aborted_paused"
+    assert payload.exists() and child.exists()
+    assert rename_calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real symlink coverage runs on POSIX CI")
+def test_payload_tree_fence_rejects_real_child_symlink_before_rename(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.write_bytes(b"keep")
+    (payload / "linked").symlink_to(external)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    reclaimer = DeadPartialReclaimer(
+        db,
+        RecordingExecutor({"h": candidate}),
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["unsafe_filesystem_object"] == 1
+    assert external.read_bytes() == b"keep"
+
+
+def test_host_path_rejects_mocked_windows_reparse_component(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    reclaimer = DeadPartialReclaimer(
+        db,
+        RecordingExecutor(),
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+    )
+    original_reparse = reclaimer._is_reparse_point
+    reclaimer._is_reparse_point = (
+        lambda path, metadata: Path(path) == payload
+        or original_reparse(path, metadata)
+    )
+
+    assert reclaimer._host_path("/downloads/incomplete/h") is None
+
+
+def test_mark_quarantined_failure_restores_original_and_never_deletes(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    marker = payload / "part"
+    marker.write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    reclaimer = DeadPartialReclaimer(
+        db,
+        RecordingExecutor({"h": candidate}),
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+    reclaimer.audit.mark_quarantined = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("database unavailable")
+    )
+    delete_calls = []
+    reclaimer._delete_quarantine_path = lambda *_args: delete_calls.append(_args)
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert result.reclaimed == 0
+    assert row["state"] == "partial_or_unknown"
+    assert marker.read_bytes() == b"x" * 4096
+    assert not Path(row["quarantine_path"] or managed / "missing").exists()
+    assert delete_calls == []
+
+
+def test_restart_recovers_only_valid_seeded_quarantine(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    executor = RecordingExecutor({"h": candidate})
+    crashing = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+    crashing._delete_quarantine_path = lambda *_args: (_ for _ in ()).throw(
+        KeyboardInterrupt("simulated crash")
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="simulated crash"):
+        crashing.run(
+            {"h": candidate},
+            assessment=_assessment(),
+            capacity_state="capacity_deadlock",
+            free_bytes=0,
+            target_free_bytes=10_000,
+        )
+
+    crashed_row = _capacity_reclaim_rows(db)[0]
+    quarantine_path = Path(crashed_row["quarantine_path"])
+    assert crashed_row["state"] == "quarantined"
+    assert not payload.exists() and quarantine_path.exists()
+
+    recovery = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_001,
+    )
+    recovery.run(
+        {},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert _capacity_reclaim_rows(db)[0]["state"] == "deleted"
+    assert not quarantine_path.exists()
+    recovery.run(
+        {},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+    assert _capacity_reclaim_rows(db)[0]["state"] == "reclaimed"
+
+
+def test_restart_rejects_forged_quarantine_path_escape_without_delete(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    external = tmp_path / "external-payload"
+    external.mkdir()
+    marker = external / "keep"
+    marker.write_bytes(b"keep")
+    metadata = external.lstat()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _direct_reclaim_candidate(tmp_path)
+    audit_row = {
+        **candidate,
+        "filesystem_dev": int(metadata.st_dev),
+        "filesystem_ino": int(metadata.st_ino),
+    }
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+
+    audit = CapacityReclaimAuditStore(db, now=lambda: 5_000)
+    reservation = audit.reserve(candidate)
+    assert audit.mark_deleting(reservation["reclaim_id"], audit_row) is True
+    con = sqlite3.connect(db)
+    con.execute(
+        "update capacity_reclaims set state='quarantined',quarantine_path=? where id=?",
+        (str(external), reservation["reclaim_id"]),
+    )
+    con.commit()
+    con.close()
+    executor = RecordingExecutor({})
+    recovery = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        notification_chat_ids=["100"],
+        now=lambda: 5_001,
+    )
+
+    recovery.run(
+        {},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert marker.read_bytes() == b"keep"
+    assert _capacity_reclaim_rows(db)[0]["state"] == "partial_or_unknown"
+    assert len(_capacity_reclaim_notifications(db)) == 1

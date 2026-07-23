@@ -464,6 +464,9 @@ def migration_sql() -> list[str]:
         "alter table capacity_reclaims add column capacity_generation integer",
         "alter table capacity_reclaims add column capacity_reason text",
         "alter table capacity_reclaims add column assessment_json text",
+        "alter table capacity_reclaims add column quarantine_path text",
+        "alter table capacity_reclaims add column filesystem_dev integer",
+        "alter table capacity_reclaims add column filesystem_ino integer",
         "create trigger if not exists trg_capacity_reclaim_lock_job_insert "
         "before insert on torrent_jobs "
         "when NEW.hash is not null "

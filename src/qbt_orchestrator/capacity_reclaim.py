@@ -4,7 +4,7 @@ import inspect
 import json
 import math
 import os
-import shutil
+import stat as statmod
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -37,6 +37,7 @@ RECLAIM_LOCKED_STATES = frozenset(
     {
         "stopping",
         "deleting",
+        "quarantined",
         "deleted",
         "recheck_pending",
         "partial_or_unknown",
@@ -49,6 +50,25 @@ RECLAIM_LOCKED_STATES = frozenset(
 MAGNET_PREFIX = "mag" + "net:?"
 PROGRESS_EPSILON = 1e-9
 CONTENT_SIZE_FIELDS = ("size", "total_size", "wanted_size")
+QUARANTINE_DIRNAME = ".qbt-orchestrator-reclaim"
+FILE_ATTRIBUTE_REPARSE_POINT = getattr(
+    statmod, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+)
+
+
+@dataclass(frozen=True)
+class FilesystemIdentity:
+    dev: int
+    ino: int
+    mode: int
+
+
+class UnsafeFilesystemObject(RuntimeError):
+    pass
+
+
+class FilesystemIdentityChanged(RuntimeError):
+    pass
 
 
 def _nonnegative_integer(value: Any) -> int | None:
@@ -61,6 +81,17 @@ def _nonnegative_integer(value: Any) -> int | None:
     if not math.isfinite(number) or number < 0 or not number.is_integer():
         return None
     return int(number)
+
+
+def _filesystem_id(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    text = str(value).strip()
+    if not text.isdigit():
+        return None
+    return int(text)
 
 
 def _completed_bytes(item: Mapping[str, Any]) -> int | None:
@@ -139,6 +170,10 @@ class CapacityReclaimAuditStore:
             "capacity_generation": int(candidate.get("capacity_generation") or 0),
             "capacity_reason": str(candidate.get("capacity_reason") or "")[:256],
             "assessment_json": assessment_json,
+            "quarantine_path": str(candidate.get("quarantine_path") or "").strip()
+            or None,
+            "filesystem_dev": _filesystem_id(candidate.get("filesystem_dev")),
+            "filesystem_ino": _filesystem_id(candidate.get("filesystem_ino")),
         }
 
     @staticmethod
@@ -469,11 +504,16 @@ class CapacityReclaimAuditStore:
             ).fetchone()
             if row is None or self._eligibility_reason(con, candidate) is not None:
                 return False
+            if identity["filesystem_dev"] is None or identity["filesystem_ino"] is None:
+                return False
             changed = con.execute(
                 "update capacity_reclaims set state='deleting',recheck_state='pending',"
-                "recheck_error=null,updated_at=? where id=? and capacity_generation=? "
+                "recheck_error=null,filesystem_dev=?,filesystem_ino=?,quarantine_path=null,"
+                "updated_at=? where id=? and capacity_generation=? "
                 "and reclaim_key=? and hash=? and state='stopping'",
                 (
+                    int(identity["filesystem_dev"]),
+                    int(identity["filesystem_ino"]),
                     now,
                     int(reclaim_id),
                     generation,
@@ -485,6 +525,33 @@ class CapacityReclaimAuditStore:
 
         return bool(write_transaction(self.state_db, txn))
 
+    def mark_quarantined(
+        self,
+        reclaim_id: int,
+        generation: int,
+        quarantine_path: str | Path,
+        filesystem_dev: int,
+        filesystem_ino: int,
+    ) -> bool:
+        now = int(self.now())
+        changed = write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update capacity_reclaims set state='quarantined',quarantine_path=?,"
+                "updated_at=? where id=? and capacity_generation=? and state='deleting' "
+                "and filesystem_dev=? and filesystem_ino=?",
+                (
+                    str(quarantine_path),
+                    now,
+                    int(reclaim_id),
+                    int(generation),
+                    int(filesystem_dev),
+                    int(filesystem_ino),
+                ),
+            ).rowcount,
+        )
+        return int(changed or 0) == 1
+
     def mark_deleted(self, reclaim_id: int, generation: int) -> bool:
         now = int(self.now())
         changed = write_transaction(
@@ -492,7 +559,7 @@ class CapacityReclaimAuditStore:
             lambda con: con.execute(
                 "update capacity_reclaims set state='deleted',recheck_state='pending',"
                 "recheck_error=null,updated_at=? where id=? and capacity_generation=? "
-                "and state='deleting'",
+                "and state in ('deleting','quarantined')",
                 (now, int(reclaim_id), int(generation)),
             ).rowcount,
         )
@@ -509,7 +576,7 @@ class CapacityReclaimAuditStore:
             reclaim_id,
             generation,
             target_state="partial_or_unknown",
-            allowed_states=("deleting", "deleted", "recheck_pending"),
+            allowed_states=("deleting", "quarantined", "deleted", "recheck_pending"),
             reason=reason,
             error=error,
         )
@@ -519,7 +586,7 @@ class CapacityReclaimAuditStore:
         try:
             rows = con.execute(
                 "select * from capacity_reclaims where capacity_generation=? "
-                "and state in ('stopping','deleting','deleted','recheck_pending','partial_or_unknown') "
+                "and state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown') "
                 "order by id",
                 (int(generation),),
             ).fetchall()
@@ -739,6 +806,7 @@ class DeadPartialReclaimer:
         )
         if not self.managed_root.is_relative_to(self.host_downloads):
             raise ValueError("capacity reclaim managed_root must be inside host_downloads")
+        self.quarantine_root = self.managed_root / QUARANTINE_DIRNAME
 
     def run(
         self,
@@ -1094,6 +1162,24 @@ class DeadPartialReclaimer:
                 abort_paused(reason)
                 continue
             try:
+                filesystem_identity = self._capture_payload_identity(host_path)
+                self._ensure_quarantine_root()
+                quarantine_path = self._quarantine_destination(int(reclaim_id))
+                if self._path_exists_no_follow(quarantine_path):
+                    raise UnsafeFilesystemObject(
+                        "quarantine destination already exists"
+                    )
+            except (OSError, UnsafeFilesystemObject, FilesystemIdentityChanged) as exc:
+                abort_paused("unsafe_filesystem_object", str(exc))
+                continue
+            candidate = {
+                **candidate,
+                "filesystem_dev": int(filesystem_identity.dev),
+                "filesystem_ino": int(filesystem_identity.ino),
+                "filesystem_mode": int(filesystem_identity.mode),
+                "quarantine_path": str(quarantine_path),
+            }
+            try:
                 deleting = self.audit.mark_deleting(int(reclaim_id), candidate)
             except Exception as exc:
                 errors.append(
@@ -1104,17 +1190,51 @@ class DeadPartialReclaimer:
             if not deleting:
                 abort_paused("reclaim_state_changed")
                 continue
-            try:
-                self._delete_path(host_path)
-            except Exception as exc:
+
+            def mark_partial(reason: str, error: Exception | str) -> None:
                 try:
-                    self.audit.mark_partial_or_unknown(
-                        int(reclaim_id), generation, "delete_partial_or_unknown", str(exc)
-                    )
+                    if not self.audit.mark_partial_or_unknown(
+                        int(reclaim_id), generation, reason, str(error)
+                    ):
+                        errors.append(
+                            f"{torrent_hash}: failed to fence partial quarantine state"
+                        )
                 except Exception as audit_exc:
                     errors.append(
                         f"{torrent_hash}: failed to persist partial deletion: {audit_exc}"
                     )
+
+            try:
+                self._rename_to_quarantine(
+                    host_path,
+                    quarantine_path,
+                    filesystem_identity,
+                )
+            except Exception as exc:
+                mark_partial("quarantine_identity_changed", exc)
+                errors.append(f"{torrent_hash}: {exc}")
+                continue
+            try:
+                if not self.audit.mark_quarantined(
+                    int(reclaim_id),
+                    generation,
+                    quarantine_path,
+                    filesystem_identity.dev,
+                    filesystem_identity.ino,
+                ):
+                    raise RuntimeError("capacity reclaim quarantine state changed")
+            except Exception as exc:
+                restored = self._restore_from_quarantine(quarantine_path, host_path)
+                mark_partial("quarantine_state_persist_failed", exc)
+                errors.append(
+                    f"{torrent_hash}: failed to persist quarantined state: {exc}; "
+                    f"restored={restored}"
+                )
+                continue
+            try:
+                self._delete_quarantine_path(quarantine_path, filesystem_identity)
+            except Exception as exc:
+                mark_partial("quarantine_delete_partial_or_unknown", exc)
                 errors.append(f"{torrent_hash}: {exc}")
                 continue
             try:
@@ -1222,29 +1342,104 @@ class DeadPartialReclaimer:
                 continue
 
             host_path = self._recovery_path(row)
-            if state == "deleting":
+
+            def recovery_partial(reason: str, error: Exception | str | None = None) -> None:
                 try:
-                    if host_path is not None and not host_path.exists():
+                    changed = self.audit.mark_partial_or_unknown(
+                        reclaim_id,
+                        generation,
+                        reason,
+                        None if error is None else str(error),
+                    )
+                    if not changed:
+                        errors.append(
+                            f"{torrent_hash}: reclaim recovery fence changed"
+                        )
+                except Exception as audit_exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to persist recovery warning: {audit_exc}"
+                    )
+
+            if state in {"deleting", "quarantined"}:
+                try:
+                    self._ensure_quarantine_root()
+                    quarantine_path = self._quarantine_destination(reclaim_id)
+                    if not self._quarantine_record_matches(row, quarantine_path):
+                        raise UnsafeFilesystemObject(
+                            "recorded quarantine path is not controlled"
+                        )
+                    if host_path is None:
+                        raise UnsafeFilesystemObject("recorded original path is unsafe")
+                    original_exists = self._path_exists_no_follow(host_path)
+                    quarantine_exists = self._path_exists_no_follow(quarantine_path)
+                    if original_exists and quarantine_exists:
+                        raise UnsafeFilesystemObject(
+                            "original and quarantine paths both exist"
+                        )
+                    if original_exists:
+                        raise UnsafeFilesystemObject(
+                            "original path exists without quarantine payload"
+                        )
+                    if not quarantine_exists:
                         if not self.audit.mark_deleted(reclaim_id, generation):
                             errors.append(
                                 f"{torrent_hash}: deleting reconciliation fence changed"
                             )
-                    else:
-                        changed = self.audit.mark_partial_or_unknown(
-                            reclaim_id,
-                            generation,
-                            "restart_during_delete",
+                        continue
+                    expected_dev = _filesystem_id(row.get("filesystem_dev"))
+                    expected_ino = _filesystem_id(row.get("filesystem_ino"))
+                    if expected_dev is None or expected_ino is None:
+                        raise UnsafeFilesystemObject(
+                            "quarantine filesystem identity is missing"
                         )
-                        if not changed:
-                            errors.append(
-                                f"{torrent_hash}: deleting reconciliation fence changed"
-                            )
+                    metadata = self._validate_payload_node(
+                        quarantine_path,
+                        expected_dev,
+                    )
+                    identity = FilesystemIdentity(
+                        int(metadata.st_dev),
+                        int(metadata.st_ino),
+                        int(metadata.st_mode),
+                    )
+                    if int(identity.ino) != int(expected_ino):
+                        raise FilesystemIdentityChanged(
+                            "quarantine filesystem identity changed"
+                        )
+                    if state == "deleting" and not self.audit.mark_quarantined(
+                        reclaim_id,
+                        generation,
+                        quarantine_path,
+                        identity.dev,
+                        identity.ino,
+                    ):
+                        raise RuntimeError(
+                            "quarantine recovery state changed before deletion"
+                        )
+                    self._delete_quarantine_path(quarantine_path, identity)
+                    if not self.audit.mark_deleted(reclaim_id, generation):
+                        errors.append(
+                            f"{torrent_hash}: quarantined reconciliation fence changed"
+                        )
                 except Exception as exc:
-                    errors.append(f"{torrent_hash}: deleting reconciliation failed: {exc}")
+                    recovery_partial("quarantine_recovery_unsafe", exc)
                 continue
 
             if state in {"deleted", "recheck_pending"}:
-                if host_path is None or host_path.exists():
+                quarantine_inconsistent = False
+                try:
+                    self._ensure_quarantine_root()
+                    quarantine_path = self._quarantine_destination(reclaim_id)
+                    quarantine_inconsistent = (
+                        not self._quarantine_record_matches(row, quarantine_path)
+                        or self._path_exists_no_follow(quarantine_path)
+                    )
+                except (OSError, UnsafeFilesystemObject):
+                    quarantine_inconsistent = True
+                if (
+                    host_path is None
+                    or self._path_exists_no_follow(host_path)
+                    or quarantine_inconsistent
+                ):
                     try:
                         changed = self.audit.mark_partial_or_unknown(
                             reclaim_id,
@@ -1673,6 +1868,230 @@ class DeadPartialReclaimer:
                 result[torrent_hash] = path
         return result
 
+    @staticmethod
+    def _lstat(path: Path):
+        return Path(path).lstat()
+
+    @staticmethod
+    def _is_reparse_point(path: Path, metadata: Any) -> bool:
+        if statmod.S_ISLNK(int(metadata.st_mode)):
+            return True
+        if int(getattr(metadata, "st_file_attributes", 0) or 0) & int(
+            FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            return True
+        is_junction = getattr(Path(path), "is_junction", None)
+        if callable(is_junction):
+            try:
+                return bool(is_junction())
+            except OSError:
+                return True
+        return False
+
+    @staticmethod
+    def _same_identity(metadata: Any, identity: FilesystemIdentity) -> bool:
+        return (
+            int(metadata.st_dev) == int(identity.dev)
+            and int(metadata.st_ino) == int(identity.ino)
+            and statmod.S_IFMT(int(metadata.st_mode))
+            == statmod.S_IFMT(int(identity.mode))
+        )
+
+    def _path_exists_no_follow(self, path: Path) -> bool:
+        try:
+            self._lstat(path)
+        except FileNotFoundError:
+            return False
+        return True
+
+    @staticmethod
+    def _lexical_path(path: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+    def _ensure_quarantine_root(self) -> Path:
+        managed_metadata = self._lstat(self.managed_root)
+        if (
+            not statmod.S_ISDIR(int(managed_metadata.st_mode))
+            or self._is_reparse_point(self.managed_root, managed_metadata)
+        ):
+            raise UnsafeFilesystemObject("managed root is not a plain directory")
+        self.quarantine_root.mkdir(mode=0o700, exist_ok=True)
+        quarantine_metadata = self._lstat(self.quarantine_root)
+        if (
+            not statmod.S_ISDIR(int(quarantine_metadata.st_mode))
+            or self._is_reparse_point(self.quarantine_root, quarantine_metadata)
+            or int(quarantine_metadata.st_dev) != int(managed_metadata.st_dev)
+            or os.path.ismount(self.quarantine_root)
+        ):
+            raise UnsafeFilesystemObject("quarantine root is unsafe")
+        try:
+            resolved = self.quarantine_root.resolve(strict=True)
+        except OSError as exc:
+            raise UnsafeFilesystemObject("quarantine root cannot be resolved") from exc
+        if resolved != self.quarantine_root:
+            raise UnsafeFilesystemObject("quarantine root escaped managed root")
+        if os.name != "nt":
+            os.chmod(self.quarantine_root, 0o700)
+        return self.quarantine_root
+
+    def _quarantine_destination(self, reclaim_id: int) -> Path:
+        return self.quarantine_root / f"reclaim-{int(reclaim_id)}"
+
+    def _is_controlled_quarantine_destination(self, path: Path) -> bool:
+        suffix = path.name.removeprefix("reclaim-")
+        return (
+            path.parent == self.quarantine_root
+            and path.name.startswith("reclaim-")
+            and suffix.isdigit()
+            and int(suffix) > 0
+        )
+
+    def _quarantine_record_matches(
+        self,
+        row: Mapping[str, Any],
+        destination: Path,
+    ) -> bool:
+        if not self._is_controlled_quarantine_destination(destination):
+            return False
+        if destination.name != f"reclaim-{int(row['id'])}":
+            return False
+        recorded = str(row.get("quarantine_path") or "").strip()
+        if not recorded:
+            return str(row.get("state") or "") != "quarantined"
+        return self._lexical_path(recorded) == self._lexical_path(destination)
+
+    def _validate_payload_node(
+        self,
+        path: Path,
+        expected_dev: int,
+        *,
+        expected_identity: FilesystemIdentity | None = None,
+    ) -> Any:
+        metadata = self._lstat(path)
+        if self._is_reparse_point(path, metadata):
+            raise UnsafeFilesystemObject(f"reparse point rejected: {path}")
+        if int(metadata.st_dev) != int(expected_dev):
+            raise UnsafeFilesystemObject(f"cross-device payload rejected: {path}")
+        if os.path.ismount(path):
+            raise UnsafeFilesystemObject(f"mount point rejected: {path}")
+        if expected_identity is not None and not self._same_identity(
+            metadata, expected_identity
+        ):
+            raise FilesystemIdentityChanged(f"filesystem identity changed: {path}")
+        mode = int(metadata.st_mode)
+        if not (statmod.S_ISREG(mode) or statmod.S_ISDIR(mode)):
+            raise UnsafeFilesystemObject(f"special filesystem object rejected: {path}")
+        if statmod.S_ISDIR(mode):
+            try:
+                with os.scandir(path) as entries:
+                    children = [path / entry.name for entry in entries]
+            except OSError as exc:
+                raise UnsafeFilesystemObject(f"payload tree cannot be scanned: {path}") from exc
+            for child in children:
+                self._validate_payload_node(child, expected_dev)
+            current = self._lstat(path)
+            if not self._same_identity(
+                current,
+                FilesystemIdentity(
+                    int(metadata.st_dev), int(metadata.st_ino), int(metadata.st_mode)
+                ),
+            ):
+                raise FilesystemIdentityChanged(f"directory changed during scan: {path}")
+        return metadata
+
+    def _capture_payload_identity(self, path: Path) -> FilesystemIdentity:
+        managed_metadata = self._lstat(self.managed_root)
+        metadata = self._validate_payload_node(path, int(managed_metadata.st_dev))
+        return FilesystemIdentity(
+            int(metadata.st_dev), int(metadata.st_ino), int(metadata.st_mode)
+        )
+
+    def _rename_to_quarantine(
+        self,
+        source: Path,
+        destination: Path,
+        identity: FilesystemIdentity,
+    ) -> None:
+        self._ensure_quarantine_root()
+        if not self._is_controlled_quarantine_destination(destination):
+            raise UnsafeFilesystemObject("invalid quarantine destination")
+        if self._path_exists_no_follow(destination):
+            raise UnsafeFilesystemObject("quarantine destination already exists")
+        os.rename(source, destination)
+        try:
+            moved = self._lstat(destination)
+            if (
+                not self._same_identity(moved, identity)
+                or self._is_reparse_point(destination, moved)
+            ):
+                raise FilesystemIdentityChanged("moved payload identity changed")
+        except Exception:
+            self._restore_from_quarantine(destination, source)
+            raise
+
+    def _restore_from_quarantine(self, destination: Path, source: Path) -> bool:
+        if not self._is_controlled_quarantine_destination(destination):
+            return False
+        try:
+            if self._path_exists_no_follow(source) or not self._path_exists_no_follow(
+                destination
+            ):
+                return False
+            os.rename(destination, source)
+            return self._path_exists_no_follow(source) and not self._path_exists_no_follow(
+                destination
+            )
+        except OSError:
+            return False
+
+    def _remove_node_no_follow(
+        self,
+        path: Path,
+        expected_dev: int,
+        *,
+        expected_identity: FilesystemIdentity | None = None,
+    ) -> None:
+        metadata = self._validate_payload_node(
+            path,
+            expected_dev,
+            expected_identity=expected_identity,
+        )
+        identity = FilesystemIdentity(
+            int(metadata.st_dev), int(metadata.st_ino), int(metadata.st_mode)
+        )
+        if statmod.S_ISDIR(int(metadata.st_mode)):
+            with os.scandir(path) as entries:
+                children = [path / entry.name for entry in entries]
+            for child in children:
+                self._remove_node_no_follow(child, expected_dev)
+            current = self._lstat(path)
+            if not self._same_identity(current, identity):
+                raise FilesystemIdentityChanged(
+                    f"directory changed before removal: {path}"
+                )
+            os.rmdir(path)
+        else:
+            current = self._lstat(path)
+            if not self._same_identity(current, identity):
+                raise FilesystemIdentityChanged(f"file changed before removal: {path}")
+            os.unlink(path)
+        if self._path_exists_no_follow(path):
+            raise UnsafeFilesystemObject(f"filesystem object survived removal: {path}")
+
+    def _delete_quarantine_path(
+        self,
+        destination: Path,
+        identity: FilesystemIdentity,
+    ) -> None:
+        self._ensure_quarantine_root()
+        if not self._is_controlled_quarantine_destination(destination):
+            raise UnsafeFilesystemObject("refusing non-quarantine deletion")
+        self._remove_node_no_follow(
+            destination,
+            identity.dev,
+            expected_identity=identity,
+        )
+
     def _host_path(self, raw_path: Any) -> Path | None:
         text = str(raw_path or "").strip()
         if not text:
@@ -1690,6 +2109,10 @@ class DeadPartialReclaimer:
             self.managed_root
         ):
             return None
+        if resolved == self.quarantine_root or resolved.is_relative_to(
+            self.quarantine_root
+        ):
+            return None
         return resolved
 
     def _has_symlink_component(self, path: Path) -> bool:
@@ -1697,8 +2120,13 @@ class DeadPartialReclaimer:
         while current != self.host_downloads and current.is_relative_to(
             self.host_downloads
         ):
-            if current.exists() and current.is_symlink():
-                return True
+            try:
+                metadata = self._lstat(current)
+            except FileNotFoundError:
+                pass
+            else:
+                if self._is_reparse_point(current, metadata):
+                    return True
             current = current.parent
         return False
 
@@ -1728,10 +2156,3 @@ class DeadPartialReclaimer:
             total += sum(allocated(base / name) for name in dirs)
             total += sum(allocated(base / name) for name in files)
         return total
-
-    @staticmethod
-    def _delete_path(path: Path) -> None:
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
