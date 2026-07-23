@@ -200,11 +200,14 @@ class DownloadPlanner:
         cooldown_hashes |= active_soak_cooldown_hashes(self.state_db, now)
         active_intents = self.intent_repository.active(now)
         intent_priority: dict[str, int] = {}
+        capacity_probe_hashes: set[str] = set()
         for intent in active_intents:
             h = str(intent.hash)
             intent_priority[h] = max(intent_priority.get(h, -1), int(intent.priority))
             if intent.intent in {"probe", "availability_probe"}:
                 forced_active_hashes.add(h)
+                if intent.intent == "availability_probe":
+                    capacity_probe_hashes.add(h)
             elif intent.intent == "protect_batch":
                 protected_running_hashes.add(h)
                 forced_active_hashes.add(h)
@@ -271,6 +274,7 @@ class DownloadPlanner:
             forced_active_hashes=forced_active_hashes,
             allowed_active_hashes=allowed_active_hashes,
             capacity_assessment=capacity_assessment,
+            capacity_probe_hashes=capacity_probe_hashes,
         )
         selected: list[dict[str, Any]] = []
         used = 0
@@ -403,19 +407,17 @@ class DownloadPlanner:
         forced_active_hashes: set[str],
         allowed_active_hashes: set[str] | None,
         capacity_assessment: CapacityAssessment | None = None,
+        capacity_probe_hashes: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         candidates: list[dict[str, Any]] = []
         skipped: dict[str, str] = {}
+        capacity_probe_hashes = {
+            str(item) for item in (capacity_probe_hashes or set())
+        }
         for torrent in managed:
             h = str(torrent.get("hash") or "")
             amount_left = int(torrent.get("amount_left") or 0)
             if amount_left <= 0 or h in dead_hashes or h in cooldown_hashes:
-                continue
-            if allowed_active_hashes is not None and h not in allowed_active_hashes and h not in forced_active_hashes:
-                skipped[h] = "global_scheduler_not_selected"
-                continue
-            if h in protected_running_hashes and h not in forced_active_hashes:
-                skipped[h] = "protected_running"
                 continue
             evidence = (
                 None
@@ -425,9 +427,15 @@ class DownloadPlanner:
             if (
                 evidence is not None
                 and not evidence.viable
-                and h not in forced_active_hashes
+                and h not in capacity_probe_hashes
             ):
                 skipped[h] = "capacity_nonviable"
+                continue
+            if allowed_active_hashes is not None and h not in allowed_active_hashes and h not in forced_active_hashes:
+                skipped[h] = "global_scheduler_not_selected"
+                continue
+            if h in protected_running_hashes and h not in forced_active_hashes:
+                skipped[h] = "protected_running"
                 continue
             if mode == "recovery" and amount_left > int(self.recovery_max_remaining_bytes):
                 skipped[h] = "recovery_remaining_too_large"
