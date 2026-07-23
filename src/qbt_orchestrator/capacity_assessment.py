@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -29,6 +30,9 @@ class CapacityAssessment:
     selected_hashes: frozenset[str]
     disk_releasing_jobs: int
     torrents: Mapping[str, TorrentCapacityEvidence] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "torrents", MappingProxyType(dict(self.torrents)))
 
     @property
     def managed_incomplete(self) -> int:
