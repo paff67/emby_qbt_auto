@@ -3634,3 +3634,253 @@ def test_restart_rejects_forged_quarantine_path_escape_without_delete(tmp_path):
     assert marker.read_bytes() == b"keep"
     assert _capacity_reclaim_rows(db)[0]["state"] == "partial_or_unknown"
     assert len(_capacity_reclaim_notifications(db)) == 1
+
+
+def _advance_capacity_generation(db: Path, generation: int) -> None:
+    con = sqlite3.connect(db)
+    con.execute(
+        "update capacity_assessment_state set current_generation=? where id=1",
+        (int(generation),),
+    )
+    con.commit()
+    con.close()
+
+
+def test_missing_assessment_reconciles_prior_generation_stopping_lease_once(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import (
+        CapacityReclaimAuditStore,
+        DeadPartialReclaimer,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h", generation=4)
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: 4_999,
+    )
+    assert audit.reserve(_direct_reclaim_candidate(tmp_path))["reserved"] is True
+    _advance_capacity_generation(db, 5)
+    stopped = {
+        **_snapshot("h", content_path="/downloads/incomplete/h")["h"],
+        "state": "stoppedDL",
+    }
+    executor = RecordingExecutor({"h": stopped})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+
+    first = reclaimer.run(
+        {}, capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=1,
+    )
+    second = reclaimer.run(
+        {}, capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=1,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert first.rejection_counts == {"uncommitted_assessment": 1}
+    assert first.errors == []
+    assert second.rejection_counts == {"uncommitted_assessment": 1}
+    assert row["capacity_generation"] == 4
+    assert row["state"] == "aborted_paused"
+    assert len(_capacity_reclaim_notifications(db)) == 1
+    assert executor.posts == []
+
+
+def test_missing_assessment_returns_recovery_errors_with_uncommitted_result(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    reclaimer = DeadPartialReclaimer(
+        db, RecordingExecutor(), host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False,
+    )
+    reclaimer.audit.recovery_rows = lambda: (_ for _ in ()).throw(
+        RuntimeError("recovery unavailable")
+    )
+
+    result = reclaimer.run(
+        {}, capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=1,
+    )
+
+    assert result.rejection_counts == {"uncommitted_assessment": 1}
+    assert result.errors == [
+        "capacity reclaim recovery scan failed: recovery unavailable"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("seed_state", "path_exists", "expected_state", "recheck_count"),
+    [
+        ("deleting", True, "partial_or_unknown", 0),
+        ("deleted", False, "reclaimed", 1),
+        ("recheck_pending", False, "reclaimed", 1),
+        ("partial_or_unknown", True, "partial_or_unknown", 0),
+    ],
+)
+def test_prior_generation_recovery_uses_row_generation_and_dedupes_notification(
+    tmp_path, seed_state, path_exists, expected_state, recheck_count
+):
+    from qbt_orchestrator.capacity_reclaim import (
+        CapacityReclaimAuditStore,
+        DeadPartialReclaimer,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    payload = managed / "h"
+    if path_exists:
+        payload.mkdir()
+        (payload / "part").write_bytes(b"keep")
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h", generation=4)
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: 4_999,
+    )
+    reservation = audit.reserve(_direct_reclaim_candidate(tmp_path))
+    assert reservation["reserved"] is True
+    _advance_capacity_generation(db, 5)
+    con = sqlite3.connect(db)
+    con.execute(
+        "update capacity_reclaims set state=? where id=?",
+        (seed_state, int(reservation["reclaim_id"])),
+    )
+    con.commit()
+    con.close()
+    executor = RecordingExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+
+    reclaimer.run(
+        {}, assessment=_assessment(generation=5),
+        capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=1,
+    )
+    reclaimer.run(
+        {}, assessment=_assessment(generation=5),
+        capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=1,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["capacity_generation"] == 4
+    assert row["state"] == expected_state
+    assert payload.exists() is path_exists
+    assert len(_capacity_reclaim_notifications(db)) == 1
+    assert len([post for post in executor.posts if post[0].endswith("/recheck")]) == recheck_count
+
+
+def test_prior_generation_quarantine_is_restored_without_delete(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import (
+        CapacityReclaimAuditStore,
+        DeadPartialReclaimer,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    marker = payload / "part"
+    marker.write_bytes(b"keep")
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h", generation=4)
+    executor = RecordingExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+    identity = reclaimer._capture_payload_identity(payload)
+    candidate = {
+        **_direct_reclaim_candidate(tmp_path),
+        "filesystem_dev": identity.dev,
+        "filesystem_ino": identity.ino,
+    }
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: 4_999,
+    )
+    reservation = audit.reserve(candidate)
+    reclaim_id = int(reservation["reclaim_id"])
+    assert audit.mark_deleting(reclaim_id, candidate) is True
+    quarantine_path = reclaimer._quarantine_destination(reclaim_id)
+    reclaimer._rename_to_quarantine(payload, quarantine_path, identity)
+    assert audit.mark_quarantined(
+        reclaim_id, 4, quarantine_path, identity.dev, identity.ino
+    ) is True
+    _advance_capacity_generation(db, 5)
+    delete_calls = []
+    reclaimer._delete_quarantine_path = lambda *_args: delete_calls.append(_args)
+
+    reclaimer.run(
+        {}, assessment=_assessment(generation=5),
+        capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=1,
+    )
+    reclaimer.run(
+        {}, assessment=_assessment(generation=5),
+        capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=1,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["capacity_generation"] == 4
+    assert row["state"] == "aborted_paused"
+    assert marker.read_bytes() == b"keep"
+    assert not quarantine_path.exists()
+    assert delete_calls == []
+    assert len(_capacity_reclaim_notifications(db)) == 1
+
+
+def test_prior_generation_quarantine_missing_from_both_paths_stays_partial(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import (
+        CapacityReclaimAuditStore,
+        DeadPartialReclaimer,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h", generation=4)
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: 4_999,
+    )
+    reservation = audit.reserve(_direct_reclaim_candidate(tmp_path))
+    reclaim_id = int(reservation["reclaim_id"])
+    _advance_capacity_generation(db, 5)
+    recorded_quarantine = managed / ".qbt-orchestrator-reclaim" / f"reclaim-{reclaim_id}"
+    con = sqlite3.connect(db)
+    con.execute(
+        "update capacity_reclaims set state='quarantined',quarantine_path=?,"
+        "filesystem_dev=1,filesystem_ino=1 where id=?",
+        (str(recorded_quarantine), reclaim_id),
+    )
+    con.commit()
+    con.close()
+    executor = RecordingExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+
+    reclaimer.run(
+        {}, assessment=_assessment(generation=5),
+        capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=1,
+    )
+
+    assert _capacity_reclaim_rows(db)[0]["state"] == "partial_or_unknown"
+    assert len(_capacity_reclaim_notifications(db)) == 1
+    assert executor.posts == []

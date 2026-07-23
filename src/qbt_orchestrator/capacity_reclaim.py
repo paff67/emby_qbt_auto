@@ -480,6 +480,22 @@ class CapacityReclaimAuditStore:
             error=error,
         )
 
+    def mark_restored_aborted_paused(
+        self,
+        reclaim_id: int,
+        generation: int,
+        reason: str,
+        error: str | None = None,
+    ) -> bool:
+        return self._mark_warning_state(
+            reclaim_id,
+            generation,
+            target_state="aborted_paused",
+            allowed_states=("deleting", "quarantined"),
+            reason=reason,
+            error=error,
+        )
+
     def mark_deleting(
         self,
         reclaim_id: int,
@@ -581,14 +597,13 @@ class CapacityReclaimAuditStore:
             error=error,
         )
 
-    def recovery_rows(self, generation: int) -> list[dict[str, Any]]:
+    def recovery_rows(self) -> list[dict[str, Any]]:
         con = readonly_connect(self.state_db)
         try:
             rows = con.execute(
-                "select * from capacity_reclaims where capacity_generation=? "
-                "and state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown') "
-                "order by id",
-                (int(generation),),
+                "select * from capacity_reclaims where "
+                "state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown') "
+                "order by capacity_generation,id",
             ).fetchall()
             return [dict(row) for row in rows]
         finally:
@@ -818,11 +833,13 @@ class DeadPartialReclaimer:
         target_free_bytes: int,
     ) -> CapacityReclaimResult:
         generation = 0 if assessment is None else int(assessment.generation)
+        recovery_errors = [] if self.dry_run else self._reconcile_reclaims()
         if generation <= 0:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
                 assessment_generation=generation,
                 rejection_counts={"uncommitted_assessment": 1},
+                errors=recovery_errors,
             )
         assert assessment is not None
         if self._current_assessment_generation() != generation:
@@ -830,10 +847,8 @@ class DeadPartialReclaimer:
                 dry_run=self.dry_run,
                 assessment_generation=generation,
                 rejection_counts={"stale_assessment": 1},
+                errors=recovery_errors,
             )
-        recovery_errors = (
-            [] if self.dry_run else self._reconcile_reclaims(assessment)
-        )
         if recovery_errors:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
@@ -1286,20 +1301,21 @@ class DeadPartialReclaimer:
             return None
         return mapped_path
 
-    def _reconcile_reclaims(
-        self,
-        assessment: CapacityAssessment,
-    ) -> list[str]:
-        generation = int(assessment.generation)
+    def _reconcile_reclaims(self) -> list[str]:
         errors: list[str] = []
         try:
-            recovery_rows = self.audit.recovery_rows(generation)
+            current_generation = self._current_assessment_generation()
+            recovery_rows = self.audit.recovery_rows()
         except Exception as exc:
             return [f"capacity reclaim recovery scan failed: {exc}"]
         for row in recovery_rows:
             reclaim_id = int(row["id"])
             torrent_hash = str(row["hash"])
             state = str(row["state"])
+            row_generation = int(row.get("capacity_generation") or 0)
+            same_generation = (
+                current_generation > 0 and row_generation == current_generation
+            )
             if state == "stopping":
                 try:
                     current = self._qbt_call_with_timeout(
@@ -1310,13 +1326,13 @@ class DeadPartialReclaimer:
                     if _is_stopped_download_state(current.get("state")):
                         changed = self.audit.mark_aborted_paused(
                             reclaim_id,
-                            generation,
+                            row_generation,
                             "restart_after_stopping",
                         )
                     else:
                         changed = self.audit.mark_stop_unknown(
                             reclaim_id,
-                            generation,
+                            row_generation,
                             "restart_stop_state_unknown",
                         )
                     if not changed:
@@ -1327,7 +1343,7 @@ class DeadPartialReclaimer:
                     try:
                         changed = self.audit.mark_stop_unknown(
                             reclaim_id,
-                            generation,
+                            row_generation,
                             "restart_stop_state_unknown",
                             str(exc),
                         )
@@ -1347,7 +1363,7 @@ class DeadPartialReclaimer:
                 try:
                     changed = self.audit.mark_partial_or_unknown(
                         reclaim_id,
-                        generation,
+                        row_generation,
                         reason,
                         None if error is None else str(error),
                     )
@@ -1381,7 +1397,11 @@ class DeadPartialReclaimer:
                             "original path exists without quarantine payload"
                         )
                     if not quarantine_exists:
-                        if not self.audit.mark_deleted(reclaim_id, generation):
+                        if not same_generation:
+                            raise UnsafeFilesystemObject(
+                                "prior-generation payload is missing from both paths"
+                            )
+                        if not self.audit.mark_deleted(reclaim_id, row_generation):
                             errors.append(
                                 f"{torrent_hash}: deleting reconciliation fence changed"
                             )
@@ -1405,9 +1425,30 @@ class DeadPartialReclaimer:
                         raise FilesystemIdentityChanged(
                             "quarantine filesystem identity changed"
                         )
+                    if not same_generation:
+                        if not self._restore_from_quarantine(
+                            quarantine_path, host_path
+                        ):
+                            raise RuntimeError(
+                                "prior-generation quarantine restore failed"
+                            )
+                        self._validate_payload_node(
+                            host_path,
+                            expected_dev,
+                            expected_identity=identity,
+                        )
+                        if not self.audit.mark_restored_aborted_paused(
+                            reclaim_id,
+                            row_generation,
+                            "prior_generation_quarantine_restored",
+                        ):
+                            raise RuntimeError(
+                                "restored reclaim recovery state changed"
+                            )
+                        continue
                     if state == "deleting" and not self.audit.mark_quarantined(
                         reclaim_id,
-                        generation,
+                        row_generation,
                         quarantine_path,
                         identity.dev,
                         identity.ino,
@@ -1416,7 +1457,7 @@ class DeadPartialReclaimer:
                             "quarantine recovery state changed before deletion"
                         )
                     self._delete_quarantine_path(quarantine_path, identity)
-                    if not self.audit.mark_deleted(reclaim_id, generation):
+                    if not self.audit.mark_deleted(reclaim_id, row_generation):
                         errors.append(
                             f"{torrent_hash}: quarantined reconciliation fence changed"
                         )
@@ -1443,7 +1484,7 @@ class DeadPartialReclaimer:
                     try:
                         changed = self.audit.mark_partial_or_unknown(
                             reclaim_id,
-                            generation,
+                            row_generation,
                             "deleted_path_present_or_unsafe",
                         )
                         if not changed:
@@ -1479,7 +1520,7 @@ class DeadPartialReclaimer:
                 try:
                     changed = self.audit.mark_partial_or_unknown(
                         reclaim_id,
-                        generation,
+                        row_generation,
                         "partial_or_unknown_requires_confirmation",
                     )
                     if not changed:
