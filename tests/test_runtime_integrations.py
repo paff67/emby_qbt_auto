@@ -38,7 +38,7 @@ def test_qbt_docker_client_uses_container_local_api_and_parses_json():
 
     assert client.get_maindata(1)["rid"] == 2
     assert client.torrent_info("h1")["seq_dl"] is False
-    assert client.torrent_files("h1") == [{"name": "a.mp4", "size": 10, "index": 0}, {"index": 9, "name": "b.nfo", "size": 1}]
+    assert client.torrent_files("h1", timeout=0.25) == [{"name": "a.mp4", "size": 10}, {"index": 9, "name": "b.nfo", "size": 1}]
     assert client.post("/api/v2/torrents/stop", {"hashes": "h1"}) == "Ok."
 
     first = runner.calls[0][0]
@@ -47,6 +47,7 @@ def test_qbt_docker_client_uses_container_local_api_and_parses_json():
     assert "--max-time" in first
     assert "http://127.0.0.1:8080/api/v2/sync/maindata?rid=1" in first
     assert runner.calls[3][1] == "hashes=h1"
+    assert 0 < runner.calls[2][2] <= 0.25
 
 
 def test_rclone_client_copyto_and_lsjson_size_use_root_config_with_redaction():
@@ -516,7 +517,10 @@ def test_qbt_http_client_uses_same_public_methods_as_docker_client():
         "/api/v2/app/setPreferences": "Ok.",
     }
 
+    observed_timeouts = []
+
     def transport(method, url, body, headers, timeout):
+        observed_timeouts.append((url, timeout))
         suffix = url.removeprefix("http://127.0.0.1:8081")
         if suffix == "/api/v2/auth/login":
             return 200, "Ok.", {"Set-Cookie": "SID=abc; Path=/"}
@@ -527,9 +531,15 @@ def test_qbt_http_client_uses_same_public_methods_as_docker_client():
     client = QbtHttpClient(username="admin", password="secret", transport=transport)
 
     assert client.torrent_info("h1") == {"hash": "h1", "seq_dl": True}
-    assert client.torrent_files("h1") == [{"name": "a.mp4", "size": 1, "index": 0}]
+    assert client.torrent_files("h1", timeout=0.25) == [{"name": "a.mp4", "size": 1}]
     assert client.torrent_properties("h1") == {"piece_size": 4194304}
     assert client.set_preferences({"preallocate_all": True}) == "Ok."
+    files_timeout = next(
+        timeout
+        for url, timeout in observed_timeouts
+        if "/api/v2/torrents/files?hash=h1" in url
+    )
+    assert 0 < files_timeout <= 0.25
 
 
 def test_qbt_http_client_host_proxy_noauth_does_not_login_even_if_credentials_exist():

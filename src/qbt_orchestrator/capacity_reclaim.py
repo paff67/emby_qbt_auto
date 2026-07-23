@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import math
 import os
+import shutil
 import stat as statmod
 import time
 from dataclasses import dataclass, field
@@ -68,6 +70,10 @@ class UnsafeFilesystemObject(RuntimeError):
 
 
 class FilesystemIdentityChanged(RuntimeError):
+    pass
+
+
+class QbtDeadlineUnsupported(RuntimeError):
     pass
 
 
@@ -174,6 +180,13 @@ class CapacityReclaimAuditStore:
             or None,
             "filesystem_dev": _filesystem_id(candidate.get("filesystem_dev")),
             "filesystem_ino": _filesystem_id(candidate.get("filesystem_ino")),
+            "file_selection_fingerprint": (
+                str(candidate.get("file_selection_fingerprint") or "").strip()
+                or None
+            ),
+            "target_free_bytes": max(
+                0, int(candidate.get("target_free_bytes") or 0)
+            ),
         }
 
     @staticmethod
@@ -257,6 +270,15 @@ class CapacityReclaimAuditStore:
         ).fetchone()
         if assessment is None or int(assessment["current_generation"]) != generation:
             return "stale_assessment"
+        capacity = con.execute(
+            "select state,assessment_generation from capacity_state where id=1"
+        ).fetchone()
+        if (
+            capacity is None
+            or str(capacity["state"]) != "capacity_deadlock"
+            or int(capacity["assessment_generation"] or 0) != generation
+        ):
+            return "capacity_episode_changed"
         health = con.execute(
             "select capacity_generation,capacity_viable,reclaimable_since,no_progress_since "
             "from torrent_health where hash=?",
@@ -339,8 +361,9 @@ class CapacityReclaimAuditStore:
             con.execute(
                 "insert into capacity_reclaims(reclaim_key,hash,name,magnet_uri,host_path,content_path,"
                 "allocated_bytes,completed_bytes,progress,dead_since,reclaimable_since,capacity_generation,"
-                "capacity_reason,assessment_json,state,recheck_state,created_at,updated_at) "
-                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'stopping','not_requested',?,?)",
+                "capacity_reason,assessment_json,file_selection_fingerprint,target_free_bytes,"
+                "state,recheck_state,created_at,updated_at) "
+                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'stopping','not_requested',?,?)",
                 (
                     identity["reclaim_key"],
                     identity["hash"],
@@ -356,6 +379,8 @@ class CapacityReclaimAuditStore:
                     identity["capacity_generation"],
                     identity["capacity_reason"],
                     identity["assessment_json"],
+                    identity["file_selection_fingerprint"],
+                    identity["target_free_bytes"],
                     now,
                     now,
                 ),
@@ -581,6 +606,48 @@ class CapacityReclaimAuditStore:
         )
         return int(changed or 0) == 1
 
+    def authorize_delete(
+        self,
+        reclaim_id: int,
+        candidate: Mapping[str, Any],
+    ) -> str | None:
+        identity = self._identity(candidate)
+        generation = int(identity["capacity_generation"])
+
+        def txn(con) -> str | None:
+            if not con.in_transaction:
+                con.execute("begin immediate")
+            row = con.execute(
+                "select reclaim_key,hash,file_selection_fingerprint from capacity_reclaims "
+                "where id=? and reclaim_key=? and hash=? and capacity_generation=? "
+                "and state='quarantined'",
+                (
+                    int(reclaim_id),
+                    identity["reclaim_key"],
+                    identity["hash"],
+                    generation,
+                ),
+            ).fetchone()
+            if row is None:
+                return "reclaim_state_changed"
+            if str(row["file_selection_fingerprint"] or "") != str(
+                identity["file_selection_fingerprint"] or ""
+            ):
+                return "content_selection_changed"
+            fenced_candidate = dict(candidate)
+            if fenced_candidate.get("no_progress_since") is None:
+                try:
+                    evidence = json.loads(str(candidate.get("assessment_json") or "{}"))
+                    fenced_candidate["no_progress_since"] = evidence["torrent"][
+                        "no_progress_since"
+                    ]
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    return "progress_evidence_changed"
+            return self._eligibility_reason(con, fenced_candidate)
+
+        reason = write_transaction(self.state_db, txn)
+        return None if reason is None else str(reason)
+
     def mark_partial_or_unknown(
         self,
         reclaim_id: int,
@@ -746,6 +813,7 @@ class CapacityReclaimResult:
     rejection_counts: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     assessment_generation: int = 0
+    live_execution_cap: int = 1
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -758,6 +826,7 @@ class CapacityReclaimResult:
             "rejection_counts": dict(self.rejection_counts),
             "errors": list(self.errors),
             "assessment_generation": int(self.assessment_generation),
+            "live_execution_cap": int(self.live_execution_cap),
         }
 
 
@@ -790,6 +859,7 @@ class DeadPartialReclaimer:
         stop_poll_interval_sec: float = 0.1,
         stop_max_polls: int = 8,
         inventory_timeout_sec: float = 5.0,
+        disk_free_bytes: Callable[[Path], int] | None = None,
     ):
         self.state_db = Path(state_db)
         self.executor = executor
@@ -814,6 +884,9 @@ class DeadPartialReclaimer:
         self.stop_poll_interval_sec = max(0.001, float(stop_poll_interval_sec))
         self.stop_max_polls = max(1, int(stop_max_polls))
         self.inventory_timeout_sec = max(0.0, float(inventory_timeout_sec))
+        self.disk_free_bytes = disk_free_bytes or (
+            lambda path: int(shutil.disk_usage(path).free)
+        )
         self.audit = CapacityReclaimAuditStore(
             self.state_db,
             notification_chat_ids=notification_chat_ids,
@@ -1027,6 +1100,7 @@ class DeadPartialReclaimer:
                     "reclaimable_since": int(reclaimable_since),
                     "capacity_generation": generation,
                     "capacity_reason": str(row.get("capacity_reason") or ""),
+                    "target_free_bytes": max(0, int(target_free_bytes)),
                     "assessment_json": self._assessment_evidence_json(
                         assessment, evidence
                     ),
@@ -1043,8 +1117,11 @@ class DeadPartialReclaimer:
         needed = max(0, int(target_free_bytes) - int(free_bytes))
         selected: list[dict[str, Any]] = []
         planned_bytes = 0
+        selection_limit = self.max_per_tick if self.dry_run else min(
+            self.max_per_tick, 1
+        )
         for candidate in candidates:
-            if len(selected) >= self.max_per_tick or planned_bytes >= needed:
+            if len(selected) >= selection_limit or planned_bytes >= needed:
                 break
             selected.append(candidate)
             planned_bytes += int(candidate["allocated_bytes"])
@@ -1069,12 +1146,23 @@ class DeadPartialReclaimer:
             if reason is not None:
                 reject(reason)
                 continue
+            fingerprint, fingerprint_reason = (
+                self._current_file_selection_fingerprint(torrent_hash)
+            )
+            if fingerprint_reason is not None:
+                reject(fingerprint_reason)
+                continue
+            assert fingerprint is not None
+            candidate = {
+                **candidate,
+                "file_selection_fingerprint": fingerprint,
+            }
             try:
                 reservation = self.audit.reserve(candidate)
             except Exception as exc:
                 reject("reservation_failed")
                 errors.append(f"{torrent_hash}: failed to reserve reclaim: {exc}")
-                continue
+                break
             if not reservation["reserved"]:
                 reject(str(reservation.get("reason") or "reservation_failed"))
                 continue
@@ -1094,6 +1182,11 @@ class DeadPartialReclaimer:
                         f"{torrent_hash}: failed to persist paused abort: {exc}"
                     )
 
+            reason = self._file_selection_change_reason(candidate)
+            if reason is not None:
+                abort_paused(reason)
+                break
+
             try:
                 self.executor.qbt_post(
                     "/api/v2/torrents/stop", {"hashes": torrent_hash}
@@ -1109,11 +1202,11 @@ class DeadPartialReclaimer:
                     errors.append(
                         f"{torrent_hash}: failed to persist unknown stop: {audit_exc}"
                     )
-                continue
+                break
             current, stop_reason = self._wait_until_stopped(torrent_hash)
             if stop_reason is not None:
                 abort_paused(stop_reason)
-                continue
+                break
             assert current is not None
             reason = self._live_torrent_rejection(
                 current,
@@ -1122,14 +1215,14 @@ class DeadPartialReclaimer:
             )
             if reason is not None:
                 abort_paused(reason)
-                continue
+                break
             host_path = self._host_path(current.get("content_path"))
             if host_path is None:
                 abort_paused("unsafe_path")
-                continue
+                break
             if host_path != Path(str(candidate["host_path"])):
                 abort_paused("path_changed")
-                continue
+                break
             (
                 fresh_paths,
                 inventory_candidate,
@@ -1137,7 +1230,7 @@ class DeadPartialReclaimer:
             ) = self._fresh_path_inventory(torrent_hash)
             if inventory_reason is not None:
                 abort_paused(inventory_reason)
-                continue
+                break
             assert inventory_candidate is not None
             reason = self._live_torrent_rejection(
                 inventory_candidate,
@@ -1146,36 +1239,51 @@ class DeadPartialReclaimer:
             )
             if reason is not None:
                 abort_paused(reason)
-                continue
+                break
             if not _is_stopped_download_state(inventory_candidate.get("state")):
                 abort_paused("torrent_not_stopped")
-                continue
+                break
             inventory_host_path = fresh_paths.get(torrent_hash.strip().lower())
             if inventory_host_path is None:
                 abort_paused("path_inventory_failed")
-                continue
+                break
             if inventory_host_path != host_path:
                 abort_paused("path_changed")
-                continue
+                break
             if self._overlaps_other(torrent_hash, host_path, fresh_paths):
                 abort_paused("path_overlap")
-                continue
+                break
             if not host_path.exists():
                 abort_paused("path_missing")
-                continue
+                break
             try:
                 allocated = self._allocated_bytes(host_path)
             except OSError as exc:
                 abort_paused("path_inspection_failed", str(exc))
-                continue
+                break
             if allocated < self.min_reclaim_bytes:
                 abort_paused("below_min_reclaim")
-                continue
+                break
             candidate = {**candidate, "allocated_bytes": int(allocated)}
             reason = self._candidate_fence_reason(candidate, assessment)
             if reason is not None:
                 abort_paused(reason)
-                continue
+                break
+            reason = self._file_selection_change_reason(candidate)
+            if reason is not None:
+                abort_paused(reason)
+                break
+            try:
+                pressure_resolved = int(self.disk_free_bytes(self.managed_root)) >= int(
+                    candidate["target_free_bytes"]
+                )
+            except Exception as exc:
+                abort_paused("disk_free_recheck_failed", str(exc))
+                errors.append(f"{torrent_hash}: disk free recheck failed: {exc}")
+                break
+            if pressure_resolved:
+                abort_paused("capacity_pressure_resolved")
+                break
             try:
                 filesystem_identity = self._capture_payload_identity(host_path)
                 self._ensure_quarantine_root()
@@ -1186,7 +1294,7 @@ class DeadPartialReclaimer:
                     )
             except (OSError, UnsafeFilesystemObject, FilesystemIdentityChanged) as exc:
                 abort_paused("unsafe_filesystem_object", str(exc))
-                continue
+                break
             candidate = {
                 **candidate,
                 "filesystem_dev": int(filesystem_identity.dev),
@@ -1201,10 +1309,10 @@ class DeadPartialReclaimer:
                     f"{torrent_hash}: failed to persist deleting state: {exc}"
                 )
                 abort_paused("reclaim_state_changed", str(exc))
-                continue
+                break
             if not deleting:
                 abort_paused("reclaim_state_changed")
-                continue
+                break
 
             def mark_partial(reason: str, error: Exception | str) -> None:
                 try:
@@ -1228,7 +1336,7 @@ class DeadPartialReclaimer:
             except Exception as exc:
                 mark_partial("quarantine_identity_changed", exc)
                 errors.append(f"{torrent_hash}: {exc}")
-                continue
+                break
             try:
                 if not self.audit.mark_quarantined(
                     int(reclaim_id),
@@ -1245,19 +1353,71 @@ class DeadPartialReclaimer:
                     f"{torrent_hash}: failed to persist quarantined state: {exc}; "
                     f"restored={restored}"
                 )
-                continue
+                break
+
+            def abort_quarantined(
+                reason: str,
+                error: Exception | str | None = None,
+            ) -> None:
+                reject(reason)
+                try:
+                    self._validate_payload_node(
+                        quarantine_path,
+                        filesystem_identity.dev,
+                        expected_identity=filesystem_identity,
+                    )
+                    if not self._restore_from_quarantine(
+                        quarantine_path, host_path
+                    ):
+                        raise RuntimeError("quarantine restore failed")
+                    if not self.audit.mark_restored_aborted_paused(
+                        int(reclaim_id), generation, reason,
+                        None if error is None else str(error),
+                    ):
+                        raise RuntimeError("restored reclaim state changed")
+                except Exception as restore_exc:
+                    mark_partial(reason, error or restore_exc)
+                    errors.append(
+                        f"{torrent_hash}: failed to restore quarantined payload: "
+                        f"{restore_exc}"
+                    )
+
+            reason = self._file_selection_change_reason(candidate)
+            if reason is not None:
+                abort_quarantined(reason)
+                break
+            try:
+                pressure_resolved = int(self.disk_free_bytes(self.managed_root)) >= int(
+                    candidate["target_free_bytes"]
+                )
+            except Exception as exc:
+                abort_quarantined("disk_free_recheck_failed", exc)
+                break
+            if pressure_resolved:
+                abort_quarantined("capacity_pressure_resolved")
+                break
+            try:
+                authorization_reason = self.audit.authorize_delete(
+                    int(reclaim_id), candidate
+                )
+            except Exception as exc:
+                abort_quarantined("delete_authorization_failed", exc)
+                break
+            if authorization_reason is not None:
+                abort_quarantined(authorization_reason)
+                break
             try:
                 self._delete_quarantine_path(quarantine_path, filesystem_identity)
             except Exception as exc:
                 mark_partial("quarantine_delete_partial_or_unknown", exc)
                 errors.append(f"{torrent_hash}: {exc}")
-                continue
+                break
             try:
                 if not self.audit.mark_deleted(int(reclaim_id), generation):
                     raise RuntimeError("capacity reclaim deleted state changed")
             except Exception as exc:
                 errors.append(f"{torrent_hash}: failed to persist deleted state: {exc}")
-                continue
+                break
             reclaimed_bytes += int(candidate["allocated_bytes"])
             recheck_error: str | None = None
             try:
@@ -1425,13 +1585,44 @@ class DeadPartialReclaimer:
                         raise FilesystemIdentityChanged(
                             "quarantine filesystem identity changed"
                         )
+                    if same_generation and state == "deleting":
+                        if not self.audit.mark_quarantined(
+                            reclaim_id,
+                            row_generation,
+                            quarantine_path,
+                            identity.dev,
+                            identity.ino,
+                        ):
+                            raise RuntimeError(
+                                "quarantine recovery state changed before deletion"
+                            )
+
+                    restore_reason: str | None = None
                     if not same_generation:
+                        restore_reason = "prior_generation_quarantine_restored"
+                    else:
+                        restore_reason = self._capacity_episode_reason(
+                            row_generation
+                        )
+                        if restore_reason is None:
+                            try:
+                                if int(self.disk_free_bytes(self.managed_root)) >= int(
+                                    row.get("target_free_bytes") or 0
+                                ):
+                                    restore_reason = "capacity_pressure_resolved"
+                            except Exception:
+                                restore_reason = "disk_free_recheck_failed"
+                        if restore_reason is None:
+                            restore_reason = self._file_selection_change_reason(row)
+                        if restore_reason is None:
+                            restore_reason = self.audit.authorize_delete(
+                                reclaim_id, row
+                            )
+                    if restore_reason is not None:
                         if not self._restore_from_quarantine(
                             quarantine_path, host_path
                         ):
-                            raise RuntimeError(
-                                "prior-generation quarantine restore failed"
-                            )
+                            raise RuntimeError("quarantine recovery restore failed")
                         self._validate_payload_node(
                             host_path,
                             expected_dev,
@@ -1440,22 +1631,12 @@ class DeadPartialReclaimer:
                         if not self.audit.mark_restored_aborted_paused(
                             reclaim_id,
                             row_generation,
-                            "prior_generation_quarantine_restored",
+                            restore_reason,
                         ):
                             raise RuntimeError(
                                 "restored reclaim recovery state changed"
                             )
                         continue
-                    if state == "deleting" and not self.audit.mark_quarantined(
-                        reclaim_id,
-                        row_generation,
-                        quarantine_path,
-                        identity.dev,
-                        identity.ino,
-                    ):
-                        raise RuntimeError(
-                            "quarantine recovery state changed before deletion"
-                        )
                     self._delete_quarantine_path(quarantine_path, identity)
                     if not self.audit.mark_deleted(reclaim_id, row_generation):
                         errors.append(
@@ -1576,6 +1757,22 @@ class DeadPartialReclaimer:
             con.close()
         return int(row["current_generation"]) if row is not None else 0
 
+    def _capacity_episode_reason(self, generation: int) -> str | None:
+        con = readonly_connect(self.state_db)
+        try:
+            row = con.execute(
+                "select state,assessment_generation from capacity_state where id=1"
+            ).fetchone()
+        finally:
+            con.close()
+        if (
+            row is None
+            or str(row["state"]) != "capacity_deadlock"
+            or int(row["assessment_generation"] or 0) != int(generation)
+        ):
+            return "capacity_episode_changed"
+        return None
+
     @staticmethod
     def _assessment_evidence_json(
         assessment: CapacityAssessment,
@@ -1603,6 +1800,86 @@ class DeadPartialReclaimer:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    @staticmethod
+    def _selection_boolean(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"0", "false"}:
+            return False
+        if text in {"1", "true"}:
+            return True
+        raise ValueError("invalid file selection boolean")
+
+    @staticmethod
+    def _file_selection_fingerprint(rows: Any) -> str:
+        if not isinstance(rows, (list, tuple)) or not rows:
+            raise ValueError("torrent file selection is missing")
+        normalized: list[dict[str, Any]] = []
+        indices: set[int] = set()
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                raise ValueError("torrent file selection row is invalid")
+            for field in ("index", "size", "priority"):
+                if field not in raw:
+                    raise ValueError(f"torrent file selection {field} is missing")
+            index = _nonnegative_integer(raw.get("index"))
+            size = _nonnegative_integer(raw.get("size"))
+            priority = _nonnegative_integer(raw.get("priority"))
+            if index is None or size is None or priority is None:
+                raise ValueError("torrent file selection numeric value is invalid")
+            if index in indices:
+                raise ValueError("torrent file selection index is duplicated")
+            indices.add(index)
+            item: dict[str, Any] = {
+                "index": index,
+                "priority": priority,
+                "size": size,
+            }
+            for field in ("wanted", "skip", "selected"):
+                if field in raw:
+                    item[field] = DeadPartialReclaimer._selection_boolean(raw[field])
+            normalized.append(item)
+        normalized.sort(key=lambda item: int(item["index"]))
+        compact = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(compact.encode("utf-8")).hexdigest()
+
+    def _current_file_selection_fingerprint(
+        self,
+        torrent_hash: str,
+    ) -> tuple[str | None, str | None]:
+        try:
+            rows = self._qbt_call_with_timeout(
+                "torrent_files",
+                str(torrent_hash),
+                timeout=self.inventory_timeout_sec,
+            )
+            return self._file_selection_fingerprint(rows), None
+        except QbtDeadlineUnsupported:
+            return None, "qbt_deadline_unsupported"
+        except Exception:
+            return None, "content_selection_unknown"
+
+    def _file_selection_change_reason(
+        self,
+        candidate: Mapping[str, Any],
+    ) -> str | None:
+        current, reason = self._current_file_selection_fingerprint(
+            str(candidate["hash"])
+        )
+        if reason is not None:
+            return reason
+        if current != str(candidate.get("file_selection_fingerprint") or ""):
+            return "content_selection_changed"
+        return None
 
     def _has_open_job_or_reservation_or_cooldown(
         self, torrent_hash: str
@@ -1792,6 +2069,8 @@ class DeadPartialReclaimer:
                 str(candidate["hash"]),
                 timeout=self.inventory_timeout_sec,
             )
+        except QbtDeadlineUnsupported:
+            return "qbt_deadline_unsupported"
         except Exception:
             return "revalidation_failed"
         reason = self._live_torrent_rejection(
@@ -1849,7 +2128,9 @@ class DeadPartialReclaimer:
         )
         if accepts_timeout:
             return method(*args, timeout=timeout)
-        return method(*args)
+        raise QbtDeadlineUnsupported(
+            f"qBT adapter method does not accept timeout: {method_name}"
+        )
 
     def _fresh_path_inventory(
         self,
@@ -1886,14 +2167,16 @@ class DeadPartialReclaimer:
             raw_path = str(item.get("content_path") or "").strip()
             if not raw_path:
                 return {}, None, "path_inventory_failed"
-            path = self._host_path(raw_path)
+            path = self._inventory_host_path(raw_path)
+            if path is None:
+                return {}, None, "path_inventory_failed"
             if identity == expected_hash:
-                if path is None:
+                authorized_path = self._host_path(raw_path)
+                if authorized_path is None or authorized_path != path:
                     return {}, None, "path_inventory_failed"
                 item["hash"] = identity
                 candidate_row = item
-            if path is not None:
-                paths[identity] = path
+            paths[identity] = path
         if candidate_row is None:
             return {}, None, "path_inventory_failed"
         return paths, candidate_row, None
@@ -2156,6 +2439,37 @@ class DeadPartialReclaimer:
             return None
         return resolved
 
+    def _inventory_host_path(self, raw_path: Any) -> Path | None:
+        text = str(raw_path or "").strip()
+        if not text:
+            return None
+        container_path = PurePosixPath(text)
+        if not container_path.is_absolute() or ".." in container_path.parts:
+            return None
+        try:
+            relative = container_path.relative_to(self.container_downloads)
+        except ValueError:
+            return None
+        unresolved = self.host_downloads.joinpath(*relative.parts)
+        lexical = Path(os.path.abspath(os.fspath(unresolved)))
+        if not lexical.is_relative_to(self.host_downloads):
+            return None
+        try:
+            return unresolved.resolve(strict=True)
+        except FileNotFoundError:
+            if lexical == self.managed_root or lexical.is_relative_to(
+                self.managed_root
+            ):
+                return None
+            if self._has_symlink_component(unresolved):
+                return None
+            try:
+                return unresolved.resolve(strict=False)
+            except OSError:
+                return None
+        except OSError:
+            return None
+
     def _has_symlink_component(self, path: Path) -> bool:
         current = path
         while current != self.host_downloads and current.is_relative_to(
@@ -2172,13 +2486,56 @@ class DeadPartialReclaimer:
         return False
 
     @staticmethod
+    def _path_identity(path: Path) -> tuple[int, int] | None:
+        try:
+            metadata = path.stat()
+        except OSError:
+            return None
+        return int(metadata.st_dev), int(metadata.st_ino)
+
+    @classmethod
+    def _paths_overlap(cls, first: Path, second: Path) -> bool:
+        if (
+            first == second
+            or first.is_relative_to(second)
+            or second.is_relative_to(first)
+        ):
+            return True
+        try:
+            if first.exists() and second.exists() and os.path.samefile(first, second):
+                return True
+        except OSError:
+            return True
+        first_identity = cls._path_identity(first)
+        second_identity = cls._path_identity(second)
+        if first_identity is None or second_identity is None:
+            return False
+
+        def ancestor_identities(path: Path) -> set[tuple[int, int]]:
+            identities: set[tuple[int, int]] = set()
+            current = path
+            while True:
+                identity = cls._path_identity(current)
+                if identity is not None:
+                    identities.add(identity)
+                if current == current.parent:
+                    break
+                current = current.parent
+            return identities
+
+        return (
+            first_identity in ancestor_identities(second)
+            or second_identity in ancestor_identities(first)
+        )
+
+    @classmethod
     def _overlaps_other(
-        torrent_hash: str, candidate: Path, all_paths: Mapping[str, Path]
+        cls, torrent_hash: str, candidate: Path, all_paths: Mapping[str, Path]
     ) -> bool:
         for other_hash, other in all_paths.items():
             if str(other_hash) == str(torrent_hash):
                 continue
-            if other == candidate or other.is_relative_to(candidate) or candidate.is_relative_to(other):
+            if cls._paths_overlap(candidate, other):
                 return True
         return False
 

@@ -5,7 +5,7 @@ class FakeQbtClient:
         self.posts = []
         self.heavy_calls = []
 
-    def get_maindata(self, rid):
+    def get_maindata(self, rid, timeout=None):
         if not self.maindata:
             return {"rid": rid, "full_update": False, "torrents": {}}
         item = self.maindata.pop(0)
@@ -13,7 +13,7 @@ class FakeQbtClient:
             raise item
         return item
 
-    def torrent_info(self, hash):
+    def torrent_info(self, hash, timeout=None):
         return self.info.get(hash, {"hash": hash, "seq_dl": False})
 
     def post(self, path, payload):
@@ -81,7 +81,7 @@ class BudgetedQbtFake:
         self.maindata_calls = 0
         self.delta_calls = 0
 
-    def get_maindata(self, rid):
+    def get_maindata(self, rid, timeout=None):
         self.maindata_calls += 1
         full = int(rid) == 0
         if not full:
@@ -93,7 +93,7 @@ class BudgetedQbtFake:
             "server_state": {},
         }
 
-    def torrent_files(self, torrent_hash):
+    def torrent_files(self, torrent_hash, timeout=None):
         self.calls.append((int(self.now()), "torrents/files", str(torrent_hash)))
         return [{"index": 0, "name": f"{torrent_hash}.mp4", "size": 1024**3, "progress": 0.0, "priority": 0}]
 
