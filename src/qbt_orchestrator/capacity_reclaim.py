@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 from urllib.parse import quote
 
+from .capacity_assessment import CapacityAssessment, TorrentCapacityEvidence
 from .db import readonly_connect, write_transaction
 from .observability import redact
 
@@ -58,9 +61,11 @@ class CapacityReclaimAuditStore:
                 + "&dn="
                 + quote(name, safe="")
             )
-        dead_since = int(candidate.get("dead_since") or 0)
+        reclaimable_since = int(candidate.get("reclaimable_since") or 0)
+        dead_since = candidate.get("dead_since")
+        assessment_json = str(candidate.get("assessment_json") or "{}")
         return {
-            "reclaim_key": f"{torrent_hash}:{dead_since}",
+            "reclaim_key": f"{torrent_hash}:{reclaimable_since}",
             "hash": torrent_hash,
             "name": name,
             "magnet_uri": magnet_uri,
@@ -69,7 +74,11 @@ class CapacityReclaimAuditStore:
             "allocated_bytes": max(0, int(candidate.get("allocated_bytes") or 0)),
             "completed_bytes": max(0, int(candidate.get("completed_bytes") or 0)),
             "progress": float(candidate.get("progress") or 0.0),
-            "dead_since": dead_since,
+            "dead_since": None if dead_since is None else int(dead_since),
+            "reclaimable_since": reclaimable_since,
+            "capacity_generation": int(candidate.get("capacity_generation") or 0),
+            "capacity_reason": str(candidate.get("capacity_reason") or "")[:256],
+            "assessment_json": assessment_json,
         }
 
     def begin(self, candidate: Mapping[str, Any]) -> int:
@@ -79,11 +88,14 @@ class CapacityReclaimAuditStore:
         def txn(con) -> int:
             con.execute(
                 "insert into capacity_reclaims(reclaim_key,hash,name,magnet_uri,host_path,content_path,"
-                "allocated_bytes,completed_bytes,progress,dead_since,state,recheck_state,created_at,updated_at) "
-                "values(?,?,?,?,?,?,?,?,?,?,'deleting','pending',?,?) "
+                "allocated_bytes,completed_bytes,progress,dead_since,reclaimable_since,capacity_generation,"
+                "capacity_reason,assessment_json,state,recheck_state,created_at,updated_at) "
+                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'deleting','pending',?,?) "
                 "on conflict(reclaim_key) do update set name=excluded.name,magnet_uri=excluded.magnet_uri,"
                 "host_path=excluded.host_path,content_path=excluded.content_path,allocated_bytes=excluded.allocated_bytes,"
-                "completed_bytes=excluded.completed_bytes,progress=excluded.progress,state='deleting',"
+                "completed_bytes=excluded.completed_bytes,progress=excluded.progress,dead_since=excluded.dead_since,"
+                "reclaimable_since=excluded.reclaimable_since,capacity_generation=excluded.capacity_generation,"
+                "capacity_reason=excluded.capacity_reason,assessment_json=excluded.assessment_json,state='deleting',"
                 "recheck_state='pending',recheck_error=null,updated_at=excluded.updated_at",
                 (
                     identity["reclaim_key"],
@@ -96,6 +108,10 @@ class CapacityReclaimAuditStore:
                     identity["completed_bytes"],
                     identity["progress"],
                     identity["dead_since"],
+                    identity["reclaimable_since"],
+                    identity["capacity_generation"],
+                    identity["capacity_reason"],
+                    identity["assessment_json"],
                     now,
                     now,
                 ),
@@ -211,6 +227,7 @@ class CapacityReclaimResult:
     candidates: list[dict[str, Any]] = field(default_factory=list)
     rejection_counts: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    assessment_generation: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -222,6 +239,7 @@ class CapacityReclaimResult:
             "candidates": [dict(item) for item in self.candidates],
             "rejection_counts": dict(self.rejection_counts),
             "errors": list(self.errors),
+            "assessment_generation": int(self.assessment_generation),
         }
 
 
@@ -242,11 +260,15 @@ class DeadPartialReclaimer:
         container_downloads: str,
         managed_root: str | Path,
         dry_run: bool = True,
-        min_dead_age_sec: int = 21_600,
+        min_reclaimable_age_sec: int = 3_600,
+        min_dead_age_sec: int | None = None,
         min_reclaim_bytes: int = 64 * 1024**2,
         max_per_tick: int = 1,
         notification_chat_ids: list[str] | tuple[str, ...] | None = None,
         now: Callable[[], int] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        stop_timeout_sec: float = 5.0,
+        stop_poll_interval_sec: float = 0.1,
     ):
         self.state_db = Path(state_db)
         self.executor = executor
@@ -254,10 +276,20 @@ class DeadPartialReclaimer:
         self.container_downloads = PurePosixPath(str(container_downloads))
         self.managed_root = Path(managed_root).resolve()
         self.dry_run = bool(dry_run)
-        self.min_dead_age_sec = max(0, int(min_dead_age_sec))
+        if min_dead_age_sec is not None:
+            if (
+                int(min_reclaimable_age_sec) != 3_600
+                and int(min_reclaimable_age_sec) != int(min_dead_age_sec)
+            ):
+                raise ValueError("conflicting reclaimable age settings")
+            min_reclaimable_age_sec = int(min_dead_age_sec)
+        self.min_reclaimable_age_sec = max(0, int(min_reclaimable_age_sec))
         self.min_reclaim_bytes = max(0, int(min_reclaim_bytes))
         self.max_per_tick = max(0, int(max_per_tick))
         self.now = now or (lambda: int(__import__("time").time()))
+        self.sleep = sleep or time.sleep
+        self.stop_timeout_sec = max(0.0, float(stop_timeout_sec))
+        self.stop_poll_interval_sec = max(0.001, float(stop_poll_interval_sec))
         self.audit = CapacityReclaimAuditStore(
             self.state_db,
             notification_chat_ids=notification_chat_ids,
@@ -270,19 +302,45 @@ class DeadPartialReclaimer:
         self,
         snapshots: Mapping[str, Mapping[str, Any]],
         *,
+        assessment: CapacityAssessment,
         capacity_state: str,
         free_bytes: int,
         target_free_bytes: int,
     ) -> CapacityReclaimResult:
+        generation = int(assessment.generation)
+        if generation <= 0:
+            return CapacityReclaimResult(
+                dry_run=self.dry_run,
+                assessment_generation=generation,
+                rejection_counts={"uncommitted_assessment": 1},
+            )
+        if self._current_assessment_generation() != generation:
+            return CapacityReclaimResult(
+                dry_run=self.dry_run,
+                assessment_generation=generation,
+                rejection_counts={"stale_assessment": 1},
+            )
         if (
             str(capacity_state) != "capacity_deadlock"
             or int(free_bytes) >= int(target_free_bytes)
             or self.max_per_tick <= 0
         ):
-            return CapacityReclaimResult(dry_run=self.dry_run)
+            return CapacityReclaimResult(
+                dry_run=self.dry_run,
+                assessment_generation=generation,
+            )
 
-        eligible_rows, open_jobs, active_claims = self._eligibility_state()
+        (
+            eligible_rows,
+            open_jobs,
+            active_claims,
+            active_cooldowns,
+        ) = self._eligibility_state()
         all_paths = self._snapshot_paths(snapshots)
+        snapshots_by_hash = {
+            str(raw.get("hash") or fallback_hash): dict(raw)
+            for fallback_hash, raw in snapshots.items()
+        }
         rejection_counts: dict[str, int] = {}
 
         def reject(reason: str) -> None:
@@ -290,11 +348,52 @@ class DeadPartialReclaimer:
 
         candidates: list[dict[str, Any]] = []
         now = int(self.now())
-        for fallback_hash, raw in snapshots.items():
-            torrent = dict(raw)
-            torrent_hash = str(torrent.get("hash") or fallback_hash)
+        for assessment_hash, evidence in assessment.torrents.items():
+            torrent_hash = str(evidence.hash or assessment_hash)
+            torrent = snapshots_by_hash.get(torrent_hash)
+            if torrent is None:
+                reject("snapshot_missing")
+                continue
+            if not evidence.managed:
+                reject("not_managed")
+                continue
+            if not evidence.incomplete:
+                reject("not_incomplete")
+                continue
+            if evidence.availability is None or float(evidence.availability) < 0:
+                reject("availability_unknown")
+                continue
+            if (
+                float(evidence.availability) >= 1.0
+                or int(evidence.complete_sources) > 0
+            ):
+                reject("complete_source")
+                continue
+            if evidence.viable:
+                reject("capacity_viable")
+                continue
             row = eligible_rows.get(torrent_hash)
             if row is None:
+                reject("health_missing")
+                continue
+            if int(row.get("capacity_generation") or 0) != generation:
+                reject("stale_health_generation")
+                continue
+            if (
+                row.get("capacity_viable") is None
+                or int(row["capacity_viable"]) != 0
+            ):
+                reject("capacity_viable")
+                continue
+            if row.get("no_progress_since") is None or evidence.no_progress_since is None:
+                reject("no_progress_unconfirmed")
+                continue
+            reclaimable_since = row.get("reclaimable_since")
+            if reclaimable_since is None:
+                reject("reclaimable_unconfirmed")
+                continue
+            if now - int(reclaimable_since) < self.min_reclaimable_age_sec:
+                reject("reclaimable_age")
                 continue
             tags = {
                 item.strip()
@@ -304,53 +403,14 @@ class DeadPartialReclaimer:
             if tags & PROTECTED_TAGS:
                 reject("protected_tag")
                 continue
-            if str(torrent.get("state") or "") not in STOPPED_DOWNLOAD_STATES:
-                reject("not_stopped")
-                continue
-            if int(torrent.get("amount_left") or 0) <= 0:
-                reject("not_incomplete")
-                continue
-            dead_since = row.get("dead_since")
-            no_progress_since = row.get("no_progress_since")
-            no_swarm_since = row.get("no_swarm_since")
-            if (
-                dead_since is None
-                or no_progress_since is None
-                or now - max(
-                    int(dead_since),
-                    int(no_progress_since),
-                )
-                < self.min_dead_age_sec
-            ):
-                reject("dead_age")
-                continue
-            seeds = max(
-                0,
-                int(torrent.get("num_seeds") or 0),
-                int(torrent.get("num_complete") or 0),
-            )
-            raw_availability = torrent.get("availability")
-            availability = (
-                None
-                if raw_availability is None
-                else float(raw_availability)
-            )
-            if seeds > 0 or (
-                availability is not None and availability >= 0.999999
-            ):
-                reject("complete_source")
-                continue
-            if availability is None and (
-                no_swarm_since is None
-                or now - int(no_swarm_since) < self.min_dead_age_sec
-            ):
-                reject("unavailability_unconfirmed")
-                continue
             if torrent_hash in open_jobs:
                 reject("open_job")
                 continue
             if torrent_hash in active_claims:
                 reject("active_reservation")
+                continue
+            if torrent_hash in active_cooldowns:
+                reject("active_cooldown")
                 continue
             host_path = self._host_path(torrent.get("content_path"))
             if host_path is None:
@@ -388,7 +448,12 @@ class DeadPartialReclaimer:
                         ),
                     ),
                     "progress": float(torrent.get("progress") or 0.0),
-                    "dead_since": int(dead_since),
+                    "reclaimable_since": int(reclaimable_since),
+                    "capacity_generation": generation,
+                    "capacity_reason": str(row.get("capacity_reason") or ""),
+                    "assessment_json": self._assessment_evidence_json(
+                        assessment, evidence
+                    ),
                 }
             )
 
@@ -415,6 +480,7 @@ class DeadPartialReclaimer:
                 planned_bytes=planned_bytes,
                 candidates=selected,
                 rejection_counts=rejection_counts,
+                assessment_generation=generation,
             )
 
         reclaimed = 0
@@ -423,13 +489,56 @@ class DeadPartialReclaimer:
         completed: list[dict[str, Any]] = []
         for candidate in selected:
             torrent_hash = str(candidate["hash"])
-            host_path = Path(str(candidate["host_path"]))
             reclaim_id: int | None = None
+            reason = self._revalidate_candidate(candidate, assessment)
+            if reason is not None:
+                reject(reason)
+                continue
             try:
-                reclaim_id = self.audit.begin(candidate)
                 self.executor.qbt_post(
                     "/api/v2/torrents/stop", {"hashes": torrent_hash}
                 )
+            except Exception as exc:
+                reject("stop_failed")
+                errors.append(f"{torrent_hash}: {exc}")
+                continue
+            current, stop_reason = self._wait_until_stopped(torrent_hash)
+            if stop_reason is not None:
+                reject(stop_reason)
+                continue
+            assert current is not None
+            reason = self._live_torrent_rejection(current)
+            if reason is not None:
+                reject(reason)
+                continue
+            host_path = self._host_path(current.get("content_path"))
+            if host_path is None:
+                reject("unsafe_path")
+                continue
+            if host_path != Path(str(candidate["host_path"])):
+                reject("path_changed")
+                continue
+            if self._overlaps_other(torrent_hash, host_path, all_paths):
+                reject("path_overlap")
+                continue
+            if not host_path.exists():
+                reject("path_missing")
+                continue
+            try:
+                allocated = self._allocated_bytes(host_path)
+            except OSError:
+                reject("path_inspection_failed")
+                continue
+            if allocated < self.min_reclaim_bytes:
+                reject("below_min_reclaim")
+                continue
+            candidate = {**candidate, "allocated_bytes": int(allocated)}
+            reason = self._candidate_fence_reason(candidate, assessment)
+            if reason is not None:
+                reject(reason)
+                continue
+            try:
+                reclaim_id = self.audit.begin(candidate)
                 self._delete_path(host_path)
                 reclaimed += 1
                 reclaimed_bytes += int(candidate["allocated_bytes"])
@@ -466,17 +575,17 @@ class DeadPartialReclaimer:
             candidates=completed,
             rejection_counts=rejection_counts,
             errors=errors,
+            assessment_generation=generation,
         )
 
     def _eligibility_state(
         self,
-    ) -> tuple[dict[str, dict[str, Any]], set[str], set[str]]:
+    ) -> tuple[dict[str, dict[str, Any]], set[str], set[str], set[str]]:
         con = readonly_connect(self.state_db)
         try:
             rows = con.execute(
-                "select sa.hash,th.dead_since,th.no_progress_since,th.no_swarm_since "
-                "from scheduler_allocations sa join torrent_health th on th.hash=sa.hash "
-                "where sa.desired_state='dead'"
+                "select hash,reclaimable_since,no_progress_since,capacity_viable,"
+                "capacity_reason,capacity_generation from torrent_health"
             ).fetchall()
             placeholders = ",".join("?" for _ in OPEN_JOB_STATES)
             jobs = con.execute(
@@ -488,13 +597,183 @@ class DeadPartialReclaimer:
                 "and (expires_at is null or expires_at>?)",
                 (int(self.now()),),
             ).fetchall()
+            cooldowns = con.execute(
+                "select hash from soak_state where cooldown_until is not null "
+                "and cooldown_until>?",
+                (int(self.now()),),
+            ).fetchall()
         finally:
             con.close()
         return (
             {str(row["hash"]): dict(row) for row in rows},
             {str(row["hash"]) for row in jobs if row["hash"]},
             {str(row["hash"]) for row in claims if row["hash"]},
+            {str(row["hash"]) for row in cooldowns if row["hash"]},
         )
+
+    def _current_assessment_generation(self) -> int:
+        con = readonly_connect(self.state_db)
+        try:
+            row = con.execute(
+                "select current_generation from capacity_assessment_state where id=1"
+            ).fetchone()
+        finally:
+            con.close()
+        return int(row["current_generation"]) if row is not None else 0
+
+    @staticmethod
+    def _assessment_evidence_json(
+        assessment: CapacityAssessment,
+        evidence: TorrentCapacityEvidence,
+    ) -> str:
+        compact = redact(
+            {
+                "generation": int(assessment.generation),
+                "observed_at": int(assessment.observed_at),
+                "torrent": {
+                    "hash": str(evidence.hash),
+                    "managed": bool(evidence.managed),
+                    "incomplete": bool(evidence.incomplete),
+                    "availability": evidence.availability,
+                    "complete_sources": int(evidence.complete_sources),
+                    "no_progress_since": evidence.no_progress_since,
+                    "viable": bool(evidence.viable),
+                    "viability_reason": str(evidence.viability_reason),
+                },
+            }
+        )
+        return json.dumps(
+            compact,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _has_open_job_or_reservation_or_cooldown(
+        self, torrent_hash: str
+    ) -> bool:
+        con = readonly_connect(self.state_db)
+        try:
+            placeholders = ",".join("?" for _ in OPEN_JOB_STATES)
+            job = con.execute(
+                f"select 1 from torrent_jobs where hash=? "
+                f"and state in ({placeholders}) limit 1",
+                (str(torrent_hash), *OPEN_JOB_STATES),
+            ).fetchone()
+            if job is not None:
+                return True
+            now = int(self.now())
+            claim = con.execute(
+                "select 1 from resource_reservations where hash=? and state='active' "
+                "and (expires_at is null or expires_at>?) limit 1",
+                (str(torrent_hash), now),
+            ).fetchone()
+            if claim is not None:
+                return True
+            cooldown = con.execute(
+                "select 1 from soak_state where hash=? and cooldown_until is not null "
+                "and cooldown_until>? limit 1",
+                (str(torrent_hash), now),
+            ).fetchone()
+            return cooldown is not None
+        finally:
+            con.close()
+
+    def _candidate_fence_reason(
+        self,
+        candidate: Mapping[str, Any],
+        assessment: CapacityAssessment,
+    ) -> str | None:
+        if self._current_assessment_generation() != int(assessment.generation):
+            return "stale_assessment"
+        torrent_hash = str(candidate["hash"])
+        con = readonly_connect(self.state_db)
+        try:
+            row = con.execute(
+                "select reclaimable_since,capacity_viable,capacity_generation "
+                "from torrent_health where hash=?",
+                (torrent_hash,),
+            ).fetchone()
+        finally:
+            con.close()
+        if (
+            row is None
+            or int(row["capacity_generation"] or 0) != int(assessment.generation)
+            or row["capacity_viable"] is None
+            or int(row["capacity_viable"]) != 0
+            or row["reclaimable_since"] is None
+            or int(row["reclaimable_since"])
+            != int(candidate.get("reclaimable_since") or 0)
+        ):
+            return "eligibility_changed"
+        if self._has_open_job_or_reservation_or_cooldown(torrent_hash):
+            return "active_protection"
+        return None
+
+    @staticmethod
+    def _live_torrent_rejection(current: Mapping[str, Any]) -> str | None:
+        tags = {
+            item.strip()
+            for item in str(current.get("tags") or "").split(",")
+            if item.strip()
+        }
+        if tags & PROTECTED_TAGS:
+            return "protected_tag"
+        if str(current.get("category") or "") != "auto" and "auto" not in tags:
+            return "not_managed"
+        if int(current.get("amount_left") or 0) <= 0:
+            return "not_incomplete"
+        raw_availability = current.get("availability")
+        try:
+            availability = (
+                None if raw_availability is None else float(raw_availability)
+            )
+        except (TypeError, ValueError):
+            availability = None
+        if availability is None or availability < 0:
+            return "availability_unknown"
+        complete_sources = max(
+            int(current.get("num_seeds") or 0),
+            int(current.get("num_complete") or 0),
+        )
+        if availability >= 1.0 or complete_sources > 0:
+            return "complete_source"
+        return None
+
+    def _revalidate_candidate(
+        self,
+        candidate: Mapping[str, Any],
+        assessment: CapacityAssessment,
+    ) -> str | None:
+        if self._current_assessment_generation() != int(assessment.generation):
+            return "stale_assessment"
+        try:
+            current = self.executor.qbt.torrent_info(str(candidate["hash"]))
+        except Exception:
+            return "revalidation_failed"
+        reason = self._live_torrent_rejection(current)
+        if reason is not None:
+            return reason
+        return self._candidate_fence_reason(candidate, assessment)
+
+    def _wait_until_stopped(
+        self,
+        torrent_hash: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        attempts = max(
+            1,
+            int(math.ceil(self.stop_timeout_sec / self.stop_poll_interval_sec)) + 1,
+        )
+        for attempt in range(attempts):
+            try:
+                current = dict(self.executor.qbt.torrent_info(torrent_hash))
+            except Exception:
+                return None, "stop_confirmation_failed"
+            if str(current.get("state") or "") in STOPPED_DOWNLOAD_STATES:
+                return current, None
+            if attempt + 1 < attempts:
+                self.sleep(self.stop_poll_interval_sec)
+        return None, "stop_timeout"
 
     def _snapshot_paths(
         self, snapshots: Mapping[str, Mapping[str, Any]]
