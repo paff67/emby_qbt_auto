@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
@@ -1062,7 +1064,7 @@ def test_command_processor_executes_safe_commands_and_requires_cleanup_approval(
 
 def test_resume_command_canonicalizes_hash_and_blocks_on_reclaim_lease():
     from qbt_orchestrator.db import migrate
-    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
     from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
 
     class Qbt:
@@ -1088,7 +1090,8 @@ def test_resume_command_canonicalizes_hash_and_blocks_on_reclaim_lease():
             "h", "reclaim:7:4"
         ) is True
         try:
-            assert CommandProcessor(commands, executor).run_next() == "resume-locked"
+            with pytest.raises(QbtMutationLeaseBlocked):
+                CommandProcessor(commands, executor).run_next()
         finally:
             executor.close(timeout=1)
 
@@ -1099,6 +1102,134 @@ def test_resume_command_canonicalizes_hash_and_blocks_on_reclaim_lease():
             "path=/api/v2/torrents/start hashes=h"
         )
         assert qbt.posts == []
+
+
+def test_queue_command_reclaim_trigger_becomes_blocked_without_creating_job():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into capacity_reclaims("
+            "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,created_at,updated_at"
+            ") values(?,?,?,?,?,?,?,?,?)",
+            (
+                "reclaim:h",
+                "h",
+                "H",
+                "mag" + "net:?xt=urn:btih:h",
+                str(Path(td) / "h"),
+                "/downloads/h",
+                "stopping",
+                100,
+                100,
+            ),
+        )
+        con.commit()
+        con.close()
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command("queue-locked", 100, 2, "queue", {"args": [" H "]})
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="capacity_reclaim_locked",
+        ):
+            CommandProcessor(commands, FakeExecutor()).run_next()
+
+        command = commands.get("queue-locked")
+        assert command["state"] == "blocked"
+        assert command["last_error"] == "capacity_reclaim_locked"
+        assert _rows(db, "select * from torrent_jobs") == []
+
+
+def test_pause_timeout_fails_command_and_propagates_error():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+
+    class TimeoutExecutor:
+        def qbt_post(self, _path, _payload):
+            raise TimeoutError(
+                "qBT timed out token " + "123456:" + "secret-token"
+            )
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command("pause-timeout", 100, 2, "pause", {"args": ["h"]})
+        processor = CommandProcessor(commands, TimeoutExecutor())
+
+        with pytest.raises(TimeoutError, match="qBT timed out"):
+            processor.run_next()
+
+        command = commands.get("pause-timeout")
+        assert command["state"] == "failed"
+        assert "qBT timed out" in command["last_error"]
+        assert "secret-token" not in command["last_error"]
+
+
+def test_approved_dangerous_failure_is_terminal_and_never_replayed():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    class FailingPreemption:
+        def __init__(self):
+            self.calls = 0
+
+        def force_preempt_hash(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("preemption transport failed")
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command("preempt-failed", 100, 3, "preempt", {"args": ["seed"]})
+        preemption = FailingPreemption()
+        processor = CommandProcessor(
+            commands,
+            FakeExecutor(),
+            preemption_service=preemption,
+        )
+        assert processor.run_next() == "preempt-failed"
+        assert commands.approve_once("approval-preempt-failed", user_id=3) is True
+
+        with pytest.raises(RuntimeError, match="preemption transport failed"):
+            processor.run_next()
+
+        command = commands.get("preempt-failed")
+        assert command["state"] == "failed"
+        assert command["last_error"] == "preemption transport failed"
+        assert processor.run_next() is None
+        assert preemption.calls == 1
+
+
+def test_new_command_processor_recovers_stale_running_without_replay():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 200)
+        commands.insert_command("stale", 100, 3, "preempt", {"args": ["seed"]})
+        claimed = commands.claim_next()
+        assert claimed is not None and claimed["state"] == "running"
+
+        processor = CommandProcessor(commands, FakeExecutor())
+
+        command = commands.get("stale")
+        assert command["state"] == "failed"
+        assert command["last_error"] == (
+            "recovered stale running command; manual retry required"
+        )
+        assert processor.run_next() is None
 
 
 def test_approved_dangerous_command_executes_once_after_approval():

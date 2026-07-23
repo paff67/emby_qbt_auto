@@ -1453,11 +1453,11 @@ def test_file_batch_service_queues_downloaded_pipeline_batch_without_delete():
         con = sqlite3.connect(db)
         con.execute(
             "insert into torrent_batches(id,hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
-            (1, "big", 1, "downloading", "pipeline", "[0,1]", 15, 100, 900, 900),
+            (1, " BIG ", 1, "downloading", "pipeline", "[0,1]", 15, 100, 900, 900),
         )
         con.execute(
             "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
-            ("big", 1, "batch", 100, "active", 900, 4600, "batch_pipeline_reserved"),
+            (" BIG ", 1, "batch", 100, "active", 900, 4600, "batch_pipeline_reserved"),
         )
         con.commit(); con.close()
         qbt = BatchQbt([
@@ -1527,11 +1527,12 @@ def test_file_batch_service_queues_downloaded_pipeline_batch_without_delete():
         }
         reservations = _rows(
             db,
-            "select kind,accounting_class,owner,last_observed_at,bytes,state,released_at,reason "
+            "select hash,kind,accounting_class,owner,last_observed_at,bytes,state,released_at,reason "
             "from resource_reservations order by id",
         )
         assert reservations == [
             {
+                "hash": " BIG ",
                 "kind": "batch",
                 "accounting_class": "future_growth",
                 "owner": "file_batch",
@@ -1542,6 +1543,7 @@ def test_file_batch_service_queues_downloaded_pipeline_batch_without_delete():
                 "reason": "batch_downloaded_upload_queued",
             },
             {
+                "hash": "big",
                 "kind": "cleanup_pending",
                 "accounting_class": "current_pinned",
                 "owner": "file_batch",

@@ -847,7 +847,9 @@ class FileBatchService:
             rows = [
                 dict(r)
                 for r in con.execute(
-                    "select * from torrent_batches where hash=? and state in ('downloading','applied_to_qbt','downloaded') order by batch_no,id",
+                    "select * from torrent_batches where lower(trim(hash))=? "
+                    "and state in ('downloading','applied_to_qbt','downloaded') "
+                    "order by batch_no,id",
                     (h,),
                 )
             ]
@@ -948,7 +950,7 @@ class FileBatchService:
         now = int(self.now())
         def txn(con: sqlite3.Connection) -> None:
             row = con.execute("select hash from torrent_batches where id=?", (int(batch_id),)).fetchone()
-            h = str(row["hash"]) if row else None
+            h = canonical_torrent_hash(row["hash"] if row else None) or None
             con.execute(
                 "update torrent_batches set state='upload_queued', downloaded_bytes=?, downloaded_at=coalesce(downloaded_at,?), "
                 "upload_job_id=?, local_pinned_bytes=?, upload_queued_at=?, updated_at=? where id=?",

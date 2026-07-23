@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -16,6 +17,12 @@ from .io_governor import JobPriority
 from .observability import redact
 from .promotion import finalize_canonical_upload
 from .upload import RcloneUploadWorker, UploadJob, UploadResult
+
+
+LOGGER = logging.getLogger(__name__)
+STALE_RUNNING_COMMAND_ERROR = (
+    "recovered stale running command; manual retry required"
+)
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -1474,6 +1481,25 @@ class BotCommandRepository:
             ),
         )
 
+    def recover_stale_running(self) -> int:
+        """Fail closed on commands abandoned by a previous process.
+
+        bot_commands has no owner/lease columns, so CommandProcessor invokes
+        this once during construction under the daemon's single-instance
+        startup model.  Recovered commands are never automatically replayed.
+        """
+        now = int(self.now())
+
+        def txn(con: sqlite3.Connection) -> int:
+            cur = con.execute(
+                "update bot_commands set state='failed',last_error=?,updated_at=? "
+                "where state='running'",
+                (STALE_RUNNING_COMMAND_ERROR, now),
+            )
+            return int(cur.rowcount)
+
+        return int(write_transaction(self.state_db, txn))
+
     def create_approval(self, command_id: str, action: str, payload: dict[str, Any], ttl: int = 300) -> str:
         aid = f"approval-{command_id}"
         now = int(self.now())
@@ -1651,12 +1677,60 @@ class CommandProcessor:
         self.executor = executor
         self.notifications = notifications
         self.preemption_service = preemption_service
+        self.recovered_stale_commands = commands.recover_stale_running()
         self.jobs = TorrentJobRepository(commands.state_db, now=commands.now)
 
     def run_next(self) -> str | None:
         row = self.commands.claim_next()
-        if not row: return None
-        command_id = row["command_id"]; command = row["command"]; payload = json.loads(row["payload_json"] or "{}"); args = payload.get("args") or []
+        if not row:
+            return None
+        command_id = str(row["command_id"])
+        try:
+            terminal_state = self._execute_claimed(row)
+            self.commands.set_state(command_id, terminal_state)
+        except Exception as exc:
+            terminal_state, error = self._exception_terminal_state(exc)
+            try:
+                self.commands.set_state(command_id, terminal_state, error)
+            except Exception:
+                LOGGER.exception(
+                    "failed to persist terminal bot command state "
+                    "command_id=%s intended_state=%s",
+                    command_id,
+                    terminal_state,
+                )
+                raise
+            if terminal_state == "blocked":
+                LOGGER.warning(
+                    "bot command blocked command_id=%s reason=%s",
+                    command_id,
+                    error,
+                )
+            raise
+        return command_id
+
+    @staticmethod
+    def _exception_terminal_state(exc: Exception) -> tuple[str, str]:
+        if isinstance(exc, QbtMutationLeaseBlocked):
+            return "blocked", str(redact(str(exc)))
+        message = str(exc)
+        lowered = message.lower()
+        for marker in (
+            "capacity_reclaim_locked",
+            "capacity_reclaim_delete_in_progress",
+        ):
+            if marker in lowered:
+                return "blocked", marker
+        safe_error = str(redact(message)).strip()
+        if not safe_error:
+            safe_error = exc.__class__.__name__
+        return "failed", safe_error
+
+    def _execute_claimed(self, row: Mapping[str, Any]) -> str:
+        command_id = str(row["command_id"])
+        command = str(row["command"])
+        payload = json.loads(row["payload_json"] or "{}")
+        args = payload.get("args") or []
         if command in {
             "pause",
             "resume",
@@ -1689,52 +1763,36 @@ class CommandProcessor:
                     },
                     dedupe_key=f"approval-request:{approval_id}",
                 )
-            self.commands.set_state(command_id, "approval_required"); return command_id
+            return "approval_required"
         if command == "pause" and args:
-            try:
-                self.executor.qbt_post(
-                    "/api/v2/torrents/stop", {"hashes": args[0]}
-                )
-            except QbtMutationLeaseBlocked as exc:
-                self.commands.set_state(command_id, "blocked", str(exc))
-                return command_id
-            self.commands.set_state(command_id, "done"); return command_id
+            self.executor.qbt_post(
+                "/api/v2/torrents/stop", {"hashes": args[0]}
+            )
+            return "done"
         if command == "resume" and args:
-            try:
-                self.executor.qbt_post(
-                    "/api/v2/torrents/start", {"hashes": args[0]}
-                )
-            except QbtMutationLeaseBlocked as exc:
-                self.commands.set_state(command_id, "blocked", str(exc))
-                return command_id
-            self.commands.set_state(command_id, "done"); return command_id
+            self.executor.qbt_post(
+                "/api/v2/torrents/start", {"hashes": args[0]}
+            )
+            return "done"
         if command == "queue":
             self._enqueue_command_job(command, payload, args, default_job_type="upload", default_priority=50)
-            self.commands.set_state(command_id, "done")
-            return command_id
+            return "done"
         if command == "force_upload":
             self._enqueue_command_job(command, payload, args, default_job_type="upload", default_priority=0, force_upload=True)
-            self.commands.set_state(command_id, "done")
-            return command_id
+            return "done"
         if command == "cleanup":
             self._enqueue_command_job(command, payload, args, default_job_type="cleanup_request", default_priority=10)
-            self.commands.set_state(command_id, "done")
-            return command_id
+            return "done"
         if command == "config":
             self._audit_config_command(payload, args)
-            self.commands.set_state(command_id, "done")
-            return command_id
+            return "done"
         if command == "preempt" and args:
-            try:
-                if self.preemption_service is not None and hasattr(self.preemption_service, "force_preempt_hash"):
-                    target_hash = canonical_torrent_hash(args[1]) if len(args) > 1 else None
-                    self.preemption_service.force_preempt_hash(canonical_torrent_hash(args[0]), target_hash=target_hash, reason="telegram")
-                else:
-                    self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]})
-            except QbtMutationLeaseBlocked as exc:
-                self.commands.set_state(command_id, "blocked", str(exc))
-                return command_id
-            self.commands.set_state(command_id, "done"); return command_id
+            if self.preemption_service is not None and hasattr(self.preemption_service, "force_preempt_hash"):
+                target_hash = canonical_torrent_hash(args[1]) if len(args) > 1 else None
+                self.preemption_service.force_preempt_hash(canonical_torrent_hash(args[0]), target_hash=target_hash, reason="telegram")
+            else:
+                self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]})
+            return "done"
         if command in {"status", "trace", "perf"}:
             if self.notifications is not None:
                 self.notifications.enqueue(
@@ -1743,9 +1801,8 @@ class CommandProcessor:
                     message=self._readonly_message(command, args),
                     dedupe_key=f"command-result:{command_id}",
                 )
-            self.commands.set_state(command_id, "done")
-            return command_id
-        self.commands.set_state(command_id, "ignored"); return command_id
+            return "done"
+        return "ignored"
 
     def _approval_message(self, command: str, args: list[Any]) -> str:
         suffix = " ".join(str(a) for a in args)
