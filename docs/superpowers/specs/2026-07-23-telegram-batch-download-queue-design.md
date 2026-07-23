@@ -247,8 +247,10 @@ Every item that requires qBT metadata enters with category/tag isolation:
 
 ```text
 category: precheck
-tags: precheck, metadata-probe, add-item-<opaque token>, hold
+tags: precheck, metadata-probe, add-item-a1b2c3d4, hold
 ```
+
+The `a1b2c3d4` suffix is an example; production generates a random opaque eight-character token persisted on the item row.
 
 The probe uses a 1 KiB/s temporary payload download limit so metadata extension traffic can proceed while payload transfer remains negligible. As soon as metadata appears, the next due poll stops the torrent, sets every file priority to zero, verifies the opaque item tag/hash correlation, and reads the file list, total size, main-video candidate, and qBT hash. It never changes the torrent to managed `auto` or removes `hold` during precheck.
 
