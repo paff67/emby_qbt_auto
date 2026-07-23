@@ -470,11 +470,17 @@ def migration_sql() -> list[str]:
         "alter table capacity_reclaims add column file_selection_fingerprint text",
         "alter table capacity_reclaims add column target_free_bytes integer not null default 0",
         "drop trigger if exists trg_capacity_reclaim_lock_reservation_update",
+        "drop trigger if exists trg_capacity_reclaim_lock_soak_insert",
+        "drop trigger if exists trg_capacity_reclaim_lock_soak_update",
         "drop trigger if exists trg_capacity_reclaim_fence_assessment_insert",
         "drop trigger if exists trg_capacity_reclaim_fence_assessment_update",
+        "drop trigger if exists trg_capacity_reclaim_fence_assessment_delete",
+        "drop trigger if exists trg_capacity_reclaim_fence_health_insert",
         "drop trigger if exists trg_capacity_reclaim_fence_health_update",
+        "drop trigger if exists trg_capacity_reclaim_fence_health_delete",
         "drop trigger if exists trg_capacity_reclaim_fence_capacity_state_insert",
         "drop trigger if exists trg_capacity_reclaim_fence_capacity_state_update",
+        "drop trigger if exists trg_capacity_reclaim_fence_capacity_state_delete",
         "create trigger if not exists trg_capacity_reclaim_lock_job_insert "
         "before insert on torrent_jobs "
         "when NEW.hash is not null "
@@ -501,6 +507,20 @@ def migration_sql() -> list[str]:
         "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
         "and cr.state not in ('released','cancelled')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
+        "create trigger if not exists trg_capacity_reclaim_lock_soak_insert "
+        "before insert on soak_state "
+        "when NEW.hash is not null and NEW.cooldown_until is not null "
+        "and NEW.cooldown_until>0 "
+        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and cr.state not in ('released','cancelled')) "
+        "begin select raise(abort,'capacity_reclaim_locked'); end",
+        "create trigger if not exists trg_capacity_reclaim_lock_soak_update "
+        "before update on soak_state "
+        "when NEW.hash is not null and NEW.cooldown_until is not null "
+        "and NEW.cooldown_until>0 "
+        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and cr.state not in ('released','cancelled')) "
+        "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_assessment_insert "
         "before insert on capacity_assessment_state "
         "when exists(select 1 from capacity_reclaims "
@@ -511,14 +531,34 @@ def migration_sql() -> list[str]:
         "when exists(select 1 from capacity_reclaims "
         "where state in ('deleting','quarantined')) "
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
+        "create trigger if not exists trg_capacity_reclaim_fence_assessment_delete "
+        "before delete on capacity_assessment_state "
+        "when exists(select 1 from capacity_reclaims "
+        "where state in ('deleting','quarantined')) "
+        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
+        "create trigger if not exists trg_capacity_reclaim_fence_health_insert "
+        "before insert on torrent_health "
+        "when exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and cr.state in ('deleting','quarantined')) "
+        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_health_update "
         "before update of capacity_generation,capacity_viable,reclaimable_since,no_progress_since "
         "on torrent_health "
         "when exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
         "and cr.state in ('deleting','quarantined')) "
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
+        "create trigger if not exists trg_capacity_reclaim_fence_health_delete "
+        "before delete on torrent_health "
+        "when exists(select 1 from capacity_reclaims cr where cr.hash=OLD.hash "
+        "and cr.state in ('deleting','quarantined')) "
+        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_capacity_state_insert "
         "before insert on capacity_state "
+        "when exists(select 1 from capacity_reclaims "
+        "where state in ('deleting','quarantined')) "
+        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
+        "create trigger if not exists trg_capacity_reclaim_fence_capacity_state_delete "
+        "before delete on capacity_state "
         "when exists(select 1 from capacity_reclaims "
         "where state in ('deleting','quarantined')) "
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",

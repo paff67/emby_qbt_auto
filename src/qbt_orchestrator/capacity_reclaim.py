@@ -676,6 +676,17 @@ class CapacityReclaimAuditStore:
         finally:
             con.close()
 
+    def locked_rows(self) -> list[dict[str, Any]]:
+        con = readonly_connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select id,hash,capacity_generation,state from capacity_reclaims "
+                "where state not in ('released','cancelled') order by id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            con.close()
+
     def mark_recheck_pending(
         self,
         reclaim_id: int,
@@ -896,6 +907,92 @@ class DeadPartialReclaimer:
             raise ValueError("capacity reclaim managed_root must be inside host_downloads")
         self.quarantine_root = self.managed_root / QUARANTINE_DIRNAME
 
+    @staticmethod
+    def _reclaim_mutation_lease_token(
+        reclaim_id: int,
+        generation: int,
+    ) -> str:
+        return f"reclaim:{int(reclaim_id)}:{int(generation)}"
+
+    def _executor_supports_reclaim_mutation_leases(self) -> bool:
+        for method_name in (
+            "acquire_hash_mutation_lease",
+            "release_hash_mutation_lease",
+            "hydrate_hash_mutation_lease",
+        ):
+            if not callable(getattr(self.executor, method_name, None)):
+                return False
+        qbt_post = getattr(self.executor, "qbt_post", None)
+        if not callable(qbt_post):
+            return False
+        try:
+            parameters = inspect.signature(qbt_post).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == "lease_token"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    def _hydrate_reclaim_mutation_leases(self) -> list[str]:
+        try:
+            rows = self.audit.locked_rows()
+        except Exception as exc:
+            return [f"capacity reclaim lease scan failed: {exc}"]
+        if not rows:
+            return []
+        if not self._executor_supports_reclaim_mutation_leases():
+            return ["qbt_mutation_lease_unsupported"]
+        hydrate = self.executor.hydrate_hash_mutation_lease
+        errors: list[str] = []
+        for row in rows:
+            torrent_hash = str(row.get("hash") or "")
+            token = self._reclaim_mutation_lease_token(
+                int(row["id"]),
+                int(row.get("capacity_generation") or 0),
+            )
+            try:
+                hydrated = bool(hydrate(torrent_hash, token))
+            except Exception as exc:
+                errors.append(
+                    f"{torrent_hash}: qBT mutation lease hydration failed: {exc}"
+                )
+                continue
+            if not hydrated:
+                errors.append(
+                    f"{torrent_hash}: qbt_mutation_lease_conflict"
+                )
+        return errors
+
+    def _acquire_reclaim_mutation_lease(
+        self,
+        torrent_hash: str,
+        lease_token: str,
+    ) -> str | None:
+        if not self._executor_supports_reclaim_mutation_leases():
+            return "qbt_mutation_lease_unsupported"
+        try:
+            acquired = bool(
+                self.executor.acquire_hash_mutation_lease(
+                    torrent_hash,
+                    lease_token,
+                )
+            )
+        except Exception:
+            return "qbt_mutation_lease_failed"
+        return None if acquired else "qbt_mutation_lease_conflict"
+
+    @staticmethod
+    def _combined_restore_error(
+        original_error: Exception | str | None,
+        restore_error: Exception | str,
+    ) -> str:
+        combined = f"quarantine restore failed: {restore_error}"
+        if original_error is not None:
+            combined += f"; original error: {original_error}"
+        return combined
+
     def run(
         self,
         snapshots: Mapping[str, Mapping[str, Any]],
@@ -906,9 +1003,9 @@ class DeadPartialReclaimer:
         target_free_bytes: int,
     ) -> CapacityReclaimResult:
         generation = 0 if assessment is None else int(assessment.generation)
-        recovery_errors = (
-            [] if self.dry_run else self._reconcile_reclaims(assessment)
-        )
+        recovery_errors = self._hydrate_reclaim_mutation_leases()
+        if not self.dry_run and not recovery_errors:
+            recovery_errors = self._reconcile_reclaims(assessment)
         if generation <= 0:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
@@ -1135,6 +1232,7 @@ class DeadPartialReclaimer:
                 planned_bytes=planned_bytes,
                 candidates=selected,
                 rejection_counts=rejection_counts,
+                errors=recovery_errors,
                 assessment_generation=generation,
             )
 
@@ -1169,6 +1267,10 @@ class DeadPartialReclaimer:
                 reject(str(reservation.get("reason") or "reservation_failed"))
                 continue
             reclaim_id = int(reservation["reclaim_id"])
+            lease_token = self._reclaim_mutation_lease_token(
+                reclaim_id,
+                generation,
+            )
 
             def abort_paused(reason: str, error: str | None = None) -> None:
                 reject(reason)
@@ -1184,15 +1286,27 @@ class DeadPartialReclaimer:
                         f"{torrent_hash}: failed to persist paused abort: {exc}"
                     )
 
+            lease_reason = self._acquire_reclaim_mutation_lease(
+                torrent_hash,
+                lease_token,
+            )
+            if lease_reason is not None:
+                abort_paused(lease_reason)
+                break
+
             reason = self._file_selection_change_reason(candidate)
             if reason is not None:
                 abort_paused(reason)
                 break
 
             try:
-                self.executor.qbt_post(
-                    "/api/v2/torrents/stop", {"hashes": torrent_hash}
+                applied = self.executor.qbt_post(
+                    "/api/v2/torrents/stop",
+                    {"hashes": torrent_hash},
+                    lease_token=lease_token,
                 )
+                if applied is False:
+                    raise RuntimeError("qBT stop rejected by mutation lease")
             except Exception as exc:
                 reject("stop_failed")
                 errors.append(f"{torrent_hash}: {exc}")
@@ -1350,10 +1464,16 @@ class DeadPartialReclaimer:
                     raise RuntimeError("capacity reclaim quarantine state changed")
             except Exception as exc:
                 restored = self._restore_from_quarantine(quarantine_path, host_path)
-                mark_partial("quarantine_state_persist_failed", exc)
+                persisted_error: Exception | str = exc
+                if not restored:
+                    persisted_error = self._combined_restore_error(
+                        exc,
+                        "quarantine state persistence recovery returned false",
+                    )
+                mark_partial("quarantine_state_persist_failed", persisted_error)
                 errors.append(
                     f"{torrent_hash}: failed to persist quarantined state: {exc}; "
-                    f"restored={restored}"
+                    f"restored={restored}; persisted_error={persisted_error}"
                 )
                 break
 
@@ -1378,12 +1498,26 @@ class DeadPartialReclaimer:
                     ):
                         raise RuntimeError("restored reclaim state changed")
                 except Exception as restore_exc:
-                    mark_partial(reason, error or restore_exc)
+                    combined_error = self._combined_restore_error(
+                        error,
+                        restore_exc,
+                    )
+                    mark_partial(reason, combined_error)
                     errors.append(
                         f"{torrent_hash}: failed to restore quarantined payload: "
-                        f"{restore_exc}"
+                        f"{combined_error}"
                     )
 
+            try:
+                authorization_reason = self.audit.authorize_delete(
+                    int(reclaim_id), candidate
+                )
+            except Exception as exc:
+                abort_quarantined("delete_authorization_failed", exc)
+                break
+            if authorization_reason is not None:
+                abort_quarantined(authorization_reason)
+                break
             reason = self._final_live_authorization(
                 candidate,
                 assessment,
@@ -1403,16 +1537,6 @@ class DeadPartialReclaimer:
                 abort_quarantined("capacity_pressure_resolved")
                 break
             try:
-                authorization_reason = self.audit.authorize_delete(
-                    int(reclaim_id), candidate
-                )
-            except Exception as exc:
-                abort_quarantined("delete_authorization_failed", exc)
-                break
-            if authorization_reason is not None:
-                abort_quarantined(authorization_reason)
-                break
-            try:
                 self._delete_quarantine_path(quarantine_path, filesystem_identity)
             except Exception as exc:
                 mark_partial("quarantine_delete_partial_or_unknown", exc)
@@ -1427,9 +1551,13 @@ class DeadPartialReclaimer:
             reclaimed_bytes += int(candidate["allocated_bytes"])
             recheck_error: str | None = None
             try:
-                self.executor.qbt_post(
-                    "/api/v2/torrents/recheck", {"hashes": torrent_hash}
+                applied = self.executor.qbt_post(
+                    "/api/v2/torrents/recheck",
+                    {"hashes": torrent_hash},
+                    lease_token=lease_token,
                 )
+                if applied is False:
+                    raise RuntimeError("qBT recheck rejected by mutation lease")
             except Exception as exc:
                 recheck_error = str(exc)
                 errors.append(f"{torrent_hash}: {exc}")
@@ -1482,6 +1610,10 @@ class DeadPartialReclaimer:
             torrent_hash = str(row["hash"])
             state = str(row["state"])
             row_generation = int(row.get("capacity_generation") or 0)
+            lease_token = self._reclaim_mutation_lease_token(
+                reclaim_id,
+                row_generation,
+            )
             same_generation = (
                 current_generation > 0 and row_generation == current_generation
             )
@@ -1611,31 +1743,20 @@ class DeadPartialReclaimer:
                     if not same_generation:
                         restore_reason = "prior_generation_quarantine_restored"
                     else:
-                        restore_reason = self._capacity_episode_reason(
-                            row_generation
-                        )
-                        if restore_reason is None:
-                            try:
-                                if int(self.disk_free_bytes(self.managed_root)) >= int(
-                                    row.get("target_free_bytes") or 0
-                                ):
-                                    restore_reason = "capacity_pressure_resolved"
-                            except Exception:
-                                restore_reason = "disk_free_recheck_failed"
-                        if restore_reason is None:
-                            if (
-                                assessment is None
-                                or int(assessment.generation) != row_generation
-                            ):
+                        if (
+                            assessment is None
+                            or int(assessment.generation) != row_generation
+                        ):
+                            restore_reason = "live_revalidation_unavailable"
+                        else:
+                            recovery_candidate = self._recovery_live_candidate(row)
+                            if recovery_candidate is None:
                                 restore_reason = "live_revalidation_unavailable"
-                            else:
-                                recovery_candidate = (
-                                    self._recovery_live_candidate(row)
-                                )
-                                if recovery_candidate is None:
-                                    restore_reason = (
-                                        "live_revalidation_unavailable"
-                                    )
+                        if restore_reason is None:
+                            assert recovery_candidate is not None
+                            restore_reason = self.audit.authorize_delete(
+                                reclaim_id, recovery_candidate
+                            )
                         if restore_reason is None:
                             assert assessment is not None
                             assert recovery_candidate is not None
@@ -1645,15 +1766,23 @@ class DeadPartialReclaimer:
                                 actual_payload_path=quarantine_path,
                             )
                         if restore_reason is None:
-                            assert recovery_candidate is not None
-                            restore_reason = self.audit.authorize_delete(
-                                reclaim_id, recovery_candidate
-                            )
+                            try:
+                                if int(self.disk_free_bytes(self.managed_root)) >= int(
+                                    row.get("target_free_bytes") or 0
+                                ):
+                                    restore_reason = "capacity_pressure_resolved"
+                            except Exception:
+                                restore_reason = "disk_free_recheck_failed"
                     if restore_reason is not None:
                         if not self._restore_from_quarantine(
                             quarantine_path, host_path
                         ):
-                            raise RuntimeError("quarantine recovery restore failed")
+                            raise RuntimeError(
+                                self._combined_restore_error(
+                                    restore_reason,
+                                    "quarantine recovery restore returned false",
+                                )
+                            )
                         self._validate_payload_node(
                             host_path,
                             expected_dev,
@@ -1710,9 +1839,15 @@ class DeadPartialReclaimer:
                     continue
                 recheck_error: str | None = None
                 try:
-                    self.executor.qbt_post(
-                        "/api/v2/torrents/recheck", {"hashes": torrent_hash}
+                    applied = self.executor.qbt_post(
+                        "/api/v2/torrents/recheck",
+                        {"hashes": torrent_hash},
+                        lease_token=lease_token,
                     )
+                    if applied is False:
+                        raise RuntimeError(
+                            "qBT recheck rejected by mutation lease"
+                        )
                 except Exception as exc:
                     recheck_error = str(exc)
                     errors.append(f"{torrent_hash}: {exc}")
@@ -1787,22 +1922,6 @@ class DeadPartialReclaimer:
         finally:
             con.close()
         return int(row["current_generation"]) if row is not None else 0
-
-    def _capacity_episode_reason(self, generation: int) -> str | None:
-        con = readonly_connect(self.state_db)
-        try:
-            row = con.execute(
-                "select state,assessment_generation from capacity_state where id=1"
-            ).fetchone()
-        finally:
-            con.close()
-        if (
-            row is None
-            or str(row["state"]) != "capacity_deadlock"
-            or int(row["assessment_generation"] or 0) != int(generation)
-        ):
-            return "capacity_episode_changed"
-        return None
 
     @staticmethod
     def _assessment_evidence_json(
@@ -2516,8 +2635,14 @@ class DeadPartialReclaimer:
                 or self._is_reparse_point(destination, moved)
             ):
                 raise FilesystemIdentityChanged("moved payload identity changed")
-        except Exception:
-            self._restore_from_quarantine(destination, source)
+        except Exception as exc:
+            if not self._restore_from_quarantine(destination, source):
+                raise RuntimeError(
+                    self._combined_restore_error(
+                        exc,
+                        "post-rename validation recovery returned false",
+                    )
+                ) from exc
             raise
 
     def _restore_from_quarantine(self, destination: Path, source: Path) -> bool:
