@@ -2074,12 +2074,8 @@ def test_daemon_runtime_enqueues_proactive_telegram_alerts_for_all_stopped_and_n
         assert [(r["chat_id"], r["topic"], r["level"], r["state"]) for r in rows] == [
             ("12345", "scheduler_all_stopped", "warning", "queued"),
             ("12345", "disk_threshold", "warning", "queued"),
-            ("12345", "capacity_deadlock", "critical", "queued"),
         ]
         assert "free=" in rows[1]["message"]
-        assert rows[2]["message"] == (
-            "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
-        )
 
 
 class FakeTelegramService:

@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from .db import readonly_connect
 from .observability import redact
 from .runtime import BotNotificationRepository
 
@@ -22,6 +21,21 @@ class SchedulerAlertConfig:
     interval_sec: int = 1800
     disk_alert_margin_bytes: int = 512 * MIB
     capacity_deadlock_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class CapacityReclaimAlertContext:
+    evaluation_status: str
+    dry_run: bool
+    planned: int
+    reclaimed: int
+    errors_count: int
+    errors_summary: tuple[str, ...]
+    rejection_counts: Mapping[str, int]
+    rejection_fingerprint: str
+    assessment_generation: int
+    capacity_pressure_remaining: bool
+    post_reclaim_free_bytes: int | None
 
 
 def _tags(torrent: Mapping[str, Any]) -> set[str]:
@@ -136,6 +150,7 @@ class SchedulerAlertService:
         *,
         required_minimum_growth_bytes: int,
         top_manual_candidates: list[Mapping[str, Any]],
+        reclaim_context: CapacityReclaimAlertContext | None = None,
         mature_reclaim_candidates: int = 0,
         rejection_fingerprint: str = "",
     ) -> list[int]:
@@ -149,14 +164,38 @@ class SchedulerAlertService:
         ):
             return []
 
-        minimum = max(0, int(required_minimum_growth_bytes))
-        mature = max(0, int(mature_reclaim_candidates))
-        fingerprint = _normalize_rejection_fingerprint(rejection_fingerprint)
         if (
-            not bool(getattr(transition, "transitioned", False))
-            and fingerprint in {"", "not_evaluated"}
+            reclaim_context is None
+            or str(reclaim_context.evaluation_status) != "live_evaluated"
+            or bool(reclaim_context.dry_run)
+            or not bool(reclaim_context.capacity_pressure_remaining)
         ):
             return []
+
+        minimum = max(0, int(required_minimum_growth_bytes))
+        planned = max(0, int(reclaim_context.planned))
+        reclaimed = max(0, int(reclaim_context.reclaimed))
+        message_state = "reclaiming" if reclaimed > 0 else "manual"
+        rejection_counts = dict(
+            sorted(
+                (
+                    str(reason).strip(),
+                    max(0, int(count or 0)),
+                )
+                for reason, count in dict(reclaim_context.rejection_counts).items()
+                if str(reason).strip()
+            )[:32]
+        )
+        fingerprint = _normalize_rejection_fingerprint(
+            "|".join(
+                f"{reason}:{count}" for reason, count in rejection_counts.items()
+            )
+            or reclaim_context.rejection_fingerprint
+        )
+        errors_summary = [
+            str(error)[:200]
+            for error in tuple(reclaim_context.errors_summary)[:3]
+        ]
         candidates = [
             {
                 "hash": str(candidate.get("hash") or ""),
@@ -167,47 +206,57 @@ class SchedulerAlertService:
         payload = {
             "state": str(getattr(transition, "state", "")),
             "reason": str(getattr(transition, "reason", "")),
-            "assessment_generation": int(
-                getattr(transition, "assessment_generation", 0) or 0
+            "entered_at": int(getattr(transition, "entered_at", 0) or 0),
+            "assessment_generation": max(
+                0, int(reclaim_context.assessment_generation)
             ),
             "required_minimum_growth_bytes": minimum,
             "top_manual_candidates": candidates,
-            "mature_reclaim_candidates": mature,
+            "evaluation_status": "live_evaluated",
+            "message_state": message_state,
+            "dry_run": False,
+            "planned": planned,
+            "reclaimed": reclaimed,
+            "errors_count": max(0, int(reclaim_context.errors_count)),
+            "errors_summary": errors_summary,
+            "rejection_counts": rejection_counts,
             "rejection_fingerprint": fingerprint,
+            "capacity_pressure_remaining": True,
+            "post_reclaim_free_bytes": (
+                None
+                if reclaim_context.post_reclaim_free_bytes is None
+                else max(0, int(reclaim_context.post_reclaim_free_bytes))
+            ),
         }
         message = (
             "可用空间不足，已暂停启动新任务；系统正在安全释放无效文件。"
-            if mature > 0
+            if message_state == "reclaiming"
             else "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
         )
         entered_at = int(getattr(transition, "entered_at", 0) or 0)
-        fingerprint_digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+        dedupe_state = (
+            f"{fingerprint}|message_state:{message_state}|"
+            "evaluation_status:live_evaluated"
+        )
+        fingerprint_digest = hashlib.sha256(
+            dedupe_state.encode("utf-8")
+        ).hexdigest()[:16]
         ids: list[int] = []
         for chat_id in self.config.chat_ids:
             dedupe_key = (
                 f"scheduler-alert:capacity-deadlock:{chat_id}:"
                 f"{entered_at}:{fingerprint_digest}"
             )
-            con = readonly_connect(self.repo.state_db)
-            try:
-                exists = con.execute(
-                    "select 1 from bot_notifications where dedupe_key=?",
-                    (dedupe_key,),
-                ).fetchone()
-            finally:
-                con.close()
-            if exists is not None:
-                continue
-            ids.append(
-                self.repo.enqueue(
-                    chat_id=chat_id,
-                    topic="capacity_deadlock",
-                    message=message,
-                    level="critical",
-                    payload=payload,
-                    dedupe_key=dedupe_key,
-                )
+            notification_id, inserted = self.repo.enqueue_with_status(
+                chat_id=chat_id,
+                topic="capacity_deadlock",
+                message=message,
+                level="critical",
+                payload=payload,
+                dedupe_key=dedupe_key,
             )
+            if inserted:
+                ids.append(notification_id)
         return ids
 
     def _broadcast(self, *, topic: str, level: str, message: str, payload: dict[str, Any], dedupe_topic: str, bucket: int) -> list[int]:

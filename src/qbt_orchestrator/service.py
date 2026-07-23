@@ -10,7 +10,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .alerts import SchedulerAlertConfig, SchedulerAlertService
+from .alerts import (
+    CapacityReclaimAlertContext,
+    SchedulerAlertConfig,
+    SchedulerAlertService,
+)
 from .budget import calculate_growth_budget, resource_claims_from_rows
 from .capacity_assessment import (
     CapacityAssessmentBuilder,
@@ -63,25 +67,67 @@ CAPACITY_RECOVERY_PREFLIGHT_MAX_ROUNDS = 8
 
 def _capacity_deadlock_alert_context(
     capacity_reclaim_payload: Mapping[str, Any] | None,
-) -> tuple[int, str]:
+    *,
+    assessment_generation: int,
+    post_reclaim_free_bytes: int | None,
+    target_free_bytes: int,
+) -> CapacityReclaimAlertContext:
     if capacity_reclaim_payload is None:
-        return 0, "not_evaluated"
+        return CapacityReclaimAlertContext(
+            evaluation_status="not_evaluated",
+            dry_run=False,
+            planned=0,
+            reclaimed=0,
+            errors_count=0,
+            errors_summary=(),
+            rejection_counts={},
+            rejection_fingerprint="not_evaluated",
+            assessment_generation=max(0, int(assessment_generation)),
+            capacity_pressure_remaining=True,
+            post_reclaim_free_bytes=None,
+        )
 
-    mature_reclaim_candidates = max(
-        0,
-        int(capacity_reclaim_payload.get("planned") or 0),
-        int(capacity_reclaim_payload.get("reclaimed") or 0),
-    )
-    rejection_counts = capacity_reclaim_payload.get("rejection_counts") or {}
-    normalized_counts = sorted(
-        (str(reason).strip(), max(0, int(count or 0)))
-        for reason, count in rejection_counts.items()
-        if str(reason).strip()
+    dry_run = bool(capacity_reclaim_payload.get("dry_run"))
+    evaluation_status = "dry_run" if dry_run else "live_evaluated"
+    planned = max(0, int(capacity_reclaim_payload.get("planned") or 0))
+    reclaimed = max(0, int(capacity_reclaim_payload.get("reclaimed") or 0))
+    raw_rejection_counts = capacity_reclaim_payload.get("rejection_counts") or {}
+    rejection_counts = dict(
+        sorted(
+            (str(reason).strip(), max(0, int(count or 0)))
+            for reason, count in dict(raw_rejection_counts).items()
+            if str(reason).strip()
+        )[:32]
     )
     rejection_fingerprint = "|".join(
-        f"{reason}:{count}" for reason, count in normalized_counts
+        f"{reason}:{count}" for reason, count in rejection_counts.items()
     )
-    return mature_reclaim_candidates, rejection_fingerprint
+    raw_errors = capacity_reclaim_payload.get("errors") or []
+    if not isinstance(raw_errors, (list, tuple)):
+        raw_errors = [raw_errors]
+    errors_summary = tuple(str(error)[:200] for error in raw_errors[:3])
+    pressure_remaining = (
+        True
+        if post_reclaim_free_bytes is None
+        else int(post_reclaim_free_bytes) < int(target_free_bytes)
+    )
+    return CapacityReclaimAlertContext(
+        evaluation_status=evaluation_status,
+        dry_run=dry_run,
+        planned=planned,
+        reclaimed=reclaimed,
+        errors_count=len(raw_errors),
+        errors_summary=errors_summary,
+        rejection_counts=rejection_counts,
+        rejection_fingerprint=rejection_fingerprint,
+        assessment_generation=max(0, int(assessment_generation)),
+        capacity_pressure_remaining=pressure_remaining,
+        post_reclaim_free_bytes=(
+            None
+            if post_reclaim_free_bytes is None
+            else max(0, int(post_reclaim_free_bytes))
+        ),
+    )
 
 
 @dataclass
@@ -753,6 +799,7 @@ class DaemonRuntime:
             sync_healthy=sync_healthy,
         )
         capacity_reclaim_payload = None
+        post_reclaim_free_bytes = None
         if (
             self.capacity_reclaimer is not None
             and sync_healthy
@@ -775,9 +822,46 @@ class DaemonRuntime:
             )
             capacity_reclaim_payload = reclaim_result.as_dict()
             self._last_capacity_reclaim_at = planner_now
+            if (
+                not bool(capacity_reclaim_payload.get("dry_run"))
+                and int(capacity_reclaim_payload.get("reclaimed") or 0) > 0
+            ):
+                post_reclaim_free_bytes = int(self.free_bytes_provider())
+                capacity_details = dict(capacity_details)
+                capacity_details.update(
+                    {
+                        "post_reclaim_free_bytes": post_reclaim_free_bytes,
+                        "capacity_pressure_remaining": (
+                            post_reclaim_free_bytes < assessment.target_free_bytes
+                        ),
+                    }
+                )
+                if post_reclaim_free_bytes >= assessment.target_free_bytes:
+                    capacity_result = CapacityResult(
+                        "progress_possible",
+                        "capacity_pressure_relieved_after_reclaim",
+                        actions=[],
+                    )
+                    capacity_transition = self.capacity_state_store.persist(
+                        scheduler_mode,
+                        capacity_result,
+                        capacity_details,
+                        assessment_generation=assessment.generation,
+                    )
+        reclaim_alert_context = _capacity_deadlock_alert_context(
+            capacity_reclaim_payload,
+            assessment_generation=assessment.generation,
+            post_reclaim_free_bytes=post_reclaim_free_bytes,
+            target_free_bytes=assessment.target_free_bytes,
+        )
+        alert_free_bytes = (
+            free_bytes
+            if post_reclaim_free_bytes is None
+            else post_reclaim_free_bytes
+        )
         alert_ids = self.scheduler_alert_service.evaluate_and_enqueue(
             snapshots=assessment_snapshots,
-            free_bytes=free_bytes,
+            free_bytes=alert_free_bytes,
             disk_floor_bytes=self.disk_floor_bytes,
             recovery_enter_bytes=self.recovery_enter_bytes,
             emergency_floor_bytes=self.emergency_floor_bytes,
@@ -785,16 +869,12 @@ class DaemonRuntime:
             sync_healthy=sync_healthy,
         )
         if hasattr(self.scheduler_alert_service, "enqueue_capacity_deadlock"):
-            mature_reclaim_candidates, rejection_fingerprint = (
-                _capacity_deadlock_alert_context(capacity_reclaim_payload)
-            )
             alert_ids.extend(
                 self.scheduler_alert_service.enqueue_capacity_deadlock(
                     capacity_transition,
                     required_minimum_growth_bytes=capacity_observation.required_minimum_growth_bytes,
                     top_manual_candidates=list(capacity_observation.top_manual_candidates),
-                    mature_reclaim_candidates=mature_reclaim_candidates,
-                    rejection_fingerprint=rejection_fingerprint,
+                    reclaim_context=reclaim_alert_context,
                 )
             )
         capacity_payload = {

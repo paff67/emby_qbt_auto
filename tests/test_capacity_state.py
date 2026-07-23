@@ -6,6 +6,7 @@ import json
 import sqlite3
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -329,9 +330,30 @@ def test_capacity_state_persists_assessment_generation(tmp_path):
     assert row == (9,)
 
 
+def test_capacity_state_same_second_reentry_gets_a_new_episode_identity(tmp_path):
+    from qbt_orchestrator.capacity_state import CapacityResult, CapacityStateStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "same-second.sqlite"
+    migrate(db, dry_run=False)
+    store = CapacityStateStore(db, now=lambda: 100)
+
+    first = store.persist("drain", CapacityResult("capacity_deadlock", "none"))
+    recovered = store.persist("normal", CapacityResult("progress_possible", "work"))
+    reentered = store.persist("drain", CapacityResult("capacity_deadlock", "none"))
+
+    assert first.entered_at == 100
+    assert recovered.entered_at == 101
+    assert reentered.entered_at == 102
+
+
 @pytest.fixture
 def alert_fixture(tmp_path):
-    from qbt_orchestrator.alerts import SchedulerAlertConfig, SchedulerAlertService
+    from qbt_orchestrator.alerts import (
+        CapacityReclaimAlertContext,
+        SchedulerAlertConfig,
+        SchedulerAlertService,
+    )
     from qbt_orchestrator.capacity_state import CapacityTransition
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import BotNotificationRepository
@@ -367,111 +389,237 @@ def alert_fixture(tmp_path):
         values.update(overrides)
         return CapacityTransition(**values)
 
+    def context(**overrides):
+        values = {
+            "evaluation_status": "live_evaluated",
+            "dry_run": False,
+            "planned": 0,
+            "reclaimed": 0,
+            "errors_count": 0,
+            "errors_summary": (),
+            "rejection_counts": {
+                "availability_unknown": 3,
+                "protected_tag": 1,
+            },
+            "rejection_fingerprint": "availability_unknown:3|protected_tag:1",
+            "assessment_generation": 8,
+            "capacity_pressure_remaining": True,
+            "post_reclaim_free_bytes": None,
+        }
+        values.update(overrides)
+        return CapacityReclaimAlertContext(**values)
+
     return SimpleNamespace(
         db=db,
         repo=repo,
         service=service,
         transition=transition,
+        context=context,
         notifications=repo.list_all,
     )
 
 
-def test_capacity_deadlock_without_candidate_uses_natural_language_and_dedupes(alert_fixture):
-    transition = alert_fixture.transition(
-        state="capacity_deadlock", entered_at=100, assessment_generation=8
-    )
+@pytest.mark.parametrize(
+    "context",
+    [
+        pytest.param(
+            {"evaluation_status": "not_evaluated"},
+            id="not-evaluated",
+        ),
+        pytest.param(
+            {
+                "evaluation_status": "dry_run",
+                "dry_run": True,
+                "planned": 1,
+            },
+            id="dry-run",
+        ),
+        pytest.param(
+            {
+                "evaluation_status": "live_evaluated",
+                "reclaimed": 1,
+                "capacity_pressure_remaining": False,
+                "post_reclaim_free_bytes": 6 * GIB,
+            },
+            id="pressure-relieved",
+        ),
+    ],
+)
+def test_capacity_deadlock_does_not_alert_without_live_evaluation(alert_fixture, context):
+    assert alert_fixture.service.enqueue_capacity_deadlock(
+        alert_fixture.transition(),
+        required_minimum_growth_bytes=1000,
+        top_manual_candidates=[],
+        reclaim_context=alert_fixture.context(**context),
+    ) == []
+    assert alert_fixture.notifications() == []
+
+
+def test_live_capacity_evaluation_without_successful_reclaim_uses_manual_message_and_dedupes(alert_fixture):
+    transition = alert_fixture.transition()
+    context = alert_fixture.context(planned=1, reclaimed=0)
 
     first = alert_fixture.service.enqueue_capacity_deadlock(
         transition,
         required_minimum_growth_bytes=1000,
         top_manual_candidates=[],
-        mature_reclaim_candidates=0,
-        rejection_fingerprint="availability_unknown:3|protected_tag:1",
+        reclaim_context=context,
     )
     second = alert_fixture.service.enqueue_capacity_deadlock(
         transition,
         required_minimum_growth_bytes=1000,
         top_manual_candidates=[],
-        mature_reclaim_candidates=0,
-        rejection_fingerprint="availability_unknown:3|protected_tag:1",
+        reclaim_context=alert_fixture.context(
+            planned=1,
+            reclaimed=0,
+            rejection_counts={
+                "protected_tag": 1,
+                "availability_unknown": 3,
+            },
+            rejection_fingerprint="protected_tag:1|availability_unknown:3",
+        ),
     )
 
     assert len(first) == 1
     assert second == []
     row = alert_fixture.notifications()[0]
+    dedupe_state = (
+        "availability_unknown:3|protected_tag:1|"
+        "message_state:manual|evaluation_status:live_evaluated"
+    )
     digest = hashlib.sha256(
-        b"availability_unknown:3|protected_tag:1"
+        dedupe_state.encode("utf-8")
     ).hexdigest()[:16]
     assert row["dedupe_key"] == f"scheduler-alert:capacity-deadlock:123:100:{digest}"
-    assert "当前没有能够安全回收的任务，需要人工处理" in row["message"]
-    assert "capacity_deadlock" not in row["message"]
+    assert row["message"] == "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
     payload = json.loads(row["payload_json"])
-    assert payload == {
-        "state": "capacity_deadlock",
-        "reason": "no_finishable_or_releasing_work",
-        "assessment_generation": 8,
-        "required_minimum_growth_bytes": 1000,
-        "top_manual_candidates": [],
-        "mature_reclaim_candidates": 0,
-        "rejection_fingerprint": "availability_unknown:3|protected_tag:1",
+    assert payload["entered_at"] == 100
+    assert payload["evaluation_status"] == "live_evaluated"
+    assert payload["message_state"] == "manual"
+    assert payload["dry_run"] is False
+    assert payload["planned"] == 1
+    assert payload["reclaimed"] == 0
+    assert payload["errors_count"] == 0
+    assert payload["errors_summary"] == []
+    assert payload["rejection_counts"] == {
+        "availability_unknown": 3,
+        "protected_tag": 1,
     }
+    assert payload["assessment_generation"] == 8
+    assert "capacity_deadlock" not in row["message"]
 
 
-def test_capacity_deadlock_with_mature_reclaim_uses_natural_language_and_normalizes_fingerprint(alert_fixture):
+def test_live_successful_reclaim_uses_reclaiming_message_and_state_change_is_not_deduped(alert_fixture):
     transition = alert_fixture.transition()
 
-    first = alert_fixture.service.enqueue_capacity_deadlock(
+    manual = alert_fixture.service.enqueue_capacity_deadlock(
         transition,
         required_minimum_growth_bytes=2 * GIB,
-        top_manual_candidates=[
-            {"hash": "h1", "required_growth_bytes": 2 * GIB},
-        ],
-        mature_reclaim_candidates=1,
-        rejection_fingerprint=" protected_tag:1 | availability_unknown:3 ",
+        top_manual_candidates=[],
+        reclaim_context=alert_fixture.context(planned=1, reclaimed=0),
+    )
+    reclaiming = alert_fixture.service.enqueue_capacity_deadlock(
+        alert_fixture.transition(transitioned=False),
+        required_minimum_growth_bytes=2 * GIB,
+        top_manual_candidates=[],
+        reclaim_context=alert_fixture.context(planned=1, reclaimed=1),
     )
     repeated = alert_fixture.service.enqueue_capacity_deadlock(
         alert_fixture.transition(transitioned=False),
         required_minimum_growth_bytes=2 * GIB,
-        top_manual_candidates=[
-            {"hash": "h1", "required_growth_bytes": 2 * GIB},
-        ],
-        mature_reclaim_candidates=1,
-        rejection_fingerprint="availability_unknown:3|protected_tag:1",
+        top_manual_candidates=[],
+        reclaim_context=alert_fixture.context(planned=1, reclaimed=1),
     )
-    skipped_reclaim_tick = alert_fixture.service.enqueue_capacity_deadlock(
+
+    assert len(manual) == 1
+    assert len(reclaiming) == 1
+    assert repeated == []
+    rows = alert_fixture.notifications()
+    assert len(rows) == 2
+    assert rows[0]["message"] == "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
+    assert rows[1]["message"] == "可用空间不足，已暂停启动新任务；系统正在安全释放无效文件。"
+    assert rows[0]["dedupe_key"] != rows[1]["dedupe_key"]
+    assert json.loads(rows[1]["payload_json"])["message_state"] == "reclaiming"
+
+
+def test_live_reclaiming_to_manual_and_rejection_changes_create_new_notifications(alert_fixture):
+    transition = alert_fixture.transition()
+
+    reclaiming = alert_fixture.service.enqueue_capacity_deadlock(
+        transition,
+        required_minimum_growth_bytes=0,
+        top_manual_candidates=[],
+        reclaim_context=alert_fixture.context(planned=1, reclaimed=1),
+    )
+    manual = alert_fixture.service.enqueue_capacity_deadlock(
         alert_fixture.transition(transitioned=False),
-        required_minimum_growth_bytes=2 * GIB,
-        top_manual_candidates=[
-            {"hash": "h1", "required_growth_bytes": 2 * GIB},
-        ],
-        mature_reclaim_candidates=0,
-        rejection_fingerprint="not_evaluated",
+        required_minimum_growth_bytes=0,
+        top_manual_candidates=[],
+        reclaim_context=alert_fixture.context(planned=1, reclaimed=0),
     )
     changed = alert_fixture.service.enqueue_capacity_deadlock(
         alert_fixture.transition(transitioned=False),
-        required_minimum_growth_bytes=2 * GIB,
-        top_manual_candidates=[
-            {"hash": "h1", "required_growth_bytes": 2 * GIB},
-        ],
-        mature_reclaim_candidates=1,
-        rejection_fingerprint="availability_unknown:2|protected_tag:2",
+        required_minimum_growth_bytes=0,
+        top_manual_candidates=[],
+        reclaim_context=alert_fixture.context(
+            planned=1,
+            reclaimed=0,
+            rejection_counts={"protected_tag": 2},
+            rejection_fingerprint="protected_tag:2",
+        ),
+    )
+    repeated = alert_fixture.service.enqueue_capacity_deadlock(
+        alert_fixture.transition(transitioned=False),
+        required_minimum_growth_bytes=0,
+        top_manual_candidates=[],
+        reclaim_context=alert_fixture.context(
+            planned=1,
+            reclaimed=0,
+            rejection_counts={"protected_tag": 2},
+            rejection_fingerprint="protected_tag:2",
+        ),
     )
 
-    assert len(first) == 1
+    assert all(len(result) == 1 for result in (reclaiming, manual, changed))
     assert repeated == []
-    assert skipped_reclaim_tick == []
-    assert len(changed) == 1
-    rows = alert_fixture.notifications()
-    assert len(rows) == 2
-    assert all(
-        row["message"] == "可用空间不足，已暂停启动新任务；系统正在安全释放无效文件。"
-        for row in rows
-    )
-    first_payload = json.loads(rows[0]["payload_json"])
-    assert first_payload["rejection_fingerprint"] == "availability_unknown:3|protected_tag:1"
-    assert first_payload["top_manual_candidates"] == [
-        {"hash": "h1", "required_growth_bytes": 2 * GIB}
-    ]
+    assert len(alert_fixture.notifications()) == 3
+
+
+def test_capacity_alert_payload_bounds_and_redacts_error_summary(alert_fixture):
+    errors = tuple(["Bearer abcdef"] + ["x" * 500] * 5)
+
+    assert len(
+        alert_fixture.service.enqueue_capacity_deadlock(
+            alert_fixture.transition(),
+            required_minimum_growth_bytes=0,
+            top_manual_candidates=[],
+            reclaim_context=alert_fixture.context(
+                errors_count=len(errors),
+                errors_summary=errors,
+            ),
+        )
+    ) == 1
+    payload = json.loads(alert_fixture.notifications()[0]["payload_json"])
+    assert payload["errors_count"] == 6
+    assert len(payload["errors_summary"]) == 3
+    assert all(len(item) <= 200 for item in payload["errors_summary"])
+    assert payload["errors_summary"][0] == "Bearer <redacted>"
+
+
+def test_concurrent_capacity_alert_enqueue_returns_only_the_inserted_notification(alert_fixture):
+    def enqueue(_index):
+        return alert_fixture.service.enqueue_capacity_deadlock(
+            alert_fixture.transition(),
+            required_minimum_growth_bytes=0,
+            top_manual_candidates=[],
+            reclaim_context=alert_fixture.context(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(enqueue, range(2)))
+
+    assert sorted(len(result) for result in results) == [0, 1]
+    assert len(alert_fixture.notifications()) == 1
 
 
 def test_capacity_deadlock_dedupe_is_per_episode_and_chat(tmp_path):
@@ -508,9 +656,23 @@ def test_capacity_deadlock_dedupe_is_per_episode_and_chat(tmp_path):
     kwargs = {
         "required_minimum_growth_bytes": 0,
         "top_manual_candidates": [],
-        "mature_reclaim_candidates": 0,
-        "rejection_fingerprint": "not_evaluated",
+        "reclaim_context": None,
     }
+    from qbt_orchestrator.alerts import CapacityReclaimAlertContext
+
+    kwargs["reclaim_context"] = CapacityReclaimAlertContext(
+        evaluation_status="live_evaluated",
+        dry_run=False,
+        planned=1,
+        reclaimed=0,
+        errors_count=0,
+        errors_summary=(),
+        rejection_counts={},
+        rejection_fingerprint="",
+        assessment_generation=8,
+        capacity_pressure_remaining=True,
+        post_reclaim_free_bytes=None,
+    )
     assert len(service.enqueue_capacity_deadlock(transition(100), **kwargs)) == 2
     assert service.enqueue_capacity_deadlock(transition(100), **kwargs) == []
     assert len(service.enqueue_capacity_deadlock(transition(101), **kwargs)) == 2
@@ -552,7 +714,7 @@ def test_capacity_alert_ignores_recovered_state():
         ) == []
 
 
-def test_daemon_persists_deadlock_without_actions_and_alerts_once_until_recovery():
+def test_daemon_persists_deadlock_without_actions_and_does_not_alert_without_reclaim_evaluation():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime
     from tests.test_daemon_runtime import FakeExecutor, FakeQbt
@@ -625,44 +787,82 @@ def test_daemon_persists_deadlock_without_actions_and_alerts_once_until_recovery
         finally:
             con.close()
         assert capacity["state"] == "progress_possible"
-        assert len(notices) == 1
-        assert notices[0]["message"] == (
-            "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
-        )
-        notice_payload = json.loads(notices[0]["payload_json"])
-        assert notice_payload["rejection_fingerprint"] == "not_evaluated"
-        assert notice_payload["assessment_generation"] == first["capacity"]["assessment_generation"]
-        assert "capacity_deadlock" not in notices[0]["message"]
+        assert notices == []
 
 
 @pytest.mark.parametrize(
-    ("payload", "expected"),
+    ("payload", "expected_status", "expected_planned", "expected_reclaimed"),
     [
-        (None, (0, "not_evaluated")),
+        (None, "not_evaluated", 0, 0),
+        (
+            {"dry_run": True, "planned": 1, "reclaimed": 0},
+            "dry_run",
+            1,
+            0,
+        ),
         (
             {
+                "dry_run": False,
                 "planned": 2,
                 "reclaimed": 1,
                 "rejection_counts": {
                     "protected_tag": 1,
                     "availability_unknown": 3,
                 },
+                "errors": ["first", "second"],
             },
-            (2, "availability_unknown:3|protected_tag:1"),
-        ),
-        (
-            {"planned": 0, "reclaimed": 1, "rejection_counts": {}},
-            (1, ""),
+            "live_evaluated",
+            2,
+            1,
         ),
     ],
 )
-def test_capacity_deadlock_alert_context_maps_reclaim_result_stably(payload, expected):
+def test_capacity_deadlock_alert_context_is_structured(
+    payload, expected_status, expected_planned, expected_reclaimed
+):
     from qbt_orchestrator.service import _capacity_deadlock_alert_context
 
-    assert _capacity_deadlock_alert_context(payload) == expected
+    context = _capacity_deadlock_alert_context(
+        payload,
+        assessment_generation=9,
+        post_reclaim_free_bytes=4 * GIB if expected_reclaimed else None,
+        target_free_bytes=5 * GIB,
+    )
+
+    assert context.evaluation_status == expected_status
+    assert context.planned == expected_planned
+    assert context.reclaimed == expected_reclaimed
+    assert context.assessment_generation == 9
+    if expected_status == "live_evaluated":
+        assert context.rejection_fingerprint == (
+            "availability_unknown:3|protected_tag:1"
+        )
+        assert context.errors_count == 2
+        assert context.errors_summary == ("first", "second")
+        assert context.capacity_pressure_remaining is True
 
 
-def test_daemon_marks_stale_unavailable_finish_deadlocked_under_capacity_pressure():
+@pytest.mark.parametrize(
+    (
+        "reclaimed",
+        "post_reclaim_free_bytes",
+        "expected_capacity_state",
+        "expected_alerts",
+        "expected_message_state",
+    ),
+    [
+        (0, int(3.25 * GIB), "capacity_deadlock", 1, "manual"),
+        (1, int(3.25 * GIB), "capacity_deadlock", 1, "reclaiming"),
+        (1, 6 * GIB, "progress_possible", 0, "reclaiming"),
+    ],
+)
+def test_daemon_rechecks_pressure_after_live_reclaim(
+    reclaimed,
+    post_reclaim_free_bytes,
+    expected_capacity_state,
+    expected_alerts,
+    expected_message_state,
+):
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime
     from tests.test_daemon_runtime import FakeExecutor, FakeQbt
@@ -714,46 +914,51 @@ def test_daemon_marks_stale_unavailable_finish_deadlocked_under_capacity_pressur
         )
         con.commit()
         con.close()
+        free = [int(3.25 * GIB)]
+
         class RecordingReclaimer:
             def __init__(self):
                 self.calls = []
 
             def run(self, snapshots, **kwargs):
                 self.calls.append((snapshots, kwargs))
+                free[0] = post_reclaim_free_bytes
 
                 class Result:
                     def as_dict(self):
                         return {
                             "dry_run": False,
                             "planned": 2,
-                            "reclaimed": 1,
+                            "reclaimed": reclaimed,
                             "candidates": [{"hash": "dead"}],
                             "rejection_counts": {
                                 "protected_tag": 1,
                                 "availability_unknown": 3,
                             },
+                            "errors": [],
+                            "assessment_generation": 1,
                         }
 
                 return Result()
 
         class RecordingAlerts:
-            def __init__(self):
+            def __init__(self, delegate):
+                self.delegate = delegate
                 self.deadlocks = []
 
-            def evaluate_and_enqueue(self, **_kwargs):
-                return []
+            def evaluate_and_enqueue(self, **kwargs):
+                return self.delegate.evaluate_and_enqueue(**kwargs)
 
             def enqueue_capacity_deadlock(self, transition, **kwargs):
                 self.deadlocks.append((transition, kwargs))
-                return []
+                return self.delegate.enqueue_capacity_deadlock(transition, **kwargs)
 
         reclaimer = RecordingReclaimer()
-        alerts = RecordingAlerts()
         daemon = DaemonRuntime(
             state_db=db,
             qbt=StuckFinishQbt(),
             executor=FakeExecutor(),
-            free_bytes_provider=lambda: int(3.25 * GIB),
+            free_bytes_provider=lambda: free[0],
             dry_run=True,
             safety_interval=0,
             disk_floor_bytes=3 * GIB,
@@ -765,14 +970,18 @@ def test_daemon_marks_stale_unavailable_finish_deadlocked_under_capacity_pressur
             capacity_viability_stale_sec=1_800,
             capacity_reclaimer=reclaimer,
             scheduler_engine_mode="live",
+            scheduler_alert_chat_ids=["123"],
+            scheduler_alerts_enabled=True,
+            capacity_deadlock_alerts_enabled=True,
         )
+        alerts = RecordingAlerts(daemon.scheduler_alert_service)
         daemon.scheduler_alert_service = alerts
 
         daemon.tick_safety()
         result = daemon.planner_tick()
 
         assert result["capacity"]["scheduler_mode"] == "normal"
-        assert result["capacity"]["state"] == "capacity_deadlock"
+        assert result["capacity"]["state"] == expected_capacity_state
         assert result["capacity"]["details"]["feasible_full_finish"] == 0
         assert result["capacity"]["details"]["nonviable_finish"] == 1
         assert result["planner"]["selected_hashes"] == []
@@ -784,11 +993,34 @@ def test_daemon_marks_stale_unavailable_finish_deadlocked_under_capacity_pressur
         }
         assert len(alerts.deadlocks) == 1
         transition, alert_kwargs = alerts.deadlocks[0]
-        assert transition.state == "capacity_deadlock"
-        assert alert_kwargs["mature_reclaim_candidates"] == 2
-        assert alert_kwargs["rejection_fingerprint"] == (
+        assert transition.state == expected_capacity_state
+        context = alert_kwargs["reclaim_context"]
+        assert context.evaluation_status == "live_evaluated"
+        assert context.dry_run is False
+        assert context.planned == 2
+        assert context.reclaimed == reclaimed
+        assert context.rejection_fingerprint == (
             "availability_unknown:3|protected_tag:1"
         )
+        assert context.capacity_pressure_remaining is (expected_alerts == 1)
+        assert result["capacity"]["assessment_generation"] == 1
+        assert result["capacity_reclaim"]["assessment_generation"] == 1
+        con = sqlite3.connect(db)
+        try:
+            capacity_alert_count = con.execute(
+                "select count(*) from bot_notifications where topic='capacity_deadlock'"
+            ).fetchone()[0]
+            capacity_alert_row = con.execute(
+                "select payload_json from bot_notifications "
+                "where topic='capacity_deadlock'"
+            ).fetchone()
+        finally:
+            con.close()
+        assert capacity_alert_count == expected_alerts
+        if expected_alerts:
+            assert capacity_alert_row is not None
+            payload = json.loads(capacity_alert_row[0])
+            assert payload["message_state"] == expected_message_state
 
 
 def test_daemon_records_redacted_effective_scheduler_config_at_startup():

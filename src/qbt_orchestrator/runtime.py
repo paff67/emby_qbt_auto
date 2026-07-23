@@ -1584,25 +1584,46 @@ class BotNotificationRepository:
         payload: dict[str, Any] | None = None,
         dedupe_key: str | None = None,
     ) -> int:
+        notification_id, _inserted = self.enqueue_with_status(
+            chat_id=chat_id,
+            topic=topic,
+            message=message,
+            level=level,
+            payload=payload,
+            dedupe_key=dedupe_key,
+        )
+        return notification_id
+
+    def enqueue_with_status(
+        self,
+        chat_id: int | str,
+        topic: str,
+        message: str,
+        level: str = "info",
+        payload: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+    ) -> tuple[int, bool]:
         now = int(self.now())
         safe_message = str(redact(message))
         safe_payload = json.dumps(redact(payload or {}), ensure_ascii=False)
-        def txn(con: sqlite3.Connection) -> int:
+
+        def txn(con: sqlite3.Connection) -> tuple[int, bool]:
             if dedupe_key:
-                con.execute(
+                cur = con.execute(
                     "insert or ignore into bot_notifications(dedupe_key,chat_id,level,topic,message,payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
                     (str(dedupe_key), str(chat_id), level, topic, safe_message, safe_payload, "queued", 0, now, now),
                 )
                 row = con.execute("select id from bot_notifications where dedupe_key=?", (str(dedupe_key),)).fetchone()
                 assert row is not None
-                return int(row["id"])
+                return int(row["id"]), int(cur.rowcount) == 1
             cur = con.execute(
                 "insert into bot_notifications(chat_id,level,topic,message,payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
                 (str(chat_id), level, topic, safe_message, safe_payload, "queued", 0, now, now),
             )
-            return int(cur.lastrowid)
+            return int(cur.lastrowid), True
 
-        return int(write_transaction(self.state_db, txn))
+        notification_id, inserted = write_transaction(self.state_db, txn)
+        return int(notification_id), bool(inserted)
 
     def peek_next(self) -> dict[str, Any] | None:
         con = _connect(self.state_db)

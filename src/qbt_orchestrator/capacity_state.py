@@ -323,7 +323,12 @@ class CapacityStateStore:
             previous = con.execute("select state,entered_at from capacity_state where id=1").fetchone()
             previous_state = str(previous["state"]) if previous else None
             transitioned = previous_state != str(result.state)
-            entered_at = now if transitioned or previous is None else int(previous["entered_at"])
+            if previous is None:
+                entered_at = now
+            elif transitioned:
+                entered_at = max(now, int(previous["entered_at"]) + 1)
+            else:
+                entered_at = int(previous["entered_at"])
             con.execute(
                 "insert into capacity_state(id,scheduler_mode,state,entered_at,last_evaluated_at,reason,details_json,assessment_generation) "
                 "values(1,?,?,?,?,?,?,?) "
