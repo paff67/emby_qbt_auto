@@ -540,12 +540,29 @@ class DeadPartialReclaimer:
             if host_path != Path(str(candidate["host_path"])):
                 reject("path_changed")
                 continue
-            fresh_paths, inventory_reason = self._fresh_path_inventory(
-                torrent_hash,
-                host_path,
-            )
+            (
+                fresh_paths,
+                inventory_candidate,
+                inventory_reason,
+            ) = self._fresh_path_inventory(torrent_hash)
             if inventory_reason is not None:
                 reject(inventory_reason)
+                continue
+            assert inventory_candidate is not None
+            reason = self._live_torrent_rejection(
+                inventory_candidate,
+                candidate=candidate,
+                assessment=assessment,
+            )
+            if reason is not None:
+                reject(reason)
+                continue
+            inventory_host_path = fresh_paths.get(torrent_hash.strip().lower())
+            if inventory_host_path is None:
+                reject("path_inventory_failed")
+                continue
+            if inventory_host_path != host_path:
+                reject("path_changed")
                 continue
             if self._overlaps_other(torrent_hash, host_path, fresh_paths):
                 reject("path_overlap")
@@ -907,49 +924,47 @@ class DeadPartialReclaimer:
     def _fresh_path_inventory(
         self,
         torrent_hash: str,
-        current_host_path: Path,
-    ) -> tuple[dict[str, Path], str | None]:
+    ) -> tuple[dict[str, Path], dict[str, Any] | None, str | None]:
         try:
             payload = self.executor.qbt.get_maindata(0)
         except Exception:
-            return {}, "path_inventory_failed"
+            return {}, None, "path_inventory_failed"
         if not isinstance(payload, Mapping) or payload.get("full_update") is not True:
-            return {}, "path_inventory_failed"
+            return {}, None, "path_inventory_failed"
         torrents = payload.get("torrents")
         if not isinstance(torrents, Mapping):
-            return {}, "path_inventory_failed"
+            return {}, None, "path_inventory_failed"
 
         expected_hash = str(torrent_hash).strip().lower()
         paths: dict[str, Path] = {}
         identities: set[str] = set()
-        candidate_found = False
+        candidate_row: dict[str, Any] | None = None
         for fallback_hash, raw in torrents.items():
             if not isinstance(raw, Mapping):
-                return {}, "path_inventory_failed"
+                return {}, None, "path_inventory_failed"
             item = dict(raw)
             fallback_identity = str(fallback_hash or "").strip().lower()
             row_identity = str(item.get("hash") or "").strip().lower()
             if row_identity and fallback_identity and row_identity != fallback_identity:
-                return {}, "path_inventory_failed"
+                return {}, None, "path_inventory_failed"
             identity = row_identity or fallback_identity
             if not identity or identity in identities:
-                return {}, "path_inventory_failed"
+                return {}, None, "path_inventory_failed"
             identities.add(identity)
             raw_path = str(item.get("content_path") or "").strip()
             if not raw_path:
-                return {}, "path_inventory_failed"
+                return {}, None, "path_inventory_failed"
             path = self._host_path(raw_path)
             if identity == expected_hash:
                 if path is None:
-                    return {}, "path_inventory_failed"
-                candidate_found = True
-                if path != current_host_path:
-                    return {}, "path_changed"
+                    return {}, None, "path_inventory_failed"
+                item["hash"] = identity
+                candidate_row = item
             if path is not None:
                 paths[identity] = path
-        if not candidate_found:
-            return {}, "path_inventory_failed"
-        return paths, None
+        if candidate_row is None:
+            return {}, None, "path_inventory_failed"
+        return paths, candidate_row, None
 
     def _snapshot_paths(
         self, snapshots: Mapping[str, Mapping[str, Any]]

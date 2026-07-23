@@ -1997,3 +1997,60 @@ def test_fresh_inventory_candidate_path_must_match_live_info(tmp_path):
     assert result.rejection_counts["path_changed"] == 1
     assert payload.exists() and moved.exists()
     _assert_no_capacity_reclaim_audit(db)
+
+
+@pytest.mark.parametrize(
+    ("inventory_change", "reason"),
+    [
+        ({"tags": "auto,hold"}, "protected_tag"),
+        ({"category": "", "tags": ""}, "not_managed"),
+        ({"availability": 1.0}, "complete_source"),
+        ({"num_seeds": 1}, "complete_source"),
+        ({"num_complete": 1}, "complete_source"),
+        ({"completed_bytes": 101}, "progress_resumed"),
+        ({"progress": 0.1}, "progress_resumed"),
+        ({"amount_left": 899}, "progress_resumed"),
+    ],
+)
+def test_fresh_inventory_candidate_evidence_is_revalidated_before_audit(
+    tmp_path, inventory_change, reason
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+
+    class InventoryEvidenceRaceExecutor(RecordingExecutor):
+        def get_maindata(self, rid):
+            assert rid == 0
+            return {
+                "full_update": True,
+                "torrents": {
+                    "h": {**self.info["h"], **inventory_change},
+                },
+            }
+
+    executor = InventoryEvidenceRaceExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts[reason] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
