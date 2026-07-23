@@ -25,12 +25,11 @@ class RecordingExecutor:
         self.posts.append((path, payload))
         if path.endswith("/stop") and self.stop_updates_state:
             torrent_hash = str(payload["hashes"])
-            self.info.setdefault(torrent_hash, {"hash": torrent_hash})["state"] = "stoppedDL"
+            self.info.setdefault(torrent_hash, {})["state"] = "stoppedDL"
 
     def torrent_info(self, torrent_hash):
         torrent_hash = str(torrent_hash)
         current = {
-            "hash": torrent_hash,
             "category": "auto",
             "tags": "auto",
             "state": "stoppedDL",
@@ -288,7 +287,13 @@ def test_dead_partial_reclaimer_live_resets_payload_but_keeps_torrent_record():
         db = root / "state.sqlite"
         migrate(db, dry_run=False)
         _dead_row(db, "dead-one", now)
-        executor = RecordingExecutor()
+        executor = RecordingExecutor(
+            {
+                "dead-one": _snapshot(
+                    "dead-one", content_path="/downloads/incomplete/dead-one"
+                )["dead-one"]
+            }
+        )
         reclaimer = DeadPartialReclaimer(
             db,
             executor,
@@ -610,7 +615,15 @@ def test_dead_partial_reclaimer_reports_reclaimed_bytes_when_recheck_fails():
         migrate(db, dry_run=False)
         _dead_row(db, "dead-one", now)
         reclaimer = DeadPartialReclaimer(
-            db, RecheckFailExecutor(), host_downloads=root,
+            db,
+            RecheckFailExecutor(
+                {
+                    "dead-one": _snapshot(
+                        "dead-one", content_path="/downloads/incomplete/dead-one"
+                    )["dead-one"]
+                }
+            ),
+            host_downloads=root,
             container_downloads="/downloads", managed_root=managed,
             dry_run=False, min_dead_age_sec=3_600, min_reclaim_bytes=1,
             now=lambda: now,
@@ -652,7 +665,13 @@ def test_live_reclaim_persists_torrent_identity_and_queues_magnet_notification()
         _dead_row(db, "dead-one", now)
         reclaimer = DeadPartialReclaimer(
             db,
-            RecordingExecutor(),
+            RecordingExecutor(
+                {
+                    "dead-one": _snapshot(
+                        "dead-one", content_path="/downloads/incomplete/dead-one"
+                    )["dead-one"]
+                }
+            ),
             host_downloads=root,
             container_downloads="/downloads",
             managed_root=managed,
@@ -799,7 +818,13 @@ def test_recheck_failure_is_persisted_and_notified_after_payload_reclaim():
         _dead_row(db, "dead-one", now)
         reclaimer = DeadPartialReclaimer(
             db,
-            RecheckFailExecutor(),
+            RecheckFailExecutor(
+                {
+                    "dead-one": _snapshot(
+                        "dead-one", content_path="/downloads/incomplete/dead-one"
+                    )["dead-one"]
+                }
+            ),
             host_downloads=root,
             container_downloads="/downloads",
             managed_root=managed,
@@ -1514,6 +1539,94 @@ def test_stop_window_completed_growth_is_revalidated_before_audit(tmp_path):
     assert result.planned == 1
     assert result.reclaimed == 0
     assert result.rejection_counts["progress_resumed"] == 1
+    assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h"})]
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+@pytest.mark.parametrize("live_hash", [pytest.param("missing", id="missing-key"), None, "", "   "])
+def test_live_revalidation_fails_closed_when_torrent_hash_is_unknown(
+    tmp_path, live_hash
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    current = {**snapshot, "state": "stoppedDL"}
+    if live_hash == "missing":
+        current.pop("hash")
+    else:
+        current["hash"] = live_hash
+
+    class RawInfoExecutor(RecordingExecutor):
+        def torrent_info(self, torrent_hash):
+            return dict(current)
+
+    executor = RawInfoExecutor({"h": current})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["torrent_identity_unknown"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_stop_window_missing_torrent_hash_is_revalidated_before_audit(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    before_stop = {**snapshot, "state": "downloading"}
+    after_stop = {**snapshot, "state": "stoppedDL", "hash": "   "}
+
+    class StopWindowExecutor(RecordingExecutor):
+        def __init__(self):
+            super().__init__({"h": before_stop})
+            self.responses = [before_stop, after_stop]
+
+        def torrent_info(self, torrent_hash):
+            return dict(self.responses.pop(0))
+
+    executor = StopWindowExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.planned == 1
+    assert result.reclaimed == 0
+    assert result.rejection_counts["torrent_identity_unknown"] == 1
     assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h"})]
     assert payload.exists()
     _assert_no_capacity_reclaim_audit(db)

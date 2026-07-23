@@ -747,7 +747,9 @@ class DeadPartialReclaimer:
     ) -> str | None:
         expected_hash = str(candidate["hash"]).strip().lower()
         current_hash = str(current.get("hash") or "").strip().lower()
-        if current_hash and current_hash != expected_hash:
+        if not current_hash:
+            return "torrent_identity_unknown"
+        if current_hash != expected_hash:
             return "torrent_identity_changed"
         evidence = self._assessment_torrent_evidence(assessment, expected_hash)
         if evidence is None:
