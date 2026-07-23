@@ -95,6 +95,81 @@ def test_emby_client_posts_precise_media_updated_payload_and_blocks_root():
         raise AssertionError("library root refresh must be blocked")
 
 
+def test_emby_client_notifies_then_recursively_refreshes_exact_folder():
+    from qbt_orchestrator.integrations.emby import EmbyClient
+
+    posts = []
+    gets = []
+
+    def transport(url, payload, headers, timeout):
+        posts.append((url, payload, headers, timeout))
+        return {}
+
+    def get_transport(url, headers, timeout):
+        gets.append((url, headers, timeout))
+        return {
+            "Items": [
+                {
+                    "Id": "folder-123",
+                    "Type": "Folder",
+                    "Path": "/media/gcrypt/ABC-123",
+                }
+            ]
+        }
+
+    client = EmbyClient(
+        base_url="http://127.0.0.1:8096",
+        api_key="secret",
+        media_prefix="/media/gcrypt",
+        transport=transport,
+        get_transport=get_transport,
+    )
+
+    result = client.refresh_path("/media/gcrypt/ABC-123")
+
+    assert result["refreshed_item_ids"] == ["folder-123"]
+    assert posts[0][0].endswith("/Library/Media/Updated")
+    assert "Path=%2Fmedia%2Fgcrypt%2FABC-123" in gets[0][0]
+    assert posts[1][0].startswith(
+        "http://127.0.0.1:8096/Items/folder-123/Refresh?"
+    )
+    assert "Recursive=true" in posts[1][0]
+    assert "MetadataRefreshMode=FullRefresh" in posts[1][0]
+    assert posts[1][1] == {"ReplaceThumbnailImages": False}
+
+
+def test_rclone_mount_cache_flusher_signals_only_configured_service():
+    from qbt_orchestrator.integrations.emby import RcloneMountCacheFlusher
+
+    calls = []
+
+    def runner(argv, timeout):
+        calls.append((list(argv), timeout))
+        return 0, "", ""
+
+    flusher = RcloneMountCacheFlusher(
+        service_name="rclone-gcrypt-emby.service",
+        runner=runner,
+        monotonic=lambda: 100.0,
+    )
+
+    flusher.flush("/media/gcrypt/WAAA-614")
+    flusher.flush("/media/gcrypt/BBAN-582")
+
+    assert calls == [
+        (
+            [
+                "systemctl",
+                "kill",
+                "--kill-who=main",
+                "--signal=HUP",
+                "rclone-gcrypt-emby.service",
+            ],
+            15,
+        )
+    ]
+
+
 def test_telegram_polling_writes_commands_and_rejects_unauthorized_users():
     from qbt_orchestrator.integrations.telegram import TelegramPollingService
     from qbt_orchestrator.telegram_control import TelegramAuthorizer
@@ -350,6 +425,55 @@ def test_qbt_http_client_logs_in_and_reuses_sid_cookie_for_host_api():
     assert calls[0][4] == 7
 
 
+def test_qbt_sync_session_reuses_sid_and_observes_delta():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    request_cookies = []
+    responses = iter(
+        [
+            {"rid": 10, "full_update": True, "torrents": {"h": {"size": 1}}},
+            {"rid": 11, "full_update": False, "torrents": {"h": {"dlspeed": 2}}},
+        ]
+    )
+
+    def transport(method, url, body, headers, timeout):
+        if url.endswith("/api/v2/auth/login"):
+            return 200, "Ok.", {"Set-Cookie": "SID=abc; Path=/"}
+        request_cookies.append(headers.get("Cookie"))
+        return 200, json.dumps(next(responses)), {}
+
+    client = QbtHttpClient(username="u", password="p", transport=transport, auth_mode="required")
+    first = client.get_maindata(0)
+    second = client.get_maindata(first["rid"])
+
+    assert second["full_update"] is False
+    assert request_cookies == ["SID=abc", "SID=abc"]
+
+
+def test_qbt_client_builder_honors_required_auth_mode():
+    from qbt_orchestrator.cli import _build_qbt_client_from_env
+
+    client = _build_qbt_client_from_env(
+        env={
+            "QBT_ORCH_QBT_API_MODE": "host",
+            "QBT_ORCH_QBT_API_BASE": "http://127.0.0.1:8081",
+            "QBT_ORCH_QBT_USERNAME": "user",
+            "QBT_ORCH_QBT_PASSWORD": "pass",
+            "QBT_ORCH_QBT_AUTH_MODE": "required",
+        }
+    )
+
+    assert client.auth_mode == "required"
+
+
+def test_qbt_token_bucket_uses_a_thread_lock():
+    from qbt_orchestrator.integrations.qbt import TokenBucket
+
+    bucket = TokenBucket(1)
+
+    assert hasattr(bucket, "_lock")
+
+
 def test_qbt_http_client_reauthenticates_once_after_unauthorized_response():
     from qbt_orchestrator.integrations.qbt import QbtHttpClient
 
@@ -434,6 +558,27 @@ def test_qbt_http_client_host_proxy_noauth_does_not_login_even_if_credentials_ex
     assert client.app_version() == "v5.1.4"
     assert client.get_maindata(0)["rid"] == 7
     assert [c[0] for c in calls] == ["GET", "GET"]
+
+
+def test_qbt_client_builder_host_proxy_can_require_sid_authentication():
+    from qbt_orchestrator.cli import _build_qbt_client_from_env
+
+    client = _build_qbt_client_from_env(
+        env={
+            "QBT_ORCH_QBT_API_MODE": "host-proxy",
+            "QBT_ORCH_QBT_API_BASE": "http://127.0.0.1:18081",
+            "QBT_ORCH_QBT_HTTP_HOST_HEADER": "127.0.0.1:8080",
+            "QBT_ORCH_QBT_AUTH_MODE": "required",
+            "QBT_ORCH_QBT_USERNAME": "admin",
+            "QBT_ORCH_QBT_PASSWORD": "secret",
+        }
+    )
+
+    assert client.auth_mode == "required"
+    assert client.auth_enabled is True
+    assert client.username == "admin"
+    assert client.password == "secret"
+    assert client.default_headers == {"Host": "127.0.0.1:8080"}
 
 
 if __name__ == "__main__":

@@ -2,11 +2,77 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from ..io_governor import RcloneLimits
 
 Runner = Callable[[Sequence[str], str | None, int | None], tuple[int, str, str]]
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    verified: bool
+    method: str
+    mismatches: list[str]
+
+
+def _relative_path(row: dict) -> str:
+    return str(
+        row.get("relative_path")
+        or row.get("path")
+        or row.get("Path")
+        or row.get("name")
+        or row.get("Name")
+        or ""
+    ).replace("\\", "/").lstrip("/")
+
+
+def _hashes(row: dict) -> dict[str, str]:
+    raw = row.get("hashes") or row.get("Hashes") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key).strip().lower(): str(value).strip().lower()
+        for key, value in raw.items()
+        if str(key).strip() and str(value).strip()
+    }
+
+
+def verify_manifest_listing(expected_files: list[dict], actual_rows: list[dict]) -> VerifyResult:
+    """Verify an exact remote manifest, preferring a common backend hash."""
+    expected = {_relative_path(dict(row)): dict(row) for row in expected_files if _relative_path(dict(row))}
+    actual = {
+        _relative_path(dict(row)): dict(row)
+        for row in actual_rows
+        if not row.get("IsDir") and _relative_path(dict(row))
+    }
+    path_mismatches = [f"missing:{path}" for path in sorted(set(expected) - set(actual))]
+    path_mismatches.extend(f"unexpected:{path}" for path in sorted(set(actual) - set(expected)))
+    if path_mismatches:
+        return VerifyResult(False, "path_size", path_mismatches)
+
+    common_algorithms: set[str] | None = None
+    for path in sorted(expected):
+        compatible = set(_hashes(expected[path])) & set(_hashes(actual[path]))
+        common_algorithms = compatible if common_algorithms is None else common_algorithms & compatible
+    if common_algorithms:
+        preferred = ["sha256", "sha1", "md5"]
+        algorithm = next((name for name in preferred if name in common_algorithms), sorted(common_algorithms)[0])
+        mismatches = [
+            f"hash:{algorithm}:{path}"
+            for path in sorted(expected)
+            if _hashes(expected[path]).get(algorithm) != _hashes(actual[path]).get(algorithm)
+        ]
+        return VerifyResult(not mismatches, f"hash:{algorithm}", mismatches)
+
+    mismatches = [
+        f"size:{path}"
+        for path in sorted(expected)
+        if int(expected[path].get("size") or expected[path].get("Size") or 0)
+        != int(actual[path].get("size") or actual[path].get("Size") or 0)
+    ]
+    return VerifyResult(not mismatches, "path_size", mismatches)
 
 
 def default_runner(argv: Sequence[str], input_text: str | None = None, timeout: int | None = None) -> tuple[int, str, str]:
@@ -64,6 +130,29 @@ class RcloneClient:
             raise RuntimeError(f"rclone copy failed rc={rc}: {err[-400:]}")
         return True
 
+    def stat(self, remote: str) -> dict | None:
+        rc, out, err = self.runner(
+            self._base() + ["lsjson", "--stat", remote], None, 300
+        )
+        if rc != 0:
+            message = str(err or "").lower()
+            if "not found" in message:
+                return None
+            raise RuntimeError(f"rclone stat failed rc={rc}: {err[-400:]}")
+        data = json.loads(out or "null")
+        if isinstance(data, dict):
+            return dict(data)
+        if isinstance(data, list) and data:
+            return dict(data[0])
+        return None
+
+    def moveto(self, source: str, target: str) -> None:
+        rc, _out, err = self.runner(
+            self._base() + ["moveto", source, target], None, self.timeout
+        )
+        if rc != 0:
+            raise RuntimeError(f"rclone moveto failed rc={rc}: {err[-400:]}")
+
     def lsjson_size(self, remote: str) -> int | None:
         rc, out, err = self.runner(self._base() + ["lsjson", remote], None, 300)
         if rc != 0:
@@ -89,3 +178,6 @@ class RcloneClient:
         if isinstance(data, dict):
             return [dict(data)]
         return []
+
+    def verify_manifest(self, files: list[dict], remote_root: str, recursive: bool = True) -> VerifyResult:
+        return verify_manifest_listing(files, self.lsjson(remote_root, recursive=recursive))

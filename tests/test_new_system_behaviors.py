@@ -66,6 +66,21 @@ def test_redaction_masks_tokens_magnets_and_rclone_config_paths():
     assert redacted["safe"] == "gcrypt:/Media/ABC-123/"
 
 
+def test_torrent_snapshot_preserves_magnet_uri_for_reclaim_audit():
+    from qbt_orchestrator.models import TorrentSnapshot
+
+    magnet = "mag" + "net:?xt=urn:btih:ABCDEF&dn=example"
+    snap = TorrentSnapshot.from_qbt(
+        {
+            "hash": "abcdef",
+            "name": "example",
+            "magnet_uri": magnet,
+        }
+    )
+
+    assert snap.magnet_uri == magnet
+
+
 def test_qbt_sync_full_update_rebuilds_and_unhealthy_preserves_cache():
     from qbt_orchestrator.qbt_sync import QbtSyncCache, SyncHealth
     from tests.fakes import FakeQbtClient
@@ -91,14 +106,135 @@ def test_qbt_sync_full_update_rebuilds_and_unhealthy_preserves_cache():
     assert cache.high_risk_actions_allowed is False
 
 
+def test_qbt_sync_partial_delta_preserves_full_snapshot_fields():
+    from qbt_orchestrator.qbt_sync import QbtSyncCache, SyncHealth
+    from tests.fakes import FakeQbtClient
+
+    client = FakeQbtClient(
+        maindata=[
+            {
+                "rid": 1,
+                "full_update": True,
+                "torrents": {
+                    "h1": {
+                        "name": "one",
+                        "category": "auto",
+                        "tags": "auto",
+                        "amount_left": 100,
+                        "size": 200,
+                        "progress": 0.5,
+                    }
+                },
+            },
+            {"rid": 2, "full_update": False, "torrents": {"h1": {"dlspeed": 123}}},
+        ]
+    )
+    cache = QbtSyncCache(client)
+
+    assert cache.poll_once().health == SyncHealth.HEALTHY_FULL
+    assert cache.poll_once().health == SyncHealth.HEALTHY_DELTA
+
+    snap = cache.snapshots["h1"]
+    assert snap.category == "auto"
+    assert snap.tags == "auto"
+    assert snap.amount_left == 100
+    assert snap.size == 200
+    assert snap.progress == 0.5
+    assert snap.dlspeed_bps == 123
+
+
+def test_qbt_sync_detects_repeated_full_updates_and_backs_off_until_due():
+    from qbt_orchestrator.qbt_sync import QbtSyncCache
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    class RepeatedFullClient:
+        def __init__(self):
+            self.rids = []
+
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            if len(self.rids) <= 4:
+                return {
+                    "rid": rid + 1,
+                    "full_update": True,
+                    "torrents": {"h": {"category": "auto", "size": 1}},
+                }
+            return {"rid": rid + 1, "full_update": False, "torrents": {"h": {"dlspeed": 2}}}
+
+    clock = Clock()
+    client = RepeatedFullClient()
+    cache = QbtSyncCache(
+        client,
+        repeated_full_limit=3,
+        degraded_interval_sec=10,
+        monotonic=clock,
+    )
+
+    for _ in range(4):
+        cache.poll_once()
+
+    assert cache.session_stats.full_updates == 4
+    assert cache.session_stats.repeated_full_updates == 3
+    assert cache.session_stats.consecutive_repeated_full_updates == 3
+    assert cache.session_stats.degraded is True
+
+    skipped = cache.poll_once()
+    assert skipped.skipped is True
+    assert client.rids == [0, 1, 2, 3]
+
+    clock.now = 10.0
+    recovered = cache.poll_once()
+    assert recovered.skipped is False
+    assert cache.session_stats.delta_updates == 1
+    assert cache.session_stats.degraded is False
+
+
 def test_torrent_snapshot_preserves_speed_and_completed_for_health_planner():
     from qbt_orchestrator.models import TorrentSnapshot
 
-    snap = TorrentSnapshot.from_qbt({"hash": "h1", "dlspeed": 123, "upspeed": 45, "completed": 678, "progress": 0.5})
+    snap = TorrentSnapshot.from_qbt(
+        {
+            "hash": "h1",
+            "dlspeed": 123,
+            "upspeed": 45,
+            "completed": 678,
+            "progress": 0.5,
+            "ratio": 3.13,
+            "seeding_time": 901,
+            "completion_on": 12_345,
+            "share_limit_reached": True,
+        }
+    )
 
     assert snap.dlspeed_bps == 123
     assert snap.upspeed_bps == 45
     assert snap.completed_bytes == 678
+    assert snap.ratio == 3.13
+    assert snap.seeding_time == 901
+    assert snap.completion_on == 12_345
+    assert snap.share_limit_reached is True
+
+
+def test_torrent_snapshot_keeps_tracker_swarm_totals_when_peers_connect():
+    from qbt_orchestrator.models import TorrentSnapshot
+
+    snap = TorrentSnapshot.from_qbt(
+        {
+            "hash": "h1",
+            "num_seeds": 1,
+            "num_complete": 13,
+            "num_peers": 2,
+            "num_incomplete": 45,
+        }
+    )
+
+    assert snap.num_seeds == 13
+    assert snap.num_peers == 45
 
 
 def test_disk_pressure_and_emergency_action_do_not_need_db():
@@ -180,6 +316,9 @@ def test_sqlite_migration_db_actor_readonly_and_job_recovery():
             return job_id
 
         job_id = asyncio.run(run_actor())
+        con = sqlite3.connect(db)
+        assert con.execute("select phase from torrent_jobs where id=?", (job_id,)).fetchone()[0] == "queued_copy"
+        con.close()
         assert job_id >= 1
         assert readonly_counts(db)["torrent_jobs"] == 1
         recovered = recover_jobs(db)
@@ -219,7 +358,7 @@ def test_daemon_safety_loop_only_uses_allowed_operations_and_pauses_below_floor(
     assert qbt.heavy_calls == []
 
 
-def test_rclone_upload_worker_verify_failure_does_not_cleanup_and_success_full_allows_delete():
+def test_rclone_upload_worker_verify_failure_blocks_cleanup_and_success_returns_cleanup_intent():
     from qbt_orchestrator.upload import RcloneUploadWorker, UploadJob
     from tests.fakes import FakeExecutor, FakeRclone
 
@@ -231,8 +370,9 @@ def test_rclone_upload_worker_verify_failure_does_not_cleanup_and_success_full_a
     executor = FakeExecutor()
     ok = RcloneUploadWorker(FakeRclone(copy_ok=True, remote_sizes={"gcrypt:/A/a.mp4": 100}), executor)
     result = ok.run_once(UploadJob(hash="h1", batch_id=1, local="/tmp/a.mp4", remote="gcrypt:/A/a.mp4", size=100, full_torrent=True))
-    assert result.state == "done"
-    assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
+    assert result.state == "cleanup_wait"
+    assert result.cleanup_allowed is True
+    assert executor.posts == []
 
 
 def test_rclone_upload_worker_directory_manifest_verify_gates_cleanup():
@@ -265,10 +405,10 @@ def test_rclone_upload_worker_directory_manifest_verify_gates_cleanup():
 
     result = ok.run_once(UploadJob(hash="h1", batch_id=1, local="/tmp/ABC", remote="gcrypt:/ABC", size=110, full_torrent=True, files=files))
 
-    assert result.state == "done"
+    assert result.state == "cleanup_wait"
     assert ok.rclone.copies == [("/tmp/ABC", "gcrypt:/ABC")]
     assert ok.rclone.copytos == []
-    assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
+    assert executor.posts == []
 
     bad_executor = FakeExecutor()
     bad = RcloneUploadWorker(
@@ -279,6 +419,32 @@ def test_rclone_upload_worker_directory_manifest_verify_gates_cleanup():
 
     assert bad_result.state == "verify_pending"
     assert bad_executor.posts == []
+
+
+def test_manifest_verification_prefers_compatible_hashes_and_rejects_extra_paths():
+    from qbt_orchestrator.integrations.rclone import verify_manifest_listing
+
+    expected_hash = [
+        {"relative_path": "A.mp4", "size": 100, "hashes": {"MD5": "abc"}},
+        {"relative_path": "extras/B.nfo", "size": 10, "hashes": {"MD5": "def"}},
+    ]
+    actual_hash = [
+        {"Path": "A.mp4", "Size": 100, "Hashes": {"MD5": "abc"}},
+        {"Path": "extras/B.nfo", "Size": 10, "Hashes": {"MD5": "def"}},
+    ]
+
+    hashed = verify_manifest_listing(expected_hash, actual_hash)
+    assert hashed.verified is True
+    assert hashed.method == "hash:md5"
+    assert hashed.mismatches == []
+
+    extra = verify_manifest_listing(
+        [{"relative_path": "A.mp4", "size": 100}],
+        [{"Path": "A.mp4", "Size": 100}, {"Path": "unexpected.txt", "Size": 1}],
+    )
+    assert extra.verified is False
+    assert extra.method == "path_size"
+    assert extra.mismatches == ["unexpected:unexpected.txt"]
 
 
 def test_rclone_upload_worker_single_file_manifest_uses_copyto():
@@ -313,11 +479,11 @@ def test_rclone_upload_worker_single_file_manifest_uses_copyto():
         )
     )
 
-    assert result.state == "done"
+    assert result.state == "cleanup_wait"
     assert worker.rclone.copytos == [("/tmp/A.mp4", "gcrypt:/A/A.mp4")]
     assert worker.rclone.copies == []
     assert worker.rclone.lsjson_calls == [("gcrypt:/A/A.mp4", False)]
-    assert executor.posts == [("/api/v2/torrents/delete", {"hashes": "h1", "deleteFiles": "true"})]
+    assert executor.posts == []
 
 
 def test_rclone_upload_worker_copy_files_copies_each_file_and_defers_cleanup_without_delete():
@@ -459,8 +625,3 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
-
-
-
-
-

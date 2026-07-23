@@ -71,6 +71,16 @@ class WriteResult:
     rowcount: int
 
 
+def _detach_cursor(value: Any) -> Any:
+    """Convert a SQLite cursor into connection-independent write metadata."""
+    if not isinstance(value, sqlite3.Cursor):
+        return value
+    lastrowid = int(value.lastrowid or 0)
+    rowcount = int(value.rowcount if value.rowcount is not None else -1)
+    value.close()
+    return WriteResult(lastrowid, rowcount)
+
+
 class _SyncWriteActor:
     """Per-DB single writer for synchronous daemon code.
 
@@ -86,6 +96,10 @@ class _SyncWriteActor:
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
         self._connection: sqlite3.Connection | None = None
+        self._ready = threading.Event()
+        self._persistent = False
+        self._direct_lock = threading.RLock()
+        self._direct_thread_id: int | None = None
         self._lock = threading.Lock()
         self._stopped = True
         self._enqueued_total = 0
@@ -96,11 +110,21 @@ class _SyncWriteActor:
     def start(self) -> None:
         with self._lock:
             if self._thread and self._thread.is_alive():
-                return
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._stopped = False
-            self._thread = threading.Thread(target=self._run, name=f"qbt-db-writer:{self.path}", daemon=True)
-            self._thread.start()
+                ready = self._ready
+            else:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._stopped = False
+                self._ready.clear()
+                self._thread = threading.Thread(target=self._run, name=f"qbt-db-writer:{self.path}", daemon=True)
+                self._thread.start()
+                ready = self._ready
+        if not ready.wait(timeout=5):
+            raise TimeoutError(f"SQLite writer did not start for {self.path}")
+
+    def enable_persistence(self) -> None:
+        """Keep the writer connection open until actor shutdown."""
+        with self._lock:
+            self._persistent = True
 
     def stop(self) -> None:
         with self._lock:
@@ -122,6 +146,10 @@ class _SyncWriteActor:
             raise value
 
     def transaction(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        with self._lock:
+            persistent = self._persistent
+        if not persistent:
+            return self._direct_transaction(fn)
         self.start()
         if self._thread_id == threading.get_ident() and self._connection is not None:
             return fn(self._connection)
@@ -134,7 +162,41 @@ class _SyncWriteActor:
             return value
         raise value
 
+    def _direct_transaction(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """Serialize one-off writes without leaving a Windows file handle open."""
+        with self._direct_lock:
+            if self._direct_thread_id == threading.get_ident() and self._connection is not None:
+                return fn(self._connection)
+            con = _connect(self.path)
+            con.execute("pragma journal_mode=WAL")
+            con.execute("pragma busy_timeout=5000")
+            self._direct_thread_id = threading.get_ident()
+            self._connection = con
+            with self._lock:
+                self._enqueued_total += 1
+            try:
+                result = _detach_cursor(fn(con))
+                con.commit()
+                with self._lock:
+                    self._completed_total += 1
+                return result
+            except Exception:
+                con.rollback()
+                with self._lock:
+                    self._failed_total += 1
+                raise
+            finally:
+                self._connection = None
+                self._direct_thread_id = None
+                con.close()
+
     def flush(self) -> None:
+        with self._lock:
+            persistent = self._persistent
+        if not persistent:
+            with self._lock:
+                self._flushes_completed += 1
+            return
         self.start()
         reply: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
         self._queue.put(("flush", None, reply))
@@ -156,6 +218,8 @@ class _SyncWriteActor:
 
     def _run(self) -> None:
         self._thread_id = threading.get_ident()
+        con: sqlite3.Connection | None = None
+        self._ready.set()
         try:
             while True:
                 op, payload, reply = self._queue.get()
@@ -169,23 +233,23 @@ class _SyncWriteActor:
                     return
                 try:
                     if op == "flush":
+                        if con is not None:
+                            con.commit()
                         with self._lock:
                             self._flushes_completed += 1
                         reply.put((True, True))
                     else:
-                        con = _connect(self.path)
-                        self._connection = con
-                        con.execute("pragma journal_mode=WAL")
-                        con.execute("pragma busy_timeout=5000")
+                        if con is None:
+                            con = _connect(self.path)
+                            con.execute("pragma journal_mode=WAL")
+                            con.execute("pragma busy_timeout=5000")
+                            self._connection = con
                         try:
-                            result = payload(con)
+                            result = _detach_cursor(payload(con))
                             con.commit()
                         except Exception:
                             con.rollback()
                             raise
-                        finally:
-                            self._connection = None
-                            con.close()
                         with self._lock:
                             self._completed_total += 1
                         reply.put((True, result))
@@ -194,9 +258,17 @@ class _SyncWriteActor:
                         self._failed_total += 1
                     reply.put((False, exc))
                 finally:
+                    with self._lock:
+                        persistent = self._persistent
+                    if con is not None and not persistent:
+                        self._connection = None
+                        con.close()
+                        con = None
                     self._queue.task_done()
         finally:
             self._connection = None
+            if con is not None:
+                con.close()
 
 
 _WRITE_ACTORS: dict[str, _SyncWriteActor] = {}
@@ -215,6 +287,21 @@ def _actor_for(path: str | Path) -> _SyncWriteActor:
 
 def write_transaction(path: str | Path, fn: Callable[[sqlite3.Connection], Any]) -> Any:
     return _actor_for(path).transaction(fn)
+
+
+def start_persistent_write_actor(path: str | Path) -> None:
+    """Acquire a long-lived writer for a daemon-scoped SQLite database."""
+    actor = _actor_for(path)
+    actor.enable_persistence()
+    actor.start()
+
+
+def stop_write_actor(path: str | Path) -> None:
+    key = str(Path(path).resolve())
+    with _WRITE_ACTORS_LOCK:
+        actor = _WRITE_ACTORS.pop(key, None)
+    if actor is not None:
+        actor.stop()
 
 
 def flush_write_actor(path: str | Path) -> None:
@@ -252,24 +339,75 @@ atexit.register(stop_write_actors)
 def migration_sql() -> list[str]:
     return [
         "create table if not exists schema_migrations(version integer primary key, name text not null, applied_at integer not null)",
-        "create table if not exists torrent_health(hash text primary key, sampled_at integer, dlspeed_bps integer default 0, upspeed_bps integer default 0, ema_fast_bps real default 0, ema_slow_bps real default 0, completed_bytes integer default 0, last_completed_bytes integer default 0, progress real default 0, num_seeds integer default 0, num_peers integer default 0, last_swarm_seen_at integer, low_speed_since integer, no_progress_since integer, active_since integer, soak_since integer, dead_since integer, promote_candidate_since integer, updated_at integer)",
+        "create table if not exists torrent_health(hash text primary key, sampled_at integer, dlspeed_bps integer default 0, upspeed_bps integer default 0, ema_fast_bps real default 0, ema_slow_bps real default 0, completed_bytes integer default 0, last_completed_bytes integer default 0, progress real default 0, num_seeds integer default 0, num_peers integer default 0, last_swarm_seen_at integer, no_swarm_since integer, low_speed_since integer, no_progress_since integer, active_since integer, soak_since integer, dead_since integer, promote_candidate_since integer, updated_at integer)",
+        "alter table torrent_health add column no_swarm_since integer",
         "create table if not exists torrent_batches(id integer primary key autoincrement, hash text not null, batch_no integer not null, state text not null, mode text, indices_json text not null default '[]', total_bytes integer default 0, downloaded_bytes integer default 0, reserved_bytes integer default 0, piece_size integer default 0, selected_extents integer default 0, piece_spill_overhead_bytes integer default 0, payload_efficiency real default 1.0, priority_applied integer default 0, upload_job_id integer, created_at integer, updated_at integer, local_pinned_bytes integer default 0, cleanup_deferred_at integer, cleanup_done_at integer, unique(hash,batch_no))",
         "alter table torrent_batches add column downloaded_at integer",
         "alter table torrent_batches add column upload_queued_at integer",
         "alter table torrent_batches add column verified_at integer",
+        "alter table torrent_batches add column lease_until integer",
+        "alter table torrent_batches add column last_progress_at integer",
+        "alter table torrent_batches add column last_progress_bytes integer not null default 0",
+        "alter table torrent_batches add column source_present integer not null default 1",
+        "create table if not exists batch_file_claims(batch_id integer not null, hash text not null, file_index integer not null, state text not null, created_at integer not null, released_at integer, primary key(batch_id,file_index))",
+        "create unique index if not exists idx_batch_file_claim_active on batch_file_claims(hash,file_index) where state='active'",
+        "create table if not exists batch_inventory_state(id integer primary key check(id=1), cursor_hash text, window_started_at integer not null, probes_in_window integer not null default 0, updated_at integer not null)",
+        "create table if not exists batch_inventory_cache(hash text primary key, snapshot_fingerprint text not null, files_json text not null, piece_size integer not null default 0, refreshed_at integer not null)",
+        "create table if not exists scan_cursors(scanner text primary key,last_hash text,updated_at integer not null)",
         "create index if not exists idx_torrent_batches_hash_state on torrent_batches(hash,state)",
         "create index if not exists idx_torrent_batches_state on torrent_batches(state)",
         "create index if not exists idx_torrent_batches_cleanup_deferred on torrent_batches(state,cleanup_deferred_at)",
         "create table if not exists resource_reservations(id integer primary key autoincrement, hash text, batch_id integer, kind text, bytes integer not null, state text default 'active', created_at integer, expires_at integer, released_at integer, reason text)",
+        "alter table resource_reservations add column accounting_class text not null default 'future_growth'",
+        "alter table resource_reservations add column owner text",
+        "alter table resource_reservations add column lease_generation integer not null default 0",
+        "alter table resource_reservations add column last_observed_at integer",
+        "update resource_reservations set accounting_class='current_pinned' where kind='cleanup_pending'",
         "create index if not exists idx_reservations_active on resource_reservations(state,expires_at)",
         "create index if not exists idx_reservations_hash on resource_reservations(hash)",
+        "create index if not exists idx_reservations_accounting_active on resource_reservations(accounting_class,state,expires_at)",
         "create table if not exists scheduler_allocations(hash text primary key, desired_state text, applied_state text, slot_kind text, priority_score real default 0, reserved_bytes integer default 0, download_limit_bps integer, upload_limit_bps integer, force_start integer default 0, desired_seq_dl integer, applied_seq_dl integer, allocated_at integer, applied_at integer, expires_at integer, reason text)",
+        "alter table scheduler_allocations add column owner text not null default 'legacy'",
+        "alter table scheduler_allocations add column plan_generation integer not null default 0",
+        "create table if not exists scheduler_intents(component text not null, hash text not null, intent text not null, priority integer not null, expires_at integer, data_json text not null, primary key(component,hash))",
+        "create index if not exists idx_scheduler_intents_expiry_priority on scheduler_intents(expires_at,priority,component,hash)",
+        "insert or replace into scheduler_intents(component,hash,intent,priority,expires_at,data_json) "
+        "select 'batch',tb.hash,'protect_batch',20,"
+        "case when sum(case when rr.expires_at is null then 1 else 0 end)>0 then null else max(rr.expires_at) end,"
+        "'{\"batch_id\":'||max(tb.id)||'}' "
+        "from torrent_batches tb join resource_reservations rr on rr.batch_id=tb.id and rr.kind='batch' "
+        "where tb.state in ('reserved','applied_to_qbt','downloading') and rr.state='active' "
+        "and (rr.expires_at is null or rr.expires_at>strftime('%s','now')) group by tb.hash",
+        "create table if not exists scheduler_plan_state(id integer primary key check(id=1), current_generation integer not null default 0, updated_at integer not null)",
         "create table if not exists disk_state(id integer primary key check(id=1), sampled_at integer, free_bytes integer, pressure_state text, previous_state text, state_since integer, resume_allowed integer default 1)",
+        "create table if not exists capacity_state(id integer primary key check(id=1), scheduler_mode text not null, state text not null, entered_at integer not null, last_evaluated_at integer not null, reason text, details_json text not null default '{}')",
         "create table if not exists torrent_jobs(id integer primary key autoincrement, hash text, batch_id integer, job_type text, state text default 'queued', priority integer default 100, payload_json text, payload_schema_version integer default 1, lease_owner text, lease_until integer, attempts integer default 0, max_attempts integer default 6, next_run_at integer, last_exit_code integer, last_stderr_tail text, cancel_requested integer default 0, cancel_requested_at integer, created_at integer, updated_at integer)",
+        "alter table torrent_jobs add column phase text",
+        "alter table torrent_jobs add column copy_completed_at integer",
+        "alter table torrent_jobs add column verification_method text",
+        "alter table torrent_jobs add column verification_result_json text",
+        "alter table torrent_jobs add column verified_at integer",
+        "alter table torrent_jobs add column parent_job_id integer",
+        "alter table torrent_jobs add column lease_generation integer not null default 0",
+        "update torrent_jobs set last_stderr_tail=null,next_run_at=null "
+        "where state in ('done','cleanup_deferred','promotion_wait','cleanup_wait') "
+        "and (last_stderr_tail is not null or next_run_at is not null)",
+        "create unique index if not exists idx_torrent_jobs_cleanup_parent on torrent_jobs(job_type,parent_job_id) where job_type='cleanup_full_torrent' and parent_job_id is not null",
+        "update torrent_jobs set phase=case "
+        "when state='verify_pending' then 'verifying' "
+        "when state='cleanup_wait' then 'cleanup_wait' "
+        "when state in ('done','cleanup_deferred') then 'done' "
+        "else 'queued_copy' end "
+        "where phase is null and job_type in ('upload','sidecar_upload')",
         "create table if not exists action_log(id integer primary key autoincrement, ts integer, correlation_id text, hash text, job_id integer, action_type text, path text, payload_json text, status text, dry_run integer default 0, error text)",
         "create table if not exists events_v2(id integer primary key autoincrement, ts integer, level text, component text, event_type text, hash text, job_id integer, correlation_id text, message text, data_json text)",
         "create table if not exists decision_log(id integer primary key autoincrement, ts integer, component text, hash text, decision text, reason_code text, data_json text)",
+        "create table if not exists decision_state(component text not null, hash text not null default '', decision text not null, reason_code text not null, data_fingerprint text not null, updated_at integer not null, primary key(component,hash))",
+        "create index if not exists idx_events_component_type_ts on events_v2(component,event_type,ts)",
+        "create index if not exists idx_decisions_component_hash_ts on decision_log(component,hash,ts)",
+        "create index if not exists idx_decisions_ts_id on decision_log(ts,id)",
         "create table if not exists metrics_snapshots(id integer primary key autoincrement, ts integer, component text, metrics_json text)",
+        "create index if not exists idx_metrics_component_id on metrics_snapshots(component,id desc)",
         "create table if not exists media_groups(id integer primary key autoincrement, media_group_key text unique, normalized_id text, emby_media_dir text, created_at integer, updated_at integer)",
         "create table if not exists media_pipeline_runs(id integer primary key autoincrement, upload_manifest_id text, media_group_id integer, state text, created_at integer, updated_at integer, unique(upload_manifest_id, media_group_id))",
         "alter table media_pipeline_runs add column metadata_policy text",
@@ -278,6 +416,12 @@ def migration_sql() -> list[str]:
         "alter table media_pipeline_runs add column normalize_confidence real",
         "alter table media_pipeline_runs add column normalize_result_json text",
         "alter table media_pipeline_runs add column missing_outputs_json text",
+        "alter table media_pipeline_runs add column canonical_remote_dir text",
+        "alter table media_pipeline_runs add column canonical_basename text",
+        "alter table media_pipeline_runs add column canonical_video_manifest_json text",
+        "create table if not exists media_promotions(id integer primary key autoincrement, upload_job_id integer not null, hash text, media_group_id integer, normalized_id text not null, metadata_title text not null, display_title text not null, source_remote text not null, target_remote text not null, expected_size integer not null, expected_hashes_json text not null default '{}', state text not null default 'planned', verification_method text, verification_result_json text, attempts integer not null default 0, max_attempts integer not null default 6, lease_owner text, lease_until integer, next_run_at integer, last_error text, created_at integer not null, updated_at integer not null, verified_at integer)",
+        "create unique index if not exists idx_media_promotions_identity on media_promotions(upload_job_id,source_remote,target_remote)",
+        "create index if not exists idx_media_promotions_claim on media_promotions(state,next_run_at,id)",
         "create table if not exists sidecar_manifests(id integer primary key autoincrement, media_group_id integer, staging_dir text, artifacts_json text, state text, created_at integer, updated_at integer)",
         "alter table sidecar_manifests add column local_artifact_dir text",
         "alter table sidecar_manifests add column artifact_manifest_json text",
@@ -287,9 +431,15 @@ def migration_sql() -> list[str]:
         "alter table sidecar_manifests add column media_group_key_snapshot text",
         "create table if not exists emby_refresh_tasks(id integer primary key autoincrement, emby_media_dir text, state text default 'queued', earliest_run_at integer, max_run_at integer, payload_json text, created_at integer, updated_at integer)",
         "alter table emby_refresh_tasks add column last_error text",
+        "alter table emby_refresh_tasks add column attempts integer not null default 0",
+        "alter table emby_refresh_tasks add column max_attempts integer not null default 6",
+        "alter table emby_refresh_tasks add column next_run_at integer",
         "create table if not exists bot_commands(id integer primary key autoincrement, command_id text unique, chat_id text, user_id text, command text, payload_json text, state text default 'queued', created_at integer, updated_at integer)",
         "create table if not exists bot_approvals(id integer primary key autoincrement, approval_id text unique, command_id text, action text, payload_json text, state text default 'pending', expires_at integer, approved_by text, approved_at integer, created_at integer)",
         "create table if not exists bot_notifications(id integer primary key autoincrement, dedupe_key text unique, chat_id text not null, level text default 'info', topic text, message text not null, payload_json text, state text default 'queued', attempts integer default 0, next_run_at integer, last_error text, created_at integer, updated_at integer, sent_at integer)",
+        "create table if not exists capacity_reclaims(id integer primary key autoincrement, reclaim_key text not null unique, hash text not null, name text not null, magnet_uri text not null, host_path text not null, content_path text not null, allocated_bytes integer not null default 0, completed_bytes integer not null default 0, progress real not null default 0, dead_since integer, state text not null, recheck_state text not null default 'pending', recheck_error text, notification_ids_json text not null default '[]', created_at integer not null, reclaimed_at integer, updated_at integer not null)",
+        "create index if not exists idx_capacity_reclaims_hash_time on capacity_reclaims(hash,reclaimed_at desc)",
+        "create index if not exists idx_capacity_reclaims_state on capacity_reclaims(state,updated_at)",
         "create table if not exists orphan_candidates(path text primary key, first_seen_at integer, last_seen_at integer, confirmations integer default 0, state text default 'seen', quarantined_at integer, trash_path text)",
         "create table if not exists carousel_state(hash text primary key, state text not null, probe_started_at integer, last_probe_at integer, backoff_until integer, backoff_level integer default 0, updated_at integer)",
         "create table if not exists soak_state(hash text primary key, state text not null default 'candidate', ema_dlspeed_bps integer not null default 0, hot_since integer, resident_since integer, cooldown_until integer, last_started_at integer, last_stopped_at integer, exposure_bytes integer not null default 0, last_sample_at integer, updated_at integer not null, reason text)",
@@ -304,6 +454,18 @@ def migration_sql() -> list[str]:
         "create index if not exists idx_seeding_preemptions_ts on seeding_preemptions(ts)",
         "create index if not exists idx_seeding_preemptions_hash on seeding_preemptions(seeding_hash)",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(3,'resource_ledger_v2',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(4,'capacity_state_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(5,'scheduler_intents_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(6,'batch_lease_claims_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(7,'batch_inventory_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(8,'upload_phases_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(9,'job_recovery_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(10,'scan_cursors_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(11,'canonical_media_promotions_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(12,'torrent_job_leases_v2',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(13,'successful_job_diagnostics_cleanup_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(14,'capacity_reclaim_audit_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:
@@ -363,9 +525,10 @@ class DbActor:
                 try:
                     if op == "enqueue_job":
                         now = int(time.time())
+                        phase = "queued_copy" if payload["job_type"] in {"upload", "sidecar_upload"} else None
                         cur = con.execute(
-                            "insert into torrent_jobs(hash,batch_id,job_type,state,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
-                            (payload["hash"], payload["batch_id"], payload["job_type"], "queued", payload["priority"], json.dumps(payload["payload"], ensure_ascii=False), now, now),
+                            "insert into torrent_jobs(hash,batch_id,job_type,state,phase,priority,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+                            (payload["hash"], payload["batch_id"], payload["job_type"], "queued", phase, payload["priority"], json.dumps(payload["payload"], ensure_ascii=False), now, now),
                         )
                         con.commit()
                         self._writes_completed += 1

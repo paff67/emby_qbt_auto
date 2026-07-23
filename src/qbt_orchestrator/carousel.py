@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping
 
 from .db import readonly_connect, write_transaction
 from .observability import redact
+from .scheduler_intents import SchedulerIntent, SchedulerIntentRepository
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -53,6 +54,7 @@ class CarouselService:
         self.backoff_schedule_sec = tuple(int(x) for x in backoff_schedule_sec) or (30 * 60,)
         self.min_free_bytes = int(min_free_bytes)
         self.now = now or (lambda: int(time.time()))
+        self.intent_repository = SchedulerIntentRepository(self.state_db)
 
     def run_once(self, snapshots: Mapping[str, Any], sync_healthy: bool, free_bytes: int | None = None) -> dict[str, Any]:
         now = int(self.now())
@@ -62,14 +64,14 @@ class CarouselService:
             result = {"suspended": True, "reason": "unhealthy_sync", "started": [], "promoted": [], "stopped": [], "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency}
             self._metrics(result)
             return result
+        promoted, stopped = self._reconcile_active_probes(snapshots, now)
         if free_bytes is not None and int(free_bytes) < self.min_free_bytes:
             data = {"free_bytes": int(free_bytes), "min_free_bytes": self.min_free_bytes, "dry_run": self.dry_run}
             self._event("warning", "suspended_disk_guard", "carousel suspended because disk free space is below live guard", data)
-            result = {"suspended": True, "reason": "disk_guard", "started": [], "promoted": [], "stopped": [], "active_probes": self._active_probe_count(), "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency, **data}
+            result = {"suspended": True, "reason": "disk_guard", "started": [], "promoted": promoted, "stopped": stopped, "active_probes": self._active_probe_count(), "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency, **data}
             self._metrics(result)
             return result
 
-        promoted, stopped = self._reconcile_active_probes(snapshots, now)
         active_count = self._active_probe_count()
         capacity = max(0, effective_concurrency - active_count)
         started = self._start_new_probes(snapshots, now, capacity)
@@ -103,7 +105,6 @@ class CarouselService:
             snap = self._snapshot(snapshots, h)
             if self._has_swarm(snap):
                 self._mark_soak(h, now)
-                self._allocation(h, "soak", "soak", 0, "carousel_swarm_seen", now)
                 self._decision(h, "soak", "carousel_swarm_seen", {"probe_started_at": row.get("probe_started_at")})
                 promoted.append(h)
                 continue
@@ -113,10 +114,7 @@ class CarouselService:
                 level = int(row.get("backoff_level") or 0)
                 backoff = self.backoff_schedule_sec[min(level, len(self.backoff_schedule_sec) - 1)]
                 self._mark_dead(h, now, backoff_until=now + backoff, backoff_level=level + 1)
-                self._allocation(h, "dead", "dead", 0, "carousel_no_swarm", now)
                 self._decision(h, "dead", "carousel_no_swarm", {"probe_started_at": started_at, "backoff_sec": backoff})
-        if expired:
-            self._post("/api/v2/torrents/stop", expired, action_type="carousel_stop_expired")
         return promoted, expired
 
     def _start_new_probes(self, snapshots: Mapping[str, Any], now: int, capacity: int) -> list[str]:
@@ -127,11 +125,8 @@ class CarouselService:
         if not selected:
             return []
         for h in selected:
-            self._disable_seq_dl(h)
             self._mark_probing(h, now)
-            self._allocation(h, "carousel_probe", "carousel", 0, "carousel_probe_started", now)
             self._decision(h, "carousel_probe", "carousel_probe_started", {"concurrency": self.concurrency})
-        self._post("/api/v2/torrents/start", selected, action_type="carousel_start_probe")
         return selected
 
     def _dead_candidates(self, snapshots: Mapping[str, Any], now: int) -> list[str]:
@@ -160,28 +155,6 @@ class CarouselService:
             out.append(h)
         return out
 
-    def _disable_seq_dl(self, h: str) -> None:
-        if self.dry_run:
-            self._action("carousel_set_seq_dl", h, "/api/v2/torrents/toggleSequentialDownload", {"hashes": h, "desired_seq_dl": False}, "dry_run", True)
-            return
-        if hasattr(self.executor, "set_seq_dl"):
-            self.executor.set_seq_dl(h, False)
-            self._action("carousel_set_seq_dl", h, "/api/v2/torrents/toggleSequentialDownload", {"hashes": h, "desired_seq_dl": False}, "succeeded", False)
-
-    def _post(self, path: str, hashes: list[str], action_type: str) -> None:
-        if not hashes:
-            return
-        payload = {"hashes": "|".join(hashes)}
-        if self.dry_run:
-            self._action(action_type, None, path, payload, "dry_run", True)
-            return
-        try:
-            self.executor.qbt_post(path, payload)
-            self._action(action_type, None, path, payload, "succeeded", False)
-        except Exception as exc:
-            self._action(action_type, None, path, payload, "failed", False, str(exc))
-            raise
-
     def _active_probe_count(self) -> int:
         con = _connect(self.state_db)
         count = int(con.execute("select count(*) from carousel_state where state='probing'").fetchone()[0])
@@ -189,47 +162,48 @@ class CarouselService:
         return count
 
     def _mark_probing(self, h: str, now: int) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
                 "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_until,backoff_level,updated_at) values(?,?,?,?,?,?,?) "
                 "on conflict(hash) do update set state=excluded.state, probe_started_at=excluded.probe_started_at, "
                 "last_probe_at=excluded.last_probe_at, backoff_until=null, updated_at=excluded.updated_at",
                 (h, "probing", now, now, None, 0, now),
-            ),
-        )
+            )
+            self.intent_repository.upsert_in_transaction(
+                con,
+                SchedulerIntent(
+                    "carousel",
+                    h,
+                    "availability_probe",
+                    40,
+                    now + int(self.probe_duration_sec),
+                    {},
+                ),
+            )
+
+        write_transaction(self.state_db, txn)
 
     def _mark_soak(self, h: str, now: int) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
                 "update carousel_state set state='soak', last_probe_at=?, updated_at=? where hash=?",
                 (now, now, h),
-            ),
-        )
+            )
+            self.intent_repository.delete_in_transaction(con, "carousel", h)
+
+        write_transaction(self.state_db, txn)
 
     def _mark_dead(self, h: str, now: int, backoff_until: int, backoff_level: int) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
                 "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_until,backoff_level,updated_at) values(?,?,?,?,?,?,?) "
                 "on conflict(hash) do update set state='dead', last_probe_at=excluded.last_probe_at, "
                 "backoff_until=excluded.backoff_until, backoff_level=excluded.backoff_level, updated_at=excluded.updated_at",
                 (h, "dead", None, now, backoff_until, backoff_level, now),
-            ),
-        )
+            )
+            self.intent_repository.delete_in_transaction(con, "carousel", h)
 
-    def _allocation(self, h: str, desired_state: str, slot_kind: str, desired_seq_dl: int, reason: str, now: int) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,desired_seq_dl,allocated_at,reason) "
-                "values(?,?,?,?,?,?,?) "
-                "on conflict(hash) do update set desired_state=excluded.desired_state, applied_state=excluded.applied_state, "
-                "slot_kind=excluded.slot_kind, desired_seq_dl=excluded.desired_seq_dl, allocated_at=excluded.allocated_at, reason=excluded.reason",
-                (h, desired_state, desired_state, slot_kind, int(desired_seq_dl), now, reason),
-            ),
-        )
+        write_transaction(self.state_db, txn)
 
     def _decision(self, h: str, decision: str, reason_code: str, data: dict[str, Any]) -> None:
         write_transaction(
@@ -237,15 +211,6 @@ class CarouselService:
             lambda con: con.execute(
                 "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
                 (int(self.now()), "carousel", h, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
-            ),
-        )
-
-    def _action(self, action_type: str, h: str | None, path: str, payload: dict[str, Any], status: str, dry_run: bool, error: str | None = None) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                "insert into action_log(ts,hash,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?,?)",
-                (int(self.now()), h, action_type, path, json.dumps(redact(payload), ensure_ascii=False), status, 1 if dry_run else 0, redact(error) if error else None),
             ),
         )
 

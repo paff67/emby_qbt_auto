@@ -57,6 +57,9 @@ class DiskConfig:
     guard_free_bytes: int = 3 * GIB
     critical_free_bytes: int = 2 * GIB
     emergency_free_bytes: int = 2 * GIB
+    drain_enter_bytes: int = 3 * GIB
+    drain_exit_bytes: int = 5 * GIB
+    explore_enter_bytes: int = 8 * GIB
 
 @dataclass(frozen=True)
 class EmbyConfig:
@@ -93,6 +96,7 @@ class AppConfig:
 class TorrentSnapshot:
     hash: str
     name: str = ""
+    magnet_uri: str = ""
     category: str = ""
     tags: str = ""
     state: str = ""
@@ -106,7 +110,14 @@ class TorrentSnapshot:
     dlspeed_bps: int = 0
     upspeed_bps: int = 0
     completed_bytes: int = 0
+    ratio: float = 0.0
+    seeding_time: int = 0
+    completion_on: int = 0
+    share_limit_reached: bool = False
     has_metadata: bool | None = None
+    availability: float | None = None
+    last_activity: int = 0
+    seen_complete: int = 0
 
     @classmethod
     def from_qbt(cls, payload: Dict[str, Any]) -> "TorrentSnapshot":
@@ -114,6 +125,7 @@ class TorrentSnapshot:
         return cls(
             hash=payload.get("hash", ""),
             name=payload.get("name", ""),
+            magnet_uri=str(payload.get("magnet_uri") or ""),
             category=payload.get("category", "") or "",
             tags=payload.get("tags", "") or "",
             state=payload.get("state", "") or "",
@@ -122,12 +134,29 @@ class TorrentSnapshot:
             progress=float(payload.get("progress") or 0),
             content_path=str(payload.get("content_path") or ""),
             save_path=str(payload.get("save_path") or ""),
-            num_seeds=int(payload.get("num_seeds") or payload.get("num_complete") or 0),
-            num_peers=int(payload.get("num_peers") or payload.get("num_incomplete") or 0),
+            num_seeds=max(
+                int(payload.get("num_seeds") or 0),
+                int(payload.get("num_complete") or 0),
+            ),
+            num_peers=max(
+                int(payload.get("num_peers") or 0),
+                int(payload.get("num_incomplete") or 0),
+            ),
             dlspeed_bps=int(payload.get("dlspeed_bps") or payload.get("dlspeed") or 0),
             upspeed_bps=int(payload.get("upspeed_bps") or payload.get("upspeed") or 0),
             completed_bytes=int(payload.get("completed_bytes") or payload.get("completed") or payload.get("downloaded") or 0),
+            ratio=float(payload.get("ratio") or 0.0),
+            seeding_time=int(payload.get("seeding_time") or 0),
+            completion_on=int(payload.get("completion_on") or 0),
+            share_limit_reached=bool(payload.get("share_limit_reached") or False),
             has_metadata=None if has_metadata is None else bool(has_metadata),
+            availability=(
+                None
+                if payload.get("availability") is None
+                else float(payload.get("availability"))
+            ),
+            last_activity=int(payload.get("last_activity") or 0),
+            seen_complete=int(payload.get("seen_complete") or 0),
         )
 
 @dataclass(frozen=True)

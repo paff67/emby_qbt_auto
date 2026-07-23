@@ -66,7 +66,7 @@ def test_qbt_preferences_guard_records_drift_and_dry_run_without_forcing_incompl
 
         result = guard.reconcile()
 
-        assert result["drift"] == {"preallocate_all": {"actual": True, "desired": False}, "incomplete_files_ext": {"actual": False, "desired": None}}
+        assert result["drift"] == {"preallocate_all": {"actual": True, "desired": False}}
         assert result["would_set"] == {"preallocate_all": False}
         assert qbt.set_calls == []
         con = sqlite3.connect(db)
@@ -76,7 +76,9 @@ def test_qbt_preferences_guard_records_drift_and_dry_run_without_forcing_incompl
         assert action[:4] == ("qbt_preferences", "/api/v2/app/setPreferences", "dry_run", 1)
         assert json.loads(action[4])["set"] == {"preallocate_all": False}
         assert event[:2] == ("qbt_preferences", "preferences_drift")
-        assert json.loads(event[2])["drift"]["incomplete_files_ext"]["desired"] is None
+        event_data = json.loads(event[2])
+        assert "incomplete_files_ext" not in event_data["drift"]
+        assert result["observed"] == {"incomplete_files_ext": False}
 
 
 def test_qbt_preferences_guard_live_sets_only_configured_preferences():

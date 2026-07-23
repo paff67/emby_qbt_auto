@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hashlib
 import json
 import re
 import sqlite3
@@ -8,6 +9,9 @@ from pathlib import PurePosixPath
 from typing import Iterable, Protocol
 
 from .db import readonly_connect, write_transaction
+from .io_governor import JobPriority
+from .naming import CanonicalMediaName, canonical_file_basename, canonical_media_name
+from .promotion import MediaPromotionRepository
 from .runtime import TorrentJobRepository
 from .observability import redact
 @dataclass(frozen=True)
@@ -116,8 +120,16 @@ class MediaPipelineService:
         self.required_sidecar_outputs = tuple(required_sidecar_outputs)
         self.now = now or (lambda: int(time.time()))
         self.jobs = TorrentJobRepository(state_db, now=self.now)
+        self.promotions = MediaPromotionRepository(state_db, now=self.now)
 
-    def handle_upload_verified(self, manifest_id: str, files: Iterable[UploadedFile]) -> PipelineRun:
+    def handle_upload_verified(
+        self,
+        manifest_id: str,
+        files: Iterable[UploadedFile],
+        *,
+        upload_job_id: int | None = None,
+        torrent_hash: str | None = None,
+    ) -> PipelineRun:
         valid = [f for f in files if self._content_gate_allows(f)]
         if not valid:
             return PipelineRun("", "content_gate_failed")
@@ -133,6 +145,10 @@ class MediaPipelineService:
         emby_dir = f"{self.emby_prefix}/{key}".rstrip("/") if normalize_high_confidence else _emby_dir_from_remote(primary.remote_path, self.emby_prefix)
         group_id = self._ensure_media_group(key, emby_dir, normalized_id=normalized_id if normalize_high_confidence else fallback_key)
         run_id = self._ensure_pipeline_run(str(manifest_id), group_id)
+        canonical_name: CanonicalMediaName | None = None
+        canonical_manifest: list[dict] = []
+        canonical_remote_dir: str | None = None
+        canonical_basename: str | None = None
 
         existing_sidecar_state = self._sidecar_manifest_state(group_id)
         queue_refresh = False
@@ -164,6 +180,31 @@ class MediaPipelineService:
             missing_outputs = []
         else:
             scrape = self.backfill.scrape_one(key, str(manifest_id))
+            canonical_name = self._canonical_name_from_scrape(key, scrape)
+            if upload_job_id is not None:
+                if canonical_name is None:
+                    raise ValueError("canonical metadata missing from scraper result")
+                canonical_manifest = self._enqueue_promotions(
+                    upload_job_id=int(upload_job_id),
+                    torrent_hash=torrent_hash,
+                    group_id=group_id,
+                    canonical=canonical_name,
+                    files=valid,
+                )
+                scrape = dict(scrape)
+                scrape["artifacts"] = self._retarget_sidecar_artifacts(
+                    canonical_name,
+                    list(scrape.get("artifacts") or []),
+                )
+                normalize_result = {
+                    **normalize_result,
+                    "metadata_title": canonical_name.metadata_title,
+                    "display_title": canonical_name.display_title,
+                    "canonical_basename": canonical_name.canonical_basename,
+                    "canonical_remote_dir": canonical_name.remote_dir("gcrypt:"),
+                }
+                canonical_remote_dir = canonical_name.remote_dir("gcrypt:")
+                canonical_basename = canonical_name.canonical_basename
             valid_artifacts, missing_outputs = self._validate_sidecar_artifacts(scrape.get("artifacts") or [])
             if scrape.get("status") == "sidecar_verified" and valid_artifacts:
                 manifest_row_id = self._record_sidecar_manifest(group_id, scrape, state="local_sidecar_validated", missing_outputs=[])
@@ -180,6 +221,22 @@ class MediaPipelineService:
                 passthrough_reason = "sidecar_verify_failed"
                 queue_refresh = True
 
+        if upload_job_id is not None and not canonical_manifest and state != "ManualReview":
+            identity = self._enqueue_identity_promotions(
+                upload_job_id=int(upload_job_id),
+                torrent_hash=torrent_hash,
+                group_id=group_id,
+                media_group_key=key,
+                files=valid,
+            )
+            if identity is None:
+                state = "ManualReview"
+                metadata_policy = "manual_review"
+                passthrough_reason = "media_spans_multiple_remote_directories"
+            else:
+                canonical_remote_dir, canonical_basename, canonical_manifest = identity
+                queue_refresh = False
+
         self._set_pipeline_state(
             run_id,
             state,
@@ -189,10 +246,147 @@ class MediaPipelineService:
             normalize_confidence=normalize_confidence,
             normalize_result=normalize_result,
             missing_outputs=missing_outputs,
+            canonical_remote_dir=canonical_remote_dir,
+            canonical_basename=canonical_basename,
+            canonical_video_manifest=canonical_manifest,
         )
         if queue_refresh:
             self._queue_emby_refresh(emby_dir, key, manifest_id, state)
         return PipelineRun(key, state)
+
+    @staticmethod
+    def _canonical_name_from_scrape(
+        key: str,
+        scrape: dict,
+    ) -> CanonicalMediaName | None:
+        normalized_id = str(scrape.get("normalized_id") or "").strip().upper()
+        metadata_title = str(scrape.get("metadata_title") or "").strip()
+        if normalized_id != str(key).strip().upper() or not metadata_title:
+            return None
+        value = canonical_media_name(normalized_id, metadata_title)
+        supplied_basename = str(scrape.get("canonical_basename") or "").strip()
+        supplied_dir = str(scrape.get("canonical_remote_dir") or "").rstrip("/")
+        if supplied_basename and supplied_basename != value.canonical_basename:
+            raise ValueError("scraper canonical basename disagrees with naming policy")
+        if supplied_dir and supplied_dir != value.remote_dir("gcrypt:"):
+            raise ValueError("scraper canonical directory disagrees with naming policy")
+        return value
+
+    def _enqueue_promotions(
+        self,
+        *,
+        upload_job_id: int,
+        torrent_hash: str | None,
+        group_id: int,
+        canonical: CanonicalMediaName,
+        files: list[UploadedFile],
+    ) -> list[dict]:
+        manifest: list[dict] = []
+        occupied: set[str] = set()
+        for file in files:
+            source_name = PurePosixPath(
+                _remote_path_without_remote(file.remote_path)
+            ).name
+            basename = canonical_file_basename(canonical, source_name)
+            suffix = PurePosixPath(source_name).suffix.lower() or ".mp4"
+            target = f"{canonical.remote_dir('gcrypt:')}/{basename}{suffix}"
+            if target in occupied:
+                digest = hashlib.sha1(file.remote_path.encode("utf-8")).hexdigest()[:8]
+                basename = canonical_file_basename(
+                    canonical,
+                    source_name,
+                    collision_digest=digest,
+                )
+                target = f"{canonical.remote_dir('gcrypt:')}/{basename}{suffix}"
+            occupied.add(target)
+            self.promotions.enqueue(
+                upload_job_id=int(upload_job_id),
+                hash=torrent_hash,
+                media_group_id=int(group_id),
+                normalized_id=canonical.normalized_id,
+                metadata_title=canonical.metadata_title,
+                display_title=canonical.display_title,
+                source_remote=file.remote_path,
+                target_remote=target,
+                expected_size=int(file.size),
+            )
+            manifest.append({"remote_path": target, "size": int(file.size)})
+        return manifest
+
+    def _enqueue_identity_promotions(
+        self,
+        *,
+        upload_job_id: int,
+        torrent_hash: str | None,
+        group_id: int,
+        media_group_key: str,
+        files: list[UploadedFile],
+    ) -> tuple[str, str, list[dict]] | None:
+        parents = {_remote_parent(file.remote_path) for file in files}
+        if len(parents) != 1:
+            return None
+        remote_dir = next(iter(parents))
+        primary_name = PurePosixPath(
+            _remote_path_without_remote(files[0].remote_path)
+        ).stem
+        manifest: list[dict] = []
+        for file in files:
+            self.promotions.enqueue(
+                upload_job_id=int(upload_job_id),
+                hash=torrent_hash,
+                media_group_id=int(group_id),
+                normalized_id=str(media_group_key),
+                metadata_title=primary_name,
+                display_title=primary_name,
+                source_remote=file.remote_path,
+                target_remote=file.remote_path,
+                expected_size=int(file.size),
+            )
+            manifest.append(
+                {"remote_path": file.remote_path, "size": int(file.size)}
+            )
+        return remote_dir, primary_name, manifest
+
+    @staticmethod
+    def _retarget_sidecar_artifacts(
+        canonical: CanonicalMediaName,
+        artifacts: list[dict],
+    ) -> list[dict]:
+        out: list[dict] = []
+        generic = {
+            "poster.jpg",
+            "poster.jpeg",
+            "poster.png",
+            "poster.webp",
+            "fanart.jpg",
+            "fanart.jpeg",
+            "fanart.png",
+            "fanart.webp",
+            "thumb.jpg",
+            "thumb.jpeg",
+            "thumb.png",
+            "thumb.webp",
+        }
+        for artifact in artifacts:
+            row = dict(artifact)
+            local_name = PurePosixPath(str(row.get("local") or "")).name
+            suffix = PurePosixPath(local_name).suffix.lower()
+            stem = PurePosixPath(local_name).stem.lower()
+            if local_name.lower() in generic:
+                target_name = local_name
+            elif suffix == ".nfo":
+                target_name = f"{canonical.canonical_basename}.nfo"
+            elif stem.endswith("-poster"):
+                target_name = f"{canonical.canonical_basename}-poster{suffix}"
+            elif stem.endswith("-fanart"):
+                target_name = f"{canonical.canonical_basename}-fanart{suffix}"
+            elif stem.endswith("-thumb"):
+                target_name = f"{canonical.canonical_basename}-thumb{suffix}"
+            else:
+                target_name = local_name
+            row["remote"] = f"{canonical.remote_dir('gcrypt:')}/{target_name}"
+            out.append(row)
+        return out
 
     def _normalize_filename(self, raw_filename: str) -> dict:
         try:
@@ -269,12 +463,16 @@ class MediaPipelineService:
         normalize_confidence: float | None = None,
         normalize_result: dict | None = None,
         missing_outputs: list[str] | None = None,
+        canonical_remote_dir: str | None = None,
+        canonical_basename: str | None = None,
+        canonical_video_manifest: list[dict] | None = None,
     ) -> None:
         write_transaction(
             self.state_db,
             lambda con: con.execute(
                 "update media_pipeline_runs set state=?, metadata_policy=?, metadata_quality=?, passthrough_reason=?, "
-                "normalize_confidence=?, normalize_result_json=?, missing_outputs_json=?, updated_at=? where id=?",
+                "normalize_confidence=?, normalize_result_json=?, missing_outputs_json=?, canonical_remote_dir=?, "
+                "canonical_basename=?, canonical_video_manifest_json=?, updated_at=? where id=?",
                 (
                     state,
                     metadata_policy,
@@ -283,6 +481,9 @@ class MediaPipelineService:
                     normalize_confidence,
                     json.dumps(normalize_result or {}, ensure_ascii=False),
                     json.dumps(missing_outputs or [], ensure_ascii=False),
+                    canonical_remote_dir,
+                    canonical_basename,
+                    json.dumps(canonical_video_manifest or [], ensure_ascii=False),
                     int(self.now()),
                     run_id,
                 ),
@@ -380,7 +581,7 @@ class MediaPipelineService:
                 "sidecar_manifest_id": sidecar_manifest_id,
                 "allow_unrecognized_passthrough": self.allow_unrecognized_passthrough,
             }
-            self.jobs.enqueue(None, None, "sidecar_upload", payload, priority=20)
+            self.jobs.enqueue(None, None, "sidecar_upload", payload, priority=int(JobPriority.SIDECAR_UPLOAD))
 
     def _queue_emby_refresh(self, emby_dir: str, key: str, manifest_id: str, state: str) -> None:
         if not emby_dir.startswith(self.emby_prefix + "/"):
@@ -428,7 +629,16 @@ class MediaPipelineJobRunner:
                 )
                 for item in payload.get("files", [])
             ]
-            self.service.handle_upload_verified(str(payload.get("upload_manifest_id") or f"media-job-{row['id']}"), files)
+            self.service.handle_upload_verified(
+                str(payload.get("upload_manifest_id") or f"media-job-{row['id']}"),
+                files,
+                upload_job_id=(
+                    int(payload["upload_job_id"])
+                    if payload.get("upload_job_id") is not None
+                    else None
+                ),
+                torrent_hash=row.get("hash"),
+            )
             self.repo.update_state(int(row["id"]), "done", exit_code=0)
         except Exception as exc:
             self.repo.schedule_retry(int(row["id"]), redact(str(exc))[:500], exit_code=1, delay_sec=self.retry_delay_sec)
@@ -436,11 +646,13 @@ class MediaPipelineJobRunner:
 
 
 class EmbyRefreshWorker:
-    def __init__(self, state_db, emby, *, now=None, media_prefix: str = "/media/gcrypt"):
+    def __init__(self, state_db, emby, *, cache_flusher=None, now=None, media_prefix: str = "/media/gcrypt", retry_delay_sec: int = 60):
         self.state_db = state_db
         self.emby = emby
+        self.cache_flusher = cache_flusher
         self.now = now or (lambda: int(time.time()))
         self.media_prefix = media_prefix.rstrip("/")
+        self.retry_delay_sec = max(1, int(retry_delay_sec))
 
     def run_next(self) -> int | None:
         row = self._claim_next()
@@ -450,24 +662,43 @@ class EmbyRefreshWorker:
         path = str(row["emby_media_dir"] or "").rstrip("/")
         try:
             self._validate_path(path)
-            self.emby.media_updated(path)
+        except ValueError as exc:
+            self._finish(task_id, "blocked", redact(str(exc))[:500])
+            return task_id
+        try:
+            if self.cache_flusher is not None:
+                self.cache_flusher.flush(path)
+            refresh_path = getattr(self.emby, "refresh_path", None)
+            if callable(refresh_path):
+                refresh_path(path)
+            else:
+                self.emby.media_updated(path)
             self._finish(task_id, "done", None)
         except Exception as exc:
-            self._finish(task_id, "blocked", redact(str(exc))[:500])
+            error = redact(str(exc))[:500]
+            if self._is_transient(exc):
+                self._retry_or_fail(row, error)
+            else:
+                self._finish(task_id, "blocked", error)
         return task_id
 
     def _claim_next(self) -> dict | None:
         now = int(self.now())
         def txn(con: sqlite3.Connection) -> dict | None:
             row = con.execute(
-                "select * from emby_refresh_tasks where state='queued' and "
-                "((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)) "
+                "select * from emby_refresh_tasks where attempts<max_attempts and state in ('queued','retry_wait') and "
+                "((state='retry_wait' and (next_run_at is null or next_run_at<=?)) or "
+                "(state='queued' and ((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)))) "
                 "order by coalesce(max_run_at, earliest_run_at, created_at), id limit 1",
-                (now, now),
+                (now, now, now),
             ).fetchone()
             if not row:
                 return None
-            con.execute("update emby_refresh_tasks set state='running', updated_at=? where id=? and state='queued'", (now, row["id"]))
+            con.execute(
+                "update emby_refresh_tasks set state='running',attempts=attempts+1,updated_at=? "
+                "where id=? and state in ('queued','retry_wait')",
+                (now, row["id"]),
+            )
             return dict(con.execute("select * from emby_refresh_tasks where id=?", (row["id"],)).fetchone())
 
         return write_transaction(self.state_db, txn)
@@ -476,10 +707,11 @@ class EmbyRefreshWorker:
         now = int(self.now())
         con = _connect(self.state_db)
         row = con.execute(
-            "select * from emby_refresh_tasks where state='queued' and "
-            "((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)) "
+            "select * from emby_refresh_tasks where attempts<max_attempts and state in ('queued','retry_wait') and "
+            "((state='retry_wait' and (next_run_at is null or next_run_at<=?)) or "
+            "(state='queued' and ((earliest_run_at is not null and earliest_run_at<=?) or (max_run_at is not null and max_run_at<=?)))) "
             "order by coalesce(max_run_at, earliest_run_at, created_at), id limit 1",
-            (now, now),
+            (now, now, now),
         ).fetchone()
         out = dict(row) if row else None
         con.close()
@@ -497,3 +729,31 @@ class EmbyRefreshWorker:
     def _validate_path(self, path: str) -> None:
         if path == self.media_prefix or not path.startswith(self.media_prefix + "/"):
             raise ValueError("refresh path too broad or outside media prefix")
+
+    def _retry_or_fail(self, row: dict, error: str) -> None:
+        attempts = int(row.get("attempts") or 0)
+        max_attempts = int(row.get("max_attempts") or 1)
+        now = int(self.now())
+        if attempts >= max_attempts:
+            self._finish(int(row["id"]), "failed", error)
+            return
+        delay = min(3600, self.retry_delay_sec * (2 ** max(0, attempts - 1)))
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update emby_refresh_tasks set state='retry_wait',next_run_at=?,last_error=?,updated_at=? where id=?",
+                (now + delay, error, now, int(row["id"])),
+            ),
+        )
+
+    @staticmethod
+    def _is_transient(exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        status = getattr(exc, "status_code", None)
+        if status is not None:
+            try:
+                return int(status) >= 500
+            except (TypeError, ValueError):
+                pass
+        return bool(re.search(r"\b5\d\d\b", str(exc)))

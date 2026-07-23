@@ -20,6 +20,115 @@ def _rows(db: Path, sql: str):
     return rows
 
 
+def test_planner_consumes_active_intents_and_owns_one_plan_generation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from qbt_orchestrator.scheduler_intents import SchedulerIntent, SchedulerIntentRepository
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        intents = SchedulerIntentRepository(db)
+        intents.upsert(SchedulerIntent("soak", "probe", "probe", 30, 1_120, {"exposure_bytes": 1}))
+        intents.upsert(SchedulerIntent("batch", "protected", "protect_batch", 20, 1_120, {"batch_id": 7}))
+        intents.upsert(SchedulerIntent("soak", "expired", "probe", 99, 999, {"exposure_bytes": 1}))
+        executor = FakeExecutor()
+        planner = DownloadPlanner(
+            state_db=db,
+            executor=executor,
+            dry_run=False,
+            active_slots=1,
+            disk_floor_bytes=0,
+            now=lambda: 1_000,
+        )
+        snapshots = {
+            "regular": {"hash": "regular", "category": "auto", "state": "pausedDL", "amount_left": 1, "size": 2},
+            "probe": {"hash": "probe", "category": "auto", "state": "pausedDL", "amount_left": 3, "size": 4},
+            "protected": {"hash": "protected", "category": "auto", "state": "downloading", "amount_left": 5, "size": 6},
+            "expired": {"hash": "expired", "category": "auto", "state": "pausedDL", "amount_left": 2, "size": 3},
+        }
+
+        first = planner.plan_and_apply(snapshots, free_bytes=100, sync_healthy=True)
+
+        assert first.selected_hashes == ["probe"]
+        assert ("/api/v2/torrents/start", {"hashes": "probe"}) in executor.posts
+        assert all(
+            not (path == "/api/v2/torrents/stop" and "protected" in payload["hashes"])
+            for path, payload in executor.posts
+        )
+        allocations = _rows(
+            db,
+            "select hash,owner,plan_generation from scheduler_allocations order by hash",
+        )
+        assert allocations
+        assert {row["owner"] for row in allocations} == {"central"}
+        assert {row["plan_generation"] for row in allocations} == {first.plan_generation}
+        assert first.plan_generation == 1
+
+        second = planner.plan_and_apply(snapshots, free_bytes=100, sync_healthy=False)
+        state = _rows(db, "select current_generation from scheduler_plan_state where id=1")
+        assert second.plan_generation == 2
+        assert state == [{"current_generation": 2}]
+
+
+def test_planner_marks_never_seen_swarm_dead_after_no_progress_threshold():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = [1_000]
+        planner = DownloadPlanner(
+            db,
+            FakeExecutor(),
+            dry_run=False,
+            active_slots=0,
+            disk_floor_bytes=0,
+            now=lambda: clock[0],
+        )
+        snapshots = {
+            "never": {
+                "hash": "never",
+                "category": "auto",
+                "state": "stoppedDL",
+                "amount_left": 10,
+                "size": 20,
+                "completed": 10,
+                "progress": 0.5,
+                "num_seeds": 0,
+                "num_peers": 0,
+            }
+        }
+
+        planner.plan_and_apply(snapshots, free_bytes=100, sync_healthy=True)
+        first_health = _rows(
+            db,
+            "select last_swarm_seen_at,no_swarm_since,no_progress_since from torrent_health where hash='never'",
+        )[0]
+        assert first_health == {
+            "last_swarm_seen_at": None,
+            "no_swarm_since": 1_000,
+            "no_progress_since": None,
+        }
+
+        clock[0] = 1_001
+        planner.plan_and_apply(snapshots, free_bytes=100, sync_healthy=True)
+        clock[0] = 4_602
+        planner.plan_and_apply(snapshots, free_bytes=100, sync_healthy=True)
+
+        allocation = _rows(
+            db,
+            "select desired_state,reason from scheduler_allocations where hash='never'",
+        )[0]
+        assert allocation == {
+            "desired_state": "dead",
+            "reason": "health_no_swarm_no_progress",
+        }
+
+
 def test_planner_selects_budget_fit_active_and_pauses_unplanned_managed_downloads():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner
@@ -288,6 +397,76 @@ def test_planner_demotes_slow_active_after_five_minutes_and_selects_replacement(
             "slow": ("soak", "active_slow_3min"),
         }
 
+        # The demotion persists its cooldown in soak_state.  A new planner
+        # instance must honour it even when SoakQueue is disabled and no
+        # cooldown_hashes argument is supplied by the caller.
+        executor.posts.clear()
+        snapshots["slow"]["state"] = "stoppedDL"
+        snapshots["fresh"]["state"] = "downloading"
+        next_tick = DownloadPlanner(
+            state_db=db,
+            executor=executor,
+            dry_run=False,
+            active_slots=2,
+            disk_floor_bytes=0,
+            now=lambda: 1215,
+        )
+        follow_up = next_tick.plan_and_apply(
+            snapshots, free_bytes=10, sync_healthy=True
+        )
+
+        assert "slow" not in follow_up.selected_hashes
+        assert all(
+            not (path == "/api/v2/torrents/start" and "slow" in payload["hashes"])
+            for path, payload in executor.posts
+        )
+
+
+def test_planner_reads_unexpired_soak_state_cooldown_without_queue_service():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into soak_state(hash,state,cooldown_until,updated_at,reason) "
+            "values('cool','soak_cooldown',1300,1000,'test')"
+        )
+        con.commit()
+        con.close()
+        executor = FakeExecutor()
+        snapshots = {
+            "cool": {
+                "hash": "cool",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": 1,
+                "size": 2,
+                "progress": 0.5,
+            }
+        }
+
+        result = DownloadPlanner(
+            db,
+            executor,
+            dry_run=False,
+            active_slots=1,
+            disk_floor_bytes=0,
+            now=lambda: 1200,
+        ).plan_and_apply(snapshots, free_bytes=10, sync_healthy=True)
+
+        assert result.selected_hashes == []
+        assert executor.posts == []
+        allocation = _rows(
+            db,
+            "select desired_state,reason from scheduler_allocations where hash='cool'",
+        )[0]
+        assert allocation == {"desired_state": "soak_cooldown", "reason": "cooldown"}
+
 
 def test_planner_demotes_stalled_zero_speed_active_after_three_minutes():
     from qbt_orchestrator.db import migrate
@@ -314,6 +493,130 @@ def test_planner_demotes_stalled_zero_speed_active_after_three_minutes():
         assert ("/api/v2/torrents/stop", {"hashes": "stalled"}) in executor.posts
         alloc = _rows(db, "select hash,desired_state,reason from scheduler_allocations order by hash")
         assert {r["hash"]: (r["desired_state"], r["reason"]) for r in alloc}["stalled"] == ("soak", "active_slow_3min")
+
+
+def test_planner_keeps_engine_selected_nearly_finished_torrent_resident_when_slow():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    mib = 1024**2
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) "
+            "values('nearly-done','active','active','stable',900,'budget_fit')"
+        )
+        con.execute(
+            "insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,"
+            "num_seeds,num_peers,low_speed_since,active_since,updated_at) "
+            "values('nearly-done',1170,0,6000,6000,0.98,0,1,900,900,1170)"
+        )
+        con.commit()
+        con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(
+            state_db=db,
+            executor=executor,
+            dry_run=False,
+            active_slots=1,
+            disk_floor_bytes=0,
+            slow_active_demote_sec=180,
+            finish_resident_max_remaining_bytes=256 * mib,
+            now=lambda: 1200,
+        )
+        snapshots = {
+            "nearly-done": {
+                "hash": "nearly-done",
+                "name": "nearly-done",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stalledDL",
+                "amount_left": 80 * mib,
+                "size": 6 * 1024**3,
+                "progress": 0.98,
+                "dlspeed": 0,
+                "num_seeds": 0,
+                "num_peers": 1,
+            }
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=1024**3,
+            sync_healthy=True,
+            allowed_active_hashes={"nearly-done"},
+        )
+
+        assert result.selected_hashes == ["nearly-done"]
+        assert executor.posts == []
+        assert _rows(
+            db,
+            "select desired_state,reason from scheduler_allocations where hash='nearly-done'",
+        ) == [{"desired_state": "active", "reason": "budget_fit"}]
+
+
+def test_planner_demotes_nearly_finished_torrent_after_resident_stall_limit():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    mib = 1024**2
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) "
+            "values('stuck-finish','active','active','stable',100,'budget_fit')"
+        )
+        con.execute(
+            "insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,"
+            "num_seeds,num_peers,low_speed_since,no_progress_since,active_since,updated_at) "
+            "values('stuck-finish',3900,0,6000,6000,0.98,0,1,100,100,100,3900)"
+        )
+        con.commit()
+        con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(
+            state_db=db,
+            executor=executor,
+            dry_run=False,
+            active_slots=1,
+            disk_floor_bytes=0,
+            slow_active_demote_sec=180,
+            finish_resident_max_remaining_bytes=256 * mib,
+            finish_resident_max_stall_sec=1_800,
+            now=lambda: 4_000,
+        )
+        snapshots = {
+            "stuck-finish": {
+                "hash": "stuck-finish",
+                "name": "stuck-finish",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stalledDL",
+                "amount_left": 8 * mib,
+                "size": 6 * 1024**3,
+                "progress": 0.999,
+                "availability": 0.996,
+                "dlspeed": 0,
+                "num_seeds": 0,
+                "num_peers": 1,
+            }
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=1024**3,
+            sync_healthy=True,
+            allowed_active_hashes={"stuck-finish"},
+        )
+
+        assert result.selected_hashes == []
+        assert ("/api/v2/torrents/stop", {"hashes": "stuck-finish"}) in executor.posts
 
 
 def test_planner_only_starts_selected_torrents_that_are_stopped_or_paused():
@@ -348,7 +651,7 @@ def test_planner_marks_soak_dead_after_one_hour_without_swarm_or_progress():
         migrate(db, dry_run=False)
         con = sqlite3.connect(db)
         con.execute("insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,desired_seq_dl,allocated_at,reason) values('deadish','soak','soak','soak',0,100,'budget_or_slot_exhausted')")
-        con.execute("insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,no_progress_since,soak_since,updated_at) values('deadish',1000,0,100,100,0.2,0,0,1000,1000,1000,1000)")
+        con.execute("insert into torrent_health(hash,sampled_at,dlspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,no_swarm_since,no_progress_since,soak_since,updated_at) values('deadish',1000,0,100,100,0.2,0,0,1000,1000,1000,1000,1000)")
         con.commit(); con.close()
         executor = FakeExecutor()
         planner = DownloadPlanner(state_db=db, executor=executor, dry_run=False, active_slots=1, disk_floor_bytes=0, now=lambda: 4601)
@@ -579,6 +882,58 @@ def test_planner_subtracts_active_resource_reservations_from_budget():
         assert decision["reason_code"] == "budget_or_slot_exhausted"
 
 
+def test_planner_does_not_subtract_current_pinned_inventory_from_df_free():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    gib = 1024**3
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into resource_reservations(hash,kind,accounting_class,bytes,state,created_at,reason) "
+            "values('pinned','cleanup_pending','current_pinned',?,'active',900,'cleanup_wait')",
+            (5 * gib,),
+        )
+        con.execute(
+            "insert into resource_reservations(hash,kind,accounting_class,bytes,state,created_at,expires_at,reason) "
+            "values('future','active_download','future_growth',?,'active',900,2000,'existing')",
+            (1 * gib,),
+        )
+        con.commit(); con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(db, executor, dry_run=False, active_slots=1, disk_floor_bytes=2 * gib, now=lambda: 1000)
+        snapshots = {
+            "new": {
+                "hash": "new",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": 4 * gib,
+                "size": 8 * gib,
+                "progress": 0.5,
+            }
+        }
+
+        result = planner.plan_and_apply(snapshots, free_bytes=7 * gib, sync_healthy=True)
+
+        assert result.budget_bytes == 4 * gib
+        assert result.selected_hashes == ["new"]
+        claim = _rows(
+            db,
+            "select accounting_class,owner,lease_generation,last_observed_at "
+            "from resource_reservations where hash='new' and kind='active_download'",
+        )[0]
+        assert claim == {
+            "accounting_class": "future_growth",
+            "owner": "planner",
+            "lease_generation": 0,
+            "last_observed_at": 1000,
+        }
+
+
 def test_planner_deduplicates_batch_and_active_download_reservations_for_same_hash():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner
@@ -765,6 +1120,131 @@ def test_planner_subtracts_external_soak_reservations_from_full_active_budget():
         assert decision["decision"] == "soak"
         assert decision["reason_code"] == "budget_or_slot_exhausted"
         assert json.loads(decision["data_json"])["external_reserved_bytes"] == 3 * gib
+
+
+def test_planner_uses_at_most_two_write_transactions_for_one_tick():
+    from qbt_orchestrator.db import db_actor_metrics, migrate, stop_write_actors
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        stop_write_actors()
+        planner = DownloadPlanner(db, FakeExecutor(), dry_run=False, active_slots=0, disk_floor_bytes=0, now=lambda: 1000)
+        snapshots = {
+            f"h{index:03d}": {
+                "hash": f"h{index:03d}",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": index + 1,
+                "size": 1000,
+                "progress": 0.1,
+            }
+            for index in range(100)
+        }
+        before = db_actor_metrics(db)["writes_completed"]
+
+        planner.plan_and_apply(snapshots, free_bytes=100_000, sync_healthy=True)
+
+        written = db_actor_metrics(db)["writes_completed"] - before
+        assert written <= 2
+        assert len(_rows(db, "select hash from scheduler_allocations")) == 100
+        assert len(_rows(db, "select hash from torrent_health")) == 100
+        assert len(_rows(db, "select hash from decision_log where component='planner'")) == 100
+
+
+def test_planner_allowed_active_hashes_prevents_legacy_slot_backfill():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        executor = FakeExecutor()
+        planner = DownloadPlanner(db, executor, dry_run=False, active_slots=2, disk_floor_bytes=0, now=lambda: 100)
+        snapshots = {
+            "a": {"hash": "a", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 1, "size": 10, "progress": 0.1},
+            "b": {"hash": "b", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 2, "size": 10, "progress": 0.1},
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=100,
+            sync_healthy=True,
+            allowed_active_hashes={"b"},
+        )
+
+        assert result.selected_hashes == ["b"]
+        assert executor.posts == [("/api/v2/torrents/start", {"hashes": "b"})]
+        rows = _rows(db, "select hash,desired_state,reason from scheduler_allocations order by hash")
+        assert rows == [
+            {"hash": "a", "desired_state": "soak", "reason": "global_scheduler_not_selected"},
+            {"hash": "b", "desired_state": "active", "reason": "budget_fit"},
+        ]
+
+
+def test_planner_does_not_let_expired_carousel_dead_override_live_selection():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) "
+            "values('nearly-done','soak_cooldown','soak_cooldown','soak_cooldown',10,'legacy_cooldown')"
+        )
+        con.execute(
+            "insert into carousel_state(hash,state,last_probe_at,backoff_until,backoff_level,updated_at) "
+            "values('nearly-done','dead',10,20,1,10)"
+        )
+        con.commit()
+        con.close()
+        executor = FakeExecutor()
+        planner = DownloadPlanner(
+            db,
+            executor,
+            dry_run=False,
+            active_slots=1,
+            disk_floor_bytes=0,
+            now=lambda: 100,
+        )
+        snapshots = {
+            "nearly-done": {
+                "hash": "nearly-done",
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": 8 * 1024**2,
+                "size": 6 * 1024**3,
+                "progress": 0.99,
+                "num_seeds": 0,
+                "num_peers": 1,
+            }
+        }
+
+        result = planner.plan_and_apply(
+            snapshots,
+            free_bytes=1024**3,
+            sync_healthy=True,
+            allowed_active_hashes={"nearly-done"},
+        )
+
+        assert result.selected_hashes == ["nearly-done"]
+        assert executor.posts == [
+            ("/api/v2/torrents/start", {"hashes": "nearly-done"})
+        ]
+        assert _rows(
+            db,
+            "select desired_state,owner,reason from scheduler_allocations where hash='nearly-done'",
+        ) == [
+            {"desired_state": "active", "owner": "central", "reason": "budget_fit"}
+        ]
 
 
 if __name__ == "__main__":

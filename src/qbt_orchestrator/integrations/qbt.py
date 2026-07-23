@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -30,21 +31,24 @@ class TokenBucket:
         self.capacity = max(1.0, self.rate_per_sec)
         self.tokens = self.capacity
         self.updated_at = float(self.clock())
+        self._lock = threading.Lock()
 
     def acquire(self) -> None:
         if self.rate_per_sec <= 0:
             return
-        now = float(self.clock())
-        elapsed = max(0.0, now - self.updated_at)
-        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate_per_sec)
-        self.updated_at = now
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
-            return
-        wait_for = (1.0 - self.tokens) / self.rate_per_sec
-        self.sleeper(wait_for)
-        self.updated_at = float(self.clock())
-        self.tokens = 0.0
+        while True:
+            with self._lock:
+                now = float(self.clock())
+                elapsed = max(0.0, now - self.updated_at)
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate_per_sec)
+                self.updated_at = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                wait_for = (1.0 - self.tokens) / self.rate_per_sec
+            # Never hold the limiter lock during sleep. Other callers can
+            # observe time advancing and compete fairly when they wake.
+            self.sleeper(wait_for)
 
 
 class QbtDockerClient:
@@ -168,10 +172,15 @@ class QbtHttpClient:
         self.username = username
         self.password = password
         self.auth_mode = str(auth_mode or "auto").strip().lower()
+        if self.auth_mode not in {"auto", "required", "none", "noauth", "disabled", "off"}:
+            raise ValueError(f"unsupported qBT auth mode: {self.auth_mode}")
+        if self.auth_mode == "required" and (not self.username or not self.password):
+            raise ValueError("qBT auth mode 'required' needs both username and password")
         self.default_headers = dict(default_headers or {})
         self.transport = transport
         self.timeout = timeout
         self.cookie: str | None = None
+        self._auth_lock = threading.Lock()
         self.rate_limiter = TokenBucket(api_max_requests_per_sec, clock=clock, sleeper=sleeper)
 
     @property
@@ -206,6 +215,23 @@ class QbtHttpClient:
             raise RuntimeError("qBT host API login did not return a session cookie")
         self.cookie = set_cookie.split(";", 1)[0]
 
+    def _ensure_session(self) -> None:
+        if not self.auth_enabled or self.cookie is not None:
+            return
+        if not (self.username or self.password) and self.auth_mode != "required":
+            return
+        with self._auth_lock:
+            if self.cookie is None:
+                self._login()
+
+    def _refresh_session(self, stale_cookie: str | None) -> None:
+        with self._auth_lock:
+            # Another caller may already have replaced the rejected SID.
+            if self.cookie != stale_cookie and self.cookie is not None:
+                return
+            self.cookie = None
+            self._login()
+
     def _request(
         self,
         method: str,
@@ -215,18 +241,17 @@ class QbtHttpClient:
         retry_auth: bool = True,
     ) -> str:
         self.rate_limiter.acquire()
-        if self.auth_enabled and self.cookie is None and (self.username or self.password):
-            self._login()
+        self._ensure_session()
         body = None if data is None else urlencode(data)
         headers: dict[str, str] = dict(self.default_headers)
         if body is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         if self.cookie:
             headers["Cookie"] = self.cookie
+        request_cookie = self.cookie
         status, text, _headers = self.transport(method, self._url(path, params), body, headers, self.timeout)
         if status in {401, 403} and retry_auth and self.auth_enabled:
-            self.cookie = None
-            self._login()
+            self._refresh_session(request_cookie)
             return self._request(method, path, params=params, data=data, retry_auth=False)
         if status in {401, 403} and not self.auth_enabled:
             raise RuntimeError(f"qBT host API returned unauthorized while auth is disabled status={status}")

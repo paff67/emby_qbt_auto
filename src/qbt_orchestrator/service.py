@@ -1,28 +1,47 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import signal
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from .alerts import SchedulerAlertConfig, SchedulerAlertService
+from .budget import calculate_growth_budget, resource_claims_from_rows
+from .capacity_state import (
+    CapacityStateStore,
+    ModeController,
+    build_capacity_observation,
+    detect_capacity_state,
+    finish_viability,
+)
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
-from .db import migrate, write_transaction
-from .file_batch import FileBatchService, active_pipeline_batch_hashes
+from .db import migrate, readonly_connect, start_persistent_write_actor, stop_write_actor, write_transaction
+from .file_batch import FileBatchService
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .observe_promotion import ObservePromotionService
 from .observability import redact
-from .planner import DownloadPlanner
+from .planner import DownloadPlanner, active_soak_cooldown_hashes
 from .policies.disk import classify_disk
-from .runtime import BotCommandRepository, BotNotificationRepository, ObservabilityStore
+from .periodic import PeriodicTask, PeriodicWorker
+from .promotion import finalize_canonical_upload
+from .runtime import (
+    BotCommandRepository,
+    BotNotificationRepository,
+    FullTorrentCleanupRunner,
+    ObservabilityStore,
+    TorrentJobRepository,
+)
+from .scheduler_engine import SchedulerEngine
 from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
 from .telegram_control import TelegramAuthorizer
+from .work_items import build_full_finish_work_items
 
 
 @dataclass
@@ -31,6 +50,7 @@ class LoopTask:
     interval_sec: float
     callback: Callable[[], object]
     next_due: float = 0.0
+    max_runtime_sec: float = 1.0
 
     def due(self, now_monotonic: float) -> bool:
         return now_monotonic >= self.next_due
@@ -140,10 +160,21 @@ class DaemonRuntime:
         planner_dry_run: bool = True,
         planner_active_slots: int = 5,
         planner_slow_active_demote_sec: int = 180,
+        finish_resident_max_remaining_bytes: int = 0,
+        finish_resident_max_stall_sec: int = 1_800,
+        capacity_viability_stale_sec: int = 1_800,
+        capacity_reclaimer=None,
+        capacity_reclaim_interval_sec: int = 300,
+        scheduler_engine_mode: str = "legacy",
+        scheduler_engine=None,
+        scheduler_unit_bytes: int = 64 * 1024**2,
+        scheduler_min_residency_sec: int = 180,
         disk_floor_bytes: int = 3 * 1024**3,
         emergency_floor_bytes: int = int(1.5 * 1024**3),
         recovery_enabled: bool = True,
         recovery_enter_bytes: int | None = None,
+        drain_exit_bytes: int | None = None,
+        explore_enter_bytes: int = 8 * 1024**3,
         recovery_margin_bytes: int = 256 * 1024**2,
         recovery_active_slots: int = 4,
         recovery_max_remaining_bytes: int = int(1.5 * 1024**3),
@@ -151,11 +182,20 @@ class DaemonRuntime:
         upload_dry_run: bool = True,
         cleanup_runner=None,
         cleanup_dry_run: bool = True,
+        full_cleanup_runner=None,
+        full_cleanup_enabled: bool = False,
+        full_cleanup_dry_run: bool = True,
+        cleanup_min_seed_sec: int = 900,
+        cleanup_min_ratio: float = 1.0,
+        cleanup_pressure_free_bytes: int = 5 * 1024**3,
+        cleanup_max_retention_sec: int = 7200,
         file_batch_dry_run: bool = True,
         upload_backpressure_policy=None,
         host_downloads: str = "/data/downloads",
         container_downloads: str = "/downloads",
         rclone_remote: str = "gcrypt:",
+        media_promotion_runner=None,
+        media_promotion_dry_run: bool = True,
         media_pipeline_runner=None,
         media_pipeline_dry_run: bool = True,
         emby_refresh_worker=None,
@@ -182,6 +222,7 @@ class DaemonRuntime:
         batch_allow_tag: str = "",
         batch_max_live_batch_bytes: int = 0,
         batch_max_new_per_tick: int = 1_000_000,
+        batch_inventory_limit: int = 8,
         background_event_workers: bool = False,
         event_worker_interval: float = 1.0,
         event_worker_join_timeout: float = 0.2,
@@ -189,7 +230,13 @@ class DaemonRuntime:
         scheduler_alert_chat_ids: list[str] | None = None,
         scheduler_alert_interval_sec: int = 1800,
         disk_alert_margin_bytes: int = 512 * 1024**2,
+        capacity_deadlock_alerts_enabled: bool = True,
         scheduler_alert_service=None,
+        sync_repeated_full_limit: int = 3,
+        sync_degraded_interval_sec: float = 10.0,
+        safety_event_sample_interval_sec: float = 60.0,
+        background_periodic_workers: bool = False,
+        periodic_worker_join_timeout: float = 5.0,
     ):
         self.state_db = Path(state_db)
         migrate(self.state_db, dry_run=False)
@@ -203,10 +250,37 @@ class DaemonRuntime:
         self.planner_dry_run = planner_dry_run or dry_run
         self.planner_active_slots = int(planner_active_slots)
         self.planner_slow_active_demote_sec = int(planner_slow_active_demote_sec)
+        self.finish_resident_max_remaining_bytes = max(
+            0, int(finish_resident_max_remaining_bytes)
+        )
+        self.finish_resident_max_stall_sec = max(
+            0, int(finish_resident_max_stall_sec)
+        )
+        self.capacity_viability_stale_sec = max(
+            0, int(capacity_viability_stale_sec)
+        )
+        self.capacity_reclaimer = capacity_reclaimer
+        self.capacity_reclaim_interval_sec = max(
+            1, int(capacity_reclaim_interval_sec)
+        )
+        self._last_capacity_reclaim_at: int | None = None
+        self.scheduler_engine_mode = str(scheduler_engine_mode or "legacy").strip().lower()
+        if self.scheduler_engine_mode not in {"legacy", "shadow", "live"}:
+            raise ValueError("scheduler_engine_mode must be legacy, shadow, or live")
+        self.scheduler_engine = scheduler_engine or SchedulerEngine(unit_bytes=int(scheduler_unit_bytes))
+        self.scheduler_min_residency_sec = max(
+            0, int(scheduler_min_residency_sec)
+        )
         self.disk_floor_bytes = int(disk_floor_bytes)
         self.emergency_floor_bytes = int(emergency_floor_bytes)
         self.recovery_enabled = bool(recovery_enabled)
         self.recovery_enter_bytes = int(recovery_enter_bytes if recovery_enter_bytes is not None else self.disk_floor_bytes)
+        self.drain_exit_bytes = int(
+            drain_exit_bytes
+            if drain_exit_bytes is not None
+            else max(self.disk_floor_bytes, self.recovery_enter_bytes) + 512 * 1024**2
+        )
+        self.explore_enter_bytes = int(explore_enter_bytes)
         self.recovery_margin_bytes = int(recovery_margin_bytes)
         self.recovery_active_slots = int(recovery_active_slots)
         self.recovery_max_remaining_bytes = int(recovery_max_remaining_bytes)
@@ -214,11 +288,20 @@ class DaemonRuntime:
         self.upload_dry_run = upload_dry_run or dry_run
         self.cleanup_runner = cleanup_runner
         self.cleanup_dry_run = cleanup_dry_run or dry_run
+        self.full_cleanup_dry_run = full_cleanup_dry_run or dry_run
+        self._configured_full_cleanup_runner = full_cleanup_runner
+        self.full_cleanup_enabled = bool(full_cleanup_enabled or full_cleanup_runner is not None)
+        self.cleanup_min_seed_sec = max(0, int(cleanup_min_seed_sec))
+        self.cleanup_min_ratio = max(0.0, float(cleanup_min_ratio))
+        self.cleanup_pressure_free_bytes = max(0, int(cleanup_pressure_free_bytes))
+        self.cleanup_max_retention_sec = max(0, int(cleanup_max_retention_sec))
         self.file_batch_dry_run = file_batch_dry_run or dry_run
         self.upload_backpressure_policy = upload_backpressure_policy
         self.host_downloads = host_downloads
         self.container_downloads = container_downloads
         self.rclone_remote = rclone_remote
+        self.media_promotion_runner = media_promotion_runner
+        self.media_promotion_dry_run = media_promotion_dry_run or dry_run
         self.media_pipeline_runner = media_pipeline_runner
         self.media_pipeline_dry_run = media_pipeline_dry_run or dry_run
         self.emby_refresh_worker = emby_refresh_worker
@@ -249,11 +332,15 @@ class DaemonRuntime:
         self.batch_allow_tag = str(batch_allow_tag or "").strip()
         self.batch_max_live_batch_bytes = int(batch_max_live_batch_bytes or 0)
         self.batch_max_new_per_tick = int(batch_max_new_per_tick)
+        self.batch_inventory_limit = max(0, int(batch_inventory_limit))
         self.background_event_workers = bool(background_event_workers)
         self.event_worker_interval = max(0.01, float(event_worker_interval))
         self.event_worker_join_timeout = max(0.0, float(event_worker_join_timeout))
         self._event_worker_stop = threading.Event()
         self._event_worker_threads: list[threading.Thread] = []
+        self.background_periodic_workers = bool(background_periodic_workers)
+        self.periodic_worker_join_timeout = max(0.0, float(periodic_worker_join_timeout))
+        self._periodic_workers: list[PeriodicWorker] = []
         self.junk_file_refresh_limit = int(junk_file_refresh_limit)
         self.carousel_dry_run = carousel_dry_run or dry_run
         if carousel_service is not None:
@@ -265,8 +352,62 @@ class DaemonRuntime:
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
-        self.monitor = SafetyMonitor(qbt, executor, free_bytes_provider, managed_count_provider=managed_count_provider, emergency_floor_bytes=self.emergency_floor_bytes)
+        self.safety_event_sample_interval_sec = max(
+            0.0, float(safety_event_sample_interval_sec)
+        )
+        self._last_safety_event_at: float | None = None
+        self._last_safety_event_fingerprint: tuple[object, ...] | None = None
+        self.monitor = SafetyMonitor(
+            qbt,
+            executor,
+            free_bytes_provider,
+            managed_count_provider=managed_count_provider,
+            emergency_floor_bytes=self.emergency_floor_bytes,
+            sync_repeated_full_limit=sync_repeated_full_limit,
+            sync_degraded_interval_sec=sync_degraded_interval_sec,
+            monotonic=monotonic,
+        )
+        if self._configured_full_cleanup_runner is not None:
+            self.full_cleanup_runner = self._configured_full_cleanup_runner
+        elif self.full_cleanup_enabled:
+            self.full_cleanup_runner = FullTorrentCleanupRunner(
+                TorrentJobRepository(self.state_db),
+                self.executor,
+                torrent_provider=lambda h: self.monitor.sync.snapshots.get(str(h)),
+                free_bytes_provider=free_bytes_provider,
+                pressure_free_bytes=self.cleanup_pressure_free_bytes,
+                min_seed_sec=self.cleanup_min_seed_sec,
+                min_ratio=self.cleanup_min_ratio,
+                max_retention_sec=self.cleanup_max_retention_sec,
+            )
+        else:
+            self.full_cleanup_runner = None
         self.obs = ObservabilityStore(self.state_db)
+        self.obs.event(
+            "info",
+            "cleanup",
+            "cleanup_policy_configured",
+            "disk-adaptive cleanup policy configured",
+            {
+                "pressure_free_bytes": self.cleanup_pressure_free_bytes,
+                "min_seed_sec": self.cleanup_min_seed_sec,
+                "min_ratio": self.cleanup_min_ratio,
+                "max_retention_sec": self.cleanup_max_retention_sec,
+                "enabled": self.full_cleanup_enabled,
+                "dry_run": self.full_cleanup_dry_run,
+            },
+        )
+        self.mode_controller = ModeController(
+            emergency_enter=self.emergency_floor_bytes,
+            drain_enter=self.recovery_enter_bytes,
+            drain_exit=self.drain_exit_bytes,
+            explore_enter=self.explore_enter_bytes,
+        )
+        self.capacity_state_store = CapacityStateStore(self.state_db)
+        self._mode_lock = threading.Lock()
+        self._scheduler_mode = self.capacity_state_store.current_mode("normal")
+        self.capacity_deadlock_alerts_enabled = bool(capacity_deadlock_alerts_enabled)
+        self._sync_session_degraded_reported = False
         if scheduler_alert_service is not None:
             self.scheduler_alert_service = scheduler_alert_service
         else:
@@ -278,6 +419,7 @@ class DaemonRuntime:
                     chat_ids=chat_ids,
                     interval_sec=int(scheduler_alert_interval_sec),
                     disk_alert_margin_bytes=int(disk_alert_margin_bytes),
+                    capacity_deadlock_enabled=self.capacity_deadlock_alerts_enabled,
                 ),
             )
         self._stopping = False
@@ -291,15 +433,19 @@ class DaemonRuntime:
 
     def _default_loop_tasks(self) -> list[LoopTask]:
         return [
-            LoopTask("planner", 15, self.planner_tick),
-            LoopTask("file_batch", 60, self.file_batch_tick),
-            LoopTask("maintenance", 300, self.maintenance_tick),
-            LoopTask("carousel", 1800, self.carousel_tick),
+            LoopTask("planner", 15, self.planner_tick, max_runtime_sec=2),
+            LoopTask("file_batch", 60, self.file_batch_tick, max_runtime_sec=5),
+            LoopTask("maintenance", 300, self.maintenance_tick, max_runtime_sec=5),
+            LoopTask("carousel", 1800, self.carousel_tick, max_runtime_sec=2),
         ]
 
     def maintenance_tick(self) -> dict:
-        result = self.maintenance_service.run_once()
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        present_hashes = set(snapshots) if self.monitor.sync.high_risk_actions_allowed else None
+        result = self.maintenance_service.run_once(
+            present_hashes=present_hashes,
+            torrent_snapshots=snapshots if self.monitor.sync.high_risk_actions_allowed else None,
+        )
         if self.path_reconciler is not None:
             result["path_reconcile"] = self.path_reconciler.reconcile(snapshots)
         if self.orphan_janitor is not None:
@@ -312,22 +458,65 @@ class DaemonRuntime:
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
         free_bytes = int(self.free_bytes_provider())
+        scheduler_mode = self._next_scheduler_mode(free_bytes)
         sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
         if self.soak_queue_service is not None:
             soak_result = self.soak_queue_service.run_once(
                 snapshots,
                 free_bytes=free_bytes,
                 sync_healthy=sync_healthy,
+                scheduler_mode=scheduler_mode,
             )
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
-        batch_protected_hashes = active_pipeline_batch_hashes(self.state_db)
+        planner_now = int(time.time())
+        capacity_health = self._capacity_health_by_hash()
+        cooldown_hashes = active_soak_cooldown_hashes(
+            self.state_db, planner_now
+        ) | {str(h) for h in soak_result.cooldown_hashes}
+        incumbent_hashes = self._scheduler_incumbent_hashes(planner_now)
+        incumbent_hashes -= cooldown_hashes
+        engine_plan = None
+        engine_budget = None
+        if self.scheduler_engine_mode != "legacy":
+            engine_items = [
+                item
+                for item in build_full_finish_work_items(snapshots)
+                if item.hash not in cooldown_hashes
+                and finish_viability(
+                    snapshots.get(item.hash) or {},
+                    capacity_health.get(item.hash),
+                    observed_at=planner_now,
+                    stale_sec=self.capacity_viability_stale_sec,
+                )[0]
+            ]
+            engine_budget = self._scheduler_growth_budget(
+                free_bytes,
+                reallocatable_hashes={item.hash for item in engine_items if not item.hold},
+            )
+            engine_slots = self.recovery_active_slots if scheduler_mode == "drain" else self.planner_active_slots
+            if scheduler_mode == "emergency" or not sync_healthy:
+                engine_slots = 0
+            engine_plan = self.scheduler_engine.select(
+                engine_items,
+                scheduler_mode,
+                engine_budget.available_growth_bytes,
+                engine_slots,
+                incumbent_hashes=incumbent_hashes,
+            )
+        allowed_active_hashes = (
+            {item.hash for item in engine_plan.selected}
+            if self.scheduler_engine_mode == "live" and engine_plan is not None
+            else None
+        )
         planner = DownloadPlanner(
             self.state_db,
             self.executor,
             dry_run=self.planner_dry_run,
             active_slots=self.planner_active_slots,
             slow_active_demote_sec=self.planner_slow_active_demote_sec,
+            finish_resident_max_remaining_bytes=self.finish_resident_max_remaining_bytes,
+            finish_resident_max_stall_sec=self.finish_resident_max_stall_sec,
             disk_floor_bytes=self.disk_floor_bytes,
             recovery_enabled=self.recovery_enabled,
             recovery_enter_bytes=self.recovery_enter_bytes,
@@ -340,10 +529,17 @@ class DaemonRuntime:
             snapshots,
             free_bytes=free_bytes,
             sync_healthy=sync_healthy,
-            protected_running_hashes=soak_result.protected_hashes | batch_protected_hashes,
-            forced_active_hashes=set(soak_result.hot_hashes),
-            cooldown_hashes=set(soak_result.cooldown_hashes),
-            external_reserved_bytes=int(soak_result.reserved_bytes),
+            protected_running_hashes=soak_result.protected_hashes,
+            forced_active_hashes=soak_result.protected_hashes,
+            cooldown_hashes=cooldown_hashes,
+            external_reserved_bytes=soak_result.reserved_bytes,
+            allowed_active_hashes=allowed_active_hashes,
+        )
+        scheduler_payload = self._scheduler_engine_payload(
+            engine_plan,
+            engine_budget,
+            legacy_selected_hashes=result.selected_hashes,
+            legacy_budget_bytes=result.budget_bytes,
         )
         preemption_result = None
         if self.preemption_service is not None and sync_healthy:
@@ -353,6 +549,47 @@ class DaemonRuntime:
                 trigger_reason="planner_pressure",
                 selected_hashes=set(result.selected_hashes),
             )
+        capacity_observation = build_capacity_observation(
+            snapshots,
+            available_growth_bytes=int(result.budget_bytes),
+            selected_hashes={str(item) for item in result.selected_hashes},
+            disk_releasing_jobs=self._disk_releasing_job_count(),
+            free_bytes=free_bytes,
+            health_by_hash=self._capacity_health_by_hash(),
+            observed_at=planner_now,
+            viability_stale_sec=self.capacity_viability_stale_sec,
+        )
+        capacity_details = capacity_observation.as_details()
+        capacity_result = detect_capacity_state(
+            mode=scheduler_mode,
+            managed_incomplete=capacity_observation.managed_incomplete,
+            feasible_full_finish=capacity_observation.feasible_full_finish,
+            disk_releasing_jobs=capacity_observation.disk_releasing_jobs,
+            capacity_pressure=free_bytes < self.drain_exit_bytes,
+        )
+        capacity_transition = self.capacity_state_store.persist(
+            scheduler_mode,
+            capacity_result,
+            capacity_details,
+        )
+        capacity_reclaim_payload = None
+        if (
+            self.capacity_reclaimer is not None
+            and sync_healthy
+            and (
+                self._last_capacity_reclaim_at is None
+                or planner_now - self._last_capacity_reclaim_at
+                >= self.capacity_reclaim_interval_sec
+            )
+        ):
+            reclaim_result = self.capacity_reclaimer.run(
+                snapshots,
+                capacity_state=capacity_transition.state,
+                free_bytes=free_bytes,
+                target_free_bytes=self.drain_exit_bytes,
+            )
+            capacity_reclaim_payload = reclaim_result.as_dict()
+            self._last_capacity_reclaim_at = planner_now
         alert_ids = self.scheduler_alert_service.evaluate_and_enqueue(
             snapshots=snapshots,
             free_bytes=free_bytes,
@@ -362,12 +599,32 @@ class DaemonRuntime:
             planner_result=result,
             sync_healthy=sync_healthy,
         )
+        if hasattr(self.scheduler_alert_service, "enqueue_capacity_deadlock"):
+            alert_ids.extend(
+                self.scheduler_alert_service.enqueue_capacity_deadlock(
+                    capacity_transition,
+                    required_minimum_growth_bytes=capacity_observation.required_minimum_growth_bytes,
+                    top_manual_candidates=list(capacity_observation.top_manual_candidates),
+                )
+            )
+        capacity_payload = {
+            "scheduler_mode": capacity_transition.scheduler_mode,
+            "state": capacity_transition.state,
+            "reason": capacity_transition.reason,
+            "entered_at": capacity_transition.entered_at,
+            "last_evaluated_at": capacity_transition.last_evaluated_at,
+            "transitioned": capacity_transition.transitioned,
+            "previous_state": capacity_transition.previous_state,
+            "details": capacity_transition.details,
+            "actions": list(capacity_result.actions),
+        }
         return {
             "selected": result.selected_hashes,
             "paused": result.paused_hashes,
             "conservative": result.conservative,
             "budget_bytes": result.budget_bytes,
             "mode": result.mode,
+            "scheduler_mode": scheduler_mode,
             "planner_dry_run": self.planner_dry_run,
             "planner": {
                 "selected_hashes": result.selected_hashes,
@@ -375,15 +632,21 @@ class DaemonRuntime:
                 "conservative": result.conservative,
                 "budget_bytes": result.budget_bytes,
                 "mode": result.mode,
+                "plan_generation": result.plan_generation,
                 "planner_dry_run": self.planner_dry_run,
             },
             "soak_queue": soak_result.as_dict(),
             "preemption": None if preemption_result is None else getattr(preemption_result, "__dict__", preemption_result),
+            "scheduler_engine": scheduler_payload,
+            "capacity": capacity_payload,
+            "capacity_reclaim": capacity_reclaim_payload,
             "alerts_enqueued": alert_ids,
         }
 
     def file_batch_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        free_bytes = int(self.free_bytes_provider())
+        scheduler_mode = self._batch_scheduler_mode(free_bytes)
         observe_result = None
         if self.observe_promotion_service is not None:
             observe_result = self.observe_promotion_service.promote_ready(
@@ -414,12 +677,15 @@ class DaemonRuntime:
             batch_allow_tag=self.batch_allow_tag,
             batch_max_live_batch_bytes=self.batch_max_live_batch_bytes,
             batch_max_new_per_tick=self.batch_max_new_per_tick,
+            batch_inventory_limit=self.batch_inventory_limit,
+            scheduler_engine=self.scheduler_engine,
             disk_floor_bytes=self.disk_floor_bytes,
         )
         result = service.sync_completed(
             snapshots,
-            free_bytes=int(self.free_bytes_provider()),
+            free_bytes=free_bytes,
             sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
+            scheduler_mode=scheduler_mode,
         )
         payload = {
             "scanned": result.scanned,
@@ -429,28 +695,225 @@ class DaemonRuntime:
             "file_batch_dry_run": bool(result.dry_run),
             "batches_created": result.batches_created,
             "batches_blocked": result.batches_blocked,
+            "blocked_reasons": result.blocked_reasons,
         }
         if observe_result is not None:
             payload["observe_promotion"] = observe_result
         if self.junk_janitor is not None:
             payload["junk_janitor"] = self.junk_janitor.reconcile(
                 snapshots,
-                self._junk_file_lists(snapshots),
+                self._junk_file_lists(snapshots) if scheduler_mode in {"normal", "explore"} else {},
                 sync_healthy=bool(self.monitor.sync.high_risk_actions_allowed),
             )
         return payload
+
+    def _batch_scheduler_mode(self, free_bytes: int) -> str:
+        """Return the shared hysteretic mode used by batch admission."""
+        return self._next_scheduler_mode(free_bytes)
+
+    def _next_scheduler_mode(self, free_bytes: int) -> str:
+        with self._mode_lock:
+            if not self.recovery_enabled and int(free_bytes) >= self.emergency_floor_bytes:
+                self._scheduler_mode = "explore" if int(free_bytes) >= self.explore_enter_bytes else "normal"
+            else:
+                self._scheduler_mode = self.mode_controller.next_mode(self._scheduler_mode, int(free_bytes))
+            return self._scheduler_mode
+
+    def _disk_releasing_job_count(self) -> int:
+        con = readonly_connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select id,job_type,payload_json,parent_job_id from torrent_jobs "
+                "where state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait')"
+            ).fetchall()
+        finally:
+            con.close()
+        cleanup_parent_ids = {
+            int(row["parent_job_id"])
+            for row in rows
+            if str(row["job_type"] or "") == "cleanup_full_torrent" and row["parent_job_id"] is not None
+        }
+        count = 0
+        for row in rows:
+            job_type = str(row["job_type"] or "")
+            if job_type == "cleanup_full_torrent":
+                count += 1
+                continue
+            if job_type != "upload":
+                continue
+            if int(row["id"]) in cleanup_parent_ids:
+                continue
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if bool(payload.get("full_torrent")):
+                count += 1
+        return count
+
+    def _capacity_health_by_hash(self) -> dict[str, dict[str, Any]]:
+        con = readonly_connect(self.state_db)
+        try:
+            return {
+                str(row["hash"]): dict(row)
+                for row in con.execute(
+                    "select hash,no_progress_since,last_swarm_seen_at,no_swarm_since,"
+                    "dlspeed_bps,num_seeds,num_peers from torrent_health"
+                ).fetchall()
+            }
+        finally:
+            con.close()
+
+    def _scheduler_growth_budget(
+        self,
+        free_bytes: int,
+        *,
+        reallocatable_hashes: set[str] | None = None,
+    ):
+        con = readonly_connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select hash,kind,accounting_class,bytes from resource_reservations "
+                "where state='active' and (expires_at is null or expires_at>?)",
+                (int(time.time()),),
+            ).fetchall()
+        finally:
+            con.close()
+        # Only active-download claims represented by a non-hold WorkItem are
+        # replaced this tick. Every other future claim remains external.
+        reallocatable = {str(item) for item in (reallocatable_hashes or set())}
+        external_claims = [
+            claim
+            for claim in resource_claims_from_rows(rows)
+            if not (str(claim.kind) == "active_download" and str(claim.hash) in reallocatable)
+        ]
+        return calculate_growth_budget(
+            free_bytes=int(free_bytes),
+            emergency_floor_bytes=self.emergency_floor_bytes,
+            dynamic_guard_bytes=max(0, self.disk_floor_bytes - self.emergency_floor_bytes),
+            claims=external_claims,
+        )
+
+    def _scheduler_incumbent_hashes(self, now: int) -> set[str]:
+        if self.scheduler_min_residency_sec <= 0:
+            return set()
+        con = readonly_connect(self.state_db)
+        try:
+            return {
+                str(row["hash"])
+                for row in con.execute(
+                    "select sa.hash from scheduler_allocations sa "
+                    "join torrent_health th on th.hash=sa.hash "
+                    "where sa.desired_state='active' and th.active_since is not null "
+                    "and th.active_since>?",
+                    (int(now) - self.scheduler_min_residency_sec,),
+                ).fetchall()
+            }
+        finally:
+            con.close()
+
+    def _scheduler_engine_payload(
+        self,
+        engine_plan,
+        engine_budget,
+        *,
+        legacy_selected_hashes,
+        legacy_budget_bytes: int,
+    ) -> dict:
+        legacy_selected = sorted(str(item) for item in legacy_selected_hashes)
+        if engine_plan is None or engine_budget is None:
+            return {
+                "mode": "legacy",
+                "applied_plan": "legacy",
+                "selected_hashes": legacy_selected,
+            }
+        engine_selected = sorted(item.hash for item in engine_plan.selected)
+        engine_set = set(engine_selected)
+        legacy_set = set(legacy_selected)
+        unsafe_rejections = sum(
+            int(engine_plan.rejection_counts.get(reason) or 0)
+            for reason in ("hold", "mode_disallowed", "budget_exceeded")
+        )
+        payload = {
+            "mode": self.scheduler_engine_mode,
+            "applied_plan": "engine" if self.scheduler_engine_mode == "live" else "legacy",
+            "selected_hashes": engine_selected,
+            "engine_selected_hashes": engine_selected,
+            "legacy_selected_hashes": legacy_selected,
+            "only_engine_hashes": sorted(engine_set - legacy_set),
+            "only_legacy_hashes": sorted(legacy_set - engine_set),
+            "engine_budget_bytes": int(engine_plan.available_growth_bytes),
+            "legacy_budget_bytes": int(legacy_budget_bytes),
+            "budget_difference_bytes": int(engine_plan.available_growth_bytes) - int(legacy_budget_bytes),
+            "future_growth_reserved_bytes": int(engine_budget.future_growth_reserved_bytes),
+            "current_pinned_bytes": int(engine_budget.current_pinned_bytes),
+            "unsafe_plan_rejection_count": unsafe_rejections,
+            "rejection_counts": dict(engine_plan.rejection_counts),
+            "incumbent_hashes": list(engine_plan.incumbent_hashes),
+        }
+        # Persist one comparison sample; only shadow guarantees the Planner side
+        # is an unconstrained legacy counterfactual.
+        self.obs.metric_snapshot(f"scheduler_engine_{self.scheduler_engine_mode}", payload)
+        return payload
+
+    def _effective_config_snapshot(self) -> dict:
+        return {
+            "thresholds": {
+                "emergency_enter_bytes": self.emergency_floor_bytes,
+                "drain_enter_bytes": self.recovery_enter_bytes,
+                "drain_exit_bytes": self.drain_exit_bytes,
+                "explore_enter_bytes": self.explore_enter_bytes,
+            },
+            "limits": {
+                "planner_active_slots": self.planner_active_slots,
+                "recovery_active_slots": self.recovery_active_slots,
+                "recovery_max_remaining_bytes": self.recovery_max_remaining_bytes,
+                "finish_resident_max_remaining_bytes": self.finish_resident_max_remaining_bytes,
+                "finish_resident_max_stall_sec": self.finish_resident_max_stall_sec,
+                "capacity_viability_stale_sec": self.capacity_viability_stale_sec,
+                "scheduler_min_residency_sec": self.scheduler_min_residency_sec,
+            },
+            "feature_flags": {
+                "dry_run": bool(self.dry_run),
+                "planner_dry_run": bool(self.planner_dry_run),
+                "scheduler_engine": self.scheduler_engine_mode,
+                "file_batch_dry_run": bool(self.file_batch_dry_run),
+                "recovery_enabled": bool(self.recovery_enabled),
+                "soak_queue": self.soak_queue_service is not None,
+                "batch_pipeline": bool(self.batch_pipeline_enabled),
+                "batch_live_verify": bool(self.batch_live_verify),
+                "background_event_workers": bool(self.background_event_workers),
+                "background_periodic_workers": bool(self.background_periodic_workers),
+                "scheduler_alerts": bool(self.scheduler_alert_service.config.enabled)
+                if hasattr(self.scheduler_alert_service, "config")
+                else False,
+                "capacity_deadlock_alerts": bool(self.capacity_deadlock_alerts_enabled),
+                "capacity_reclaim": self.capacity_reclaimer is not None,
+                "capacity_reclaim_dry_run": (
+                    None
+                    if self.capacity_reclaimer is None
+                    else bool(getattr(self.capacity_reclaimer, "dry_run", True))
+                ),
+                "capacity_reclaim_notifications": bool(
+                    self.capacity_reclaimer is not None
+                    and getattr(
+                        getattr(self.capacity_reclaimer, "audit", None),
+                        "notification_chat_ids",
+                        (),
+                    )
+                ),
+            },
+        }
 
     def _junk_file_lists(self, snapshots: Mapping[str, Mapping[str, object]]) -> dict[str, list[dict]]:
         if not hasattr(self.qbt, "torrent_files"):
             return {}
         out: dict[str, list[dict]] = {}
-        for h, torrent in snapshots.items():
-            if len(out) >= self.junk_file_refresh_limit:
-                break
-            tags = {p.strip() for p in str(torrent.get("tags") or "").split(",") if p.strip()}
-            managed = (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
-            if not managed:
-                continue
+        if self.junk_janitor is not None and hasattr(self.junk_janitor, "select_scan_hashes"):
+            selected_hashes = self.junk_janitor.select_scan_hashes(snapshots, self.junk_file_refresh_limit)
+        else:
+            selected_hashes = sorted(snapshots)[: self.junk_file_refresh_limit]
+        for h in selected_hashes:
             try:
                 out[h] = list(self.qbt.torrent_files(h))
             except Exception as exc:
@@ -471,13 +934,57 @@ class DaemonRuntime:
         result = self.monitor.tick()
         free_bytes = int(self.free_bytes_provider())
         self._persist_disk_state(free_bytes, result.disk_state)
-        self.obs.event(
-            "info",
-            "daemon",
-            "safety_tick",
-            f"disk={result.disk_state} sync={result.sync_health}",
-            {"free_bytes": free_bytes, "sync_health": result.sync_health, "dry_run": self.dry_run},
+        sync_stats = self.monitor.sync.session_stats.as_dict()
+        if self.monitor.sync.session_stats.degraded and not self._sync_session_degraded_reported:
+            self.obs.event(
+                "warning",
+                "qbt",
+                "sync_session_degraded",
+                "qBT sync repeatedly returned full snapshots; degraded polling enabled",
+                sync_stats,
+            )
+            self._sync_session_degraded_reported = True
+        elif not self.monitor.sync.session_stats.degraded and self._sync_session_degraded_reported:
+            self.obs.event(
+                "info",
+                "qbt",
+                "sync_session_recovered",
+                "qBT sync resumed delta snapshots",
+                sync_stats,
+            )
+            self._sync_session_degraded_reported = False
+        now_monotonic = float(self.monotonic())
+        fingerprint = (
+            str(result.disk_state),
+            str(result.sync_health),
+            bool(result.sync_skipped),
+            bool(self.monitor.sync.session_stats.degraded),
         )
+        state_changed = fingerprint != self._last_safety_event_fingerprint
+        sample_due = (
+            self._last_safety_event_at is None
+            or self.safety_event_sample_interval_sec <= 0
+            or now_monotonic - self._last_safety_event_at
+            >= self.safety_event_sample_interval_sec
+        )
+        if state_changed or sample_due:
+            self.obs.event(
+                "info",
+                "daemon",
+                "safety_tick",
+                f"disk={result.disk_state} sync={result.sync_health}",
+                {
+                    "free_bytes": free_bytes,
+                    "sync_health": result.sync_health,
+                    "sync_skipped": result.sync_skipped,
+                    "sync_session": sync_stats,
+                    "dry_run": self.dry_run,
+                    "sample_interval_sec": self.safety_event_sample_interval_sec,
+                    "state_changed": state_changed,
+                },
+            )
+            self._last_safety_event_at = now_monotonic
+            self._last_safety_event_fingerprint = fingerprint
 
     def process_bot_commands(self, max_commands: int = 20) -> int:
         if self.command_processor is None:
@@ -574,6 +1081,33 @@ class DaemonRuntime:
             self.obs.event("info", "cleanup", "cleanup_request_processed", f"cleanup request {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
         return processed
 
+    def process_full_cleanup_jobs(self, max_jobs: int = 1) -> int:
+        if self.full_cleanup_runner is None:
+            return 0
+        if not self.monitor.sync.high_risk_actions_allowed:
+            return 0
+        if self.full_cleanup_dry_run:
+            row = self.full_cleanup_runner.repo.peek_next("cleanup_full_torrent")
+            if not row:
+                return 0
+            self.obs.action(
+                hash=row.get("hash"),
+                job_id=int(row["id"]),
+                action_type="cleanup_full_torrent",
+                path="torrent_jobs/cleanup_full_torrent",
+                payload={"job_id": row["id"], "state": row.get("state")},
+                status="dry_run",
+                dry_run=True,
+            )
+            return 1
+        processed = 0
+        for _ in range(max_jobs):
+            job_id = self.full_cleanup_runner.run_next()
+            if job_id is None:
+                break
+            processed += 1
+        return processed
+
     def process_media_pipeline_jobs(self, max_jobs: int = 1) -> int:
         if self.media_pipeline_runner is None:
             return 0
@@ -599,6 +1133,54 @@ class DaemonRuntime:
                 break
             processed += 1
             self.obs.event("info", "media_pipeline", "media_pipeline_job_processed", f"media pipeline job {job_id} processed", {"job_id": job_id}, job_id=int(job_id))
+        return processed
+
+    def process_media_promotion_jobs(self, max_jobs: int = 1) -> int:
+        if self.media_promotion_runner is None:
+            return 0
+        if not self.monitor.sync.high_risk_actions_allowed:
+            return 0
+        if self.media_promotion_dry_run:
+            row = self.media_promotion_runner.repo.peek_next()
+            if row is None:
+                return 0
+            self.obs.action(
+                hash=row.get("hash"),
+                job_id=int(row["id"]),
+                action_type="media_promotion",
+                path=str(row.get("target_remote") or ""),
+                payload={"promotion_id": row["id"], "source": row.get("source_remote")},
+                status="dry_run",
+                dry_run=True,
+            )
+            return 1
+        processed = 0
+        for _ in range(max_jobs):
+            promotion_id = self.media_promotion_runner.run_next()
+            if promotion_id is None:
+                break
+            processed += 1
+            promotion = self.media_promotion_runner.repo.get(int(promotion_id))
+            finalized = False
+            if str(promotion.get("state") or "") == "verified":
+                finalized = finalize_canonical_upload(
+                    self.state_db,
+                    upload_id=int(promotion["upload_job_id"]),
+                    now=int(time.time()),
+                )
+            self.obs.event(
+                "info",
+                "promotion",
+                "media_promotion_processed",
+                f"media promotion {promotion_id} processed",
+                {
+                    "promotion_id": int(promotion_id),
+                    "state": promotion.get("state"),
+                    "canonical_upload_finalized": finalized,
+                },
+                hash=promotion.get("hash"),
+                job_id=int(promotion_id),
+            )
         return processed
 
     def process_emby_refresh_tasks(self, max_tasks: int = 1) -> int:
@@ -633,7 +1215,9 @@ class DaemonRuntime:
             ("telegram", self.process_bot_notifications),
             ("upload", self.process_upload_jobs),
             ("cleanup", self.process_cleanup_requests),
+            ("full_cleanup", self.process_full_cleanup_jobs),
             ("media_pipeline", self.process_media_pipeline_jobs),
+            ("promotion", self.process_media_promotion_jobs),
             ("emby", self.process_emby_refresh_tasks),
         ]
 
@@ -681,21 +1265,91 @@ class DaemonRuntime:
                 )
             self._event_worker_stop.wait(self.event_worker_interval)
 
+    def _start_periodic_workers(self) -> None:
+        if not self.background_periodic_workers:
+            return
+        if any(worker.is_alive() for worker in self._periodic_workers):
+            return
+        self._periodic_workers = []
+        for loop_task in self.loop_tasks:
+            task = PeriodicTask(
+                loop_task.name,
+                loop_task.interval_sec,
+                lambda current=loop_task: self._execute_loop_task(current),
+            )
+            worker = PeriodicWorker(task, monotonic=self.monotonic, on_error=self._periodic_worker_error)
+            self._periodic_workers.append(worker)
+            worker.start()
+        self.obs.event(
+            "info",
+            "daemon",
+            "periodic_workers_started",
+            "background periodic workers started",
+            {"workers": [worker.task.name for worker in self._periodic_workers]},
+        )
+
+    def _stop_periodic_workers(self) -> list[str]:
+        if not self._periodic_workers:
+            return []
+        for worker in self._periodic_workers:
+            worker.stop()
+        for worker in self._periodic_workers:
+            worker.join(timeout=self.periodic_worker_join_timeout)
+        alive = [worker.task.name for worker in self._periodic_workers if worker.is_alive()]
+        self.obs.event(
+            "info",
+            "daemon",
+            "periodic_workers_stopped",
+            "background periodic workers stop requested",
+            {"alive": alive},
+        )
+        self._periodic_workers = [worker for worker in self._periodic_workers if worker.is_alive()]
+        return alive
+
+    def _periodic_worker_error(self, name: str, exc: Exception) -> None:
+        self.obs.event(
+            "error",
+            name,
+            "periodic_worker_failed",
+            str(redact(str(exc))),
+            {"background_periodic_workers": True, "dry_run": self.dry_run},
+        )
+
     def run_due_loop_tasks(self) -> int:
         ran = 0
         now_monotonic = self.monotonic()
         for task in self.loop_tasks:
             if not task.due(now_monotonic):
                 continue
-            try:
-                result = task.callback()
-                self.obs.event("info", task.name, "loop_tick", f"{task.name} loop completed", {"result": result, "dry_run": self.dry_run})
-            except Exception as exc:
-                self.obs.event("error", task.name, "loop_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-            finally:
-                task.mark_ran(now_monotonic)
-                ran += 1
+            self._execute_loop_task(task)
+            task.mark_ran(now_monotonic)
+            ran += 1
         return ran
+
+    def _execute_loop_task(self, task: LoopTask) -> None:
+        started = self.monotonic()
+        result = None
+        callback_error = None
+        try:
+            result = task.callback()
+        except Exception as exc:
+            callback_error = exc
+        duration = max(0.0, self.monotonic() - started)
+        try:
+            if callback_error is None:
+                self.obs.event("info", task.name, "loop_tick", f"{task.name} loop completed", {"result": result, "dry_run": self.dry_run})
+            else:
+                self.obs.event("error", task.name, "loop_failed", str(redact(str(callback_error))), {"dry_run": self.dry_run})
+        finally:
+            self._loop_metric(task, duration, succeeded=callback_error is None)
+
+    def _loop_metric(self, task: LoopTask, duration: float, *, succeeded: bool) -> None:
+        self.obs.rolling_timing_metric(
+            f"loop_runtime:{task.name}",
+            duration_ms=int(duration * 1000),
+            max_runtime_ms=int(task.max_runtime_sec * 1000),
+            succeeded=succeeded,
+        )
 
     def _persist_disk_state(self, free_bytes: int, state: str) -> None:
         now = int(time.time())
@@ -715,19 +1369,29 @@ class DaemonRuntime:
         write_transaction(self.state_db, txn)
 
     def run(self, max_safety_ticks: int | None = None) -> int:
-        self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
-        if self.telegram_supervisor is not None:
-            self.telegram_supervisor.start()
-        self._start_background_event_workers()
+        start_persistent_write_actor(self.state_db)
         ticks = 0
         try:
+            self.obs.event(
+                "info",
+                "daemon",
+                "effective_config",
+                "resolved scheduler thresholds and feature flags",
+                self._effective_config_snapshot(),
+            )
+            self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
+            if self.telegram_supervisor is not None:
+                self.telegram_supervisor.start()
+            self._start_background_event_workers()
+            self._start_periodic_workers()
             while not self._stopping:
                 started = self.monotonic()
                 try:
                     self.tick_safety()
                 except Exception as exc:  # keep safety process supervised and observable
                     self.obs.event("error", "daemon", "safety_tick_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
-                self.run_due_loop_tasks()
+                if not self.background_periodic_workers:
+                    self.run_due_loop_tasks()
                 try:
                     self.process_bot_commands()
                 except Exception as exc:
@@ -746,9 +1410,17 @@ class DaemonRuntime:
                     except Exception as exc:
                         self.obs.event("error", "cleanup", "cleanup_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                     try:
+                        self.process_full_cleanup_jobs()
+                    except Exception as exc:
+                        self.obs.event("error", "cleanup", "full_cleanup_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                    try:
                         self.process_media_pipeline_jobs()
                     except Exception as exc:
                         self.obs.event("error", "media_pipeline", "media_pipeline_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                    try:
+                        self.process_media_promotion_jobs()
+                    except Exception as exc:
+                        self.obs.event("error", "promotion", "media_promotion_processing_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                     try:
                         self.process_emby_refresh_tasks()
                     except Exception as exc:
@@ -760,8 +1432,12 @@ class DaemonRuntime:
                 if sleep_for > 0:
                     self.sleeper(sleep_for)
         finally:
+            self._stop_periodic_workers()
             self._stop_background_event_workers()
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.stop()
-            self.obs.event("info", "daemon", "stopped", "qbt orchestrator daemon stopped", {"ticks": ticks})
+            try:
+                self.obs.event("info", "daemon", "stopped", "qbt orchestrator daemon stopped", {"ticks": ticks})
+            finally:
+                stop_write_actor(self.state_db)
         return ticks

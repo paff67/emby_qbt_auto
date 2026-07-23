@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 import sys
@@ -53,7 +55,83 @@ def test_daemon_runtime_runs_safety_ticks_and_persists_disk_state():
         event_count = con.execute("select count(*) from events_v2 where component='daemon' and event_type='safety_tick'").fetchone()[0]
         con.close()
         assert row == ("ok", 6 * 1024**3)
-        assert event_count == 2
+    assert event_count == 1
+
+
+def test_daemon_safety_event_sampling_keeps_transitions_immediate():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = [0.0]
+        free_bytes = [6 * 1024**3]
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: free_bytes[0],
+            dry_run=True,
+            safety_interval=0,
+            monotonic=lambda: clock[0],
+            safety_event_sample_interval_sec=60,
+        )
+
+        daemon.tick_safety()
+        clock[0] = 1
+        daemon.tick_safety()
+        free_bytes[0] = 1024**3
+        clock[0] = 2
+        daemon.tick_safety()
+
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "select message,data_json from events_v2 "
+            "where component='daemon' and event_type='safety_tick' order by id"
+        ).fetchall()
+        con.close()
+        assert len(rows) == 2
+        assert "disk=emergency" in rows[-1][0]
+        assert json.loads(rows[-1][1])["state_changed"] is True
+
+
+def test_daemon_emits_one_event_when_sync_session_becomes_degraded():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class RepeatedFullQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = RepeatedFullQbt()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0,
+            sync_repeated_full_limit=1,
+            sync_degraded_interval_sec=60,
+        )
+
+        daemon.tick_safety()
+        daemon.tick_safety()
+        daemon.tick_safety()
+
+        con = sqlite3.connect(db)
+        events = con.execute(
+            "select event_type,data_json from events_v2 where component='qbt' and event_type='sync_session_degraded'"
+        ).fetchall()
+        con.close()
+        assert len(events) == 1
+        assert json.loads(events[0][1])["repeated_full_updates"] == 1
+        assert qbt.rids == [0, 1]
 
 
 def test_daemon_runtime_emergency_tick_pauses_managed_downloads():
@@ -180,8 +258,10 @@ def test_daemon_runtime_enqueues_proactive_telegram_alerts_for_all_stopped_and_n
         assert [(r["chat_id"], r["topic"], r["level"], r["state"]) for r in rows] == [
             ("12345", "scheduler_all_stopped", "warning", "queued"),
             ("12345", "disk_threshold", "warning", "queued"),
+            ("12345", "capacity_deadlock", "critical", "queued"),
         ]
         assert "free=" in rows[1]["message"]
+        assert "manual intervention required" in rows[2]["message"]
 
 
 class FakeTelegramService:
@@ -435,6 +515,96 @@ def test_daemon_runtime_runs_design_multirate_loops_and_records_events():
         events = con.execute("select event_type,count(*) from events_v2 group by event_type").fetchall()
         con.close()
         assert ("loop_tick", 8) in events
+
+
+class SequenceMonotonic:
+    def __init__(self, values):
+        self._values = iter(values)
+
+    def __call__(self):
+        return float(next(self._values))
+
+
+def test_loop_task_records_duration_and_deadline_miss():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = SequenceMonotonic([0.0, 0.0, 7.5])
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            monotonic=clock,
+            loop_tasks=[LoopTask("file_batch", 60, lambda: {"ok": True}, max_runtime_sec=5)],
+        )
+
+        assert daemon.run_due_loop_tasks() == 1
+
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select component,metrics_json from metrics_snapshots where component='loop_runtime:file_batch'"
+        ).fetchone()
+        con.close()
+        assert row is not None
+        metrics = json.loads(row[1])
+        assert metrics["duration_ms"] == 7500
+        assert metrics["max_runtime_ms"] == 5000
+        assert metrics["deadline_missed"] is True
+        assert metrics["sample_count"] == 1
+        assert metrics["deadline_miss_count"] == 1
+
+
+def test_loop_runtime_metric_rolls_up_and_records_failed_callbacks():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    outcomes = iter([False, True])
+
+    def callback():
+        if next(outcomes):
+            raise RuntimeError("planned failure")
+        return {"ok": True}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = SequenceMonotonic([0.0, 0.0, 1.0, 61.0, 61.0, 68.5])
+        task = LoopTask("file_batch", 60, callback, max_runtime_sec=5)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            monotonic=clock,
+            loop_tasks=[task],
+        )
+
+        assert daemon.run_due_loop_tasks() == 1
+        assert daemon.run_due_loop_tasks() == 1
+
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "select metrics_json from metrics_snapshots where component='loop_runtime:file_batch'"
+        ).fetchall()
+        failed_events = con.execute(
+            "select count(*) from events_v2 where component='file_batch' and event_type='loop_failed'"
+        ).fetchone()[0]
+        con.close()
+        assert len(rows) == 1
+        metrics = json.loads(rows[0][0])
+        assert metrics["sample_count"] == 2
+        assert metrics["failure_count"] == 1
+        assert metrics["deadline_miss_count"] == 1
+        assert metrics["recent_duration_ms"] == [1000, 7500]
+        assert metrics["p50_duration_ms"] == 1000
+        assert metrics["p95_duration_ms"] == 7500
+        assert failed_events == 1
 
 
 def test_daemon_maintenance_records_qbt_path_drift_from_sync_cache():
@@ -830,6 +1000,51 @@ def test_daemon_background_event_workers_do_not_block_safety_loop():
         assert runner.calls >= 1
 
 
+def test_daemon_background_periodic_workers_do_not_block_safety_loop():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    class BlockingInventory:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def __call__(self):
+            self.started.set()
+            self.release.wait(timeout=2)
+            return {"released": self.release.is_set()}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        blocker = BlockingInventory()
+        qbt = FakeQbt()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0.01,
+            loop_tasks=[LoopTask("file_batch", 60, blocker, max_runtime_sec=0.05)],
+            background_periodic_workers=True,
+            periodic_worker_join_timeout=0.01,
+            sync_repeated_full_limit=999,
+        )
+
+        started = time.monotonic()
+        try:
+            daemon.run(max_safety_ticks=5)
+            elapsed = time.monotonic() - started
+            assert blocker.started.wait(timeout=0.2)
+            assert qbt.rids == [0, 1, 2, 3, 4]
+            assert elapsed < 0.5
+        finally:
+            blocker.release.set()
+            for worker in list(daemon._periodic_workers):
+                worker.join(timeout=1)
+
+
 class RecordingBackfill:
     def __init__(self, result=None):
         self.result = result or {"status": "not_found", "artifacts": []}
@@ -937,6 +1152,148 @@ def test_daemon_media_pipeline_then_emby_refresh_live_path():
         assert refresh_state == "done"
         assert ("media_pipeline", "media_pipeline_job_processed") in events
         assert ("emby", "emby_refresh_processed") in events
+
+
+def test_daemon_background_workers_include_media_promotion_worker():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(
+                MediaPromotionRepository(db), FakeRclone()
+            ),
+            media_promotion_dry_run=False,
+        )
+
+        worker_names = [name for name, _callback in daemon._background_event_worker_specs()]
+
+        assert "promotion" in worker_names
+
+
+def test_daemon_media_promotion_dry_run_does_not_claim_job():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = MediaPromotionRepository(db, now=lambda: 1000)
+        promotion_id = repo.enqueue(
+            upload_job_id=1,
+            hash="h1",
+            media_group_id=None,
+            normalized_id="ABC-123",
+            metadata_title="Title",
+            display_title="ABC-123 Title",
+            source_remote="gcrypt:/old.mp4",
+            target_remote="gcrypt:/ABC-123/ABC-123 Title.mp4",
+            expected_size=10,
+        )
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(repo, FakeRclone()),
+            media_promotion_dry_run=True,
+        )
+        daemon.tick_safety()
+
+        assert daemon.process_media_promotion_jobs() == 1
+        assert repo.get(promotion_id)["state"] == "planned"
+        assert repo.get(promotion_id)["attempts"] == 0
+
+
+def test_daemon_live_promotion_moves_media_and_opens_finalization_barrier():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.runtime import TorrentJobRepository
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        jobs = TorrentJobRepository(db, now=lambda: 1000)
+        upload_id = jobs.enqueue("h1", None, "upload", {"full_torrent": True}, priority=1)
+        con = sqlite3.connect(db)
+        con.execute(
+            "update torrent_jobs set state='promotion_wait',phase='promotion_wait' where id=?",
+            (upload_id,),
+        )
+        con.execute(
+            "insert into media_groups(id,media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?,?)",
+            (1, "ABC-123", "ABC-123", "/media/gcrypt/ABC-123", 100, 100),
+        )
+        con.execute(
+            "insert into media_pipeline_runs(upload_manifest_id,media_group_id,state,created_at,updated_at,canonical_remote_dir,canonical_basename,canonical_video_manifest_json) "
+            "values(?,?,?,?,?,?,?,?)",
+            (
+                f"upload-job-{upload_id}",
+                1,
+                "SidecarVerified",
+                100,
+                100,
+                "gcrypt:/ABC-123",
+                "ABC-123 Title",
+                '[{"remote_path":"gcrypt:/ABC-123/ABC-123 Title.mp4","size":10}]',
+            ),
+        )
+        con.commit()
+        con.close()
+        promotions = MediaPromotionRepository(db, now=lambda: 1000)
+        promotion_id = promotions.enqueue(
+            upload_job_id=upload_id,
+            hash="h1",
+            media_group_id=1,
+            normalized_id="ABC-123",
+            metadata_title="Title",
+            display_title="ABC-123 Title",
+            source_remote="gcrypt:/hash/raw.mp4",
+            target_remote="gcrypt:/ABC-123/ABC-123 Title.mp4",
+            expected_size=10,
+        )
+        rclone = FakeRclone(remote_sizes={"gcrypt:/hash/raw.mp4": 10})
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(promotions, rclone),
+            media_promotion_dry_run=False,
+        )
+        daemon.tick_safety()
+
+        assert daemon.process_media_promotion_jobs() == 1
+
+        assert rclone.movetos == [
+            ("gcrypt:/hash/raw.mp4", "gcrypt:/ABC-123/ABC-123 Title.mp4")
+        ]
+        assert promotions.get(promotion_id)["state"] == "verified"
+        assert jobs.get(upload_id)["state"] == "cleanup_wait"
+        con = sqlite3.connect(db)
+        assert con.execute(
+            "select count(*) from torrent_jobs where job_type='cleanup_full_torrent'"
+        ).fetchone()[0] == 1
+        assert con.execute("select count(*) from emby_refresh_tasks").fetchone()[0] == 1
+        con.close()
 
 
 def test_daemon_default_file_batch_loop_uses_sync_cache_and_dry_run_records_upload():
@@ -1080,7 +1437,81 @@ def test_daemon_file_batch_loop_creates_pipeline_batch_from_qbt_file_list():
         assert '"batches_created": 1' in loop
 
 
-def test_daemon_file_batch_live_respects_upload_backpressure_policy():
+def test_daemon_drain_file_batch_does_not_call_torrent_files():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    gib = 1024**3
+
+    class DrainQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.heavy_calls = []
+
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "big": {
+                        "name": "Big",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 5 * gib,
+                        "size": 5 * gib,
+                        "progress": 0.0,
+                    }
+                },
+                "server_state": {},
+            }
+
+        def torrent_files(self, hash):
+            self.heavy_calls.append(("torrent_files", hash))
+            return [{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.0, "priority": 0}]
+
+        def torrent_properties(self, hash):
+            self.heavy_calls.append(("torrent_properties", hash))
+            return {"piece_size": 16 * 1024**2}
+
+    class RecordingJunkJanitor:
+        def __init__(self):
+            self.file_lists = None
+
+        def reconcile(self, snapshots, file_lists, sync_healthy):
+            self.file_lists = file_lists
+            return {"scanned": len(snapshots)}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = DrainQbt()
+        junk_janitor = RecordingJunkJanitor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: int(2.2 * gib),
+            dry_run=False,
+            safety_interval=0,
+            file_batch_dry_run=False,
+            batch_pipeline_enabled=True,
+            disk_floor_bytes=3 * gib,
+            junk_janitor=junk_janitor,
+        )
+        daemon.tick_safety()
+
+        result = daemon.file_batch_tick()
+
+        assert qbt.heavy_calls == []
+        assert result["batches_created"] == 0
+        assert result["batches_blocked"] == 1
+        assert result["blocked_reasons"] == {"mode_disallows_batch": 1}
+        assert junk_janitor.file_lists == {}
+
+
+def test_daemon_file_batch_live_bypasses_backpressure_for_disk_releasing_upload():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.io_governor import UploadBackpressurePolicy
     from qbt_orchestrator.maintenance import SQLiteMaintenanceService
@@ -1136,8 +1567,8 @@ def test_daemon_file_batch_live_respects_upload_backpressure_policy():
         jobs = con.execute("select hash from torrent_jobs order by id").fetchall()
         event = con.execute("select component,event_type from events_v2 where component='upload_backpressure' order by id desc limit 1").fetchone()
         con.close()
-        assert jobs == [("old",)]
-        assert event == ("upload_backpressure", "new_upload_blocked")
+        assert jobs == [("old",), ("new",)]
+        assert event is None
 
 
 
@@ -1161,8 +1592,8 @@ def test_runtime_planner_tick_runs_soak_queue_before_planner_and_protects_reside
                 "rid": rid + 1,
                 "full_update": True,
                 "torrents": {
-                    "active": {"hash": "active", "name": "Active", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 10, "progress": 0.1},
-                    "soak": {"hash": "soak", "name": "Soak", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 9, "size": 10, "progress": 0.9},
+                    "active": {"hash": "active", "name": "Active", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 10, "progress": 0.1, "num_seeds": 1},
+                    "soak": {"hash": "soak", "name": "Soak", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 9, "size": 10, "progress": 0.9, "num_seeds": 1},
                 },
                 "server_state": {},
             }
@@ -1188,10 +1619,11 @@ def test_runtime_planner_tick_runs_soak_queue_before_planner_and_protects_reside
         result = daemon.planner_tick()
 
         assert result["soak_queue"]["started"] == ["soak"]
-        assert result["planner"]["selected_hashes"] == ["active"]
+        assert result["planner"]["selected_hashes"] == ["soak"]
+        assert result["planner"]["plan_generation"] == 1
         assert ("/api/v2/torrents/start", {"hashes": "soak"}) in executor.posts
-        assert ("/api/v2/torrents/start", {"hashes": "active"}) in executor.posts
-        assert ("/api/v2/torrents/stop", {"hashes": "soak"}) not in executor.posts
+        assert ("/api/v2/torrents/start", {"hashes": "active"}) not in executor.posts
+        assert executor.seq == [("active", False), ("soak", False)]
 
 
 def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
@@ -1225,6 +1657,10 @@ def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
             "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
             ("batch", 1, "batch", 3 * gib, "active", 900, None, "batch_pipeline_reserved"),
         )
+        con.execute(
+            "insert into scheduler_intents(component,hash,intent,priority,expires_at,data_json) values(?,?,?,?,?,?)",
+            ("batch", "batch", "protect_batch", 20, None, '{"batch_id":1}'),
+        )
         con.commit(); con.close()
         executor = FakeExecutor()
         daemon = DaemonRuntime(
@@ -1242,8 +1678,8 @@ def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
 
         result = daemon.planner_tick()
 
-        assert result["planner"]["selected_hashes"] == ["tiny"]
-        assert ("/api/v2/torrents/start", {"hashes": "tiny"}) in executor.posts
+        assert result["planner"]["selected_hashes"] == ["batch"]
+        assert ("/api/v2/torrents/start", {"hashes": "tiny"}) not in executor.posts
         assert not any(path == "/api/v2/torrents/stop" and payload == {"hashes": "batch"} for path, payload in executor.posts)
 
 
@@ -1256,11 +1692,16 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
     keys = [
         "QBT_ORCH_STATE_DB", "QBT_ORCH_DRY_RUN", "QBT_ORCH_PLANNER_DRY_RUN", "QBT_ORCH_SOAK_ENABLED",
         "QBT_ORCH_SOAK_DRY_RUN", "QBT_ORCH_SOAK_RESIDENT_SLOTS", "QBT_ORCH_SOAK_MIN_FREE_GB",
+        "QBT_ORCH_SOAK_ALLOWED_MODES", "QBT_ORCH_SOAK_REQUIRE_SWARM", "QBT_ORCH_MAX_COLD_PARTIAL_GB",
+        "QBT_ORCH_MAX_COLD_PARTIAL_TORRENTS", "QBT_ORCH_SOAK_MAX_NEW_PER_HOUR",
         "QBT_ORCH_SOAK_MAX_EXPOSURE_GB", "QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB",
         "QBT_ORCH_DISK_FLOOR_GB", "QBT_ORCH_SOAK_LOW_CAPACITY_THROTTLE_MARGIN_GB",
         "QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS",
         "QBT_ORCH_DISK_PATH", "QBT_ORCH_ORPHAN_JANITOR", "QBT_ORCH_JUNK_JANITOR", "QBT_ORCH_CAROUSEL",
         "QBT_ORCH_QBT_PREFERENCES_GUARD", "QBT_ORCH_PATH_RECONCILE",
+        "QBT_ORCH_DRAIN_EXIT_GB", "QBT_ORCH_EXPLORE_ENTER_GB", "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS",
+        "QBT_ORCH_SCHEDULER_ENGINE",
+        "QBT_ORCH_FINISH_RESIDENT_MAX_STALL_SEC", "QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC",
     ]
     old = {k: os.environ.get(k) for k in keys}
     try:
@@ -1274,6 +1715,11 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
                 "QBT_ORCH_SOAK_ENABLED": "1",
                 "QBT_ORCH_SOAK_DRY_RUN": "0",
                 "QBT_ORCH_SOAK_RESIDENT_SLOTS": "8",
+                "QBT_ORCH_SOAK_ALLOWED_MODES": "normal,explore",
+                "QBT_ORCH_SOAK_REQUIRE_SWARM": "1",
+                "QBT_ORCH_MAX_COLD_PARTIAL_GB": "4",
+                "QBT_ORCH_MAX_COLD_PARTIAL_TORRENTS": "8",
+                "QBT_ORCH_SOAK_MAX_NEW_PER_HOUR": "4",
                 "QBT_ORCH_SOAK_MIN_FREE_GB": "8",
                 "QBT_ORCH_DISK_FLOOR_GB": "3",
                 "QBT_ORCH_SOAK_MAX_EXPOSURE_GB": "4",
@@ -1286,6 +1732,12 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
                 "QBT_ORCH_CAROUSEL": "0",
                 "QBT_ORCH_QBT_PREFERENCES_GUARD": "0",
                 "QBT_ORCH_PATH_RECONCILE": "0",
+                "QBT_ORCH_DRAIN_EXIT_GB": "5.5",
+                "QBT_ORCH_EXPLORE_ENTER_GB": "9",
+                "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS": "0",
+                "QBT_ORCH_SCHEDULER_ENGINE": "shadow",
+                "QBT_ORCH_FINISH_RESIDENT_MAX_STALL_SEC": "2400",
+                "QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC": "2100",
             })
             ns = argparse.Namespace(cmd="daemon", dry_run=False, config=None, safety_interval=0, max_safety_ticks=1)
             runtime, dry_run = _build_runtime(ns, db)
@@ -1295,6 +1747,11 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
             assert runtime.soak_queue_service is not None
             assert runtime.soak_queue_service.dry_run is False
             assert runtime.soak_queue_service.config.resident_slots == 8
+            assert runtime.soak_queue_service.config.allowed_modes == ("normal", "explore")
+            assert runtime.soak_queue_service.config.require_swarm is True
+            assert runtime.soak_queue_service.config.max_cold_partial_bytes == 4 * 1024**3
+            assert runtime.soak_queue_service.config.max_cold_partial_torrents == 8
+            assert runtime.soak_queue_service.config.max_new_per_hour == 4
             assert runtime.soak_queue_service.config.min_free_bytes == 8 * 1024**3
             assert runtime.soak_queue_service.config.disk_floor_bytes == 3 * 1024**3
             assert runtime.soak_queue_service.config.low_capacity_throttle_margin_bytes == 1024**3
@@ -1302,6 +1759,12 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
             assert runtime.soak_queue_service.config.max_total_exposure_bytes == 4 * 1024**3
             assert runtime.soak_queue_service.config.max_per_torrent_exposure_bytes == 512 * 1024**2
             assert runtime.disk_floor_bytes == 3 * 1024**3
+            assert runtime.drain_exit_bytes == int(5.5 * 1024**3)
+            assert runtime.explore_enter_bytes == 9 * 1024**3
+            assert runtime.capacity_deadlock_alerts_enabled is False
+            assert runtime.scheduler_engine_mode == "shadow"
+            assert runtime.finish_resident_max_stall_sec == 2400
+            assert runtime.capacity_viability_stale_sec == 2100
     finally:
         for k, v in old.items():
             if v is None:

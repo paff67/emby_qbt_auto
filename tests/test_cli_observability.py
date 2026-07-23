@@ -329,7 +329,7 @@ def test_cli_wires_qbt_preferences_guard_into_maintenance_loop():
         con.close()
         result = json.loads(loop_json)["result"]
         assert result["qbt_preferences"]["would_set"] == {"preallocate_all": False}
-        assert result["qbt_preferences"]["drift"]["incomplete_files_ext"]["desired"] is None
+        assert result["qbt_preferences"]["observed"]["incomplete_files_ext"] is False
         assert action == ("qbt_preferences", "dry_run", 1)
 
 
@@ -425,6 +425,7 @@ def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
         monkeypatch.setenv("QBT_ORCH_BATCH_ALLOW_TAG", "batch-canary")
         monkeypatch.setenv("QBT_ORCH_BATCH_MAX_LIVE_BATCH_BYTES_GB", "1.5")
         monkeypatch.setenv("QBT_ORCH_BATCH_MAX_NEW_PER_TICK", "1")
+        monkeypatch.setenv("QBT_ORCH_BATCH_INVENTORY_LIMIT", "6")
 
         runtime, _ = _build_runtime(Ns(), db)
 
@@ -434,6 +435,37 @@ def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
         assert runtime.batch_allow_tag == "batch-canary"
         assert runtime.batch_max_live_batch_bytes == int(1.5 * 1024**3)
         assert runtime.batch_max_new_per_tick == 1
+        assert runtime.batch_inventory_limit == 6
+
+
+def test_cli_runtime_wires_disk_adaptive_cleanup_policy_env(monkeypatch):
+    from qbt_orchestrator.cli import _build_runtime
+    from qbt_orchestrator.db import migrate
+
+    class Ns:
+        config = None
+        dry_run = False
+        safety_interval = 0
+        cmd = "once"
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+        monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+        monkeypatch.setenv("QBT_ORCH_FULL_CLEANUP", "1")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_PRESSURE_FREE_GB", "5.5")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MIN_SEED_SEC", "901")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MIN_RATIO", "1.25")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MAX_RETENTION_SEC", "7300")
+
+        runtime, _ = _build_runtime(Ns(), db)
+
+        assert runtime.cleanup_pressure_free_bytes == int(5.5 * 1024**3)
+        assert runtime.cleanup_min_seed_sec == 901
+        assert runtime.cleanup_min_ratio == 1.25
+        assert runtime.cleanup_max_retention_sec == 7300
+        assert runtime.full_cleanup_runner.pressure_free_bytes == int(5.5 * 1024**3)
 
 
 def test_cli_runtime_enables_background_event_workers_only_for_live_daemon(monkeypatch):
@@ -631,6 +663,27 @@ def test_status_queue_includes_soak_counts():
         assert payload["scheduler_by_state"]["soak_resident"] == 1
         assert payload["scheduler_by_state"]["soak_hot"] == 1
         assert payload["soak_probe_reserved_bytes"] == 384
+
+
+def test_status_queue_includes_media_promotion_counts():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into media_promotions(upload_job_id,normalized_id,metadata_title,display_title,"
+            "source_remote,target_remote,expected_size,expected_hashes_json,state,max_attempts,created_at,updated_at) "
+            "values(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (1, "ABC-123", "Title", "ABC-123 Title", "gcrypt:/old.mp4", "gcrypt:/ABC-123/ABC-123 Title.mp4", 10, "{}", "retry_wait", 6, 1, 1),
+        )
+        con.commit()
+        con.close()
+
+        payload = json.loads(run_cli(["status", "queue", "--state-db", str(db), "--json"])[1])
+
+        assert payload["promotions_by_state"] == {"retry_wait": 1}
 
 
 if __name__ == "__main__":
