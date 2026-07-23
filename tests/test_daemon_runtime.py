@@ -2077,7 +2077,9 @@ def test_daemon_runtime_enqueues_proactive_telegram_alerts_for_all_stopped_and_n
             ("12345", "capacity_deadlock", "critical", "queued"),
         ]
         assert "free=" in rows[1]["message"]
-        assert "manual intervention required" in rows[2]["message"]
+        assert rows[2]["message"] == (
+            "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
+        )
 
 
 class FakeTelegramService:

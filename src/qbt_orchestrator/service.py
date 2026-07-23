@@ -61,6 +61,29 @@ CAPACITY_RECOVERY_PENDING_STATES = (
 CAPACITY_RECOVERY_PREFLIGHT_MAX_ROUNDS = 8
 
 
+def _capacity_deadlock_alert_context(
+    capacity_reclaim_payload: Mapping[str, Any] | None,
+) -> tuple[int, str]:
+    if capacity_reclaim_payload is None:
+        return 0, "not_evaluated"
+
+    mature_reclaim_candidates = max(
+        0,
+        int(capacity_reclaim_payload.get("planned") or 0),
+        int(capacity_reclaim_payload.get("reclaimed") or 0),
+    )
+    rejection_counts = capacity_reclaim_payload.get("rejection_counts") or {}
+    normalized_counts = sorted(
+        (str(reason).strip(), max(0, int(count or 0)))
+        for reason, count in rejection_counts.items()
+        if str(reason).strip()
+    )
+    rejection_fingerprint = "|".join(
+        f"{reason}:{count}" for reason, count in normalized_counts
+    )
+    return mature_reclaim_candidates, rejection_fingerprint
+
+
 @dataclass
 class LoopTask:
     name: str
@@ -762,11 +785,16 @@ class DaemonRuntime:
             sync_healthy=sync_healthy,
         )
         if hasattr(self.scheduler_alert_service, "enqueue_capacity_deadlock"):
+            mature_reclaim_candidates, rejection_fingerprint = (
+                _capacity_deadlock_alert_context(capacity_reclaim_payload)
+            )
             alert_ids.extend(
                 self.scheduler_alert_service.enqueue_capacity_deadlock(
                     capacity_transition,
                     required_minimum_growth_bytes=capacity_observation.required_minimum_growth_bytes,
                     top_manual_candidates=list(capacity_observation.top_manual_candidates),
+                    mature_reclaim_candidates=mature_reclaim_candidates,
+                    rejection_fingerprint=rejection_fingerprint,
                 )
             )
         capacity_payload = {

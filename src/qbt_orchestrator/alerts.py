@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from .db import readonly_connect
 from .observability import redact
 from .runtime import BotNotificationRepository
 
@@ -41,6 +43,15 @@ def _is_running_download(torrent: Mapping[str, Any]) -> bool:
 
 def _fmt_gib(value: int) -> str:
     return f"{int(value) / GIB:.2f}GiB"
+
+
+def _normalize_rejection_fingerprint(value: str) -> str:
+    parts = sorted(
+        part.strip()
+        for part in str(value or "").split("|")
+        if part.strip()
+    )
+    return "|".join(parts)
 
 
 class SchedulerAlertService:
@@ -125,23 +136,27 @@ class SchedulerAlertService:
         *,
         required_minimum_growth_bytes: int,
         top_manual_candidates: list[Mapping[str, Any]],
+        mature_reclaim_candidates: int = 0,
+        rejection_fingerprint: str = "",
     ) -> list[int]:
-        """Queue one manual-intervention notice for a new deadlock episode."""
+        """Queue a compact, episode-scoped capacity notice."""
 
         if (
             not self.config.enabled
             or not self.config.capacity_deadlock_enabled
             or not self.config.chat_ids
-            or not bool(getattr(transition, "transitioned", False))
             or str(getattr(transition, "state", "")) != "capacity_deadlock"
         ):
             return []
 
-        details = dict(getattr(transition, "details", {}) or {})
-        managed = max(0, int(details.get("managed_incomplete") or 0))
-        feasible = max(0, int(details.get("feasible_full_finish") or 0))
-        releasing = max(0, int(details.get("disk_releasing_jobs") or 0))
         minimum = max(0, int(required_minimum_growth_bytes))
+        mature = max(0, int(mature_reclaim_candidates))
+        fingerprint = _normalize_rejection_fingerprint(rejection_fingerprint)
+        if (
+            not bool(getattr(transition, "transitioned", False))
+            and fingerprint in {"", "not_evaluated"}
+        ):
+            return []
         candidates = [
             {
                 "hash": str(candidate.get("hash") or ""),
@@ -150,25 +165,39 @@ class SchedulerAlertService:
             for candidate in top_manual_candidates[:3]
         ]
         payload = {
-            "managed_incomplete": managed,
-            "feasible_full_finish": feasible,
-            "disk_releasing_jobs": releasing,
+            "state": str(getattr(transition, "state", "")),
+            "reason": str(getattr(transition, "reason", "")),
+            "assessment_generation": int(
+                getattr(transition, "assessment_generation", 0) or 0
+            ),
             "required_minimum_growth_bytes": minimum,
             "top_manual_candidates": candidates,
-            "scheduler_mode": str(getattr(transition, "scheduler_mode", "drain")),
-            "entered_at": int(getattr(transition, "entered_at", 0) or 0),
+            "mature_reclaim_candidates": mature,
+            "rejection_fingerprint": fingerprint,
         }
-        candidate_text = ",".join(
-            f"{candidate['hash'][:12]}:{_fmt_gib(candidate['required_growth_bytes'])}"
-            for candidate in candidates
-        ) or "none"
         message = (
-            "qBT Orchestrator capacity deadlock: manual intervention required; "
-            f"managed={managed} feasible={feasible} releasing={releasing} "
-            f"minimum_growth={_fmt_gib(minimum)} candidates={candidate_text}"
+            "可用空间不足，已暂停启动新任务；系统正在安全释放无效文件。"
+            if mature > 0
+            else "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
         )
+        entered_at = int(getattr(transition, "entered_at", 0) or 0)
+        fingerprint_digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
         ids: list[int] = []
         for chat_id in self.config.chat_ids:
+            dedupe_key = (
+                f"scheduler-alert:capacity-deadlock:{chat_id}:"
+                f"{entered_at}:{fingerprint_digest}"
+            )
+            con = readonly_connect(self.repo.state_db)
+            try:
+                exists = con.execute(
+                    "select 1 from bot_notifications where dedupe_key=?",
+                    (dedupe_key,),
+                ).fetchone()
+            finally:
+                con.close()
+            if exists is not None:
+                continue
             ids.append(
                 self.repo.enqueue(
                     chat_id=chat_id,
@@ -176,10 +205,7 @@ class SchedulerAlertService:
                     message=message,
                     level="critical",
                     payload=payload,
-                    dedupe_key=(
-                        f"scheduler-alert:capacity_deadlock:{chat_id}:"
-                        f"{int(getattr(transition, 'entered_at', 0) or 0)}"
-                    ),
+                    dedupe_key=dedupe_key,
                 )
             )
         return ids
