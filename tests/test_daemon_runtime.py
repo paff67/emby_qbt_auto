@@ -399,6 +399,143 @@ def test_first_planner_tick_samples_sync_and_commits_empty_unhealthy_generation(
     assert json.loads(metrics[0][0])["sync_healthy"] is False
 
 
+def test_direct_planner_tick_recovery_precedes_emergency_qbt_post(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator.planner import PlannerResult
+
+    order = []
+
+    class ActiveQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "active": {
+                        "hash": "active",
+                        "name": "active",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "downloading",
+                        "amount_left": 100,
+                        "size": 200,
+                    }
+                },
+                "server_state": {},
+            }
+
+    class OrderedExecutor(FakeExecutor):
+        def qbt_post(self, path, payload):
+            order.append(("qbt_post", path))
+            super().qbt_post(path, payload)
+
+    class Recovery:
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            assert snapshots == {}
+            assert assessment is None
+            assert capacity_state == "recovery_preflight"
+            assert free_bytes == 1024**3
+            order.append(("recovery_preflight", target_free_bytes))
+            con = sqlite3.connect(db)
+            con.execute(
+                "update capacity_reclaims set state='aborted_paused' "
+                "where state='stopping'"
+            )
+            con.commit()
+            con.close()
+            return CapacityReclaimResult(dry_run=False)
+
+    class NoopPlanner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def plan_and_apply(self, *_args, **_kwargs):
+            return PlannerResult([], [], budget_bytes=0, mode="emergency")
+
+    monkeypatch.setattr(service, "DownloadPlanner", NoopPlanner)
+    db = tmp_path / "state.sqlite"
+    executor = OrderedExecutor()
+    daemon = service.DaemonRuntime(
+        state_db=db,
+        qbt=ActiveQbt(),
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_recovery_reclaimer=Recovery(),
+    )
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    payload = daemon.planner_tick()
+
+    assert payload["capacity"]["assessment_generation"] == 1
+    assert order[:2] == [
+        ("recovery_preflight", daemon.drain_exit_bytes),
+        ("qbt_post", "/api/v2/torrents/stop"),
+    ]
+
+
+def test_direct_planner_tick_recovery_failure_precedes_safety(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class FailingRecovery:
+        def run(self, *_args, **_kwargs):
+            raise RuntimeError("direct recovery failed")
+
+    qbt = FakeQbt()
+    executor = FakeExecutor()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_recovery_reclaimer=FailingRecovery(),
+    )
+    con = sqlite3.connect(daemon.state_db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="direct recovery failed"):
+        daemon.planner_tick()
+
+    assert qbt.rids == []
+    assert executor.posts == []
+    con = sqlite3.connect(daemon.state_db)
+    assert con.execute("select count(*) from capacity_assessment_state").fetchone()[0] == 0
+    con.close()
+
+
 @pytest.mark.parametrize("signature_error", [TypeError("opaque"), ValueError("opaque")])
 def test_runtime_rejects_uninspectable_capacity_reclaimer_signature(
     tmp_path,

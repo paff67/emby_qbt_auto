@@ -522,6 +522,18 @@ class DaemonRuntime:
         return result
 
     def planner_tick(self) -> dict:
+        cached_snapshots = {
+            h: vars(snapshot)
+            for h, snapshot in self.monitor.sync.snapshots.items()
+        }
+        self._capacity_recovery_preflight(
+            cached_snapshots,
+            free_bytes=None,
+            allow_live_recovery=(
+                not self._safety_sampled
+                or bool(self.monitor.sync.high_risk_actions_allowed)
+            ),
+        )
         self._ensure_initial_safety_sample()
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
         free_bytes = int(self.free_bytes_provider())
