@@ -437,6 +437,9 @@ def migration_sql() -> list[str]:
         "create table if not exists bot_commands(id integer primary key autoincrement, command_id text unique, chat_id text, user_id text, command text, payload_json text, state text default 'queued', created_at integer, updated_at integer)",
         "create table if not exists bot_approvals(id integer primary key autoincrement, approval_id text unique, command_id text, action text, payload_json text, state text default 'pending', expires_at integer, approved_by text, approved_at integer, created_at integer)",
         "create table if not exists bot_notifications(id integer primary key autoincrement, dedupe_key text unique, chat_id text not null, level text default 'info', topic text, message text not null, payload_json text, state text default 'queued', attempts integer default 0, next_run_at integer, last_error text, created_at integer, updated_at integer, sent_at integer)",
+        "create table if not exists capacity_reclaims(id integer primary key autoincrement, reclaim_key text not null unique, hash text not null, name text not null, magnet_uri text not null, host_path text not null, content_path text not null, allocated_bytes integer not null default 0, completed_bytes integer not null default 0, progress real not null default 0, dead_since integer, state text not null, recheck_state text not null default 'pending', recheck_error text, notification_ids_json text not null default '[]', created_at integer not null, reclaimed_at integer, updated_at integer not null)",
+        "create index if not exists idx_capacity_reclaims_hash_time on capacity_reclaims(hash,reclaimed_at desc)",
+        "create index if not exists idx_capacity_reclaims_state on capacity_reclaims(state,updated_at)",
         "create table if not exists orphan_candidates(path text primary key, first_seen_at integer, last_seen_at integer, confirmations integer default 0, state text default 'seen', quarantined_at integer, trash_path text)",
         "create table if not exists carousel_state(hash text primary key, state text not null, probe_started_at integer, last_probe_at integer, backoff_until integer, backoff_level integer default 0, updated_at integer)",
         "create table if not exists soak_state(hash text primary key, state text not null default 'candidate', ema_dlspeed_bps integer not null default 0, hot_since integer, resident_since integer, cooldown_until integer, last_started_at integer, last_stopped_at integer, exposure_bytes integer not null default 0, last_sample_at integer, updated_at integer not null, reason text)",
@@ -462,6 +465,7 @@ def migration_sql() -> list[str]:
         "insert or ignore into schema_migrations(version,name,applied_at) values(11,'canonical_media_promotions_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(12,'torrent_job_leases_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(13,'successful_job_diagnostics_cleanup_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(14,'capacity_reclaim_audit_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

@@ -66,6 +66,21 @@ def test_redaction_masks_tokens_magnets_and_rclone_config_paths():
     assert redacted["safe"] == "gcrypt:/Media/ABC-123/"
 
 
+def test_torrent_snapshot_preserves_magnet_uri_for_reclaim_audit():
+    from qbt_orchestrator.models import TorrentSnapshot
+
+    magnet = "mag" + "net:?xt=urn:btih:ABCDEF&dn=example"
+    snap = TorrentSnapshot.from_qbt(
+        {
+            "hash": "abcdef",
+            "name": "example",
+            "magnet_uri": magnet,
+        }
+    )
+
+    assert snap.magnet_uri == magnet
+
+
 def test_qbt_sync_full_update_rebuilds_and_unhealthy_preserves_cache():
     from qbt_orchestrator.qbt_sync import QbtSyncCache, SyncHealth
     from tests.fakes import FakeQbtClient

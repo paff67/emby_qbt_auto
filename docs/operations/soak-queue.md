@@ -36,6 +36,7 @@ QBT_ORCH_CAPACITY_RECLAIM_MIN_DEAD_SEC=21600
 QBT_ORCH_CAPACITY_RECLAIM_MIN_BYTES_MB=64
 QBT_ORCH_CAPACITY_RECLAIM_MAX_PER_TICK=1
 QBT_ORCH_CAPACITY_RECLAIM_INTERVAL_SEC=300
+QBT_ORCH_CAPACITY_RECLAIM_TG_CHAT_IDS=
 QBT_ORCH_SOAK_MIN_FREE_GB=0
 QBT_ORCH_SOAK_LOW_CAPACITY_THROTTLE_MARGIN_GB=1
 QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS=262144
@@ -49,3 +50,9 @@ QBT_ORCH_SOAK_ENABLED=0
 ```
 
 修改后重启 `qbt-orchestrator-daemon.service`。Safety Loop 的 `<2GiB` 紧急暂停不依赖 Soak Queue，关闭 soak 不会影响 emergency pause。回收 live 模式不会调用 qBT `torrents/delete`；它仅停止已验证的 dead torrent、删除受管 incomplete payload 并触发 recheck，保留 torrent 记录。
+
+真实回收会将 hash、种子名、完整磁力链接、路径、释放字节数和 recheck
+结果持久化到 `capacity_reclaims`，并在同一个 SQLite 事务中写入
+`bot_notifications`。Telegram 发送失败沿用持久队列重试。专用 chat id 为空时，
+依次回退到 `QBT_ORCH_TG_ALERT_CHAT_IDS` 和 `QBT_ORCH_TG_ADMINS`；DRY_RUN
+不会创建正式回收记录或通知。

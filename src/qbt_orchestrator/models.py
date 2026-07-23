@@ -96,6 +96,7 @@ class AppConfig:
 class TorrentSnapshot:
     hash: str
     name: str = ""
+    magnet_uri: str = ""
     category: str = ""
     tags: str = ""
     state: str = ""
@@ -124,6 +125,7 @@ class TorrentSnapshot:
         return cls(
             hash=payload.get("hash", ""),
             name=payload.get("name", ""),
+            magnet_uri=str(payload.get("magnet_uri") or ""),
             category=payload.get("category", "") or "",
             tags=payload.get("tags", "") or "",
             state=payload.get("state", "") or "",

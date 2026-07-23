@@ -352,6 +352,11 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     qbt_cfg = cfg.qbt if cfg else None
     qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)
     executor = Executor(qbt, dry_run=dry_run)
+    capacity_reclaim_chat_ids = (
+        _csv_list(os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_TG_CHAT_IDS"))
+        or _csv_list(os.environ.get("QBT_ORCH_TG_ALERT_CHAT_IDS"))
+        or _csv_list(os.environ.get("QBT_ORCH_TG_ADMINS"))
+    )
     capacity_reclaimer = None
     capacity_reclaim_enabled = _truthy(
         os.environ.get("QBT_ORCH_CAPACITY_RECLAIM")
@@ -392,6 +397,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             max_per_tick=int(
                 os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MAX_PER_TICK", "1")
             ),
+            notification_chat_ids=capacity_reclaim_chat_ids,
         )
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
     telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)

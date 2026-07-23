@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
+from urllib.parse import quote
 
-from .db import readonly_connect
+from .db import readonly_connect, write_transaction
+from .observability import redact
 
 
 STOPPED_DOWNLOAD_STATES = frozenset({"stoppedDL", "pausedDL"})
@@ -19,6 +22,183 @@ OPEN_JOB_STATES = (
     "promotion_wait",
     "cleanup_wait",
 )
+MAGNET_PREFIX = "mag" + "net:?"
+
+
+class CapacityReclaimAuditStore:
+    """Persist every live reclaim and atomically queue its Telegram notices."""
+
+    def __init__(
+        self,
+        state_db: str | Path,
+        *,
+        notification_chat_ids: list[str] | tuple[str, ...] | None = None,
+        now: Callable[[], int] | None = None,
+    ):
+        self.state_db = Path(state_db)
+        self.notification_chat_ids = tuple(
+            dict.fromkeys(
+                str(chat_id).strip()
+                for chat_id in (notification_chat_ids or [])
+                if str(chat_id).strip()
+            )
+        )
+        self.now = now or (lambda: int(__import__("time").time()))
+
+    @staticmethod
+    def _identity(candidate: Mapping[str, Any]) -> dict[str, Any]:
+        torrent_hash = str(candidate.get("hash") or "").strip()
+        name = " ".join(str(candidate.get("name") or torrent_hash).split())[:512]
+        magnet_uri = str(candidate.get("magnet_uri") or "").strip()
+        if not magnet_uri.startswith(MAGNET_PREFIX):
+            magnet_uri = (
+                MAGNET_PREFIX
+                + "xt=urn:btih:"
+                + quote(torrent_hash, safe="")
+                + "&dn="
+                + quote(name, safe="")
+            )
+        dead_since = int(candidate.get("dead_since") or 0)
+        return {
+            "reclaim_key": f"{torrent_hash}:{dead_since}",
+            "hash": torrent_hash,
+            "name": name,
+            "magnet_uri": magnet_uri,
+            "host_path": str(candidate.get("host_path") or ""),
+            "content_path": str(candidate.get("content_path") or ""),
+            "allocated_bytes": max(0, int(candidate.get("allocated_bytes") or 0)),
+            "completed_bytes": max(0, int(candidate.get("completed_bytes") or 0)),
+            "progress": float(candidate.get("progress") or 0.0),
+            "dead_since": dead_since,
+        }
+
+    def begin(self, candidate: Mapping[str, Any]) -> int:
+        identity = self._identity(candidate)
+        now = int(self.now())
+
+        def txn(con) -> int:
+            con.execute(
+                "insert into capacity_reclaims(reclaim_key,hash,name,magnet_uri,host_path,content_path,"
+                "allocated_bytes,completed_bytes,progress,dead_since,state,recheck_state,created_at,updated_at) "
+                "values(?,?,?,?,?,?,?,?,?,?,'deleting','pending',?,?) "
+                "on conflict(reclaim_key) do update set name=excluded.name,magnet_uri=excluded.magnet_uri,"
+                "host_path=excluded.host_path,content_path=excluded.content_path,allocated_bytes=excluded.allocated_bytes,"
+                "completed_bytes=excluded.completed_bytes,progress=excluded.progress,state='deleting',"
+                "recheck_state='pending',recheck_error=null,updated_at=excluded.updated_at",
+                (
+                    identity["reclaim_key"],
+                    identity["hash"],
+                    identity["name"],
+                    identity["magnet_uri"],
+                    identity["host_path"],
+                    identity["content_path"],
+                    identity["allocated_bytes"],
+                    identity["completed_bytes"],
+                    identity["progress"],
+                    identity["dead_since"],
+                    now,
+                    now,
+                ),
+            )
+            row = con.execute(
+                "select id from capacity_reclaims where reclaim_key=?",
+                (identity["reclaim_key"],),
+            ).fetchone()
+            assert row is not None
+            return int(row["id"])
+
+        return int(write_transaction(self.state_db, txn))
+
+    def mark_failed(self, reclaim_id: int, error: str) -> None:
+        now = int(self.now())
+        safe_error = str(redact(error))[:2000]
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update capacity_reclaims set state='failed',recheck_state='not_requested',"
+                "recheck_error=?,updated_at=? where id=?",
+                (safe_error, now, int(reclaim_id)),
+            ),
+        )
+
+    def complete(
+        self,
+        reclaim_id: int,
+        candidate: Mapping[str, Any],
+        *,
+        recheck_error: str | None,
+    ) -> dict[str, Any]:
+        identity = self._identity(candidate)
+        now = int(self.now())
+        recheck_state = "failed" if recheck_error else "requested"
+        safe_recheck_error = None if recheck_error is None else str(redact(recheck_error))[:2000]
+        status_text = "重新校验失败" if recheck_error else "已请求重新校验"
+        full_magnet = identity["magnet_uri"]
+        prefix = (
+            "qBT 编排器自动容量回收完成\n"
+            f"种子名：{identity['name']}\n"
+            f"Hash：{identity['hash']}\n"
+            f"释放空间：{identity['allocated_bytes'] / 1024**3:.2f} GiB\n"
+            f"状态：{status_text}\n"
+            "磁力链接：\n"
+        )
+        push_magnet = full_magnet
+        if len(prefix) + len(push_magnet) > 4000:
+            push_magnet = (
+                MAGNET_PREFIX
+                + "xt=urn:btih:"
+                + quote(identity["hash"], safe="")
+                + "&dn="
+                + quote(identity["name"], safe="")
+            )
+        message = prefix + push_magnet
+        payload = {
+            **identity,
+            "reclaim_id": int(reclaim_id),
+            "recheck_state": recheck_state,
+            "recheck_error": safe_recheck_error,
+        }
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+        def txn(con) -> dict[str, Any]:
+            con.execute(
+                "update capacity_reclaims set state='reclaimed',recheck_state=?,recheck_error=?,"
+                "reclaimed_at=?,updated_at=? where id=?",
+                (recheck_state, safe_recheck_error, now, now, int(reclaim_id)),
+            )
+            notification_ids: list[int] = []
+            for chat_id in self.notification_chat_ids:
+                dedupe_key = f"capacity-reclaim:{reclaim_id}:{chat_id}"
+                con.execute(
+                    "insert or ignore into bot_notifications(dedupe_key,chat_id,level,topic,message,"
+                    "payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,'queued',0,?,?)",
+                    (
+                        dedupe_key,
+                        chat_id,
+                        "warning" if recheck_error else "info",
+                        "capacity_reclaim",
+                        message,
+                        payload_json,
+                        now,
+                        now,
+                    ),
+                )
+                row = con.execute(
+                    "select id from bot_notifications where dedupe_key=?", (dedupe_key,)
+                ).fetchone()
+                assert row is not None
+                notification_ids.append(int(row["id"]))
+            con.execute(
+                "update capacity_reclaims set notification_ids_json=?,updated_at=? where id=?",
+                (json.dumps(notification_ids), now, int(reclaim_id)),
+            )
+            return {
+                "reclaim_id": int(reclaim_id),
+                "notification_ids": notification_ids,
+                "recheck_state": recheck_state,
+            }
+
+        return dict(write_transaction(self.state_db, txn))
 
 
 @dataclass(frozen=True)
@@ -65,6 +245,7 @@ class DeadPartialReclaimer:
         min_dead_age_sec: int = 21_600,
         min_reclaim_bytes: int = 64 * 1024**2,
         max_per_tick: int = 1,
+        notification_chat_ids: list[str] | tuple[str, ...] | None = None,
         now: Callable[[], int] | None = None,
     ):
         self.state_db = Path(state_db)
@@ -77,6 +258,11 @@ class DeadPartialReclaimer:
         self.min_reclaim_bytes = max(0, int(min_reclaim_bytes))
         self.max_per_tick = max(0, int(max_per_tick))
         self.now = now or (lambda: int(__import__("time").time()))
+        self.audit = CapacityReclaimAuditStore(
+            self.state_db,
+            notification_chat_ids=notification_chat_ids,
+            now=self.now,
+        )
         if not self.managed_root.is_relative_to(self.host_downloads):
             raise ValueError("capacity reclaim managed_root must be inside host_downloads")
 
@@ -188,6 +374,7 @@ class DeadPartialReclaimer:
                 {
                     "hash": torrent_hash,
                     "name": str(torrent.get("name") or ""),
+                    "magnet_uri": str(torrent.get("magnet_uri") or ""),
                     "host_path": str(host_path),
                     "content_path": str(torrent.get("content_path") or ""),
                     "allocated_bytes": int(allocated),
@@ -237,23 +424,39 @@ class DeadPartialReclaimer:
         for candidate in selected:
             torrent_hash = str(candidate["hash"])
             host_path = Path(str(candidate["host_path"]))
+            reclaim_id: int | None = None
             try:
+                reclaim_id = self.audit.begin(candidate)
                 self.executor.qbt_post(
                     "/api/v2/torrents/stop", {"hashes": torrent_hash}
                 )
                 self._delete_path(host_path)
                 reclaimed += 1
                 reclaimed_bytes += int(candidate["allocated_bytes"])
-                completed.append(candidate)
             except Exception as exc:
+                if reclaim_id is not None:
+                    try:
+                        self.audit.mark_failed(reclaim_id, str(exc))
+                    except Exception as audit_exc:
+                        errors.append(f"{torrent_hash}: failed to persist reclaim failure: {audit_exc}")
                 errors.append(f"{torrent_hash}: {exc}")
                 continue
+            recheck_error: str | None = None
             try:
                 self.executor.qbt_post(
                     "/api/v2/torrents/recheck", {"hashes": torrent_hash}
                 )
             except Exception as exc:
+                recheck_error = str(exc)
                 errors.append(f"{torrent_hash}: {exc}")
+            try:
+                audit = self.audit.complete(
+                    int(reclaim_id), candidate, recheck_error=recheck_error
+                )
+                completed.append({**candidate, **audit})
+            except Exception as exc:
+                errors.append(f"{torrent_hash}: failed to persist completed reclaim: {exc}")
+                completed.append(candidate)
         return CapacityReclaimResult(
             dry_run=False,
             planned=len(selected),

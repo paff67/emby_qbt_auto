@@ -894,6 +894,14 @@ class DaemonRuntime:
                     if self.capacity_reclaimer is None
                     else bool(getattr(self.capacity_reclaimer, "dry_run", True))
                 ),
+                "capacity_reclaim_notifications": bool(
+                    self.capacity_reclaimer is not None
+                    and getattr(
+                        getattr(self.capacity_reclaimer, "audit", None),
+                        "notification_chat_ids",
+                        (),
+                    )
+                ),
             },
         }
 

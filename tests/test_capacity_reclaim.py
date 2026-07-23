@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -442,3 +443,202 @@ def test_dead_partial_reclaimer_reports_reclaimed_bytes_when_recheck_fails():
         assert result.reclaimed == 1
         assert result.reclaimed_bytes >= 4096
         assert "recheck unavailable" in result.errors[0]
+
+
+def test_live_reclaim_persists_torrent_identity_and_queues_magnet_notification():
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    now = 20_000
+    magnet = "mag" + "net:?xt=urn:btih:DEADONE&dn=Dead%20Movie&tr=udp%3A%2F%2Ftracker.example%3A80"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        managed = root / "incomplete"
+        payload = managed / "dead-one"
+        payload.mkdir(parents=True)
+        (payload / "video.part").write_bytes(b"x" * 4096)
+        db = root / "state.sqlite"
+        migrate(db, dry_run=False)
+        _dead_row(db, "dead-one", now)
+        reclaimer = DeadPartialReclaimer(
+            db,
+            RecordingExecutor(),
+            host_downloads=root,
+            container_downloads="/downloads",
+            managed_root=managed,
+            dry_run=False,
+            min_dead_age_sec=3_600,
+            min_reclaim_bytes=1,
+            notification_chat_ids=["1001", "1002"],
+            now=lambda: now,
+        )
+
+        result = reclaimer.run(
+            {
+                "dead-one": {
+                    "hash": "dead-one",
+                    "name": "Dead Movie",
+                    "magnet_uri": magnet,
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "stoppedDL",
+                    "amount_left": 900,
+                    "completed_bytes": 100,
+                    "progress": 0.1,
+                    "availability": 0.5,
+                    "content_path": "/downloads/incomplete/dead-one",
+                }
+            },
+            capacity_state="capacity_deadlock",
+            free_bytes=0,
+            target_free_bytes=10_000,
+        )
+
+        assert result.reclaimed == 1
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        reclaim = dict(con.execute("select * from capacity_reclaims").fetchone())
+        notifications = [
+            dict(row)
+            for row in con.execute(
+                "select * from bot_notifications where topic='capacity_reclaim' order by chat_id"
+            )
+        ]
+        con.close()
+
+        assert reclaim["hash"] == "dead-one"
+        assert reclaim["name"] == "Dead Movie"
+        assert reclaim["magnet_uri"] == magnet
+        assert reclaim["host_path"] == str(payload.resolve())
+        assert reclaim["state"] == "reclaimed"
+        assert reclaim["recheck_state"] == "requested"
+        assert reclaim["reclaimed_at"] == now
+        assert len(json.loads(reclaim["notification_ids_json"])) == 2
+        assert [row["chat_id"] for row in notifications] == ["1001", "1002"]
+        assert all("Dead Movie" in row["message"] for row in notifications)
+        assert all(magnet in row["message"] for row in notifications)
+        assert all(json.loads(row["payload_json"])["magnet_uri"] == magnet for row in notifications)
+
+
+def test_dry_run_does_not_persist_reclaim_or_queue_notification():
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    now = 20_000
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        managed = root / "incomplete"
+        payload = managed / "dead-one"
+        payload.mkdir(parents=True)
+        (payload / "video.part").write_bytes(b"x" * 4096)
+        db = root / "state.sqlite"
+        migrate(db, dry_run=False)
+        _dead_row(db, "dead-one", now)
+        reclaimer = DeadPartialReclaimer(
+            db,
+            RecordingExecutor(),
+            host_downloads=root,
+            container_downloads="/downloads",
+            managed_root=managed,
+            dry_run=True,
+            min_dead_age_sec=3_600,
+            min_reclaim_bytes=1,
+            notification_chat_ids=["1001"],
+            now=lambda: now,
+        )
+
+        result = reclaimer.run(
+            {
+                "dead-one": {
+                    "hash": "dead-one",
+                    "name": "Dead Movie",
+                    "magnet_uri": "mag" + "net:?xt=urn:btih:DEADONE",
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "stoppedDL",
+                    "amount_left": 900,
+                    "completed_bytes": 100,
+                    "availability": 0.5,
+                    "content_path": "/downloads/incomplete/dead-one",
+                }
+            },
+            capacity_state="capacity_deadlock",
+            free_bytes=0,
+            target_free_bytes=10_000,
+        )
+
+        assert result.planned == 1
+        con = sqlite3.connect(db)
+        assert con.execute("select count(*) from capacity_reclaims").fetchone()[0] == 0
+        assert con.execute(
+            "select count(*) from bot_notifications where topic='capacity_reclaim'"
+        ).fetchone()[0] == 0
+        con.close()
+
+
+def test_recheck_failure_is_persisted_and_notified_after_payload_reclaim():
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    class RecheckFailExecutor(RecordingExecutor):
+        def qbt_post(self, path, payload):
+            super().qbt_post(path, payload)
+            if path.endswith("/recheck"):
+                raise RuntimeError("recheck unavailable")
+
+    now = 20_000
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        managed = root / "incomplete"
+        payload = managed / "dead-one"
+        payload.mkdir(parents=True)
+        (payload / "video.part").write_bytes(b"x" * 4096)
+        db = root / "state.sqlite"
+        migrate(db, dry_run=False)
+        _dead_row(db, "dead-one", now)
+        reclaimer = DeadPartialReclaimer(
+            db,
+            RecheckFailExecutor(),
+            host_downloads=root,
+            container_downloads="/downloads",
+            managed_root=managed,
+            dry_run=False,
+            min_dead_age_sec=3_600,
+            min_reclaim_bytes=1,
+            notification_chat_ids=["1001"],
+            now=lambda: now,
+        )
+
+        result = reclaimer.run(
+            {
+                "dead-one": {
+                    "hash": "dead-one",
+                    "name": "Dead Movie",
+                    "magnet_uri": "mag" + "net:?xt=urn:btih:DEADONE",
+                    "category": "auto",
+                    "tags": "auto",
+                    "state": "stoppedDL",
+                    "amount_left": 900,
+                    "completed_bytes": 100,
+                    "availability": 0.5,
+                    "content_path": "/downloads/incomplete/dead-one",
+                }
+            },
+            capacity_state="capacity_deadlock",
+            free_bytes=0,
+            target_free_bytes=10_000,
+        )
+
+        assert result.reclaimed == 1
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        reclaim = dict(con.execute("select * from capacity_reclaims").fetchone())
+        notice = dict(
+            con.execute(
+                "select * from bot_notifications where topic='capacity_reclaim'"
+            ).fetchone()
+        )
+        con.close()
+        assert reclaim["recheck_state"] == "failed"
+        assert "recheck unavailable" in reclaim["recheck_error"]
+        assert "重新校验失败" in notice["message"]

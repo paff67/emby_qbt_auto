@@ -101,6 +101,7 @@ def test_runtime_uses_validated_config_capacity_policy(monkeypatch):
             "QBT_ORCH_CAPACITY_RECLAIM": "1",
             "QBT_ORCH_CAPACITY_RECLAIM_DRY_RUN": "1",
             "QBT_ORCH_CAPACITY_RECLAIM_ROOT": str(root / "incomplete"),
+            "QBT_ORCH_CAPACITY_RECLAIM_TG_CHAT_IDS": "1001,1002",
         }.items():
             monkeypatch.setenv(key, value)
         for key in (
@@ -128,3 +129,4 @@ def test_runtime_uses_validated_config_capacity_policy(monkeypatch):
         assert runtime.explore_enter_bytes == 8 * GIB
         assert runtime.capacity_reclaimer is not None
         assert runtime.capacity_reclaimer.dry_run is True
+        assert runtime.capacity_reclaimer.audit.notification_chat_ids == ("1001", "1002")
