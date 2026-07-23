@@ -6,6 +6,7 @@ from typing import Sequence
 from .config import load_config
 from .carousel import CarouselService
 from .capacity_reclaim import DeadPartialReclaimer
+from .capacity_assessment import CapacityAssessmentBuilder, CapacityAssessmentStore
 from .db import migrate, readonly_connect, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient, QbtHttpClient
@@ -349,18 +350,49 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     env_dry_run = _truthy(os.environ.get("QBT_ORCH_DRY_RUN"))
     dry_run = bool(ns.dry_run or (force_dry_run if force_dry_run is not None else (env_dry_run if env_dry_run is not None else (cfg.dry_run if cfg else True))))
     state_db = Path(os.environ.get("QBT_ORCH_STATE_DB") or (cfg.state_db if cfg else str(db)))
+    no_progress_env = os.environ.get(
+        "QBT_ORCH_CAPACITY_RECLAIM_MIN_NO_PROGRESS_SEC"
+    )
+    if no_progress_env is None:
+        no_progress_env = os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MIN_DEAD_SEC")
+        if no_progress_env is None:
+            no_progress_env = "21600"
+            no_progress_source = "default"
+        else:
+            no_progress_source = "QBT_ORCH_CAPACITY_RECLAIM_MIN_DEAD_SEC"
+    else:
+        no_progress_source = "QBT_ORCH_CAPACITY_RECLAIM_MIN_NO_PROGRESS_SEC"
+    min_no_progress_sec = int(no_progress_env)
+    min_reclaimable_sec = int(
+        os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MIN_RECLAIMABLE_SEC", "3600")
+    )
+    if min_no_progress_sec < 0:
+        raise ValueError("capacity reclaim min no-progress seconds must be non-negative")
+    if min_reclaimable_sec < 0:
+        raise ValueError("capacity reclaim min reclaimable seconds must be non-negative")
+    viability_stale_sec = int(
+        os.environ.get("QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC", "1800")
+    )
     # Startup reclaim fences are hydrated by Executor, so the durable schema
     # must exist before the shared mutation gateway is constructed.
     migrate(state_db, dry_run=False)
     qbt_cfg = cfg.qbt if cfg else None
     qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)
     executor = Executor(qbt, dry_run=dry_run, state_db=state_db)
+    capacity_assessment_builder = CapacityAssessmentBuilder(
+        viability_stale_sec=viability_stale_sec
+    )
+    capacity_assessment_store = CapacityAssessmentStore(
+        state_db,
+        min_no_progress_sec=min_no_progress_sec,
+    )
     capacity_reclaim_chat_ids = (
         _csv_list(os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_TG_CHAT_IDS"))
         or _csv_list(os.environ.get("QBT_ORCH_TG_ALERT_CHAT_IDS"))
         or _csv_list(os.environ.get("QBT_ORCH_TG_ADMINS"))
     )
     capacity_reclaimer = None
+    capacity_recovery_reclaimer = None
     capacity_reclaim_enabled = _truthy(
         os.environ.get("QBT_ORCH_CAPACITY_RECLAIM")
     )
@@ -388,9 +420,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
                 str(host_downloads / "incomplete"),
             ),
             dry_run=reclaim_dry_run,
-            min_dead_age_sec=int(
-                os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MIN_DEAD_SEC", "21600")
-            ),
+            min_reclaimable_age_sec=min_reclaimable_sec,
             min_reclaim_bytes=int(
                 float(
                     os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MIN_BYTES_MB", "64")
@@ -402,6 +432,53 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             ),
             notification_chat_ids=capacity_reclaim_chat_ids,
         )
+    con = readonly_connect(state_db)
+    try:
+        capacity_recovery_required = bool(
+            con.execute(
+                "select 1 from capacity_reclaims where state in "
+                "('stopping','deleting','quarantined','deleted',"
+                "'recheck_pending','partial_or_unknown') limit 1"
+            ).fetchone()
+        )
+    finally:
+        con.close()
+    if capacity_recovery_required:
+        if dry_run:
+            raise RuntimeError(
+                "capacity reclaim recovery is required; global dry-run cannot "
+                "safely reconcile durable recovery rows"
+            )
+        if capacity_reclaimer is not None and not capacity_reclaimer.dry_run:
+            capacity_recovery_reclaimer = capacity_reclaimer
+        else:
+            host_downloads = Path(
+                os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads")
+            )
+            capacity_recovery_reclaimer = DeadPartialReclaimer(
+                state_db,
+                executor,
+                host_downloads=host_downloads,
+                container_downloads=os.environ.get(
+                    "QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"
+                ),
+                managed_root=os.environ.get(
+                    "QBT_ORCH_CAPACITY_RECLAIM_ROOT",
+                    str(host_downloads / "incomplete"),
+                ),
+                dry_run=False,
+                min_reclaimable_age_sec=min_reclaimable_sec,
+                min_reclaim_bytes=int(
+                    float(
+                        os.environ.get(
+                            "QBT_ORCH_CAPACITY_RECLAIM_MIN_BYTES_MB", "64"
+                        )
+                    )
+                    * 1024**2
+                ),
+                max_per_tick=0,
+                notification_chat_ids=capacity_reclaim_chat_ids,
+            )
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
     telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
     notification_repo = BotNotificationRepository(state_db)
@@ -639,10 +716,14 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         finish_resident_max_stall_sec=int(
             os.environ.get("QBT_ORCH_FINISH_RESIDENT_MAX_STALL_SEC", "1800")
         ),
-        capacity_viability_stale_sec=int(
-            os.environ.get("QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC", "1800")
-        ),
+        capacity_viability_stale_sec=viability_stale_sec,
+        capacity_assessment_builder=capacity_assessment_builder,
+        capacity_assessment_store=capacity_assessment_store,
+        capacity_reclaim_min_no_progress_sec=min_no_progress_sec,
+        capacity_reclaim_min_reclaimable_sec=min_reclaimable_sec,
+        capacity_reclaim_min_no_progress_source=no_progress_source,
         capacity_reclaimer=capacity_reclaimer,
+        capacity_recovery_reclaimer=capacity_recovery_reclaimer,
         capacity_reclaim_interval_sec=int(
             os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_INTERVAL_SEC", "300")
         ),

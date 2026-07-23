@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 import json
 import signal
 import sqlite3
@@ -11,12 +12,12 @@ from typing import Any, Callable, Mapping
 
 from .alerts import SchedulerAlertConfig, SchedulerAlertService
 from .budget import calculate_growth_budget, resource_claims_from_rows
+from .capacity_assessment import CapacityAssessmentBuilder, CapacityAssessmentStore
 from .capacity_state import (
     CapacityStateStore,
     ModeController,
-    build_capacity_observation,
+    build_capacity_observation_from_assessment,
     detect_capacity_state,
-    finish_viability,
 )
 from .carousel import CarouselService
 from .daemon import SafetyMonitor
@@ -164,7 +165,13 @@ class DaemonRuntime:
         finish_resident_max_remaining_bytes: int = 0,
         finish_resident_max_stall_sec: int = 1_800,
         capacity_viability_stale_sec: int = 1_800,
+        capacity_assessment_builder: CapacityAssessmentBuilder | None = None,
+        capacity_assessment_store: CapacityAssessmentStore | None = None,
+        capacity_reclaim_min_no_progress_sec: int = 21_600,
+        capacity_reclaim_min_reclaimable_sec: int = 3_600,
+        capacity_reclaim_min_no_progress_source: str = "default",
         capacity_reclaimer=None,
+        capacity_recovery_reclaimer=None,
         capacity_reclaim_interval_sec: int = 300,
         scheduler_engine_mode: str = "legacy",
         scheduler_engine=None,
@@ -260,7 +267,42 @@ class DaemonRuntime:
         self.capacity_viability_stale_sec = max(
             0, int(capacity_viability_stale_sec)
         )
+        self.capacity_reclaim_min_no_progress_sec = int(
+            capacity_reclaim_min_no_progress_sec
+        )
+        self.capacity_reclaim_min_reclaimable_sec = int(
+            capacity_reclaim_min_reclaimable_sec
+        )
+        self.capacity_reclaim_min_no_progress_source = str(
+            capacity_reclaim_min_no_progress_source
+        )
+        self.capacity_assessment_builder = (
+            capacity_assessment_builder
+            or CapacityAssessmentBuilder(
+                viability_stale_sec=self.capacity_viability_stale_sec
+            )
+        )
+        self.capacity_assessment_store = (
+            capacity_assessment_store
+            or CapacityAssessmentStore(
+                self.state_db,
+                min_no_progress_sec=self.capacity_reclaim_min_no_progress_sec,
+            )
+        )
         self.capacity_reclaimer = capacity_reclaimer
+        self._capacity_reclaimer_accepts_assessment = bool(
+            capacity_reclaimer is not None
+            and "assessment"
+            in inspect.signature(capacity_reclaimer.run).parameters
+        )
+        self.capacity_recovery_reclaimer = (
+            capacity_recovery_reclaimer
+            if capacity_recovery_reclaimer is not None
+            else capacity_reclaimer
+            if self._capacity_reclaimer_accepts_assessment
+            else None
+        )
+        self._capacity_recovery_preflight_done = False
         self.capacity_reclaim_interval_sec = max(
             1, int(capacity_reclaim_interval_sec)
         )
@@ -463,8 +505,9 @@ class DaemonRuntime:
     def planner_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
         free_bytes = int(self.free_bytes_provider())
-        scheduler_mode = self._next_scheduler_mode(free_bytes)
         sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
+        self._capacity_recovery_preflight(snapshots, free_bytes=free_bytes)
+        scheduler_mode = self._next_scheduler_mode(free_bytes)
         if self.soak_queue_service is not None:
             soak_result = self.soak_queue_service.run_once(
                 snapshots,
@@ -481,6 +524,24 @@ class DaemonRuntime:
         ) | {str(h) for h in soak_result.cooldown_hashes}
         incumbent_hashes = self._scheduler_incumbent_hashes(planner_now)
         incumbent_hashes -= cooldown_hashes
+        assessment = self.capacity_assessment_builder.build(
+            snapshots,
+            capacity_health,
+            observed_at=planner_now,
+            scheduler_mode=scheduler_mode,
+            free_bytes=free_bytes,
+            target_free_bytes=self.drain_exit_bytes,
+            available_growth_bytes=max(
+                0,
+                int(free_bytes)
+                - int(self.disk_floor_bytes)
+                - int(soak_result.reserved_bytes),
+            ),
+            selected_hashes=incumbent_hashes,
+            disk_releasing_jobs=self._disk_releasing_job_count(),
+        )
+        commit_assessment = getattr(self.capacity_assessment_store, "commit")
+        assessment = commit_assessment(assessment)
         engine_plan = None
         engine_budget = None
         if self.scheduler_engine_mode != "legacy":
@@ -488,12 +549,7 @@ class DaemonRuntime:
                 item
                 for item in build_full_finish_work_items(snapshots)
                 if item.hash not in cooldown_hashes
-                and finish_viability(
-                    snapshots.get(item.hash) or {},
-                    capacity_health.get(item.hash),
-                    observed_at=planner_now,
-                    stale_sec=self.capacity_viability_stale_sec,
-                )[0]
+                and assessment.torrents[item.hash].viable
             ]
             engine_budget = self._scheduler_growth_budget(
                 free_bytes,
@@ -539,12 +595,14 @@ class DaemonRuntime:
             cooldown_hashes=cooldown_hashes,
             external_reserved_bytes=soak_result.reserved_bytes,
             allowed_active_hashes=allowed_active_hashes,
+            capacity_assessment=assessment,
         )
         scheduler_payload = self._scheduler_engine_payload(
             engine_plan,
             engine_budget,
             legacy_selected_hashes=result.selected_hashes,
             legacy_budget_bytes=result.budget_bytes,
+            assessment_generation=assessment.generation,
         )
         preemption_result = None
         if self.preemption_service is not None and sync_healthy:
@@ -554,15 +612,8 @@ class DaemonRuntime:
                 trigger_reason="planner_pressure",
                 selected_hashes=set(result.selected_hashes),
             )
-        capacity_observation = build_capacity_observation(
-            snapshots,
-            available_growth_bytes=int(result.budget_bytes),
-            selected_hashes={str(item) for item in result.selected_hashes},
-            disk_releasing_jobs=self._disk_releasing_job_count(),
-            free_bytes=free_bytes,
-            health_by_hash=self._capacity_health_by_hash(),
-            observed_at=planner_now,
-            viability_stale_sec=self.capacity_viability_stale_sec,
+        capacity_observation = build_capacity_observation_from_assessment(
+            assessment
         )
         capacity_details = capacity_observation.as_details()
         capacity_result = detect_capacity_state(
@@ -576,6 +627,7 @@ class DaemonRuntime:
             scheduler_mode,
             capacity_result,
             capacity_details,
+            assessment_generation=assessment.generation,
         )
         capacity_reclaim_payload = None
         if (
@@ -587,11 +639,16 @@ class DaemonRuntime:
                 >= self.capacity_reclaim_interval_sec
             )
         ):
+            reclaim_kwargs = {
+                "capacity_state": capacity_transition.state,
+                "free_bytes": assessment.free_bytes,
+                "target_free_bytes": assessment.target_free_bytes,
+            }
+            if self._capacity_reclaimer_accepts_assessment:
+                reclaim_kwargs["assessment"] = assessment
             reclaim_result = self.capacity_reclaimer.run(
                 snapshots,
-                capacity_state=capacity_transition.state,
-                free_bytes=free_bytes,
-                target_free_bytes=self.drain_exit_bytes,
+                **reclaim_kwargs,
             )
             capacity_reclaim_payload = reclaim_result.as_dict()
             self._last_capacity_reclaim_at = planner_now
@@ -622,6 +679,7 @@ class DaemonRuntime:
             "previous_state": capacity_transition.previous_state,
             "details": capacity_transition.details,
             "actions": list(capacity_result.actions),
+            "assessment_generation": assessment.generation,
         }
         return {
             "selected": result.selected_hashes,
@@ -647,6 +705,54 @@ class DaemonRuntime:
             "capacity_reclaim": capacity_reclaim_payload,
             "alerts_enqueued": alert_ids,
         }
+
+    def _capacity_recovery_preflight(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        *,
+        free_bytes: int,
+    ) -> None:
+        if (
+            self._capacity_recovery_preflight_done
+            or self.capacity_recovery_reclaimer is None
+        ):
+            return
+        recovery_result = self.capacity_recovery_reclaimer.run(
+            snapshots,
+            assessment=None,
+            capacity_state="recovery_preflight",
+            free_bytes=int(free_bytes),
+            target_free_bytes=self.drain_exit_bytes,
+        )
+        recovery_errors = list(getattr(recovery_result, "errors", ()))
+        con = readonly_connect(self.state_db)
+        try:
+            unresolved_recovery = con.execute(
+                "select id,state from capacity_reclaims where state in "
+                "('stopping','deleting','quarantined') order by id limit 1"
+            ).fetchone()
+        finally:
+            con.close()
+        if unresolved_recovery is not None:
+            recovery_errors.append(
+                "durable recovery row remains unresolved: "
+                f"id={int(unresolved_recovery['id'])} "
+                f"state={unresolved_recovery['state']}"
+            )
+        if recovery_errors:
+            message = (
+                "capacity reclaim recovery preflight failed: "
+                + "; ".join(str(error) for error in recovery_errors)
+            )
+            self.obs.event(
+                "error",
+                "capacity_reclaim",
+                "recovery_preflight_failed",
+                str(redact(message)),
+                {"dry_run": self.dry_run},
+            )
+            raise RuntimeError(message)
+        self._capacity_recovery_preflight_done = True
 
     def file_batch_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
@@ -824,6 +930,7 @@ class DaemonRuntime:
         *,
         legacy_selected_hashes,
         legacy_budget_bytes: int,
+        assessment_generation: int,
     ) -> dict:
         legacy_selected = sorted(str(item) for item in legacy_selected_hashes)
         if engine_plan is None or engine_budget is None:
@@ -831,6 +938,7 @@ class DaemonRuntime:
                 "mode": "legacy",
                 "applied_plan": "legacy",
                 "selected_hashes": legacy_selected,
+                "assessment_generation": int(assessment_generation),
             }
         engine_selected = sorted(item.hash for item in engine_plan.selected)
         engine_set = set(engine_selected)
@@ -855,6 +963,7 @@ class DaemonRuntime:
             "unsafe_plan_rejection_count": unsafe_rejections,
             "rejection_counts": dict(engine_plan.rejection_counts),
             "incumbent_hashes": list(engine_plan.incumbent_hashes),
+            "assessment_generation": int(assessment_generation),
         }
         # Persist one comparison sample; only shadow guarantees the Planner side
         # is an unconstrained legacy counterfactual.
@@ -876,7 +985,12 @@ class DaemonRuntime:
                 "finish_resident_max_remaining_bytes": self.finish_resident_max_remaining_bytes,
                 "finish_resident_max_stall_sec": self.finish_resident_max_stall_sec,
                 "capacity_viability_stale_sec": self.capacity_viability_stale_sec,
+                "capacity_reclaim_min_no_progress_sec": self.capacity_reclaim_min_no_progress_sec,
+                "capacity_reclaim_min_reclaimable_sec": self.capacity_reclaim_min_reclaimable_sec,
                 "scheduler_min_residency_sec": self.scheduler_min_residency_sec,
+            },
+            "config_sources": {
+                "capacity_reclaim_min_no_progress_sec": self.capacity_reclaim_min_no_progress_source,
             },
             "feature_flags": {
                 "dry_run": bool(self.dry_run),
@@ -894,10 +1008,18 @@ class DaemonRuntime:
                 else False,
                 "capacity_deadlock_alerts": bool(self.capacity_deadlock_alerts_enabled),
                 "capacity_reclaim": self.capacity_reclaimer is not None,
+                "capacity_reclaim_recovery": self.capacity_recovery_reclaimer is not None,
                 "capacity_reclaim_dry_run": (
                     None
                     if self.capacity_reclaimer is None
                     else bool(getattr(self.capacity_reclaimer, "dry_run", True))
+                ),
+                "capacity_reclaim_recovery_dry_run": (
+                    None
+                    if self.capacity_recovery_reclaimer is None
+                    else bool(
+                        getattr(self.capacity_recovery_reclaimer, "dry_run", True)
+                    )
                 ),
                 "capacity_reclaim_notifications": bool(
                     self.capacity_reclaimer is not None
@@ -1385,6 +1507,17 @@ class DaemonRuntime:
                 self._effective_config_snapshot(),
             )
             self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
+            if (
+                not self._capacity_recovery_preflight_done
+                and self.capacity_recovery_reclaimer is not None
+            ):
+                self._capacity_recovery_preflight(
+                    {
+                        h: vars(snapshot)
+                        for h, snapshot in self.monitor.sync.snapshots.items()
+                    },
+                    free_bytes=int(self.free_bytes_provider()),
+                )
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.start()
             self._start_background_event_workers()
