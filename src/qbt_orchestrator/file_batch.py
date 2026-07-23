@@ -87,6 +87,10 @@ class FileBatchService:
     This first production-safe slice does not call torrents/files, os.walk, or
     rclone.  It detects completed managed full-torrent payloads and creates a
     durable upload job for the event-driven UploadWorker.
+
+    Live qBT mutations require the process-wide shared ``Executor``.  The
+    ``allow_unguarded_qbt_mutations`` escape hatch exists only for unsafe
+    legacy/offline tooling and tests; production callers must leave it false.
     """
 
     def __init__(
@@ -114,6 +118,7 @@ class FileBatchService:
         batch_inventory_limit: int = 8,
         scheduler_engine: SchedulerEngine | None = None,
         now=None,
+        allow_unguarded_qbt_mutations: bool = False,
     ):
         self.state_db = state_db
         self.dry_run = dry_run
@@ -123,6 +128,7 @@ class FileBatchService:
         self.backpressure_policy = backpressure_policy
         self.qbt = qbt
         self.executor = executor
+        self.allow_unguarded_qbt_mutations = allow_unguarded_qbt_mutations is True
         self.batch_pipeline_enabled = bool(batch_pipeline_enabled)
         self.disk_floor_bytes = int(disk_floor_bytes)
         self.filesystem_slack_bytes = int(filesystem_slack_bytes)
@@ -1473,6 +1479,8 @@ class FileBatchService:
     def _qbt_post(self, path: str, payload: dict[str, Any], h: str | None) -> None:
         if self.executor is not None and hasattr(self.executor, "qbt_post"):
             self.executor.qbt_post(path, payload)
+        elif not self.allow_unguarded_qbt_mutations:
+            raise RuntimeError("shared Executor required for qBT mutation")
         elif hasattr(self.qbt, "qbt_post"):
             self.qbt.qbt_post(path, payload)
         elif hasattr(self.qbt, "post"):

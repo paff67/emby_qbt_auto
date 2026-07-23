@@ -7,6 +7,8 @@ import tempfile
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
@@ -424,6 +426,7 @@ def test_file_batch_service_queues_downloaded_single_file_batch_when_qbt_content
             container_downloads="/downloads",
             remote="gcrypt:",
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             batch_max_new_per_tick=0,
             now=lambda: 2000,
         )
@@ -496,6 +499,58 @@ class BatchQbt:
             raise RuntimeError("qbt filePrio failed")
 
 
+def test_file_batch_default_rejects_qbt_mutation_without_shared_executor():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([])
+        service = FileBatchService(state_db=db, dry_run=False, qbt=qbt)
+
+        with pytest.raises(
+            RuntimeError,
+            match="^shared Executor required for qBT mutation$",
+        ):
+            service._qbt_post(
+                "/api/v2/torrents/filePrio",
+                {"hash": "h", "id": "0", "priority": "0"},
+                "h",
+            )
+
+        assert qbt.calls == []
+
+
+def test_file_batch_unsafe_legacy_opt_in_retains_direct_qbt_fallback():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = BatchQbt([])
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
+        )
+
+        service._qbt_post(
+            "/api/v2/torrents/filePrio",
+            {"hash": "h", "id": "0", "priority": "0"},
+            "h",
+        )
+
+        assert qbt.calls == [
+            (
+                "/api/v2/torrents/filePrio",
+                {"hash": "h", "id": "0", "priority": "0"},
+            )
+        ]
+
+
 class PerHashBatchQbt(BatchQbt):
     def __init__(self, files_by_hash, piece_size=16 * 1024 * 1024):
         super().__init__([], piece_size=piece_size)
@@ -526,6 +581,7 @@ def test_global_batch_selection_is_independent_of_snapshot_order():
                 state_db=db,
                 dry_run=False,
                 qbt=qbt,
+                allow_unguarded_qbt_mutations=True,
                 disk_floor_bytes=2 * gib,
                 batch_max_new_per_tick=1,
             )
@@ -714,6 +770,7 @@ def test_file_batch_service_creates_pipeline_batch_with_reservation_and_file_pri
             container_downloads="/downloads",
             remote="gcrypt:",
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             filesystem_slack_bytes=128 * 1024**2,
             now=lambda: 10_000,
@@ -841,7 +898,14 @@ def test_file_batch_budget_reports_but_does_not_subtract_current_pinned_inventor
         )
         con.commit(); con.close()
         qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": gib, "progress": 0, "priority": 0}])
-        service = FileBatchService(state_db=db, dry_run=False, qbt=qbt, disk_floor_bytes=2 * gib, now=lambda: 1_000)
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
+            disk_floor_bytes=2 * gib,
+            now=lambda: 1_000,
+        )
 
         result = service.sync_completed(
             {"new": {"hash": "new", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": gib, "size": gib, "progress": 0.0}},
@@ -908,6 +972,7 @@ def test_file_batch_service_live_verify_canary_selects_one_after_global_discover
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             batch_live_verify=True,
             batch_allow_tag="batch-canary",
@@ -988,6 +1053,7 @@ def test_file_batch_service_pipeline_selects_real_media_and_skips_junk_candidate
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             filesystem_slack_bytes=128 * 1024**2,
             now=lambda: 1_000,
@@ -1027,6 +1093,7 @@ def test_file_batch_service_pipeline_blocks_ad_txt_but_keeps_informational_txt_d
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             filesystem_slack_bytes=128 * 1024**2,
             now=lambda: 1_000,
@@ -1065,6 +1132,7 @@ def test_file_batch_service_pipeline_uses_dynamic_programming_to_skip_oversized_
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             filesystem_slack_bytes=128 * 1024**2,
             now=lambda: 1_000,
@@ -1103,6 +1171,7 @@ def test_file_batch_service_pipeline_prefers_nearly_complete_high_payload_file()
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             filesystem_slack_bytes=128 * 1024**2,
             batch_live_verify=True,
@@ -1149,6 +1218,7 @@ def test_file_batch_service_live_verify_without_allowlist_allows_multiple_hashes
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             batch_live_verify=True,
             batch_max_new_per_tick=10,
@@ -1184,6 +1254,7 @@ def test_file_batch_service_pipeline_allows_real_media_with_site_prefix():
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             filesystem_slack_bytes=128 * 1024**2,
             batch_live_verify=True,
@@ -1216,6 +1287,7 @@ def test_file_batch_service_pipeline_reserves_remaining_bytes_for_partial_file()
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             filesystem_slack_bytes=128 * 1024**2,
             batch_live_verify=True,
@@ -1262,6 +1334,7 @@ def test_file_batch_service_pipeline_does_not_reselect_inflight_batch_indices():
             state_db=db,
             dry_run=False,
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             max_inflight_batches_per_torrent=2,
             now=lambda: 1_000,
@@ -1303,7 +1376,14 @@ def test_file_batch_service_pipeline_dry_run_and_qbt_failure_do_not_leave_active
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "state.sqlite"
         migrate(db, dry_run=False)
-        failing = FileBatchService(state_db=db, dry_run=False, qbt=BatchQbt(files, fail_on_post=True), disk_floor_bytes=2 * gib, now=lambda: 1_000)
+        failing = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=BatchQbt(files, fail_on_post=True),
+            allow_unguarded_qbt_mutations=True,
+            disk_floor_bytes=2 * gib,
+            now=lambda: 1_000,
+        )
 
         result = failing.sync_completed(snapshots, free_bytes=5 * gib, sync_healthy=True)
 
@@ -1349,6 +1429,7 @@ def test_file_batch_service_queues_downloaded_pipeline_batch_without_delete():
             container_downloads="/downloads",
             remote="gcrypt:",
             qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
             disk_floor_bytes=2 * gib,
             max_inflight_batches_per_torrent=1,
             now=lambda: 1_000,
@@ -1456,7 +1537,14 @@ def test_file_batch_service_reconciles_stopped_cooldown_batch_by_releasing_reser
         )
         con.commit(); con.close()
         qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.4, "priority": 1}])
-        service = FileBatchService(state_db=db, dry_run=False, qbt=qbt, disk_floor_bytes=2 * gib, now=lambda: 1_000)
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
+            disk_floor_bytes=2 * gib,
+            now=lambda: 1_000,
+        )
 
         result = service.sync_completed(
             {"stale": {"hash": "stale", "name": "Stale", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 3 * gib, "size": 5 * gib, "progress": 0.4}},
@@ -1510,7 +1598,14 @@ def test_batch_pause_keeps_claim_and_reservation_when_priority_reset_fails():
             [{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.4, "priority": 1}],
             fail_on_post=True,
         )
-        service = FileBatchService(db, dry_run=False, qbt=qbt, disk_floor_bytes=2 * gib, now=lambda: 1_000)
+        service = FileBatchService(
+            db,
+            dry_run=False,
+            qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
+            disk_floor_bytes=2 * gib,
+            now=lambda: 1_000,
+        )
 
         service.sync_completed(
             {"reset-fail": {"hash": "reset-fail", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 3 * gib, "size": 5 * gib, "progress": 0.4}},
@@ -1546,7 +1641,14 @@ def test_file_batch_service_reconciles_stopped_cooldown_batch_even_after_reserva
         )
         con.commit(); con.close()
         qbt = BatchQbt([{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.4, "priority": 1}])
-        service = FileBatchService(state_db=db, dry_run=False, qbt=qbt, disk_floor_bytes=2 * gib, now=lambda: 2_000)
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            allow_unguarded_qbt_mutations=True,
+            disk_floor_bytes=2 * gib,
+            now=lambda: 2_000,
+        )
 
         result = service.sync_completed(
             {"expired": {"hash": "expired", "name": "Expired", "category": "auto", "tags": "auto", "state": "stoppedDL", "amount_left": 3 * gib, "size": 5 * gib, "progress": 0.4}},
