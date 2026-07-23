@@ -1976,7 +1976,11 @@ def test_fresh_inventory_candidate_path_must_match_live_info(tmp_path):
             return {
                 "full_update": True,
                 "torrents": {
-                    "h": {**candidate, "content_path": "/downloads/incomplete/moved"}
+                    "h": {
+                        **candidate,
+                        "state": "stoppedDL",
+                        "content_path": "/downloads/incomplete/moved",
+                    }
                 },
             }
 
@@ -2054,3 +2058,62 @@ def test_fresh_inventory_candidate_evidence_is_revalidated_before_audit(
     assert result.rejection_counts[reason] == 1
     assert payload.exists()
     _assert_no_capacity_reclaim_audit(db)
+
+
+@pytest.mark.parametrize(
+    ("inventory_state", "expected_reclaimed"),
+    [
+        ("downloading", 0),
+        ("forcedDL", 0),
+        ("metaDL", 0),
+        ("", 0),
+        (None, 0),
+        ("stoppedDL", 1),
+        ("pausedDL", 1),
+    ],
+)
+def test_fresh_inventory_candidate_must_still_be_stopped_before_audit(
+    tmp_path, inventory_state, expected_reclaimed
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+
+    class InventoryStateExecutor(RecordingExecutor):
+        def get_maindata(self, rid):
+            assert rid == 0
+            return {
+                "full_update": True,
+                "torrents": {
+                    "h": {**self.info["h"], "state": inventory_state},
+                },
+            }
+
+    executor = InventoryStateExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == expected_reclaimed
+    if expected_reclaimed:
+        assert not payload.exists()
+    else:
+        assert result.rejection_counts["torrent_not_stopped"] == 1
+        assert payload.exists()
+        _assert_no_capacity_reclaim_audit(db)

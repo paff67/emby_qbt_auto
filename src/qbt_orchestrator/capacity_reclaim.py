@@ -16,6 +16,12 @@ from .observability import redact
 
 
 STOPPED_DOWNLOAD_STATES = frozenset({"stoppedDL", "pausedDL"})
+
+
+def _is_stopped_download_state(value: Any) -> bool:
+    return str(value or "") in STOPPED_DOWNLOAD_STATES
+
+
 PROTECTED_TAGS = frozenset({"hold", "seed-long"})
 OPEN_JOB_STATES = (
     "queued",
@@ -557,6 +563,9 @@ class DeadPartialReclaimer:
             if reason is not None:
                 reject(reason)
                 continue
+            if not _is_stopped_download_state(inventory_candidate.get("state")):
+                reject("torrent_not_stopped")
+                continue
             inventory_host_path = fresh_paths.get(torrent_hash.strip().lower())
             if inventory_host_path is None:
                 reject("path_inventory_failed")
@@ -915,7 +924,7 @@ class DeadPartialReclaimer:
                 current = dict(self.executor.qbt.torrent_info(torrent_hash))
             except Exception:
                 return None, "stop_confirmation_failed"
-            if str(current.get("state") or "") in STOPPED_DOWNLOAD_STATES:
+            if _is_stopped_download_state(current.get("state")):
                 return current, None
             if attempt + 1 < attempts:
                 self.sleep(self.stop_poll_interval_sec)
