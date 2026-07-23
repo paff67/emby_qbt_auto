@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
@@ -422,7 +424,7 @@ def test_qbt_http_client_logs_in_and_reuses_sid_cookie_for_host_api():
     assert client.post("/api/v2/torrents/stop", {"hashes": "h1|h2"}) == "Ok."
 
     assert [c[0] for c in calls] == ["POST", "GET", "POST"]
-    assert calls[0][4] == 7
+    assert 0 < calls[0][4] <= 7
 
 
 def test_qbt_sync_session_reuses_sid_and_observes_delta():
@@ -579,6 +581,156 @@ def test_qbt_client_builder_host_proxy_can_require_sid_authentication():
     assert client.username == "admin"
     assert client.password == "secret"
     assert client.default_headers == {"Host": "127.0.0.1:8080"}
+
+
+def test_qbt_token_bucket_respects_acquire_timeout_without_oversleeping():
+    from qbt_orchestrator.integrations.qbt import TokenBucket
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    bucket = TokenBucket(1, clock=clock.monotonic, sleeper=clock.sleep)
+
+    assert bucket.acquire() is True
+    assert bucket.acquire(timeout=0.05) is False
+    assert clock.now == pytest.approx(0.05)
+
+
+def test_qbt_token_bucket_lock_contention_respects_acquire_timeout():
+    from qbt_orchestrator.integrations.qbt import TokenBucket
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    class BusyLock:
+        def __init__(self, clock):
+            self.clock = clock
+            self.timeouts = []
+
+        def acquire(self, timeout=None):
+            self.timeouts.append(timeout)
+            self.clock.sleep(timeout)
+            return False
+
+        def release(self):
+            raise AssertionError("unacquired lock must not be released")
+
+    clock = FakeClock()
+    bucket = TokenBucket(1, clock=clock.monotonic, sleeper=clock.sleep)
+    busy_lock = BusyLock(clock)
+    bucket._lock = busy_lock
+
+    assert bucket.acquire(timeout=0.05) is False
+    assert busy_lock.timeouts == [0.05]
+    assert clock.now == pytest.approx(0.05)
+
+
+def test_qbt_docker_torrent_info_caps_runner_and_curl_timeout():
+    from qbt_orchestrator.integrations.qbt import QbtDockerClient
+
+    runner = RecordingRunner(outputs=[json.dumps([{"hash": "h"}])])
+    client = QbtDockerClient(
+        runner=runner, timeout=10, api_max_requests_per_sec=0,
+    )
+
+    assert client.torrent_info("h", timeout=0.05) == {"hash": "h"}
+
+    argv, _input, runner_timeout = runner.calls[0]
+    max_time = float(argv[argv.index("--max-time") + 1])
+    connect_timeout = float(argv[argv.index("--connect-timeout") + 1])
+    assert 0 < runner_timeout <= 0.05
+    assert 0 < max_time <= 0.05
+    assert 0 < connect_timeout <= 0.05
+
+
+def test_qbt_http_auth_retry_shares_one_request_deadline():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    calls = []
+
+    def transport(method, url, body, headers, timeout):
+        calls.append((url, timeout))
+        clock.sleep(min(0.02, timeout))
+        if url.endswith("/api/v2/auth/login"):
+            return 200, "Ok.", {"Set-Cookie": "SID=fresh; Path=/"}
+        if len([call for call in calls if "/torrents/info" in call[0]]) == 1:
+            return 401, "Unauthorized", {}
+        return 200, json.dumps([{"hash": "h"}]), {}
+
+    client = QbtHttpClient(
+        username="u", password="p", transport=transport, timeout=10,
+        api_max_requests_per_sec=0, clock=clock.monotonic, sleeper=clock.sleep,
+    )
+    client.cookie = "SID=stale"
+
+    assert client.torrent_info("h", timeout=0.05) == {"hash": "h"}
+    assert [url.rsplit("/", 1)[-1].split("?", 1)[0] for url, _ in calls] == [
+        "info", "login", "info",
+    ]
+    assert calls[0][1] <= 0.05
+    assert calls[1][1] <= 0.03 + 1e-9
+    assert calls[2][1] <= 0.01 + 1e-9
+    assert all(timeout > 0 for _url, timeout in calls)
+    assert clock.now <= 0.05 + 1e-9
+
+
+def test_qbt_http_rate_limit_wait_exits_at_request_deadline():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    calls = []
+
+    def transport(method, url, body, headers, timeout):
+        calls.append((url, timeout))
+        return 200, json.dumps({"rid": 1, "full_update": True, "torrents": {}}), {}
+
+    client = QbtHttpClient(
+        transport=transport, auth_mode="none", timeout=10,
+        api_max_requests_per_sec=1, clock=clock.monotonic, sleeper=clock.sleep,
+    )
+    client.get_maindata(0)
+
+    with pytest.raises(TimeoutError):
+        client.get_maindata(0, timeout=0.05)
+
+    assert len(calls) == 1
+    assert clock.now == pytest.approx(0.05)
 
 
 if __name__ == "__main__":

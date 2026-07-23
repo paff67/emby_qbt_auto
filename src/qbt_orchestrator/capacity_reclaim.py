@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -33,6 +34,26 @@ OPEN_JOB_STATES = (
 )
 MAGNET_PREFIX = "mag" + "net:?"
 PROGRESS_EPSILON = 1e-9
+CONTENT_SIZE_FIELDS = ("size", "total_size", "wanted_size")
+
+
+def _nonnegative_integer(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _completed_bytes(item: Mapping[str, Any]) -> int | None:
+    for field in ("completed_bytes", "completed", "downloaded"):
+        if field in item and item[field] is not None:
+            return _nonnegative_integer(item[field])
+    return None
 
 
 class CapacityReclaimAuditStore:
@@ -274,8 +295,11 @@ class DeadPartialReclaimer:
         notification_chat_ids: list[str] | tuple[str, ...] | None = None,
         now: Callable[[], int] | None = None,
         sleep: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
         stop_timeout_sec: float = 5.0,
         stop_poll_interval_sec: float = 0.1,
+        stop_max_polls: int = 8,
+        inventory_timeout_sec: float = 5.0,
     ):
         self.state_db = Path(state_db)
         self.executor = executor
@@ -295,8 +319,11 @@ class DeadPartialReclaimer:
         self.max_per_tick = max(0, int(max_per_tick))
         self.now = now or (lambda: int(__import__("time").time()))
         self.sleep = sleep or time.sleep
+        self.monotonic = monotonic or time.monotonic
         self.stop_timeout_sec = max(0.0, float(stop_timeout_sec))
         self.stop_poll_interval_sec = max(0.001, float(stop_poll_interval_sec))
+        self.stop_max_polls = max(1, int(stop_max_polls))
+        self.inventory_timeout_sec = max(0.0, float(inventory_timeout_sec))
         self.audit = CapacityReclaimAuditStore(
             self.state_db,
             notification_chat_ids=notification_chat_ids,
@@ -309,18 +336,19 @@ class DeadPartialReclaimer:
         self,
         snapshots: Mapping[str, Mapping[str, Any]],
         *,
-        assessment: CapacityAssessment,
+        assessment: CapacityAssessment | None = None,
         capacity_state: str,
         free_bytes: int,
         target_free_bytes: int,
     ) -> CapacityReclaimResult:
-        generation = int(assessment.generation)
+        generation = 0 if assessment is None else int(assessment.generation)
         if generation <= 0:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
                 assessment_generation=generation,
                 rejection_counts={"uncommitted_assessment": 1},
             )
+        assert assessment is not None
         if self._current_assessment_generation() != generation:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
@@ -452,6 +480,35 @@ class DeadPartialReclaimer:
             if allocated < self.min_reclaim_bytes:
                 reject("below_min_reclaim")
                 continue
+            amount_left = _nonnegative_integer(torrent.get("amount_left"))
+            completed_bytes = _completed_bytes(torrent)
+            try:
+                progress = float(torrent.get("progress") or 0.0)
+            except (TypeError, ValueError):
+                progress = float("nan")
+            if (
+                amount_left is None
+                or amount_left <= 0
+                or completed_bytes is None
+                or not math.isfinite(progress)
+                or progress < 0
+            ):
+                reject("progress_evidence_unknown")
+                continue
+            size_baseline: dict[str, int | None] = {}
+            invalid_size = False
+            for field in CONTENT_SIZE_FIELDS:
+                if field not in torrent or torrent[field] is None:
+                    size_baseline[field] = None
+                    continue
+                value = _nonnegative_integer(torrent[field])
+                if value is None:
+                    invalid_size = True
+                    break
+                size_baseline[field] = value
+            if invalid_size:
+                reject("content_selection_unknown")
+                continue
             candidates.append(
                 {
                     "hash": torrent_hash,
@@ -460,17 +517,10 @@ class DeadPartialReclaimer:
                     "host_path": str(host_path),
                     "content_path": str(torrent.get("content_path") or ""),
                     "allocated_bytes": int(allocated),
-                    "completed_bytes": max(
-                        0,
-                        int(
-                            torrent.get("completed_bytes")
-                            or torrent.get("completed")
-                            or torrent.get("downloaded")
-                            or 0
-                        ),
-                    ),
-                    "progress": float(torrent.get("progress") or 0.0),
-                    "amount_left": max(0, int(evidence.amount_left)),
+                    "completed_bytes": completed_bytes,
+                    "progress": progress,
+                    "amount_left": amount_left,
+                    **size_baseline,
                     "no_progress_since": int(evidence.no_progress_since),
                     "reclaimable_since": int(reclaimable_since),
                     "capacity_generation": generation,
@@ -809,23 +859,19 @@ class DeadPartialReclaimer:
             return "protected_tag"
         if str(current.get("category") or "") != "auto" and "auto" not in tags:
             return "not_managed"
-        raw_amount_left = current.get("amount_left")
-        try:
-            amount_left = (
-                None if raw_amount_left is None else float(raw_amount_left)
-            )
-        except (TypeError, ValueError):
-            amount_left = None
-        if (
-            amount_left is None
-            or not math.isfinite(amount_left)
-            or amount_left < 0
-        ):
+        amount_left = _nonnegative_integer(current.get("amount_left"))
+        baseline_amount_left = _nonnegative_integer(candidate.get("amount_left"))
+        if amount_left is None or baseline_amount_left is None:
             return "progress_evidence_unknown"
-        if amount_left <= 0:
-            return "torrent_completed"
-        if amount_left < int(candidate.get("amount_left") or 0):
-            return "progress_resumed"
+        if amount_left != baseline_amount_left:
+            return "content_selection_changed"
+        for field in CONTENT_SIZE_FIELDS:
+            baseline_size = candidate.get(field)
+            if baseline_size is None:
+                continue
+            current_size = _nonnegative_integer(current.get(field))
+            if current_size is None or current_size != int(baseline_size):
+                return "content_selection_changed"
         raw_availability = current.get("availability")
         try:
             availability = (
@@ -861,8 +907,8 @@ class DeadPartialReclaimer:
             or baseline_progress < 0
         ):
             return "progress_evidence_unknown"
-        if current_progress > baseline_progress + PROGRESS_EPSILON:
-            return "progress_resumed"
+        if abs(current_progress - baseline_progress) > PROGRESS_EPSILON:
+            return "progress_evidence_changed"
         for field in ("dlspeed", "dlspeed_bps"):
             raw_speed = current.get(field)
             if raw_speed is None:
@@ -875,20 +921,12 @@ class DeadPartialReclaimer:
                 return "progress_evidence_unknown"
             if speed > 0:
                 return "progress_resumed"
-        raw_completed = (
-            current.get("completed_bytes")
-            or current.get("completed")
-            or current.get("downloaded")
-            or 0
-        )
-        try:
-            completed_bytes = float(raw_completed)
-        except (TypeError, ValueError):
+        completed_bytes = _completed_bytes(current)
+        baseline_completed = _nonnegative_integer(candidate.get("completed_bytes"))
+        if completed_bytes is None or baseline_completed is None:
             return "progress_evidence_unknown"
-        if not math.isfinite(completed_bytes) or completed_bytes < 0:
-            return "progress_evidence_unknown"
-        if completed_bytes > int(evidence.completed_bytes):
-            return "progress_resumed"
+        if completed_bytes != baseline_completed:
+            return "progress_evidence_changed"
         return None
 
     def _revalidate_candidate(
@@ -899,7 +937,11 @@ class DeadPartialReclaimer:
         if self._current_assessment_generation() != int(assessment.generation):
             return "stale_assessment"
         try:
-            current = self.executor.qbt.torrent_info(str(candidate["hash"]))
+            current = self._qbt_call_with_timeout(
+                "torrent_info",
+                str(candidate["hash"]),
+                timeout=self.inventory_timeout_sec,
+            )
         except Exception:
             return "revalidation_failed"
         reason = self._live_torrent_rejection(
@@ -915,27 +957,58 @@ class DeadPartialReclaimer:
         self,
         torrent_hash: str,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        attempts = max(
-            1,
-            int(math.ceil(self.stop_timeout_sec / self.stop_poll_interval_sec)) + 1,
-        )
-        for attempt in range(attempts):
+        deadline = float(self.monotonic()) + self.stop_timeout_sec
+        for attempt in range(self.stop_max_polls):
+            remaining = deadline - float(self.monotonic())
+            if remaining <= 0:
+                break
             try:
-                current = dict(self.executor.qbt.torrent_info(torrent_hash))
+                current = dict(
+                    self._qbt_call_with_timeout(
+                        "torrent_info", torrent_hash, timeout=remaining
+                    )
+                )
+            except TimeoutError:
+                return None, "stop_timeout"
             except Exception:
                 return None, "stop_confirmation_failed"
+            if float(self.monotonic()) >= deadline:
+                return None, "stop_timeout"
             if _is_stopped_download_state(current.get("state")):
                 return current, None
-            if attempt + 1 < attempts:
-                self.sleep(self.stop_poll_interval_sec)
+            remaining = deadline - float(self.monotonic())
+            if attempt + 1 < self.stop_max_polls and remaining > 0:
+                self.sleep(min(self.stop_poll_interval_sec, remaining))
         return None, "stop_timeout"
+
+    def _qbt_call_with_timeout(
+        self,
+        method_name: str,
+        *args: Any,
+        timeout: float,
+    ) -> Any:
+        method = getattr(self.executor.qbt, method_name)
+        try:
+            parameters = inspect.signature(method).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        accepts_timeout = any(
+            parameter.name == "timeout"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if accepts_timeout:
+            return method(*args, timeout=timeout)
+        return method(*args)
 
     def _fresh_path_inventory(
         self,
         torrent_hash: str,
     ) -> tuple[dict[str, Path], dict[str, Any] | None, str | None]:
         try:
-            payload = self.executor.qbt.get_maindata(0)
+            payload = self._qbt_call_with_timeout(
+                "get_maindata", 0, timeout=self.inventory_timeout_sec
+            )
         except Exception:
             return {}, None, "path_inventory_failed"
         if not isinstance(payload, Mapping) or payload.get("full_update") is not True:
