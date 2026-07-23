@@ -1332,3 +1332,188 @@ def test_live_revalidation_rejects_torrent_that_became_manually_managed(tmp_path
     assert result.rejection_counts["not_managed"] == 1
     assert executor.posts == []
     assert payload.exists()
+
+
+def _assert_no_capacity_reclaim_audit(db: Path) -> None:
+    con = sqlite3.connect(db)
+    try:
+        assert con.execute("select count(*) from capacity_reclaims").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("availability", [float("nan"), float("inf"), float("-inf")])
+def test_live_revalidation_rejects_nonfinite_availability(tmp_path, availability):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    current = {**snapshot, "availability": availability}
+    executor = RecordingExecutor({"h": current})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["availability_unknown"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_live_revalidation_rejects_mismatched_torrent_identity(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    current = {**snapshot, "hash": "OTHER"}
+    executor = RecordingExecutor({"h": current})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["torrent_identity_changed"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+@pytest.mark.parametrize("speed_field", ["dlspeed", "dlspeed_bps"])
+def test_live_revalidation_rejects_resumed_download_speed(tmp_path, speed_field):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    current = {**snapshot, speed_field: 1}
+    executor = RecordingExecutor({"h": current})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["progress_resumed"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+@pytest.mark.parametrize("completed_field", ["completed_bytes", "completed", "downloaded"])
+def test_live_revalidation_rejects_completed_byte_growth(tmp_path, completed_field):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    current = dict(snapshot)
+    current.pop("completed_bytes", None)
+    current[completed_field] = 101
+    executor = RecordingExecutor({"h": current})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["progress_resumed"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_stop_window_completed_growth_is_revalidated_before_audit(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    before_stop = {**snapshot, "state": "downloading", "completed_bytes": 100}
+    after_stop = {**snapshot, "state": "stoppedDL", "completed_bytes": 101}
+
+    class StopWindowExecutor(RecordingExecutor):
+        def __init__(self):
+            super().__init__({"h": before_stop})
+            self.responses = [before_stop, after_stop]
+
+        def torrent_info(self, torrent_hash):
+            return dict(self.responses.pop(0))
+
+    executor = StopWindowExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.planned == 1
+    assert result.reclaimed == 0
+    assert result.rejection_counts["progress_resumed"] == 1
+    assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h"})]
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)

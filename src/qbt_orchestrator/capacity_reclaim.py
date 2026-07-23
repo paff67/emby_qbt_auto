@@ -360,11 +360,23 @@ class DeadPartialReclaimer:
             if not evidence.incomplete:
                 reject("not_incomplete")
                 continue
-            if evidence.availability is None or float(evidence.availability) < 0:
+            try:
+                assessed_availability = (
+                    None
+                    if evidence.availability is None
+                    else float(evidence.availability)
+                )
+            except (TypeError, ValueError):
+                assessed_availability = None
+            if (
+                assessed_availability is None
+                or not math.isfinite(assessed_availability)
+                or assessed_availability < 0
+            ):
                 reject("availability_unknown")
                 continue
             if (
-                float(evidence.availability) >= 1.0
+                assessed_availability >= 1.0
                 or int(evidence.complete_sources) > 0
             ):
                 reject("complete_source")
@@ -507,7 +519,11 @@ class DeadPartialReclaimer:
                 reject(stop_reason)
                 continue
             assert current is not None
-            reason = self._live_torrent_rejection(current)
+            reason = self._live_torrent_rejection(
+                current,
+                candidate=candidate,
+                assessment=assessment,
+            )
             if reason is not None:
                 reject(reason)
                 continue
@@ -711,7 +727,31 @@ class DeadPartialReclaimer:
         return None
 
     @staticmethod
-    def _live_torrent_rejection(current: Mapping[str, Any]) -> str | None:
+    def _assessment_torrent_evidence(
+        assessment: CapacityAssessment,
+        torrent_hash: str,
+    ) -> TorrentCapacityEvidence | None:
+        expected_hash = str(torrent_hash).strip().lower()
+        for assessment_hash, evidence in assessment.torrents.items():
+            evidence_hash = str(evidence.hash or assessment_hash).strip().lower()
+            if evidence_hash == expected_hash:
+                return evidence
+        return None
+
+    def _live_torrent_rejection(
+        self,
+        current: Mapping[str, Any],
+        *,
+        candidate: Mapping[str, Any],
+        assessment: CapacityAssessment,
+    ) -> str | None:
+        expected_hash = str(candidate["hash"]).strip().lower()
+        current_hash = str(current.get("hash") or "").strip().lower()
+        if current_hash and current_hash != expected_hash:
+            return "torrent_identity_changed"
+        evidence = self._assessment_torrent_evidence(assessment, expected_hash)
+        if evidence is None:
+            return "stale_assessment"
         tags = {
             item.strip()
             for item in str(current.get("tags") or "").split(",")
@@ -722,7 +762,7 @@ class DeadPartialReclaimer:
         if str(current.get("category") or "") != "auto" and "auto" not in tags:
             return "not_managed"
         if int(current.get("amount_left") or 0) <= 0:
-            return "not_incomplete"
+            return "torrent_completed"
         raw_availability = current.get("availability")
         try:
             availability = (
@@ -730,7 +770,11 @@ class DeadPartialReclaimer:
             )
         except (TypeError, ValueError):
             availability = None
-        if availability is None or availability < 0:
+        if (
+            availability is None
+            or not math.isfinite(availability)
+            or availability < 0
+        ):
             return "availability_unknown"
         complete_sources = max(
             int(current.get("num_seeds") or 0),
@@ -738,6 +782,32 @@ class DeadPartialReclaimer:
         )
         if availability >= 1.0 or complete_sources > 0:
             return "complete_source"
+        for field in ("dlspeed", "dlspeed_bps"):
+            raw_speed = current.get(field)
+            if raw_speed is None:
+                continue
+            try:
+                speed = float(raw_speed)
+            except (TypeError, ValueError):
+                return "progress_evidence_unknown"
+            if not math.isfinite(speed):
+                return "progress_evidence_unknown"
+            if speed > 0:
+                return "progress_resumed"
+        raw_completed = (
+            current.get("completed_bytes")
+            or current.get("completed")
+            or current.get("downloaded")
+            or 0
+        )
+        try:
+            completed_bytes = float(raw_completed)
+        except (TypeError, ValueError):
+            return "progress_evidence_unknown"
+        if not math.isfinite(completed_bytes) or completed_bytes < 0:
+            return "progress_evidence_unknown"
+        if completed_bytes > int(evidence.completed_bytes):
+            return "progress_resumed"
         return None
 
     def _revalidate_candidate(
@@ -751,7 +821,11 @@ class DeadPartialReclaimer:
             current = self.executor.qbt.torrent_info(str(candidate["hash"]))
         except Exception:
             return "revalidation_failed"
-        reason = self._live_torrent_rejection(current)
+        reason = self._live_torrent_rejection(
+            current,
+            candidate=candidate,
+            assessment=assessment,
+        )
         if reason is not None:
             return reason
         return self._candidate_fence_reason(candidate, assessment)
