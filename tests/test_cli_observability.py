@@ -87,13 +87,34 @@ def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes(
 
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "state.sqlite"
-        monkeypatch.setattr(cli, "QbtDockerClient", lambda *a, **kw: FakeQbt())
+        monkeypatch.setattr(
+            cli,
+            "_build_qbt_client_from_env",
+            lambda *_args, **_kwargs: FakeQbt(),
+        )
         monkeypatch.setattr(
             cli,
             "_free_bytes_for",
             lambda _path: lambda: 16 * 1024**3,
         )
         monkeypatch.setenv("QBT_ORCH_DISK_PATH", td)
+        for key, value in {
+            "QBT_ORCH_DISK_FLOOR_GB": "3",
+            "QBT_ORCH_EMERGENCY_FLOOR_GB": "1.5",
+            "QBT_ORCH_RECOVERY_ENTER_GB": "3.5",
+            "QBT_ORCH_DRAIN_EXIT_GB": "5",
+            "QBT_ORCH_EXPLORE_ENTER_GB": "8",
+            "QBT_ORCH_RECOVERY_MODE": "1",
+            "QBT_ORCH_RECOVERY_MARGIN_MB": "256",
+            "QBT_ORCH_ACTIVE_SLOTS": "5",
+            "QBT_ORCH_RECOVERY_ACTIVE_SLOTS": "4",
+            "QBT_ORCH_RECOVERY_MAX_REMAINING_GB": "1.5",
+            "QBT_ORCH_SOAK_ENABLED": "0",
+            "QBT_ORCH_SCHEDULER_ENGINE": "legacy",
+            "QBT_ORCH_CAPACITY_RECLAIM": "0",
+            "QBT_ORCH_BACKGROUND_PERIODIC_WORKERS": "0",
+        }.items():
+            monkeypatch.setenv(key, value)
 
         rc, out = run_cli(["once", "--dry-run", "--state-db", str(db)])
 
