@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
+
+from .db import write_transaction
 
 
 @dataclass(frozen=True)
@@ -150,3 +155,99 @@ class CapacityAssessmentBuilder:
             disk_releasing_jobs=max(0, int(disk_releasing_jobs)),
             torrents=items,
         )
+
+
+def _core_reclaimable(
+    item: TorrentCapacityEvidence,
+    observed_at: int,
+    min_no_progress_sec: int,
+) -> bool:
+    return bool(
+        item.managed
+        and item.incomplete
+        and not item.viable
+        and item.availability is not None
+        and 0.0 <= item.availability < 1.0
+        and item.complete_sources == 0
+        and item.no_progress_since is not None
+        and int(observed_at) - int(item.no_progress_since)
+        >= int(min_no_progress_sec)
+    )
+
+
+class CapacityAssessmentStore:
+    def __init__(self, state_db: str | Path, *, min_no_progress_sec: int):
+        self.state_db = Path(state_db)
+        self.min_no_progress_sec = int(min_no_progress_sec)
+
+    def commit(self, assessment: CapacityAssessment) -> CapacityAssessment:
+        core_by_hash = {
+            item.hash: _core_reclaimable(
+                item,
+                assessment.observed_at,
+                self.min_no_progress_sec,
+            )
+            for item in assessment.torrents.values()
+        }
+        summary_json = json.dumps(
+            {
+                "managed_incomplete": assessment.managed_incomplete,
+                "nonviable_finish": assessment.nonviable_finish,
+                "reclaimable": sum(core_by_hash.values()),
+                "torrent_count": len(assessment.torrents),
+                "viable_finish": assessment.viable_finish,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        def txn(con: sqlite3.Connection) -> int:
+            state = con.execute(
+                "insert into capacity_assessment_state("
+                "id,current_generation,observed_at,summary_json) values(1,1,?,?) "
+                "on conflict(id) do update set "
+                "current_generation=capacity_assessment_state.current_generation+1,"
+                "observed_at=excluded.observed_at,summary_json=excluded.summary_json "
+                "returning current_generation",
+                (int(assessment.observed_at), summary_json),
+            ).fetchone()
+            assert state is not None
+            generation = int(state["current_generation"])
+
+            for item in assessment.torrents.values():
+                con.execute(
+                    "insert or ignore into torrent_health(hash,sampled_at,updated_at) "
+                    "values(?,?,?)",
+                    (item.hash, assessment.observed_at, assessment.observed_at),
+                )
+                previous = con.execute(
+                    "select reclaimable_since from torrent_health where hash=?",
+                    (item.hash,),
+                ).fetchone()
+                core = core_by_hash[item.hash]
+                reclaimable_since = (
+                    int(previous["reclaimable_since"])
+                    if core
+                    and previous
+                    and previous["reclaimable_since"] is not None
+                    else int(assessment.observed_at)
+                    if core
+                    else None
+                )
+                con.execute(
+                    "update torrent_health set reclaimable_since=?,capacity_viable=?,"
+                    "capacity_reason=?,capacity_assessed_at=?,capacity_generation=? "
+                    "where hash=?",
+                    (
+                        reclaimable_since,
+                        1 if item.viable else 0,
+                        item.viability_reason,
+                        assessment.observed_at,
+                        generation,
+                        item.hash,
+                    ),
+                )
+            return generation
+
+        generation = int(write_transaction(self.state_db, txn))
+        return assessment.with_generation(generation)

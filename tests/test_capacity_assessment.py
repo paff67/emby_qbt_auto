@@ -5,6 +5,7 @@ import pytest
 from qbt_orchestrator.capacity_assessment import (
     CapacityAssessment,
     CapacityAssessmentBuilder,
+    CapacityAssessmentStore,
     TorrentCapacityEvidence,
 )
 from qbt_orchestrator.db import migrate, readonly_connect
@@ -38,6 +39,54 @@ def _assessment(torrents):
         selected_hashes=frozenset(),
         disk_releasing_jobs=0,
         torrents=torrents,
+    )
+
+
+def nonviable_assessment(*, observed_at, no_progress_since):
+    return CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 100,
+                "availability": 0.5,
+                "num_seeds": 0,
+                "num_complete": 0,
+            }
+        },
+        {"h": {"no_progress_since": no_progress_since}},
+        observed_at=observed_at,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    )
+
+
+def viable_assessment(*, observed_at, availability):
+    return CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 100,
+                "availability": availability,
+                "num_seeds": 0,
+                "num_complete": 0,
+            }
+        },
+        {"h": {"no_progress_since": 1000}},
+        observed_at=observed_at,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
     )
 
 
@@ -223,3 +272,37 @@ def test_capacity_assessment_schema_is_additive(tmp_path):
         assert row is None
     finally:
         con.close()
+
+
+def test_reclaimable_since_survives_scheduler_state_changes(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    assessment = nonviable_assessment(observed_at=30_000, no_progress_since=1_000)
+    first = CapacityAssessmentStore(db, min_no_progress_sec=21_600).commit(assessment)
+    second = CapacityAssessmentStore(db, min_no_progress_sec=21_600).commit(
+        nonviable_assessment(observed_at=30_300, no_progress_since=1_000)
+    )
+    con = readonly_connect(db)
+    row = con.execute(
+        "select reclaimable_since,capacity_generation "
+        "from torrent_health where hash='h'"
+    ).fetchone()
+    con.close()
+    assert first.generation == 1
+    assert second.generation == 2
+    assert row["reclaimable_since"] == 30_000
+    assert row["capacity_generation"] == 2
+
+
+def test_complete_availability_clears_reclaimable_since(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    store = CapacityAssessmentStore(db, min_no_progress_sec=21_600)
+    store.commit(nonviable_assessment(observed_at=30_000, no_progress_since=1_000))
+    store.commit(viable_assessment(observed_at=30_300, availability=1.0))
+    con = readonly_connect(db)
+    value = con.execute(
+        "select reclaimable_since from torrent_health where hash='h'"
+    ).fetchone()[0]
+    con.close()
+    assert value is None
