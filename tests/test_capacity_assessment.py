@@ -8,6 +8,7 @@ from qbt_orchestrator.capacity_assessment import (
     CapacityAssessmentBuilder,
     CapacityAssessmentStore,
     TorrentCapacityEvidence,
+    project_progress_health,
 )
 from qbt_orchestrator.db import migrate, readonly_connect
 
@@ -41,6 +42,59 @@ def _assessment(torrents):
         disk_releasing_jobs=0,
         torrents=torrents,
     )
+
+
+def test_progress_health_projection_clears_stall_on_completed_or_progress_growth():
+    projected = project_progress_health(
+        {
+            "hash": " H ",
+            "completed": 100,
+            "progress": 0.5,
+            "dlspeed": 0,
+        },
+        {
+            "completed_bytes": 0,
+            "progress": 0.4,
+            "no_progress_since": 1,
+        },
+        observed_at=2_000,
+    )
+
+    assert projected == {
+        "hash": "h",
+        "completed_bytes": 100,
+        "previous_completed_bytes": 0,
+        "progress": 0.5,
+        "dlspeed_bps": 0,
+        "no_progress_since": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("old_health", "expected"),
+    [
+        (
+            {"completed_bytes": 100, "progress": 0.5, "no_progress_since": 7},
+            7,
+        ),
+        (
+            {"completed_bytes": 100, "progress": 0.5, "no_progress_since": None},
+            2_000,
+        ),
+        ({}, None),
+    ],
+)
+def test_progress_health_projection_preserves_or_starts_stall_without_growth(
+    old_health,
+    expected,
+):
+    projected = project_progress_health(
+        {"hash": "h", "completed_bytes": 100, "progress": 0.5},
+        old_health,
+        observed_at=2_000,
+    )
+
+    assert projected["no_progress_since"] == expected
 
 
 def nonviable_assessment(*, observed_at, no_progress_since):

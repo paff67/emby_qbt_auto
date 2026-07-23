@@ -12,7 +12,11 @@ from typing import Any, Callable, Mapping
 
 from .alerts import SchedulerAlertConfig, SchedulerAlertService
 from .budget import calculate_growth_budget, resource_claims_from_rows
-from .capacity_assessment import CapacityAssessmentBuilder, CapacityAssessmentStore
+from .capacity_assessment import (
+    CapacityAssessmentBuilder,
+    CapacityAssessmentStore,
+    project_progress_health,
+)
 from .capacity_state import (
     CapacityResult,
     CapacityStateStore,
@@ -423,6 +427,8 @@ class DaemonRuntime:
         self._last_safety_event_fingerprint: tuple[object, ...] | None = None
         self._safety_sampled = False
         self._safety_tick_lock = threading.RLock()
+        self._published_safety_snapshots: dict[str, dict[str, Any]] = {}
+        self._published_sync_healthy = False
         self.monitor = SafetyMonitor(
             qbt,
             executor,
@@ -522,22 +528,19 @@ class DaemonRuntime:
         return result
 
     def planner_tick(self) -> dict:
-        cached_snapshots = {
-            h: vars(snapshot)
-            for h, snapshot in self.monitor.sync.snapshots.items()
-        }
+        cached_snapshots, cached_sync_healthy, cached_sampled = (
+            self._capture_safety_snapshot()
+        )
         self._capacity_recovery_preflight(
             cached_snapshots,
             free_bytes=None,
             allow_live_recovery=(
-                not self._safety_sampled
-                or bool(self.monitor.sync.high_risk_actions_allowed)
+                not cached_sampled or cached_sync_healthy
             ),
         )
         self._ensure_initial_safety_sample()
-        snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
+        snapshots, sync_healthy, _sampled = self._capture_safety_snapshot()
         free_bytes = int(self.free_bytes_provider())
-        sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
         self._capacity_recovery_preflight(
             snapshots,
             free_bytes=free_bytes,
@@ -555,7 +558,11 @@ class DaemonRuntime:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
         planner_now = int(time.time())
         assessment_snapshots = snapshots if sync_healthy else {}
-        capacity_health = self._capacity_health_by_hash() if sync_healthy else {}
+        capacity_health = (
+            self._effective_capacity_health(assessment_snapshots, planner_now)
+            if sync_healthy
+            else {}
+        )
         cooldown_hashes = (
             active_soak_cooldown_hashes(self.state_db, planner_now)
             | {str(h) for h in soak_result.cooldown_hashes}
@@ -1047,14 +1054,42 @@ class DaemonRuntime:
         con = readonly_connect(self.state_db)
         try:
             return {
-                str(row["hash"]): dict(row)
+                canonical: dict(row)
                 for row in con.execute(
                     "select hash,no_progress_since,last_swarm_seen_at,no_swarm_since,"
-                    "dlspeed_bps,num_seeds,num_peers from torrent_health"
+                    "dlspeed_bps,num_seeds,num_peers,completed_bytes,progress "
+                    "from torrent_health"
                 ).fetchall()
+                if (canonical := canonical_torrent_hash(row["hash"]))
             }
         finally:
             con.close()
+
+    def _effective_capacity_health(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        observed_at: int,
+    ) -> dict[str, dict[str, Any]]:
+        previous = self._capacity_health_by_hash()
+        effective: dict[str, dict[str, Any]] = {}
+        for fallback_hash, raw in snapshots.items():
+            torrent = dict(raw)
+            torrent_hash = canonical_torrent_hash(
+                torrent.get("hash") or fallback_hash
+            )
+            if not torrent_hash:
+                continue
+            torrent["hash"] = torrent_hash
+            old = dict(previous.get(torrent_hash) or {})
+            old.update(
+                project_progress_health(
+                    torrent,
+                    old,
+                    observed_at=observed_at,
+                )
+            )
+            effective[torrent_hash] = old
+        return effective
 
     def _record_capacity_assessment_metric(
         self,
@@ -1283,19 +1318,35 @@ class DaemonRuntime:
         )
 
     def _ensure_initial_safety_sample(self) -> None:
-        if self._safety_sampled:
+        _snapshots, _sync_healthy, sampled = self._capture_safety_snapshot()
+        if sampled:
             return
+        self.tick_safety()
+
+    def _capture_safety_snapshot(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], bool, bool]:
         with self._safety_tick_lock:
-            if not self._safety_sampled:
-                self._tick_safety_locked()
+            return (
+                {
+                    torrent_hash: dict(snapshot)
+                    for torrent_hash, snapshot in self._published_safety_snapshots.items()
+                },
+                bool(self._published_sync_healthy),
+                bool(self._safety_sampled),
+            )
 
     def tick_safety(self) -> None:
-        with self._safety_tick_lock:
-            self._tick_safety_locked()
-
-    def _tick_safety_locked(self) -> None:
         result = self.monitor.tick()
-        self._safety_sampled = True
+        snapshots = {
+            torrent_hash: dict(vars(snapshot))
+            for torrent_hash, snapshot in self.monitor.sync.snapshots.items()
+        }
+        sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
+        with self._safety_tick_lock:
+            self._published_safety_snapshots = snapshots
+            self._published_sync_healthy = sync_healthy
+            self._safety_sampled = True
         free_bytes = int(self.free_bytes_provider())
         self._persist_disk_state(free_bytes, result.disk_state)
         sync_stats = self.monitor.sync.session_stats.as_dict()

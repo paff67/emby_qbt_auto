@@ -330,6 +330,72 @@ def test_capacity_state_uses_actual_planner_budget_and_selected_hashes(
     assert payload["capacity"]["details"]["planned_selected_count"] == 1
 
 
+def test_assessment_and_planner_share_current_progress_health(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+
+    class ProgressQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    " H ": {
+                        "hash": " H ",
+                        "name": "progressed",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 100,
+                        "size": 200,
+                        "completed": 100,
+                        "progress": 0.5,
+                        "availability": 0.5,
+                        "num_seeds": 0,
+                        "dlspeed": 0,
+                    }
+                },
+                "server_state": {},
+            }
+
+    monkeypatch.setattr(service.time, "time", lambda: 2_000)
+    db = tmp_path / "state.sqlite"
+    daemon = service.DaemonRuntime(
+        state_db=db,
+        qbt=ProgressQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 10 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        planner_active_slots=1,
+    )
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into torrent_health("
+        "hash,sampled_at,completed_bytes,progress,no_progress_since,"
+        "reclaimable_since,capacity_generation,updated_at) "
+        "values('h',1,0,0.4,1,1,0,1)"
+    )
+    con.commit()
+    con.close()
+    daemon.tick_safety()
+
+    payload = daemon.planner_tick()
+
+    assert payload["selected"] == ["h"]
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "select completed_bytes,last_completed_bytes,progress,no_progress_since,"
+        "reclaimable_since,capacity_generation,capacity_viable,capacity_reason "
+        "from torrent_health where hash='h'"
+    ).fetchone()
+    con.close()
+    assert row == (100, 0, 0.5, None, None, 1, 1, "recent_progress")
+
+
 def test_first_planner_tick_samples_sync_and_commits_empty_unhealthy_generation(
     tmp_path,
     monkeypatch,
@@ -397,6 +463,71 @@ def test_first_planner_tick_samples_sync_and_commits_empty_unhealthy_generation(
     assert health_count == 0
     assert len(metrics) == 1
     assert json.loads(metrics[0][0])["sync_healthy"] is False
+
+
+def test_planner_safety_capture_is_atomic_while_next_sync_is_in_flight(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    poll_started = threading.Event()
+    release_poll = threading.Event()
+
+    class OfflineThenBarrierQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            if len(self.rids) == 1:
+                raise RuntimeError("initially offline")
+            poll_started.set()
+            assert release_poll.wait(2)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "new": {
+                        "hash": "new",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 1,
+                    }
+                },
+                "server_state": {},
+            }
+
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=OfflineThenBarrierQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+    )
+    daemon.tick_safety()
+    safety_thread = threading.Thread(target=daemon.tick_safety)
+    safety_thread.start()
+    assert poll_started.wait(1)
+
+    captured = []
+    capture_done = threading.Event()
+
+    def capture_for_planner():
+        captured.append(daemon._capture_safety_snapshot())
+        capture_done.set()
+
+    capture_thread = threading.Thread(target=capture_for_planner)
+    capture_thread.start()
+    assert capture_done.wait(0.5), "qBT network poll held the safety snapshot lock"
+    old_snapshots, old_healthy, old_sampled = captured[0]
+    assert old_snapshots == {}
+    assert old_healthy is False
+    assert old_sampled is True
+
+    release_poll.set()
+    safety_thread.join(timeout=2)
+    capture_thread.join(timeout=2)
+    assert not safety_thread.is_alive()
+    new_snapshots, new_healthy, new_sampled = daemon._capture_safety_snapshot()
+    assert set(new_snapshots) == {"new"}
+    assert new_healthy is True
+    assert new_sampled is True
 
 
 def test_direct_planner_tick_recovery_precedes_emergency_qbt_post(
@@ -665,8 +796,9 @@ def test_unhealthy_generation_breaks_reclaimable_continuity_after_long_outage(
     )
     con = sqlite3.connect(daemon.state_db)
     con.execute(
-        "insert into torrent_health(hash,sampled_at,no_progress_since,updated_at) "
-        "values('stale',0,0,0)"
+        "insert into torrent_health("
+        "hash,sampled_at,completed_bytes,progress,no_progress_since,updated_at) "
+        "values('stale',0,0,0.5,0,0)"
     )
     con.commit()
     con.close()

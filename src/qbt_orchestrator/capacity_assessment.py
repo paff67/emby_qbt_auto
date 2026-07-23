@@ -192,6 +192,49 @@ class CapacityAssessmentBuilder:
         )
 
 
+def project_progress_health(
+    torrent: Mapping[str, Any],
+    old_health: Mapping[str, Any] | None,
+    *,
+    observed_at: int,
+) -> dict[str, Any]:
+    """Project the current progress sample with Planner stall semantics."""
+
+    old = dict(old_health or {})
+    completed = max(
+        0,
+        int(
+            torrent.get("completed_bytes")
+            or torrent.get("completed")
+            or torrent.get("downloaded")
+            or 0
+        ),
+    )
+    progress = max(0.0, float(torrent.get("progress") or 0.0))
+    dlspeed = max(
+        0,
+        int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or 0),
+    )
+    previous_completed = max(0, int(old.get("completed_bytes") or 0))
+    previous_progress = max(0.0, float(old.get("progress") or 0.0))
+    no_growth = (
+        completed <= previous_completed and progress <= previous_progress
+    )
+    no_progress_since = old.get("no_progress_since") if old and no_growth else None
+    if old and no_growth and no_progress_since is None:
+        no_progress_since = int(observed_at)
+    return {
+        "hash": canonical_torrent_hash(torrent.get("hash")),
+        "completed_bytes": completed,
+        "previous_completed_bytes": previous_completed,
+        "progress": progress,
+        "dlspeed_bps": dlspeed,
+        "no_progress_since": (
+            None if no_progress_since is None else int(no_progress_since)
+        ),
+    }
+
+
 def _core_reclaimable(
     item: TorrentCapacityEvidence,
     observed_at: int,

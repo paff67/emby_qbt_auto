@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .budget import future_growth_by_hash, resource_claims_from_rows
-from .capacity_assessment import CapacityAssessment
+from .capacity_assessment import CapacityAssessment, project_progress_health
 from .capacity_reclaim import capacity_reclaim_locked_hashes
 from .db import readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
@@ -728,10 +728,15 @@ class DownloadPlanner:
             if not h or h in excluded_hashes:
                 continue
             old = previous.get(h) or {}
-            dlspeed = int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or 0)
+            progress_health = project_progress_health(
+                torrent,
+                old,
+                observed_at=now,
+            )
+            dlspeed = int(progress_health["dlspeed_bps"])
             upspeed = int(torrent.get("upspeed_bps") or torrent.get("upspeed") or 0)
-            completed = int(torrent.get("completed_bytes") or torrent.get("completed") or torrent.get("downloaded") or 0)
-            progress = float(torrent.get("progress") or 0)
+            completed = int(progress_health["completed_bytes"])
+            progress = float(progress_health["progress"])
             seeds = int(torrent.get("num_seeds") or torrent.get("num_complete") or 0)
             peers = int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0)
             prev_alloc_state = str((previous_allocations.get(h) or {}).get("desired_state") or "")
@@ -739,11 +744,8 @@ class DownloadPlanner:
                 low_speed_since = now if h in selected_set and prev_alloc_state != "active" else old.get("low_speed_since") or now
             else:
                 low_speed_since = None
-            old_completed = int(old.get("completed_bytes") or 0)
-            old_progress = float(old.get("progress") or 0)
-            no_progress_since = old.get("no_progress_since") if (completed <= old_completed and progress <= old_progress and old) else None
-            if old and completed <= old_completed and progress <= old_progress and no_progress_since is None:
-                no_progress_since = now
+            old_completed = int(progress_health["previous_completed_bytes"])
+            no_progress_since = progress_health["no_progress_since"]
             if seeds > 0 or peers > 0:
                 last_swarm_seen_at = now
                 no_swarm_since = None
