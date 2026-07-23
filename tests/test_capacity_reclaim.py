@@ -2990,6 +2990,141 @@ def test_capacity_reclaim_migration_installs_idempotent_enforcement_triggers(tmp
     assert {"file_selection_fingerprint", "target_free_bytes"} <= reclaim_columns
 
 
+def test_reclaim_triggers_canonicalize_job_reservation_cooldown_and_health_hashes(
+    tmp_path,
+):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    audit = CapacityReclaimAuditStore(db, now=lambda: 5_000)
+    reservation = audit.reserve(_direct_reclaim_candidate(tmp_path))
+    assert reservation["reserved"] is True
+
+    con = sqlite3.connect(db)
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state) "
+            "values(' H ','upload','running')"
+        )
+    con.execute(
+        "insert into torrent_jobs(hash,job_type,state) values(' H ','upload','done')"
+    )
+    job_id = con.execute("select last_insert_rowid()").fetchone()[0]
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "update torrent_jobs set hash='other',state='running' where id=?",
+            (job_id,),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "insert into resource_reservations(hash,kind,bytes,state) "
+            "values(' H ','batch',1,'active')"
+        )
+    con.execute(
+        "insert into resource_reservations(hash,kind,bytes,state) "
+        "values(' H ','batch',1,'released')"
+    )
+    claim_id = con.execute("select last_insert_rowid()").fetchone()[0]
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "update resource_reservations set hash='other',state='active' where id=?",
+            (claim_id,),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "insert into soak_state(hash,cooldown_until,updated_at) "
+            "values(' H ',6000,1)"
+        )
+    con.execute(
+        "insert into soak_state(hash,cooldown_until,updated_at) "
+        "values(' H ',null,1)"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "update soak_state set hash='other',cooldown_until=6000 "
+            "where hash=' H '"
+        )
+
+    con.execute(
+        "update capacity_reclaims set state='deleting' where id=?",
+        (reservation["reclaim_id"],),
+    )
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="capacity_reclaim_delete_in_progress",
+    ):
+        con.execute(
+            "insert into torrent_health(hash,no_progress_since) values(' H ',100)"
+        )
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="capacity_reclaim_delete_in_progress",
+    ):
+        con.execute(
+            "update torrent_health set hash='other' where hash='h'"
+        )
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="capacity_reclaim_delete_in_progress",
+    ):
+        con.execute("delete from torrent_health where hash='h'")
+    con.rollback()
+    con.close()
+
+
+def test_mixed_case_open_job_blocks_reclaim_and_preserves_payload(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"keep" * 1024)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into torrent_jobs(hash,job_type,state) "
+        "values(' H ','upload','running')"
+    )
+    con.commit()
+    con.close()
+    candidate = _snapshot(
+        "h", content_path="/downloads/incomplete/h"
+    )["h"]
+    reclaimer = DeadPartialReclaimer(
+        db,
+        RecordingExecutor({"h": candidate}),
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        disk_free_bytes=lambda _path: 0,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {" H ": {**candidate, "hash": " H "}},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["open_job"] == 1
+    assert payload.exists()
+    assert _capacity_reclaim_rows(db) == []
+
+
 def test_capacity_reclaim_lease_blocks_open_jobs_but_allows_terminal_jobs(tmp_path):
     from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
     from qbt_orchestrator.db import migrate

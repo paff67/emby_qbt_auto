@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .db import write_transaction
+from .hash_identity import canonical_torrent_hash
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,30 @@ class CapacityAssessment:
     torrents: Mapping[str, TorrentCapacityEvidence] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "torrents", MappingProxyType(dict(self.torrents)))
+        canonical_torrents: dict[str, TorrentCapacityEvidence] = {}
+        for fallback_hash, evidence in self.torrents.items():
+            torrent_hash = canonical_torrent_hash(
+                evidence.hash or fallback_hash
+            )
+            canonical_torrents[torrent_hash] = (
+                evidence
+                if evidence.hash == torrent_hash
+                else replace(evidence, hash=torrent_hash)
+            )
+        object.__setattr__(
+            self,
+            "selected_hashes",
+            frozenset(
+                canonical
+                for value in self.selected_hashes
+                if (canonical := canonical_torrent_hash(value))
+            ),
+        )
+        object.__setattr__(
+            self,
+            "torrents",
+            MappingProxyType(canonical_torrents),
+        )
 
     @property
     def managed_incomplete(self) -> int:
@@ -77,9 +101,16 @@ class CapacityAssessmentBuilder:
         disk_releasing_jobs: int,
     ) -> CapacityAssessment:
         items: dict[str, TorrentCapacityEvidence] = {}
+        canonical_health = {
+            canonical_torrent_hash(key): dict(value)
+            for key, value in health_by_hash.items()
+            if canonical_torrent_hash(key)
+        }
         for fallback_hash, raw in snapshots.items():
             torrent = dict(raw)
-            torrent_hash = str(torrent.get("hash") or fallback_hash)
+            torrent_hash = canonical_torrent_hash(
+                torrent.get("hash") or fallback_hash
+            )
             tags = {
                 part.strip()
                 for part in str(torrent.get("tags") or "").split(",")
@@ -100,7 +131,7 @@ class CapacityAssessmentBuilder:
                 int(torrent.get("num_seeds") or 0),
                 int(torrent.get("num_complete") or 0),
             )
-            health = dict(health_by_hash.get(torrent_hash) or {})
+            health = dict(canonical_health.get(torrent_hash) or {})
             no_progress_since = health.get("no_progress_since")
             dlspeed = max(
                 0,
@@ -151,7 +182,11 @@ class CapacityAssessmentBuilder:
             free_bytes=max(0, int(free_bytes)),
             target_free_bytes=max(0, int(target_free_bytes)),
             available_growth_bytes=max(0, int(available_growth_bytes)),
-            selected_hashes=frozenset(str(item) for item in selected_hashes),
+            selected_hashes=frozenset(
+                canonical
+                for item in selected_hashes
+                if (canonical := canonical_torrent_hash(item))
+            ),
             disk_releasing_jobs=max(0, int(disk_releasing_jobs)),
             torrents=items,
         )
@@ -182,7 +217,7 @@ class CapacityAssessmentStore:
 
     def commit(self, assessment: CapacityAssessment) -> CapacityAssessment:
         core_by_hash = {
-            item.hash: _core_reclaimable(
+            canonical_torrent_hash(item.hash): _core_reclaimable(
                 item,
                 assessment.observed_at,
                 self.min_no_progress_sec,
@@ -215,17 +250,29 @@ class CapacityAssessmentStore:
             generation = int(state["current_generation"])
 
             for item in assessment.torrents.values():
-                con.execute(
-                    "insert or ignore into torrent_health(hash,sampled_at,updated_at) "
-                    "values(?,?,?)",
-                    (item.hash, assessment.observed_at, assessment.observed_at),
-                )
+                torrent_hash = canonical_torrent_hash(item.hash)
                 previous = con.execute(
-                    "select reclaimable_since,capacity_generation "
-                    "from torrent_health where hash=?",
-                    (item.hash,),
+                    "select rowid,reclaimable_since,capacity_generation "
+                    "from torrent_health where lower(trim(hash))=? "
+                    "order by rowid desc limit 1",
+                    (torrent_hash,),
                 ).fetchone()
-                core = core_by_hash[item.hash]
+                if previous is None:
+                    con.execute(
+                        "insert into torrent_health(hash,sampled_at,updated_at) "
+                        "values(?,?,?)",
+                        (
+                            torrent_hash,
+                            assessment.observed_at,
+                            assessment.observed_at,
+                        ),
+                    )
+                    previous = con.execute(
+                        "select rowid,reclaimable_since,capacity_generation "
+                        "from torrent_health where rowid=last_insert_rowid()"
+                    ).fetchone()
+                assert previous is not None
+                core = core_by_hash[torrent_hash]
                 reclaimable_since = (
                     int(previous["reclaimable_since"])
                     if core
@@ -239,14 +286,14 @@ class CapacityAssessmentStore:
                 con.execute(
                     "update torrent_health set reclaimable_since=?,capacity_viable=?,"
                     "capacity_reason=?,capacity_assessed_at=?,capacity_generation=? "
-                    "where hash=?",
+                    "where rowid=?",
                     (
                         reclaimable_since,
                         1 if item.viable else 0,
                         item.viability_reason,
                         assessment.observed_at,
                         generation,
-                        item.hash,
+                        int(previous["rowid"]),
                     ),
                 )
             return generation

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .db import readonly_connect, write_transaction
+from .executor import QbtMutationLeaseBlocked
+from .hash_identity import canonical_torrent_hash
 from .cleanup_policy import cleanup_eligibility
 from .io_governor import JobPriority
 from .observability import redact
@@ -205,13 +207,14 @@ class TorrentJobRepository:
         parent_job_id: int | None = None,
     ) -> int:
         now = int(self.now())
+        torrent_hash = canonical_torrent_hash(hash) or None
         phase = "queued_copy" if job_type in {"upload", "sidecar_upload"} else None
         def txn(con: sqlite3.Connection) -> int:
             cur = con.execute(
                 "insert into torrent_jobs(hash,batch_id,job_type,state,phase,priority,payload_json,parent_job_id,created_at,updated_at) "
                 "values(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    hash,
+                    torrent_hash,
                     batch_id,
                     job_type,
                     "queued",
@@ -821,7 +824,7 @@ class UploadJobRunner:
                 "select id from resource_reservations where batch_id=? and kind='cleanup_pending' order by id limit 1",
                 (batch_id,),
             ).fetchone()
-            h = row.get("hash")
+            h = canonical_torrent_hash(row.get("hash")) or None
             if existing:
                 con.execute(
                     "update resource_reservations set hash=?,accounting_class='current_pinned',owner='upload_job_runner',"
@@ -1133,7 +1136,9 @@ class FullTorrentCleanupRunner:
         if not row:
             return None
         payload = json.loads(row["payload_json"] or "{}")
-        h = str(row.get("hash") or payload.get("hash") or "")
+        h = canonical_torrent_hash(
+            row.get("hash") or payload.get("hash")
+        )
         torrent = None
         if self.torrent_provider is not None and h:
             torrent = self.torrent_provider(h)
@@ -1233,10 +1238,12 @@ class CleanupRequestRunner:
         payload = json.loads(row["payload_json"] or "{}")
         now = int(self.repo.now())
         batch_ids = self._requested_batch_ids(row, payload)
-        target = str(payload.get("target") or row.get("hash") or "").strip()
+        target = canonical_torrent_hash(
+            payload.get("target") or row.get("hash")
+        )
         args = payload.get("args") if isinstance(payload.get("args"), list) else []
         if not target and args:
-            target = str(args[0])
+            target = canonical_torrent_hash(args[0])
 
         def txn(con: sqlite3.Connection) -> tuple[list[int], str]:
             if batch_ids:
@@ -1252,7 +1259,8 @@ class CleanupRequestRunner:
                 rows = [
                     dict(r)
                     for r in con.execute(
-                        "select * from torrent_batches where hash=? and state='cleanup_deferred' order by id",
+                        "select * from torrent_batches where lower(trim(hash))=? "
+                        "and state='cleanup_deferred' order by id",
                         (target,),
                     ).fetchall()
                 ]
@@ -1396,11 +1404,43 @@ class BotCommandRepository:
 
     def insert_command(self, command_id, chat_id, user_id, command, payload):
         now = int(self.now())
+        command_name = str(command)
+        durable_payload = dict(payload or {})
+        for key in ("hash", "target"):
+            if key in durable_payload:
+                durable_payload[key] = canonical_torrent_hash(
+                    durable_payload[key]
+                )
+        if command_name in {
+            "pause",
+            "resume",
+            "queue",
+            "force_upload",
+            "cleanup",
+            "preempt",
+        }:
+            args = durable_payload.get("args")
+            if isinstance(args, list):
+                durable_payload["args"] = [
+                    canonical_torrent_hash(value)
+                    if index < (2 if command_name == "preempt" else 1)
+                    else value
+                    for index, value in enumerate(args)
+                ]
         write_transaction(
             self.state_db,
             lambda con: con.execute(
                 "insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
-                (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now),
+                (
+                    str(command_id),
+                    str(chat_id),
+                    str(user_id),
+                    command_name,
+                    json.dumps(durable_payload, ensure_ascii=False),
+                    "queued",
+                    now,
+                    now,
+                ),
             ),
         )
 
@@ -1418,10 +1458,20 @@ class BotCommandRepository:
 
         return write_transaction(self.state_db, txn)
 
-    def set_state(self, command_id: str, state: str) -> None:
+    def set_state(
+        self,
+        command_id: str,
+        state: str,
+        error: str | None = None,
+    ) -> None:
+        safe_error = None if error is None else str(redact(str(error)))[:500]
         write_transaction(
             self.state_db,
-            lambda con: con.execute("update bot_commands set state=?, updated_at=? where command_id=?", (state, int(self.now()), command_id)),
+            lambda con: con.execute(
+                "update bot_commands set state=?,last_error=?,updated_at=? "
+                "where command_id=?",
+                (state, safe_error, int(self.now()), command_id),
+            ),
         )
 
     def create_approval(self, command_id: str, action: str, payload: dict[str, Any], ttl: int = 300) -> str:
@@ -1607,6 +1657,21 @@ class CommandProcessor:
         row = self.commands.claim_next()
         if not row: return None
         command_id = row["command_id"]; command = row["command"]; payload = json.loads(row["payload_json"] or "{}"); args = payload.get("args") or []
+        if command in {
+            "pause",
+            "resume",
+            "queue",
+            "force_upload",
+            "cleanup",
+            "preempt",
+        }:
+            args = [
+                canonical_torrent_hash(value)
+                if index < (2 if command == "preempt" else 1)
+                else value
+                for index, value in enumerate(args)
+            ]
+            payload["args"] = args
         claimed_from = row.get("_claimed_from_state") or row.get("state")
         if command in self.DANGEROUS and claimed_from != "approved":
             approval_id = self.commands.create_approval(command_id, command, payload)
@@ -1626,9 +1691,23 @@ class CommandProcessor:
                 )
             self.commands.set_state(command_id, "approval_required"); return command_id
         if command == "pause" and args:
-            self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
+            try:
+                self.executor.qbt_post(
+                    "/api/v2/torrents/stop", {"hashes": args[0]}
+                )
+            except QbtMutationLeaseBlocked as exc:
+                self.commands.set_state(command_id, "blocked", str(exc))
+                return command_id
+            self.commands.set_state(command_id, "done"); return command_id
         if command == "resume" and args:
-            self.executor.qbt_post("/api/v2/torrents/start", {"hashes": args[0]}); self.commands.set_state(command_id, "done"); return command_id
+            try:
+                self.executor.qbt_post(
+                    "/api/v2/torrents/start", {"hashes": args[0]}
+                )
+            except QbtMutationLeaseBlocked as exc:
+                self.commands.set_state(command_id, "blocked", str(exc))
+                return command_id
+            self.commands.set_state(command_id, "done"); return command_id
         if command == "queue":
             self._enqueue_command_job(command, payload, args, default_job_type="upload", default_priority=50)
             self.commands.set_state(command_id, "done")
@@ -1646,11 +1725,15 @@ class CommandProcessor:
             self.commands.set_state(command_id, "done")
             return command_id
         if command == "preempt" and args:
-            if self.preemption_service is not None and hasattr(self.preemption_service, "force_preempt_hash"):
-                target_hash = str(args[1]) if len(args) > 1 else None
-                self.preemption_service.force_preempt_hash(str(args[0]), target_hash=target_hash, reason="telegram")
-            else:
-                self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]})
+            try:
+                if self.preemption_service is not None and hasattr(self.preemption_service, "force_preempt_hash"):
+                    target_hash = canonical_torrent_hash(args[1]) if len(args) > 1 else None
+                    self.preemption_service.force_preempt_hash(canonical_torrent_hash(args[0]), target_hash=target_hash, reason="telegram")
+                else:
+                    self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]})
+            except QbtMutationLeaseBlocked as exc:
+                self.commands.set_state(command_id, "blocked", str(exc))
+                return command_id
             self.commands.set_state(command_id, "done"); return command_id
         if command in {"status", "trace", "perf"}:
             if self.notifications is not None:
@@ -1718,7 +1801,11 @@ class CommandProcessor:
         default_priority: int,
         force_upload: bool = False,
     ) -> int:
-        target = str(payload.get("hash") or payload.get("target") or (args[0] if args else "") or "")
+        target = canonical_torrent_hash(
+            payload.get("hash")
+            or payload.get("target")
+            or (args[0] if args else "")
+        )
         raw_batch_id = payload.get("batch_id")
         try:
             batch_id = int(raw_batch_id) if raw_batch_id not in (None, "") else None
@@ -1728,6 +1815,11 @@ class CommandProcessor:
         job_payload = payload.get("job_payload") or payload.get("upload_payload") or payload.get("payload")
         if isinstance(job_payload, dict) and job_payload:
             durable_payload = dict(job_payload)
+            for key in ("hash", "target"):
+                if key in durable_payload:
+                    durable_payload[key] = canonical_torrent_hash(
+                        durable_payload[key]
+                    )
             job_type = str(payload.get("job_type") or default_job_type)
         else:
             durable_payload = {"target": target, "args": [str(a) for a in args], "source": "telegram"}

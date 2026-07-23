@@ -1,4 +1,5 @@
 from dataclasses import fields
+import sqlite3
 
 import pytest
 
@@ -201,6 +202,61 @@ def test_builder_contracts_cover_management_staleness_and_normalization():
     assert assessment.target_free_bytes == 0
     assert assessment.available_growth_bytes == 0
     assert assessment.disk_releasing_jobs == 0
+
+
+def test_builder_uses_canonical_hash_for_snapshot_health_and_selection():
+    assessment = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            " H ": {
+                "hash": " H ",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 100,
+                "availability": 0.5,
+            }
+        },
+        {"h": {"no_progress_since": 100}},
+        observed_at=1900,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes={" H "},
+        disk_releasing_jobs=0,
+    )
+
+    assert set(assessment.torrents) == {"h"}
+    assert assessment.torrents["h"].hash == "h"
+    assert assessment.torrents["h"].no_progress_since == 100
+    assert assessment.selected_hashes == frozenset({"h"})
+
+
+def test_store_updates_historical_mixed_case_health_without_inserting_duplicate(
+    tmp_path,
+):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into torrent_health(hash,sampled_at,no_progress_since,updated_at) "
+        "values(' H ',100,100,100)"
+    )
+    con.commit()
+    con.close()
+
+    CapacityAssessmentStore(db, min_no_progress_sec=100).commit(
+        _assessment({"h": _evidence("h", viable=False)})
+    )
+
+    con = readonly_connect(db)
+    rows = con.execute(
+        "select hash,capacity_generation from torrent_health "
+        "where lower(trim(hash))='h'"
+    ).fetchall()
+    con.close()
+    assert [(row["hash"], row["capacity_generation"]) for row in rows] == [
+        (" H ", 1)
+    ]
 
 
 def test_leech_peer_does_not_make_incomplete_torrent_viable():

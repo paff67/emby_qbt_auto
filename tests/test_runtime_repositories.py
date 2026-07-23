@@ -500,6 +500,57 @@ def test_full_cleanup_runner_never_deletes_seed_long_and_retries_transient_seed_
         ]
 
 
+def test_full_cleanup_lease_block_retries_without_marking_job_done():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.runtime import FullTorrentCleanupRunner, TorrentJobRepository
+
+    class Qbt:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1_000)
+        cleanup_id = repo.enqueue(
+            " H ",
+            None,
+            "cleanup_full_torrent",
+            {"canonical_remote_verified": True},
+            priority=10,
+        )
+        assert repo.get(cleanup_id)["hash"] == "h"
+        qbt = Qbt()
+        executor = Executor(qbt, dry_run=False)
+        assert executor.acquire_hash_mutation_lease(
+            "h", "reclaim:1:1"
+        ) is True
+        runner = FullTorrentCleanupRunner(
+            repo,
+            executor,
+            torrent_provider=lambda _hash: {
+                "tags": "auto",
+                "seeding_time": 0,
+                "ratio": 0,
+            },
+            free_bytes_provider=lambda: 0,
+            pressure_free_bytes=1,
+        )
+        try:
+            assert runner.run_next() == cleanup_id
+        finally:
+            executor.close(timeout=1)
+
+        row = repo.get(cleanup_id)
+        assert row["state"] == "retry_wait"
+        assert "qBT mutation blocked by reclaim lease" in row["last_stderr_tail"]
+        assert qbt.posts == []
+
+
 def test_full_cleanup_runner_reclaims_largest_canonical_job_first_under_pressure():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import FullTorrentCleanupRunner, TorrentJobRepository
@@ -1007,6 +1058,47 @@ def test_command_processor_executes_safe_commands_and_requires_cleanup_approval(
                 {"text": "Deny", "callback_data": "deny:approval-c3"},
             ]]
         }
+
+
+def test_resume_command_canonicalizes_hash_and_blocks_on_reclaim_lease():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+
+    class Qbt:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command(
+            "resume-locked", 100, 2, "resume", {"args": [" H "]}
+        )
+        stored = json.loads(commands.get("resume-locked")["payload_json"])
+        assert stored["args"] == ["h"]
+
+        qbt = Qbt()
+        executor = Executor(qbt, dry_run=False)
+        assert executor.acquire_hash_mutation_lease(
+            "h", "reclaim:7:4"
+        ) is True
+        try:
+            assert CommandProcessor(commands, executor).run_next() == "resume-locked"
+        finally:
+            executor.close(timeout=1)
+
+        command = commands.get("resume-locked")
+        assert command["state"] == "blocked"
+        assert command["last_error"] == (
+            "qBT mutation blocked by reclaim lease: "
+            "path=/api/v2/torrents/start hashes=h"
+        )
+        assert qbt.posts == []
 
 
 def test_approved_dangerous_command_executes_once_after_approval():

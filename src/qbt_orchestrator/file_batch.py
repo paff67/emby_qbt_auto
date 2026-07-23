@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from .budget import future_growth_by_hash, resource_claims_from_rows
 from .db import readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
+from .hash_identity import canonical_torrent_hash
 from .io_governor import JobPriority
 from .models import BatchReservation
 from .observability import redact
@@ -137,7 +138,11 @@ class FileBatchService:
         self.min_payload_efficiency = float(min_payload_efficiency)
         self.reservation_ttl_sec = int(reservation_ttl_sec)
         self.batch_live_verify = bool(batch_live_verify)
-        self.batch_allow_hashes = {str(item).strip().lower() for item in (batch_allow_hashes or set()) if str(item).strip()}
+        self.batch_allow_hashes = {
+            canonical
+            for item in (batch_allow_hashes or set())
+            if (canonical := canonical_torrent_hash(item))
+        }
         self.batch_allow_tag = str(batch_allow_tag or "").strip()
         if batch_max_new_per_tick is None:
             batch_max_new_per_tick = 1 if self.batch_live_verify and (self.batch_allow_hashes or self.batch_allow_tag) else 1_000_000
@@ -206,19 +211,27 @@ class FileBatchService:
             inventory_torrents: dict[str, Mapping[str, Any]] = {}
             for fallback_hash, raw in sorted(snapshots.items(), key=lambda pair: str(pair[0])):
                 torrent = dict(raw)
-                torrent.setdefault("hash", fallback_hash)
+                torrent["hash"] = canonical_torrent_hash(
+                    torrent.get("hash") or fallback_hash
+                )
                 if self._batch_inventory_candidate_allowed(torrent):
-                    inventory_torrents[str(torrent.get("hash") or fallback_hash)] = torrent
+                    inventory_torrents[
+                        canonical_torrent_hash(
+                            torrent.get("hash") or fallback_hash
+                        )
+                    ] = torrent
             batch_inventories = self._prepare_batch_inventories(inventory_torrents)
         for h, raw in sorted(snapshots.items(), key=lambda pair: str(pair[0])):
             torrent = dict(raw)
-            torrent.setdefault("hash", h)
+            torrent["hash"] = canonical_torrent_hash(
+                torrent.get("hash") or h
+            )
             if _is_managed(torrent) and not _is_completed(torrent):
                 if not batch_admitted:
                     batches_blocked += 1
                     blocked_reasons[admission_reason] = blocked_reasons.get(admission_reason, 0) + 1
                     self._decision(
-                        str(torrent.get("hash") or h),
+                        canonical_torrent_hash(torrent.get("hash") or h),
                         "prefetch_blocked",
                         admission_reason,
                         {"free_bytes": free_bytes, "scheduler_mode": scheduler_mode},
@@ -228,7 +241,9 @@ class FileBatchService:
                         torrent,
                         free_bytes=free_bytes,
                         sync_healthy=sync_healthy,
-                        inventory=batch_inventories.get(str(torrent.get("hash") or h)),
+                        inventory=batch_inventories.get(
+                            canonical_torrent_hash(torrent.get("hash") or h)
+                        ),
                     )
                     if candidate is not None:
                         batch_candidates.append(candidate)
@@ -237,7 +252,7 @@ class FileBatchService:
             if not (_is_managed(torrent) and _is_completed(torrent)):
                 continue
             eligible += 1
-            torrent_hash = str(torrent.get("hash") or h)
+            torrent_hash = canonical_torrent_hash(torrent.get("hash") or h)
             payload = self._payload_for(torrent_hash, torrent)
             if payload is None:
                 continue
@@ -326,7 +341,7 @@ class FileBatchService:
         return True, "ok"
 
     def _batch_inventory_candidate_allowed(self, torrent: Mapping[str, Any]) -> bool:
-        h = str(torrent.get("hash") or "")
+        h = canonical_torrent_hash(torrent.get("hash"))
         tags = _tags(torrent)
         if (
             not self.batch_pipeline_enabled
@@ -475,7 +490,7 @@ class FileBatchService:
         inventory: _BatchInventory | None,
     ) -> tuple[_BatchCandidate | None, dict[str, int]]:
         """Discover one batch without mutating qBT priorities or capacity state."""
-        h = str(torrent.get("hash") or "")
+        h = canonical_torrent_hash(torrent.get("hash"))
         tags = _tags(torrent)
         if not self.batch_pipeline_enabled or not h or "no-batch" in tags or self.qbt is None or free_bytes is None:
             return None, {"created": 0, "blocked": 0}
@@ -592,7 +607,7 @@ class FileBatchService:
         )
 
     def _apply_pipeline_batch_candidate(self, candidate: _BatchCandidate) -> dict[str, int]:
-        h = candidate.item.hash
+        h = canonical_torrent_hash(candidate.item.hash)
         payload = dict(candidate.item.data)
         indices = [int(row["index"]) for row in candidate.selected]
         if self.dry_run:
@@ -626,7 +641,7 @@ class FileBatchService:
         return {"created": 1, "blocked": 0}
 
     def _reconcile_pipeline_batch_state(self, torrent: Mapping[str, Any], files: list[Mapping[str, Any]]) -> bool:
-        h = str(torrent.get("hash") or "")
+        h = canonical_torrent_hash(torrent.get("hash"))
         if not h:
             return False
         rows = self._pipeline_batch_rows(h)
@@ -681,6 +696,7 @@ class FileBatchService:
         return True
 
     def _pipeline_batch_rows(self, h: str) -> list[dict[str, Any]]:
+        h = canonical_torrent_hash(h)
         placeholders = ",".join("?" for _ in PIPELINE_DOWNLOAD_STATES)
         con = _connect(self.state_db)
         try:
@@ -693,7 +709,8 @@ class FileBatchService:
                     f"  and (rr.expires_at is null or rr.expires_at>?)"
                     f") as has_active_reservation "
                     f"from torrent_batches tb "
-                    f"where tb.hash=? and tb.state in ({placeholders}) order by tb.id",
+                    f"where lower(trim(tb.hash))=? "
+                    f"and tb.state in ({placeholders}) order by tb.id",
                     (int(self.now()), h, *PIPELINE_DOWNLOAD_STATES),
                 ).fetchall()
             ]
@@ -701,9 +718,14 @@ class FileBatchService:
             con.close()
 
     def _scheduler_allocation(self, h: str) -> dict[str, Any] | None:
+        h = canonical_torrent_hash(h)
         con = _connect(self.state_db)
         try:
-            row = con.execute("select * from scheduler_allocations where hash=?", (h,)).fetchone()
+            row = con.execute(
+                "select * from scheduler_allocations "
+                "where lower(trim(hash))=? order by rowid desc limit 1",
+                (h,),
+            ).fetchone()
             return dict(row) if row else None
         finally:
             con.close()
@@ -809,14 +831,14 @@ class FileBatchService:
             return True
         if not self.batch_allow_hashes and not self.batch_allow_tag:
             return True
-        if self.batch_allow_hashes and h.lower() in self.batch_allow_hashes:
+        if self.batch_allow_hashes and canonical_torrent_hash(h) in self.batch_allow_hashes:
             return True
         if self.batch_allow_tag and self.batch_allow_tag in tags:
             return True
         return False
 
     def _queue_downloaded_pipeline_batches(self, torrent: Mapping[str, Any], files: list[Mapping[str, Any]]) -> int:
-        h = str(torrent.get("hash") or "")
+        h = canonical_torrent_hash(torrent.get("hash"))
         if not h:
             return 0
         by_index = {int(row.get("index") or 0): row for row in files}
@@ -866,7 +888,7 @@ class FileBatchService:
         return queued
 
     def _payload_for_batch(self, batch_id: int, torrent: Mapping[str, Any], selected: list[Mapping[str, Any]]) -> dict[str, Any] | None:
-        h = str(torrent.get("hash") or "")
+        h = canonical_torrent_hash(torrent.get("hash"))
         name = str(torrent.get("name") or h or "torrent")
         local_root = self._local_path(torrent)
         root_path = Path(local_root)
@@ -1168,22 +1190,29 @@ class FileBatchService:
             con.close()
 
     def _inflight_batch_count(self, h: str) -> int:
+        h = canonical_torrent_hash(h)
         states = ("reserved", "applied_to_qbt", "downloading", "suspect_expired", "downloaded", "upload_queued", "uploading", "verify_pending", "verified_local_pinned", "cleanup_wait", "cleanup_deferred")
         placeholders = ",".join("?" for _ in states)
         con = _connect(self.state_db)
         try:
-            row = con.execute(f"select count(*) from torrent_batches where hash=? and state in ({placeholders})", (h, *states)).fetchone()
+            row = con.execute(
+                f"select count(*) from torrent_batches "
+                f"where lower(trim(hash))=? and state in ({placeholders})",
+                (h, *states),
+            ).fetchone()
             return int(row[0] if row else 0)
         finally:
             con.close()
 
     def _inflight_batch_indices(self, h: str) -> set[int]:
+        h = canonical_torrent_hash(h)
         con = _connect(self.state_db)
         try:
             claimed = {
                 int(row["file_index"])
                 for row in con.execute(
-                    "select file_index from batch_file_claims where hash=? and state='active'",
+                    "select file_index from batch_file_claims "
+                    "where lower(trim(hash))=? and state='active'",
                     (h,),
                 ).fetchall()
             }
@@ -1193,7 +1222,11 @@ class FileBatchService:
         placeholders = ",".join("?" for _ in states)
         con = _connect(self.state_db)
         try:
-            rows = con.execute(f"select indices_json from torrent_batches where hash=? and state in ({placeholders})", (h, *states)).fetchall()
+            rows = con.execute(
+                f"select indices_json from torrent_batches "
+                f"where lower(trim(hash))=? and state in ({placeholders})",
+                (h, *states),
+            ).fetchall()
         finally:
             con.close()
         out: set[int] = set(claimed)
@@ -1210,17 +1243,24 @@ class FileBatchService:
         return out
 
     def _has_suspect_batch(self, h: str) -> bool:
+        h = canonical_torrent_hash(h)
         con = _connect(self.state_db)
         try:
             return con.execute(
-                "select 1 from torrent_batches where hash=? and state='suspect_expired' limit 1",
-                (str(h),),
+                "select 1 from torrent_batches where lower(trim(hash))=? "
+                "and state='suspect_expired' limit 1",
+                (h,),
             ).fetchone() is not None
         finally:
             con.close()
 
     def _next_batch_no(self, con: sqlite3.Connection, h: str) -> int:
-        row = con.execute("select coalesce(max(batch_no),0)+1 from torrent_batches where hash=?", (h,)).fetchone()
+        h = canonical_torrent_hash(h)
+        row = con.execute(
+            "select coalesce(max(batch_no),0)+1 from torrent_batches "
+            "where lower(trim(hash))=?",
+            (h,),
+        ).fetchone()
         return int(row[0] if row else 1)
 
     def _selected_extents(self, indices: list[int]) -> int:
@@ -1241,6 +1281,7 @@ class FileBatchService:
         *,
         initial_progress_bytes: int = 0,
     ) -> int:
+        h = canonical_torrent_hash(h)
         now = int(self.now())
         lease_until = now + self.reservation_ttl_sec
         def txn(con: sqlite3.Connection) -> int:
@@ -1310,7 +1351,7 @@ class FileBatchService:
             row = con.execute("select * from torrent_batches where id=?", (int(batch_id),)).fetchone()
             if row is None:
                 return "missing"
-            h = str(row["hash"] or "")
+            h = canonical_torrent_hash(row["hash"])
             self._ensure_legacy_batch_claims_in_transaction(con, row, now)
             if not source_present:
                 con.execute(
@@ -1404,7 +1445,16 @@ class FileBatchService:
             return
         con.executemany(
             "insert or ignore into batch_file_claims(batch_id,hash,file_index,state,created_at) values(?,?,?,?,?)",
-            [(batch_id, str(batch["hash"] or ""), index, "active", now) for index in indices],
+            [
+                (
+                    batch_id,
+                    canonical_torrent_hash(batch["hash"]),
+                    index,
+                    "active",
+                    now,
+                )
+                for index in indices
+            ],
         )
 
     def _mark_batch_applied(self, batch_id: int) -> None:
@@ -1421,7 +1471,7 @@ class FileBatchService:
         now = int(self.now())
         def txn(con: sqlite3.Connection) -> None:
             row = con.execute("select hash from torrent_batches where id=?", (int(batch_id),)).fetchone()
-            h = str(row["hash"]) if row else ""
+            h = canonical_torrent_hash(row["hash"] if row else None)
             con.execute("update torrent_batches set state='failed', updated_at=? where id=?", (now, int(batch_id)))
             con.execute(
                 "update resource_reservations set state='released', released_at=?, reason='qbt_apply_failed' where batch_id=? and state='active'",
@@ -1442,14 +1492,15 @@ class FileBatchService:
         now: int,
     ) -> None:
         """Keep one protect intent aligned with the hash's live batch leases."""
+        h = canonical_torrent_hash(h)
         placeholders = ",".join("?" for _ in PIPELINE_DOWNLOAD_STATES)
         row = con.execute(
             f"select tb.id,rr.expires_at from torrent_batches tb "
             f"join resource_reservations rr on rr.batch_id=tb.id and rr.kind='batch' "
-            f"where tb.hash=? and tb.state in ({placeholders}) and rr.state='active' "
+            f"where lower(trim(tb.hash))=? and tb.state in ({placeholders}) and rr.state='active' "
             f"and (rr.expires_at is null or rr.expires_at>?) "
             f"order by coalesce(rr.expires_at,9223372036854775807) desc,tb.id desc limit 1",
-            (str(h), *PIPELINE_DOWNLOAD_STATES, int(now)),
+            (h, *PIPELINE_DOWNLOAD_STATES, int(now)),
         ).fetchone()
         if row is None:
             self.intent_repository.delete_in_transaction(con, "batch", h)
@@ -1458,7 +1509,7 @@ class FileBatchService:
             con,
             SchedulerIntent(
                 "batch",
-                str(h),
+                h,
                 "protect_batch",
                 20,
                 None if row["expires_at"] is None else int(row["expires_at"]),
@@ -1528,8 +1579,13 @@ class FileBatchService:
         )
 
     def _existing_upload_job(self, torrent_hash: str) -> bool:
+        torrent_hash = canonical_torrent_hash(torrent_hash)
         con = _connect(self.state_db)
-        row = con.execute("select id from torrent_jobs where hash=? and job_type='upload' and state not in ('cancelled','failed') limit 1", (torrent_hash,)).fetchone()
+        row = con.execute(
+            "select id from torrent_jobs where lower(trim(hash))=? "
+            "and job_type='upload' and state not in ('cancelled','failed') limit 1",
+            (torrent_hash,),
+        ).fetchone()
         con.close()
         return row is not None
 

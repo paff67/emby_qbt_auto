@@ -7,9 +7,43 @@ import tempfile
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
+
+
+def test_soak_limit_write_records_failed_not_success_when_lease_blocks(tmp_path):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
+    from qbt_orchestrator.soak_queue import SoakQueueService
+
+    class Qbt:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    qbt = Qbt()
+    executor = Executor(qbt, dry_run=False)
+    assert executor.acquire_hash_mutation_lease("h", "reclaim:1:1") is True
+    service = SoakQueueService(db, executor, dry_run=False)
+    try:
+        with pytest.raises(QbtMutationLeaseBlocked):
+            service._set_download_limit(" H ", 1024)
+    finally:
+        executor.close(timeout=1)
+
+    assert _rows(
+        db,
+        "select status from action_log where path="
+        "'/api/v2/torrents/setDownloadLimit'",
+    ) == [{"status": "failed"}]
+    assert qbt.posts == []
 
 
 def _rows(db: Path, sql: str, params: tuple = ()):

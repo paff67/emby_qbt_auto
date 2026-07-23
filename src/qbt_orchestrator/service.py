@@ -22,6 +22,7 @@ from .carousel import CarouselService
 from .daemon import SafetyMonitor
 from .db import migrate, readonly_connect, start_persistent_write_actor, stop_write_actor, write_transaction
 from .file_batch import FileBatchService
+from .hash_identity import canonical_torrent_hash
 from .integrations.telegram import TelegramHttpApi, TelegramPollingService
 from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
@@ -328,7 +329,11 @@ class DaemonRuntime:
             self.soak_queue_service = None
         self.batch_pipeline_enabled = bool(batch_pipeline_enabled)
         self.batch_live_verify = bool(batch_live_verify)
-        self.batch_allow_hashes = {str(item).strip().lower() for item in (batch_allow_hashes or set()) if str(item).strip()}
+        self.batch_allow_hashes = {
+            canonical
+            for item in (batch_allow_hashes or set())
+            if (canonical := canonical_torrent_hash(item))
+        }
         self.batch_allow_tag = str(batch_allow_tag or "").strip()
         self.batch_max_live_batch_bytes = int(batch_max_live_batch_bytes or 0)
         self.batch_max_new_per_tick = int(batch_max_new_per_tick)

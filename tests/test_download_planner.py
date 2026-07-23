@@ -92,8 +92,8 @@ def test_planner_reclaim_lease_beats_every_forced_start_path(
 
     result = planner.plan_and_apply(
         {
-            "h": {
-                "hash": "h",
+            " H ": {
+                "hash": " H ",
                 "category": "auto",
                 "state": "stoppedDL",
                 "amount_left": 100,

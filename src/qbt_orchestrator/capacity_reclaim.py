@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 from .capacity_assessment import CapacityAssessment, TorrentCapacityEvidence
 from .db import readonly_connect, write_transaction
+from .hash_identity import canonical_torrent_hash
 from .observability import redact
 
 
@@ -120,7 +121,11 @@ def capacity_reclaim_locked_hashes(state_db: str | Path) -> set[str]:
             "select distinct hash from capacity_reclaims "
             "where state not in ('released','cancelled')"
         ).fetchall()
-        return {str(row["hash"]) for row in rows if str(row["hash"] or "")}
+        return {
+            canonical
+            for row in rows
+            if (canonical := canonical_torrent_hash(row["hash"]))
+        }
     finally:
         con.close()
 
@@ -147,7 +152,7 @@ class CapacityReclaimAuditStore:
 
     @staticmethod
     def _identity(candidate: Mapping[str, Any]) -> dict[str, Any]:
-        torrent_hash = str(candidate.get("hash") or "").strip()
+        torrent_hash = canonical_torrent_hash(candidate.get("hash"))
         name = " ".join(str(candidate.get("name") or torrent_hash).split())[:512]
         magnet_uri = str(candidate.get("magnet_uri") or "").strip()
         if not magnet_uri.startswith(MAGNET_PREFIX):
@@ -263,7 +268,7 @@ class CapacityReclaimAuditStore:
         con,
         candidate: Mapping[str, Any],
     ) -> str | None:
-        torrent_hash = str(candidate.get("hash") or "").strip()
+        torrent_hash = canonical_torrent_hash(candidate.get("hash"))
         generation = int(candidate.get("capacity_generation") or 0)
         assessment = con.execute(
             "select current_generation from capacity_assessment_state where id=1"
@@ -281,7 +286,8 @@ class CapacityReclaimAuditStore:
             return "capacity_episode_changed"
         health = con.execute(
             "select capacity_generation,capacity_viable,reclaimable_since,no_progress_since "
-            "from torrent_health where hash=?",
+            "from torrent_health where lower(trim(hash))=? "
+            "order by rowid desc limit 1",
             (torrent_hash,),
         ).fetchone()
         if health is None:
@@ -306,19 +312,22 @@ class CapacityReclaimAuditStore:
             return "progress_evidence_changed"
         placeholders = ",".join("?" for _ in OPEN_JOB_STATES)
         if con.execute(
-            f"select 1 from torrent_jobs where hash=? and state in ({placeholders}) limit 1",
+            f"select 1 from torrent_jobs where lower(trim(hash))=? "
+            f"and state in ({placeholders}) limit 1",
             (torrent_hash, *OPEN_JOB_STATES),
         ).fetchone() is not None:
             return "open_job"
         now = int(self.now())
         if con.execute(
-            "select 1 from resource_reservations where hash=? and state='active' "
+            "select 1 from resource_reservations where lower(trim(hash))=? "
+            "and state='active' "
             "and (expires_at is null or expires_at>?) limit 1",
             (torrent_hash, now),
         ).fetchone() is not None:
             return "active_reservation"
         if con.execute(
-            "select 1 from soak_state where hash=? and cooldown_until is not null "
+            "select 1 from soak_state where lower(trim(hash))=? "
+            "and cooldown_until is not null "
             "and cooldown_until>? limit 1",
             (torrent_hash, now),
         ).fetchone() is not None:
@@ -345,7 +354,7 @@ class CapacityReclaimAuditStore:
                     "reason": "reclaim_already_recorded",
                 }
             locked = con.execute(
-                "select 1 from capacity_reclaims where hash=? "
+                "select 1 from capacity_reclaims where lower(trim(hash))=? "
                 "and state not in ('released','cancelled') limit 1",
                 (identity["hash"],),
             ).fetchone()
@@ -452,7 +461,7 @@ class CapacityReclaimAuditStore:
                 f"种子名：{row['name']}\nHash：{row['hash']}\n原因：{reason}"
             )
             payload = {
-                "hash": str(row["hash"]),
+                "hash": canonical_torrent_hash(row["hash"]),
                 "name": str(row["name"]),
                 "reason": str(reason),
                 "error": safe_error,
@@ -534,7 +543,8 @@ class CapacityReclaimAuditStore:
             if not con.in_transaction:
                 con.execute("begin immediate")
             row = con.execute(
-                "select id from capacity_reclaims where id=? and reclaim_key=? and hash=? "
+                "select id from capacity_reclaims where id=? and reclaim_key=? "
+                "and lower(trim(hash))=? "
                 "and capacity_generation=? and state='stopping'",
                 (
                     int(reclaim_id),
@@ -551,7 +561,7 @@ class CapacityReclaimAuditStore:
                 "update capacity_reclaims set state='deleting',recheck_state='pending',"
                 "recheck_error=null,filesystem_dev=?,filesystem_ino=?,quarantine_path=null,"
                 "updated_at=? where id=? and capacity_generation=? "
-                "and reclaim_key=? and hash=? and state='stopping'",
+                "and reclaim_key=? and lower(trim(hash))=? and state='stopping'",
                 (
                     int(identity["filesystem_dev"]),
                     int(identity["filesystem_ino"]),
@@ -619,7 +629,8 @@ class CapacityReclaimAuditStore:
                 con.execute("begin immediate")
             row = con.execute(
                 "select reclaim_key,hash,file_selection_fingerprint from capacity_reclaims "
-                "where id=? and reclaim_key=? and hash=? and capacity_generation=? "
+                "where id=? and reclaim_key=? and lower(trim(hash))=? "
+                "and capacity_generation=? "
                 "and state='quarantined'",
                 (
                     int(reclaim_id),
@@ -723,7 +734,7 @@ class CapacityReclaimAuditStore:
                     f"种子名：{row['name']}\nHash：{row['hash']}"
                 ),
                 payload={
-                    "hash": str(row["hash"]),
+                    "hash": canonical_torrent_hash(row["hash"]),
                     "name": str(row["name"]),
                     "reason": "recheck_failed",
                     "error": safe_error,
@@ -948,7 +959,7 @@ class DeadPartialReclaimer:
         errors: list[str] = []
         selected_rows: dict[str, dict[str, Any]] = {}
         for row in rows:
-            torrent_hash = str(row.get("hash") or "").strip().lower()
+            torrent_hash = canonical_torrent_hash(row.get("hash"))
             if not torrent_hash:
                 errors.append(
                     f"capacity reclaim row {row.get('id')} has empty hash"
@@ -1060,8 +1071,9 @@ class DeadPartialReclaimer:
         ) = self._eligibility_state()
         all_paths = self._snapshot_paths(snapshots)
         snapshots_by_hash = {
-            str(raw.get("hash") or fallback_hash): dict(raw)
+            canonical_torrent_hash(raw.get("hash") or fallback_hash): dict(raw)
             for fallback_hash, raw in snapshots.items()
+            if canonical_torrent_hash(raw.get("hash") or fallback_hash)
         }
         rejection_counts: dict[str, int] = {}
 
@@ -1071,7 +1083,9 @@ class DeadPartialReclaimer:
         candidates: list[dict[str, Any]] = []
         now = int(self.now())
         for assessment_hash, evidence in assessment.torrents.items():
-            torrent_hash = str(evidence.hash or assessment_hash)
+            torrent_hash = canonical_torrent_hash(
+                evidence.hash or assessment_hash
+            )
             torrent = snapshots_by_hash.get(torrent_hash)
             if torrent is None:
                 reject("snapshot_missing")
@@ -1254,7 +1268,7 @@ class DeadPartialReclaimer:
         errors: list[str] = list(recovery_errors)
         completed: list[dict[str, Any]] = []
         for candidate in selected:
-            torrent_hash = str(candidate["hash"])
+            torrent_hash = canonical_torrent_hash(candidate["hash"])
             reason = self._revalidate_candidate(candidate, assessment)
             if reason is not None:
                 reject(reason)
@@ -1372,7 +1386,9 @@ class DeadPartialReclaimer:
             if not _is_stopped_download_state(inventory_candidate.get("state")):
                 abort_paused("torrent_not_stopped")
                 break
-            inventory_host_path = fresh_paths.get(torrent_hash.strip().lower())
+            inventory_host_path = fresh_paths.get(
+                canonical_torrent_hash(torrent_hash)
+            )
             if inventory_host_path is None:
                 abort_paused("path_inventory_failed")
                 break
@@ -1620,7 +1636,7 @@ class DeadPartialReclaimer:
             return [f"capacity reclaim recovery scan failed: {exc}"]
         for row in recovery_rows:
             reclaim_id = int(row["id"])
-            torrent_hash = str(row["hash"])
+            torrent_hash = canonical_torrent_hash(row["hash"])
             state = str(row["state"])
             row_generation = int(row.get("capacity_generation") or 0)
             lease_token = self._reclaim_mutation_lease_token(
@@ -1920,10 +1936,26 @@ class DeadPartialReclaimer:
         finally:
             con.close()
         return (
-            {str(row["hash"]): dict(row) for row in rows},
-            {str(row["hash"]) for row in jobs if row["hash"]},
-            {str(row["hash"]) for row in claims if row["hash"]},
-            {str(row["hash"]) for row in cooldowns if row["hash"]},
+            {
+                canonical_torrent_hash(row["hash"]): dict(row)
+                for row in rows
+                if canonical_torrent_hash(row["hash"])
+            },
+            {
+                canonical_torrent_hash(row["hash"])
+                for row in jobs
+                if canonical_torrent_hash(row["hash"])
+            },
+            {
+                canonical_torrent_hash(row["hash"])
+                for row in claims
+                if canonical_torrent_hash(row["hash"])
+            },
+            {
+                canonical_torrent_hash(row["hash"])
+                for row in cooldowns
+                if canonical_torrent_hash(row["hash"])
+            },
         )
 
     def _current_assessment_generation(self) -> int:
@@ -1954,7 +1986,7 @@ class DeadPartialReclaimer:
                 "generation": int(assessment.generation),
                 "observed_at": int(assessment.observed_at),
                 "torrent": {
-                    "hash": str(evidence.hash),
+                    "hash": canonical_torrent_hash(evidence.hash),
                     "managed": bool(evidence.managed),
                     "incomplete": bool(evidence.incomplete),
                     "availability": evidence.availability,
@@ -2031,7 +2063,7 @@ class DeadPartialReclaimer:
         try:
             rows = self._qbt_call_with_timeout(
                 "torrent_files",
-                str(torrent_hash),
+                canonical_torrent_hash(torrent_hash),
                 timeout=self.inventory_timeout_sec,
             )
             return self._file_selection_fingerprint(rows), None
@@ -2045,7 +2077,7 @@ class DeadPartialReclaimer:
         candidate: Mapping[str, Any],
     ) -> str | None:
         current, reason = self._current_file_selection_fingerprint(
-            str(candidate["hash"])
+            canonical_torrent_hash(candidate["hash"])
         )
         if reason is not None:
             return reason
@@ -2103,28 +2135,31 @@ class DeadPartialReclaimer:
     def _has_open_job_or_reservation_or_cooldown(
         self, torrent_hash: str
     ) -> bool:
+        torrent_hash = canonical_torrent_hash(torrent_hash)
         con = readonly_connect(self.state_db)
         try:
             placeholders = ",".join("?" for _ in OPEN_JOB_STATES)
             job = con.execute(
-                f"select 1 from torrent_jobs where hash=? "
+                f"select 1 from torrent_jobs where lower(trim(hash))=? "
                 f"and state in ({placeholders}) limit 1",
-                (str(torrent_hash), *OPEN_JOB_STATES),
+                (torrent_hash, *OPEN_JOB_STATES),
             ).fetchone()
             if job is not None:
                 return True
             now = int(self.now())
             claim = con.execute(
-                "select 1 from resource_reservations where hash=? and state='active' "
+                "select 1 from resource_reservations where lower(trim(hash))=? "
+                "and state='active' "
                 "and (expires_at is null or expires_at>?) limit 1",
-                (str(torrent_hash), now),
+                (torrent_hash, now),
             ).fetchone()
             if claim is not None:
                 return True
             cooldown = con.execute(
-                "select 1 from soak_state where hash=? and cooldown_until is not null "
+                "select 1 from soak_state where lower(trim(hash))=? "
+                "and cooldown_until is not null "
                 "and cooldown_until>? limit 1",
-                (str(torrent_hash), now),
+                (torrent_hash, now),
             ).fetchone()
             return cooldown is not None
         finally:
@@ -2137,12 +2172,13 @@ class DeadPartialReclaimer:
     ) -> str | None:
         if self._current_assessment_generation() != int(assessment.generation):
             return "stale_assessment"
-        torrent_hash = str(candidate["hash"])
+        torrent_hash = canonical_torrent_hash(candidate["hash"])
         con = readonly_connect(self.state_db)
         try:
             row = con.execute(
                 "select reclaimable_since,no_progress_since,capacity_viable,capacity_generation "
-                "from torrent_health where hash=?",
+                "from torrent_health where lower(trim(hash))=? "
+                "order by rowid desc limit 1",
                 (torrent_hash,),
             ).fetchone()
         finally:
@@ -2173,9 +2209,11 @@ class DeadPartialReclaimer:
         assessment: CapacityAssessment,
         torrent_hash: str,
     ) -> TorrentCapacityEvidence | None:
-        expected_hash = str(torrent_hash).strip().lower()
+        expected_hash = canonical_torrent_hash(torrent_hash)
         for assessment_hash, evidence in assessment.torrents.items():
-            evidence_hash = str(evidence.hash or assessment_hash).strip().lower()
+            evidence_hash = canonical_torrent_hash(
+                evidence.hash or assessment_hash
+            )
             if evidence_hash == expected_hash:
                 return evidence
         return None
@@ -2187,8 +2225,8 @@ class DeadPartialReclaimer:
         candidate: Mapping[str, Any],
         assessment: CapacityAssessment,
     ) -> str | None:
-        expected_hash = str(candidate["hash"]).strip().lower()
-        current_hash = str(current.get("hash") or "").strip().lower()
+        expected_hash = canonical_torrent_hash(candidate["hash"])
+        current_hash = canonical_torrent_hash(current.get("hash"))
         if not current_hash:
             return "torrent_identity_unknown"
         if current_hash != expected_hash:
@@ -2285,7 +2323,7 @@ class DeadPartialReclaimer:
         try:
             current = self._qbt_call_with_timeout(
                 "torrent_info",
-                str(candidate["hash"]),
+                canonical_torrent_hash(candidate["hash"]),
                 timeout=self.inventory_timeout_sec,
             )
         except QbtDeadlineUnsupported:
@@ -2308,7 +2346,7 @@ class DeadPartialReclaimer:
         *,
         actual_payload_path: Path,
     ) -> str | None:
-        torrent_hash = str(candidate["hash"])
+        torrent_hash = canonical_torrent_hash(candidate["hash"])
         expected_path = Path(str(candidate.get("host_path") or ""))
         try:
             current = self._qbt_call_with_timeout(
@@ -2353,7 +2391,7 @@ class DeadPartialReclaimer:
             return reason
         if not _is_stopped_download_state(inventory_candidate.get("state")):
             return "torrent_not_stopped"
-        inventory_path = paths.get(torrent_hash.strip().lower())
+        inventory_path = paths.get(canonical_torrent_hash(torrent_hash))
         if inventory_path is None:
             return "path_inventory_failed"
         if inventory_path != expected_path:
@@ -2432,7 +2470,7 @@ class DeadPartialReclaimer:
         if not isinstance(torrents, Mapping):
             return {}, None, "path_inventory_failed"
 
-        expected_hash = str(torrent_hash).strip().lower()
+        expected_hash = canonical_torrent_hash(torrent_hash)
         paths: dict[str, Path] = {}
         identities: set[str] = set()
         candidate_row: dict[str, Any] | None = None
@@ -2440,8 +2478,8 @@ class DeadPartialReclaimer:
             if not isinstance(raw, Mapping):
                 return {}, None, "path_inventory_failed"
             item = dict(raw)
-            fallback_identity = str(fallback_hash or "").strip().lower()
-            row_identity = str(item.get("hash") or "").strip().lower()
+            fallback_identity = canonical_torrent_hash(fallback_hash)
+            row_identity = canonical_torrent_hash(item.get("hash"))
             if row_identity and fallback_identity and row_identity != fallback_identity:
                 return {}, None, "path_inventory_failed"
             identity = row_identity or fallback_identity
@@ -2485,7 +2523,9 @@ class DeadPartialReclaimer:
     ) -> dict[str, Path]:
         result: dict[str, Path] = {}
         for fallback_hash, raw in snapshots.items():
-            torrent_hash = str(raw.get("hash") or fallback_hash)
+            torrent_hash = canonical_torrent_hash(
+                raw.get("hash") or fallback_hash
+            )
             path = self._host_path(raw.get("content_path"))
             if path is not None:
                 result[torrent_hash] = path
@@ -2838,7 +2878,9 @@ class DeadPartialReclaimer:
         cls, torrent_hash: str, candidate: Path, all_paths: Mapping[str, Path]
     ) -> bool:
         for other_hash, other in all_paths.items():
-            if str(other_hash) == str(torrent_hash):
+            if canonical_torrent_hash(other_hash) == canonical_torrent_hash(
+                torrent_hash
+            ):
                 continue
             if cls._paths_overlap(candidate, other):
                 return True

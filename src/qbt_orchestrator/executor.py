@@ -8,10 +8,33 @@ from typing import Any, Callable, Dict
 
 from .action_dispatcher import ActionDispatcher, ActionPriority
 from .db import readonly_connect
+from .hash_identity import canonical_torrent_hash
 from .models import ActionLogEntry
+from .observability import redact
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class QbtMutationLeaseBlocked(RuntimeError):
+    """A qBT mutation was rejected by a canonical per-hash reclaim lease."""
+
+    def __init__(self, path: str, hashes: set[str] | tuple[str, ...]):
+        self.path = str(redact(str(path)))
+        self.hashes = tuple(
+            sorted(
+                {
+                    canonical
+                    for value in hashes
+                    if (canonical := canonical_torrent_hash(value))
+                }
+            )
+        )
+        message = (
+            "qBT mutation blocked by reclaim lease: "
+            f"path={self.path} hashes={','.join(self.hashes)}"
+        )
+        super().__init__(str(redact(message)))
 
 
 class Executor:
@@ -64,7 +87,7 @@ class Executor:
 
             rows_by_hash: dict[str, list[tuple[int, int]]] = {}
             for row in rows:
-                torrent_hash = self._normalized_hash(row["hash"])
+                torrent_hash = canonical_torrent_hash(row["hash"])
                 if not torrent_hash:
                     raise ValueError(
                         f"locked capacity_reclaims row id={row['id']} has empty hash"
@@ -133,23 +156,19 @@ class Executor:
                     self._hash_mutation_condition.notify_all()
 
     @staticmethod
-    def _normalized_hash(value: Any) -> str:
-        return str(value or "").strip().lower()
-
-    @classmethod
-    def _payload_hashes(cls, payload: Dict[str, Any]) -> set[str]:
+    def _payload_hashes(payload: Dict[str, Any]) -> set[str]:
         hashes: set[str] = set()
         for key in ("hash", "hashes"):
             raw = str(payload.get(key) or "")
             hashes.update(
                 normalized
                 for item in raw.split("|")
-                if (normalized := cls._normalized_hash(item))
+                if (normalized := canonical_torrent_hash(item))
             )
         return hashes
 
     def acquire_hash_mutation_lease(self, hash: str, token: str) -> bool:
-        torrent_hash = self._normalized_hash(hash)
+        torrent_hash = canonical_torrent_hash(hash)
         owner_token = str(token or "").strip()
         if not torrent_hash or not owner_token:
             return False
@@ -169,7 +188,7 @@ class Executor:
         return self.acquire_hash_mutation_lease(hash, token)
 
     def release_hash_mutation_lease(self, hash: str, token: str) -> bool:
-        torrent_hash = self._normalized_hash(hash)
+        torrent_hash = canonical_torrent_hash(hash)
         owner_token = str(token or "").strip()
         with self._hash_mutation_condition:
             if self._hash_mutation_leases.get(torrent_hash) != owner_token:
@@ -249,6 +268,10 @@ class Executor:
         safe_payload = copy.deepcopy(dict(payload))
         if self.dry_run:
             if not self._hash_mutation_allowed(safe_payload, lease_token):
+                blocked = QbtMutationLeaseBlocked(
+                    path,
+                    self._payload_hashes(safe_payload),
+                )
                 self.action_log.append(
                     ActionLogEntry(
                         path,
@@ -257,12 +280,11 @@ class Executor:
                         True,
                     )
                 )
-                return False
+                raise blocked
             self.action_log.append(ActionLogEntry(path, safe_payload, "dry_run", True))
             return True
         try:
             assert self.dispatcher is not None
-            skip_status: list[str] = []
 
             def execution_guard() -> bool:
                 with self._hash_mutation_condition:
@@ -270,10 +292,11 @@ class Executor:
                         safe_payload,
                         lease_token,
                     ):
-                        skip_status.append("skipped_hash_lease")
-                        return False
+                        raise QbtMutationLeaseBlocked(
+                            path,
+                            self._payload_hashes(safe_payload),
+                        )
                     if guard is not None and not bool(guard()):
-                        skip_status.append("skipped_stale_generation")
                         return False
                     targets = self._payload_hashes(safe_payload)
                     tracked_targets = (
@@ -300,15 +323,23 @@ class Executor:
                     ActionLogEntry(
                         path,
                         safe_payload,
-                        skip_status[-1]
-                        if skip_status
-                        else "skipped_stale_generation",
+                        "skipped_stale_generation",
                         False,
                     )
                 )
                 return False
             self.action_log.append(ActionLogEntry(path, safe_payload, "succeeded", False))
             return True
+        except QbtMutationLeaseBlocked:
+            self.action_log.append(
+                ActionLogEntry(
+                    path,
+                    safe_payload,
+                    "skipped_hash_lease",
+                    False,
+                )
+            )
+            raise
         except Exception as exc:
             self.action_log.append(ActionLogEntry(path, safe_payload, "failed", False, str(exc)))
             raise

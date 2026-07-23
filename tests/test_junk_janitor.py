@@ -8,9 +8,52 @@ import tempfile
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
+
+
+def test_junk_priority_write_does_not_record_success_when_lease_blocks(tmp_path):
+    from qbt_orchestrator.db import migrate, readonly_connect
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
+    from qbt_orchestrator.junk_janitor import JunkJanitorService
+
+    class Qbt:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    qbt = Qbt()
+    executor = Executor(qbt, dry_run=False)
+    assert executor.acquire_hash_mutation_lease("h", "reclaim:1:1") is True
+    service = JunkJanitorService(
+        db,
+        executor,
+        managed_root=tmp_path,
+        trash_dir=tmp_path / "trash",
+        dry_run=False,
+    )
+    try:
+        with pytest.raises(QbtMutationLeaseBlocked):
+            service._set_file_priority_zero(
+                " H ", 0, 1, tmp_path / "junk.url", 10, 1
+            )
+    finally:
+        executor.close(timeout=1)
+
+    con = readonly_connect(db)
+    actions = con.execute(
+        "select status from action_log where action_type='junk_set_prio_zero'"
+    ).fetchall()
+    con.close()
+    assert actions == []
+    assert qbt.posts == []
 
 
 def _rows(db: Path, sql: str):

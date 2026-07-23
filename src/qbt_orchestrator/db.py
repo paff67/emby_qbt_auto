@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
+from .hash_identity import canonical_torrent_hash
+
 
 def _connect(path: str | Path) -> sqlite3.Connection:
     con = sqlite3.connect(path)
@@ -469,6 +471,10 @@ def migration_sql() -> list[str]:
         "alter table capacity_reclaims add column filesystem_ino integer",
         "alter table capacity_reclaims add column file_selection_fingerprint text",
         "alter table capacity_reclaims add column target_free_bytes integer not null default 0",
+        "alter table bot_commands add column last_error text",
+        "drop trigger if exists trg_capacity_reclaim_lock_job_insert",
+        "drop trigger if exists trg_capacity_reclaim_lock_job_update",
+        "drop trigger if exists trg_capacity_reclaim_lock_reservation_insert",
         "drop trigger if exists trg_capacity_reclaim_lock_reservation_update",
         "drop trigger if exists trg_capacity_reclaim_lock_soak_insert",
         "drop trigger if exists trg_capacity_reclaim_lock_soak_update",
@@ -485,40 +491,48 @@ def migration_sql() -> list[str]:
         "before insert on torrent_jobs "
         "when NEW.hash is not null "
         "and NEW.state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait') "
-        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and exists(select 1 from capacity_reclaims cr "
+        "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
         "and cr.state not in ('released','cancelled')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_job_update "
         "before update of hash,state on torrent_jobs "
-        "when NEW.hash is not null "
-        "and NEW.state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait') "
-        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "when NEW.state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait') "
+        "and exists(select 1 from capacity_reclaims cr where "
+        "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
+        "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
         "and cr.state not in ('released','cancelled')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_reservation_insert "
         "before insert on resource_reservations "
         "when NEW.hash is not null and NEW.state='active' "
-        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and exists(select 1 from capacity_reclaims cr "
+        "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
         "and cr.state not in ('released','cancelled')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_reservation_update "
         "before update on resource_reservations "
-        "when NEW.hash is not null and NEW.state='active' "
-        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "when NEW.state='active' "
+        "and exists(select 1 from capacity_reclaims cr where "
+        "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
+        "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
         "and cr.state not in ('released','cancelled')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_soak_insert "
         "before insert on soak_state "
         "when NEW.hash is not null and NEW.cooldown_until is not null "
         "and NEW.cooldown_until>0 "
-        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and exists(select 1 from capacity_reclaims cr "
+        "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
         "and cr.state not in ('released','cancelled')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_soak_update "
         "before update on soak_state "
-        "when NEW.hash is not null and NEW.cooldown_until is not null "
+        "when NEW.cooldown_until is not null "
         "and NEW.cooldown_until>0 "
-        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and exists(select 1 from capacity_reclaims cr where "
+        "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
+        "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
         "and cr.state not in ('released','cancelled')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_assessment_insert "
@@ -538,18 +552,22 @@ def migration_sql() -> list[str]:
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_health_insert "
         "before insert on torrent_health "
-        "when exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "when exists(select 1 from capacity_reclaims cr "
+        "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
         "and cr.state in ('deleting','quarantined')) "
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_health_update "
-        "before update of capacity_generation,capacity_viable,reclaimable_since,no_progress_since "
+        "before update of hash,capacity_generation,capacity_viable,reclaimable_since,no_progress_since "
         "on torrent_health "
-        "when exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "when exists(select 1 from capacity_reclaims cr where "
+        "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
+        "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
         "and cr.state in ('deleting','quarantined')) "
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_health_delete "
         "before delete on torrent_health "
-        "when exists(select 1 from capacity_reclaims cr where cr.hash=OLD.hash "
+        "when exists(select 1 from capacity_reclaims cr "
+        "where lower(trim(cr.hash))=lower(trim(OLD.hash)) "
         "and cr.state in ('deleting','quarantined')) "
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_capacity_state_insert "
@@ -686,7 +704,7 @@ class DbActor:
     async def enqueue_job(self, hash: str | None, batch_id: int | None, job_type: str, payload: Dict[str, Any], priority: int = 100) -> int:
         fut = asyncio.get_running_loop().create_future()
         self._writes_enqueued += 1
-        await self.queue.put(("enqueue_job", {"hash": hash, "batch_id": batch_id, "job_type": job_type, "payload": payload, "priority": priority}, fut))
+        await self.queue.put(("enqueue_job", {"hash": canonical_torrent_hash(hash) or None, "batch_id": batch_id, "job_type": job_type, "payload": payload, "priority": priority}, fut))
         return int(await fut)
 
     async def flush(self) -> None:

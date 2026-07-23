@@ -12,6 +12,7 @@ from .capacity_assessment import CapacityAssessment
 from .capacity_reclaim import capacity_reclaim_locked_hashes
 from .db import readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
+from .hash_identity import canonical_torrent_hash
 from .models import LifecycleState
 from .observability import redact
 from .policies.download_mode import desired_seq_dl
@@ -72,12 +73,13 @@ def active_soak_cooldown_hashes(state_db: str | Path, now: int) -> set[str]:
     con = readonly_connect(state_db)
     try:
         return {
-            str(row["hash"])
+            canonical
             for row in con.execute(
                 "select hash from soak_state "
                 "where state='soak_cooldown' and cooldown_until is not null and cooldown_until>?",
                 (int(now),),
             ).fetchall()
+            if (canonical := canonical_torrent_hash(row["hash"]))
         }
     finally:
         con.close()
@@ -188,15 +190,35 @@ class DownloadPlanner:
         allowed_active_hashes: set[str] | None = None,
         capacity_assessment: CapacityAssessment | None = None,
     ) -> PlannerResult:
-        protected_running_hashes = {str(h) for h in (protected_running_hashes or set())}
-        forced_active_hashes = {str(h) for h in (forced_active_hashes or set())}
-        cooldown_hashes = {str(h) for h in (cooldown_hashes or set())}
+        protected_running_hashes = {
+            canonical_torrent_hash(h)
+            for h in (protected_running_hashes or set())
+            if canonical_torrent_hash(h)
+        }
+        forced_active_hashes = {
+            canonical_torrent_hash(h)
+            for h in (forced_active_hashes or set())
+            if canonical_torrent_hash(h)
+        }
+        cooldown_hashes = {
+            canonical_torrent_hash(h)
+            for h in (cooldown_hashes or set())
+            if canonical_torrent_hash(h)
+        }
         allowed_active_hashes = (
             None
             if allowed_active_hashes is None
-            else {str(h) for h in allowed_active_hashes}
+            else {
+                canonical_torrent_hash(h)
+                for h in allowed_active_hashes
+                if canonical_torrent_hash(h)
+            }
         )
-        managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
+        managed = [
+            dict(t, hash=canonical_torrent_hash(t.get("hash") or h))
+            for h, t in snapshots.items()
+            if _is_managed(t)
+        ]
         now = int(self.now())
         reclaim_locked_hashes = capacity_reclaim_locked_hashes(self.state_db)
         cooldown_hashes |= active_soak_cooldown_hashes(self.state_db, now)
@@ -204,7 +226,7 @@ class DownloadPlanner:
         intent_priority: dict[str, int] = {}
         capacity_probe_hashes: set[str] = set()
         for intent in active_intents:
-            h = str(intent.hash)
+            h = canonical_torrent_hash(intent.hash)
             intent_priority[h] = max(intent_priority.get(h, -1), int(intent.priority))
             if intent.intent in {"probe", "availability_probe"}:
                 forced_active_hashes.add(h)
@@ -246,7 +268,18 @@ class DownloadPlanner:
             generation = self._flush_persistence_batch()
             return PlannerResult([], [], conservative=True, budget_bytes=budget, mode=mode, plan_generation=generation)
         if not self.dry_run:
-            self._reconcile_absent_allocations(set(str(h) for h in snapshots.keys()), now)
+            self._reconcile_absent_allocations(
+                {
+                    canonical_torrent_hash(
+                        torrent.get("hash") or fallback_hash
+                    )
+                    for fallback_hash, torrent in snapshots.items()
+                    if canonical_torrent_hash(
+                        torrent.get("hash") or fallback_hash
+                    )
+                },
+                now,
+            )
             previous_allocations = self._allocation_rows()
             dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
             carousel_states = self._carousel_state_rows(now)
@@ -433,13 +466,26 @@ class DownloadPlanner:
         candidates: list[dict[str, Any]] = []
         skipped: dict[str, str] = {}
         capacity_probe_hashes = {
-            str(item) for item in (capacity_probe_hashes or set())
+            canonical_torrent_hash(item)
+            for item in (capacity_probe_hashes or set())
+            if canonical_torrent_hash(item)
         }
         reclaim_locked_hashes = {
-            str(item) for item in (reclaim_locked_hashes or set())
+            canonical_torrent_hash(item)
+            for item in (reclaim_locked_hashes or set())
+            if canonical_torrent_hash(item)
+        }
+        assessment_by_hash = {
+            canonical_torrent_hash(evidence.hash or assessment_hash): evidence
+            for assessment_hash, evidence in (
+                capacity_assessment.torrents.items()
+                if capacity_assessment is not None
+                else ()
+            )
+            if canonical_torrent_hash(evidence.hash or assessment_hash)
         }
         for torrent in managed:
-            h = str(torrent.get("hash") or "")
+            h = canonical_torrent_hash(torrent.get("hash"))
             amount_left = int(torrent.get("amount_left") or 0)
             if h in reclaim_locked_hashes:
                 skipped[h] = "capacity_reclaim_locked"
@@ -449,7 +495,7 @@ class DownloadPlanner:
             evidence = (
                 None
                 if capacity_assessment is None
-                else capacity_assessment.torrents.get(h)
+                else assessment_by_hash.get(h)
             )
             if (
                 evidence is not None
@@ -489,7 +535,11 @@ class DownloadPlanner:
         con = _connect(self.state_db)
         try:
             rows = con.execute("select * from scheduler_allocations").fetchall()
-            return {str(r["hash"]): dict(r) for r in rows}
+            return {
+                canonical_torrent_hash(r["hash"]): dict(r)
+                for r in rows
+                if canonical_torrent_hash(r["hash"])
+            }
         finally:
             con.close()
 
@@ -501,7 +551,7 @@ class DownloadPlanner:
                 "select hash,state,backoff_until from carousel_state"
             ).fetchall()
             return {
-                str(row["hash"]): str(row["state"])
+                canonical_torrent_hash(row["hash"]): str(row["state"])
                 for row in rows
                 if not (
                     str(row["state"]) == "dead"
@@ -513,21 +563,41 @@ class DownloadPlanner:
             con.close()
 
     def _reconcile_absent_allocations(self, snapshot_hashes: set[str], now: int) -> list[str]:
-        snapshot_hashes = {str(h) for h in snapshot_hashes if str(h)}
+        snapshot_hashes = {
+            canonical_torrent_hash(h)
+            for h in snapshot_hashes
+            if canonical_torrent_hash(h)
+        }
 
         def txn(con: sqlite3.Connection) -> list[str]:
-            rows = [str(r["hash"]) for r in con.execute("select hash from scheduler_allocations").fetchall()]
-            absent = sorted(h for h in rows if h and h not in snapshot_hashes)
+            rows = [
+                canonical_torrent_hash(r["hash"])
+                for r in con.execute(
+                    "select hash from scheduler_allocations"
+                ).fetchall()
+            ]
+            absent = sorted(
+                h for h in rows if h and h not in snapshot_hashes
+            )
             if not absent:
                 return []
             placeholders = ",".join("?" for _ in absent)
-            con.execute(f"delete from scheduler_allocations where hash in ({placeholders})", absent)
+            con.execute(
+                f"delete from scheduler_allocations "
+                f"where lower(trim(hash)) in ({placeholders})",
+                absent,
+            )
             con.execute(
                 f"update resource_reservations set state='released', released_at=?, reason=? "
-                f"where state='active' and hash in ({placeholders})",
+                f"where state='active' "
+                f"and lower(trim(hash)) in ({placeholders})",
                 (int(now), "qbt_absent_reconciled", *absent),
             )
-            con.execute(f"delete from soak_state where hash in ({placeholders})", absent)
+            con.execute(
+                f"delete from soak_state "
+                f"where lower(trim(hash)) in ({placeholders})",
+                absent,
+            )
             self.decision_recorder.record_many_in_transaction(
                 con,
                 [
@@ -559,7 +629,11 @@ class DownloadPlanner:
         con = _connect(self.state_db)
         try:
             rows = con.execute("select * from torrent_health").fetchall()
-            return {str(r["hash"]): dict(r) for r in rows}
+            return {
+                canonical_torrent_hash(r["hash"]): dict(r)
+                for r in rows
+                if canonical_torrent_hash(r["hash"])
+            }
         finally:
             con.close()
 
@@ -572,10 +646,16 @@ class DownloadPlanner:
                 "where state='active' and (expires_at is null or expires_at>?)",
                 (int(now),),
             ).fetchall()
-            return future_growth_by_hash(
+            raw_growth = future_growth_by_hash(
                 resource_claims_from_rows(rows),
                 ignored_kinds=ignored_kinds,
             )
+            growth: dict[str, int] = {}
+            for torrent_hash, value in raw_growth.items():
+                canonical = canonical_torrent_hash(torrent_hash)
+                if canonical:
+                    growth[canonical] = growth.get(canonical, 0) + int(value)
+            return growth
         finally:
             con.close()
 
@@ -644,7 +724,7 @@ class DownloadPlanner:
         excluded_hashes = excluded_hashes or set()
         rows: list[dict[str, Any]] = []
         for torrent in torrents:
-            h = str(torrent.get("hash") or "")
+            h = canonical_torrent_hash(torrent.get("hash"))
             if not h or h in excluded_hashes:
                 continue
             old = previous.get(h) or {}
@@ -781,7 +861,7 @@ class DownloadPlanner:
     @staticmethod
     def _allocation_params(row: Mapping[str, Any], plan_generation: int) -> tuple[Any, ...]:
         return (
-            row["hash"],
+            canonical_torrent_hash(row["hash"]),
             row["desired_state"],
             row["desired_state"],
             row["slot_kind"],
@@ -797,7 +877,7 @@ class DownloadPlanner:
     @staticmethod
     def _health_params(row: Mapping[str, Any]) -> tuple[Any, ...]:
         return (
-            row["hash"],
+            canonical_torrent_hash(row["hash"]),
             int(row["now"]),
             int(row["dlspeed"]),
             int(row["upspeed"]),
@@ -905,6 +985,7 @@ class DownloadPlanner:
         return int(write_transaction(self.state_db, txn))
 
     def _allocation(self, hash: str, desired_state: str, slot_kind: str, reserved_bytes: int, seq_dl: bool, ts: int, reason: str) -> None:
+        hash = canonical_torrent_hash(hash)
         if self._pending_persistence is not None:
             self._pending_persistence.allocations.append(
                 {
@@ -933,7 +1014,16 @@ class DownloadPlanner:
             con.close()
 
     def _sync_active_download_reservations(self, selected: list[Mapping[str, Any]], managed_hashes: set[str], now: int) -> None:
-        selected_by_hash = {str(t.get("hash")): int(t.get("amount_left") or 0) for t in selected if str(t.get("hash") or "")}
+        selected_by_hash = {
+            canonical_torrent_hash(t.get("hash")): int(t.get("amount_left") or 0)
+            for t in selected
+            if canonical_torrent_hash(t.get("hash"))
+        }
+        managed_hashes = {
+            canonical_torrent_hash(h)
+            for h in managed_hashes
+            if canonical_torrent_hash(h)
+        }
         if self._pending_persistence is not None:
             self._pending_persistence.reservation_sync = (selected_by_hash, set(managed_hashes), int(now))
             return
@@ -950,6 +1040,16 @@ class DownloadPlanner:
         managed_hashes: set[str],
         now: int,
     ) -> None:
+        selected_by_hash = {
+            canonical_torrent_hash(torrent_hash): int(value)
+            for torrent_hash, value in selected_by_hash.items()
+            if canonical_torrent_hash(torrent_hash)
+        }
+        managed_hashes = {
+            canonical_torrent_hash(torrent_hash)
+            for torrent_hash in managed_hashes
+            if canonical_torrent_hash(torrent_hash)
+        }
         selected_hashes = set(selected_by_hash)
         active_rows = [
             dict(row)
@@ -959,12 +1059,15 @@ class DownloadPlanner:
         ]
         active_by_hash: dict[str, list[int]] = {}
         for row in active_rows:
-            active_by_hash.setdefault(str(row["hash"] or ""), []).append(int(row["id"]))
+            torrent_hash = canonical_torrent_hash(row["hash"])
+            if torrent_hash:
+                active_by_hash.setdefault(torrent_hash, []).append(int(row["id"]))
 
         for torrent_hash in sorted(managed_hashes - selected_hashes):
             con.execute(
                 "update resource_reservations set state='released', released_at=?, reason=? "
-                "where kind='active_download' and state='active' and hash=?",
+                "where kind='active_download' and state='active' "
+                "and lower(trim(hash))=?",
                 (int(now), "planner_reallocated", torrent_hash),
             )
 
@@ -1004,6 +1107,7 @@ class DownloadPlanner:
                     )
 
     def _mark_soak_cooldown(self, hash: str, now: int, reason: str) -> None:
+        hash = canonical_torrent_hash(hash)
         cooldown_until = int(now) + 1800
         if self._pending_persistence is not None:
             self._pending_persistence.soak_cooldowns.append(
@@ -1021,6 +1125,7 @@ class DownloadPlanner:
         )
 
     def _mark_soak_resident(self, hash: str, now: int, reason: str) -> None:
+        hash = canonical_torrent_hash(hash)
         if self._pending_persistence is not None:
             self._pending_persistence.soak_residents.append(
                 {"hash": hash, "now": int(now), "reason": reason}
@@ -1037,6 +1142,7 @@ class DownloadPlanner:
         )
 
     def _decision(self, hash: str, decision: str, reason_code: str, data: dict[str, Any]) -> None:
+        hash = canonical_torrent_hash(hash)
         if self._pending_persistence is not None:
             self._pending_persistence.decisions.append(
                 {

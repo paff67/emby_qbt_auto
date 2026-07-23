@@ -310,14 +310,16 @@ def test_sqlite_migration_db_actor_readonly_and_job_recovery():
         async def run_actor():
             actor = DbActor(db)
             await actor.start()
-            job_id = await actor.enqueue_job("h1", None, "upload", {"path": "x"}, priority=10)
+            job_id = await actor.enqueue_job(" H1 ", None, "upload", {"path": "x"}, priority=10)
             await actor.flush()
             await actor.stop()
             return job_id
 
         job_id = asyncio.run(run_actor())
         con = sqlite3.connect(db)
-        assert con.execute("select phase from torrent_jobs where id=?", (job_id,)).fetchone()[0] == "queued_copy"
+        assert con.execute(
+            "select hash,phase from torrent_jobs where id=?", (job_id,)
+        ).fetchone() == ("h1", "queued_copy")
         con.close()
         assert job_id >= 1
         assert readonly_counts(db)["torrent_jobs"] == 1

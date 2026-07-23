@@ -551,6 +551,49 @@ def test_file_batch_unsafe_legacy_opt_in_retains_direct_qbt_fallback():
         ]
 
 
+def test_file_batch_does_not_record_success_when_executor_lease_blocks_mutation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
+    from qbt_orchestrator.file_batch import FileBatchService
+
+    class Qbt:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, path, payload):
+            self.calls.append((path, dict(payload)))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = Qbt()
+        executor = Executor(qbt, dry_run=False)
+        assert executor.acquire_hash_mutation_lease(
+            "h", "reclaim:1:1"
+        ) is True
+        service = FileBatchService(
+            state_db=db,
+            dry_run=False,
+            qbt=qbt,
+            executor=executor,
+        )
+        try:
+            with pytest.raises(QbtMutationLeaseBlocked):
+                service._qbt_post(
+                    "/api/v2/torrents/filePrio",
+                    {"hash": " H ", "id": "0", "priority": "0"},
+                    " H ",
+                )
+        finally:
+            executor.close(timeout=1)
+
+        assert qbt.calls == []
+        assert _rows(
+            db,
+            "select status from action_log where action_type='batch_qbt_post'",
+        ) == []
+
+
 class PerHashBatchQbt(BatchQbt):
     def __init__(self, files_by_hash, piece_size=16 * 1024 * 1024):
         super().__init__([], piece_size=piece_size)

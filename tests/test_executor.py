@@ -43,7 +43,7 @@ def _seed_reclaim(db, torrent_hash, state, generation):
 
 def test_executor_startup_hydrates_all_durable_reclaim_states_before_first_mutation(tmp_path):
     from qbt_orchestrator.db import migrate
-    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
 
     db = tmp_path / "state.sqlite"
     migrate(db, dry_run=False)
@@ -59,16 +59,19 @@ def test_executor_startup_hydrates_all_durable_reclaim_states_before_first_mutat
     qbt = RecordingQbt()
     executor = Executor(qbt, dry_run=False, state_db=db)
     try:
-        assert executor.qbt_post(
-            "/api/v2/torrents/start", {"hashes": "reclaimed"}
-        ) is False
-        assert executor.qbt_post(
-            "/api/v2/torrents/filePrio",
-            {"hash": "aborted", "id": "0", "priority": "1"},
-        ) is False
-        assert executor.qbt_post(
-            "/api/v2/torrents/start", {"hashes": "quarantined"}
-        ) is False
+        with pytest.raises(QbtMutationLeaseBlocked):
+            executor.qbt_post(
+                "/api/v2/torrents/start", {"hashes": " RECLAIMED "}
+            )
+        with pytest.raises(QbtMutationLeaseBlocked):
+            executor.qbt_post(
+                "/api/v2/torrents/filePrio",
+                {"hash": "ABORTED", "id": "0", "priority": "1"},
+            )
+        with pytest.raises(QbtMutationLeaseBlocked):
+            executor.qbt_post(
+                "/api/v2/torrents/start", {"hashes": "Quarantined"}
+            )
         assert qbt.posts == []
 
         assert executor.qbt_post(
@@ -93,7 +96,7 @@ def test_executor_startup_hydrates_all_durable_reclaim_states_before_first_mutat
 
 def test_executor_startup_duplicate_hash_uses_highest_reclaim_id_and_records_warning(tmp_path, caplog):
     from qbt_orchestrator.db import migrate
-    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
 
     db = tmp_path / "state.sqlite"
     migrate(db, dry_run=False)
@@ -103,11 +106,12 @@ def test_executor_startup_duplicate_hash_uses_highest_reclaim_id_and_records_war
     qbt = RecordingQbt()
     executor = Executor(qbt, dry_run=False, state_db=db)
     try:
-        assert executor.qbt_post(
-            "/api/v2/torrents/start",
-            {"hashes": "h"},
-            lease_token=f"reclaim:{low_id}:3",
-        ) is False
+        with pytest.raises(QbtMutationLeaseBlocked):
+            executor.qbt_post(
+                "/api/v2/torrents/start",
+                {"hashes": " H "},
+                lease_token=f"reclaim:{low_id}:3",
+            )
         assert executor.qbt_post(
             "/api/v2/torrents/start",
             {"hashes": "h"},
@@ -137,24 +141,29 @@ def test_executor_startup_hydration_fails_closed_when_reclaim_table_is_missing(t
 
 
 def test_hash_mutation_lease_blocks_non_owner_mutators_and_allows_owner():
-    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
 
     qbt = RecordingQbt()
     executor = Executor(qbt, dry_run=False)
     token = "reclaim:7:4"
     try:
         assert executor.acquire_hash_mutation_lease("H", token) is True
-        assert executor.qbt_post(
-            "/api/v2/torrents/filePrio",
-            {"hash": "h", "id": "0", "priority": "0"},
-        ) is False
-        assert executor.qbt_post(
-            "/api/v2/torrents/start", {"hashes": "other|H"}
-        ) is False
-        assert executor.qbt_post(
-            "/api/v2/torrents/setLocation",
-            {"hashes": "h", "location": "/downloads/other"},
-        ) is False
+        blocked_payloads = (
+            (
+                "/api/v2/torrents/filePrio",
+                {"hash": "h", "id": "0", "priority": "0"},
+            ),
+            ("/api/v2/torrents/start", {"hashes": "other|H"}),
+            (
+                "/api/v2/torrents/setLocation",
+                {"hashes": "h", "location": "/downloads/other"},
+            ),
+        )
+        for path, payload in blocked_payloads:
+            with pytest.raises(QbtMutationLeaseBlocked) as caught:
+                executor.qbt_post(path, payload)
+            assert caught.value.path == path
+            assert "h" in caught.value.hashes
         assert executor.qbt_post(
             "/api/v2/torrents/stop",
             {"hashes": "h"},
@@ -182,7 +191,7 @@ def test_hash_mutation_lease_blocks_non_owner_mutators_and_allows_owner():
 
 
 def test_queued_before_lease_action_is_checked_when_dispatcher_executes_it():
-    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
 
     first_started = threading.Event()
     release_first = threading.Event()
@@ -203,14 +212,15 @@ def test_queued_before_lease_action_is_checked_when_dispatcher_executes_it():
             "first", executor.qbt_post("/block", {"hashes": "other"})
         )
     )
-    queued = threading.Thread(
-        target=lambda: results.setdefault(
-            "queued",
+    def queued_mutation():
+        try:
             executor.qbt_post(
                 "/api/v2/torrents/start", {"hashes": "h"}
-            ),
-        )
-    )
+            )
+        except QbtMutationLeaseBlocked as exc:
+            results["queued"] = exc
+
+    queued = threading.Thread(target=queued_mutation)
     first.start()
     assert first_started.wait(timeout=0.5)
     queued.start()
@@ -224,7 +234,8 @@ def test_queued_before_lease_action_is_checked_when_dispatcher_executes_it():
     queued.join(timeout=1)
     executor.close(timeout=1)
 
-    assert results == {"first": True, "queued": False}
+    assert results["first"] is True
+    assert isinstance(results["queued"], QbtMutationLeaseBlocked)
     assert [path for path, _payload in qbt.posts] == ["/block"]
     queued_log = next(
         entry
@@ -309,16 +320,17 @@ def test_acquiring_hash_lease_does_not_wait_for_unrelated_inflight_hash():
 
 
 def test_hash_mutation_lease_release_requires_owner_and_hydration_is_idempotent():
-    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
 
     executor = Executor(RecordingQbt(), dry_run=True)
     assert executor.hydrate_hash_mutation_lease(" H ", "reclaim:2:4") is True
     assert executor.hydrate_hash_mutation_lease("h", "reclaim:2:4") is True
     assert executor.acquire_hash_mutation_lease("h", "other") is False
     assert executor.release_hash_mutation_lease("h", "other") is False
-    assert executor.qbt_post(
-        "/api/v2/torrents/start", {"hashes": "h"}
-    ) is False
+    with pytest.raises(QbtMutationLeaseBlocked):
+        executor.qbt_post(
+            "/api/v2/torrents/start", {"hashes": " H "}
+        )
     assert executor.action_log[-1].status == "skipped_hash_lease"
     assert executor.action_log[-1].dry_run is True
     assert executor.release_hash_mutation_lease("H", "reclaim:2:4") is True
@@ -329,19 +341,49 @@ def test_hash_mutation_lease_release_requires_owner_and_hydration_is_idempotent(
 
 
 def test_hash_mutation_lease_blocks_all_hashes_selector_while_any_lease_exists():
-    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
 
     qbt = RecordingQbt()
     executor = Executor(qbt, dry_run=False)
     try:
         assert executor.acquire_hash_mutation_lease("h", "reclaim:1:4") is True
-        assert executor.qbt_post(
-            "/api/v2/torrents/stop", {"hashes": "all"}
-        ) is False
+        with pytest.raises(QbtMutationLeaseBlocked):
+            executor.qbt_post(
+                "/api/v2/torrents/stop", {"hashes": "all"}
+            )
     finally:
         executor.close(timeout=1)
     assert qbt.posts == []
     assert executor.action_log[-1].status == "skipped_hash_lease"
+
+
+def test_guarded_stale_returns_false_but_lease_conflict_raises():
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
+
+    qbt = RecordingQbt()
+    executor = Executor(qbt, dry_run=False)
+    try:
+        assert executor.qbt_post_guarded(
+            "/api/v2/torrents/start",
+            {"hashes": "other"},
+            guard=lambda: False,
+        ) is False
+        assert executor.action_log[-1].status == "skipped_stale_generation"
+
+        assert executor.acquire_hash_mutation_lease(
+            "h", "reclaim:1:1"
+        ) is True
+        with pytest.raises(QbtMutationLeaseBlocked):
+            executor.qbt_post_guarded(
+                "/api/v2/torrents/start",
+                {"hashes": " H "},
+                guard=lambda: False,
+            )
+        assert executor.action_log[-1].status == "skipped_hash_lease"
+    finally:
+        executor.close(timeout=1)
+
+    assert qbt.posts == []
 
 
 def test_injected_dispatcher_handler_is_preserved_behind_lease_guard():
