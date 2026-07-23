@@ -822,10 +822,7 @@ class DaemonRuntime:
             )
             capacity_reclaim_payload = reclaim_result.as_dict()
             self._last_capacity_reclaim_at = planner_now
-            if (
-                not bool(capacity_reclaim_payload.get("dry_run"))
-                and int(capacity_reclaim_payload.get("reclaimed") or 0) > 0
-            ):
+            if not bool(capacity_reclaim_payload.get("dry_run")):
                 post_reclaim_free_bytes = int(self.free_bytes_provider())
                 capacity_details = dict(capacity_details)
                 capacity_details.update(

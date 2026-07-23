@@ -844,20 +844,37 @@ def test_capacity_deadlock_alert_context_is_structured(
 
 @pytest.mark.parametrize(
     (
+        "planned",
         "reclaimed",
+        "reclaimed_bytes",
+        "errors",
         "post_reclaim_free_bytes",
         "expected_capacity_state",
         "expected_alerts",
         "expected_message_state",
     ),
     [
-        (0, int(3.25 * GIB), "capacity_deadlock", 1, "manual"),
-        (1, int(3.25 * GIB), "capacity_deadlock", 1, "reclaiming"),
-        (1, 6 * GIB, "progress_possible", 0, "reclaiming"),
+        (2, 0, 0, [], int(3.25 * GIB), "capacity_deadlock", 1, "manual"),
+        (
+            2,
+            0,
+            128 * 1024**2,
+            ["recheck unavailable"],
+            6 * GIB,
+            "progress_possible",
+            0,
+            "manual",
+        ),
+        (0, 0, 0, [], 6 * GIB, "progress_possible", 0, "manual"),
+        (2, 1, 128 * 1024**2, [], int(3.25 * GIB), "capacity_deadlock", 1, "reclaiming"),
+        (2, 1, 128 * 1024**2, [], 6 * GIB, "progress_possible", 0, "reclaiming"),
     ],
 )
 def test_daemon_rechecks_pressure_after_live_reclaim(
+    planned,
     reclaimed,
+    reclaimed_bytes,
+    errors,
     post_reclaim_free_bytes,
     expected_capacity_state,
     expected_alerts,
@@ -928,14 +945,15 @@ def test_daemon_rechecks_pressure_after_live_reclaim(
                     def as_dict(self):
                         return {
                             "dry_run": False,
-                            "planned": 2,
+                            "planned": planned,
                             "reclaimed": reclaimed,
+                            "reclaimed_bytes": reclaimed_bytes,
                             "candidates": [{"hash": "dead"}],
                             "rejection_counts": {
                                 "protected_tag": 1,
                                 "availability_unknown": 3,
                             },
-                            "errors": [],
+                            "errors": errors,
                             "assessment_generation": 1,
                         }
 
@@ -985,7 +1003,7 @@ def test_daemon_rechecks_pressure_after_live_reclaim(
         assert result["capacity"]["details"]["feasible_full_finish"] == 0
         assert result["capacity"]["details"]["nonviable_finish"] == 1
         assert result["planner"]["selected_hashes"] == []
-        assert result["capacity_reclaim"]["planned"] == 2
+        assert result["capacity_reclaim"]["planned"] == planned
         assert reclaimer.calls[0][1] == {
             "capacity_state": "capacity_deadlock",
             "free_bytes": int(3.25 * GIB),
@@ -997,8 +1015,9 @@ def test_daemon_rechecks_pressure_after_live_reclaim(
         context = alert_kwargs["reclaim_context"]
         assert context.evaluation_status == "live_evaluated"
         assert context.dry_run is False
-        assert context.planned == 2
+        assert context.planned == planned
         assert context.reclaimed == reclaimed
+        assert context.errors_count == len(errors)
         assert context.rejection_fingerprint == (
             "availability_unknown:3|protected_tag:1"
         )
