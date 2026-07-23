@@ -306,3 +306,42 @@ def test_complete_availability_clears_reclaimable_since(tmp_path):
     ).fetchone()[0]
     con.close()
     assert value is None
+
+
+def test_assessment_gap_resets_reclaimable_since(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    store = CapacityAssessmentStore(db, min_no_progress_sec=21_600)
+    store.commit(nonviable_assessment(observed_at=30_000, no_progress_since=1_000))
+    con = readonly_connect(db)
+    initial = con.execute(
+        "select reclaimable_since from torrent_health where hash='h'"
+    ).fetchone()[0]
+    con.close()
+    assert initial == 30_000
+
+    empty = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {},
+        {},
+        observed_at=30_100,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    )
+    store.commit(empty)
+    third = store.commit(
+        nonviable_assessment(observed_at=30_300, no_progress_since=1_000)
+    )
+    con = readonly_connect(db)
+    row = con.execute(
+        "select reclaimable_since,capacity_generation "
+        "from torrent_health where hash='h'"
+    ).fetchone()
+    con.close()
+
+    assert third.generation == 3
+    assert row["reclaimable_since"] == 30_300
+    assert row["capacity_generation"] == 3

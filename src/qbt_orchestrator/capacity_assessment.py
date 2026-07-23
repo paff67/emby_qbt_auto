@@ -221,7 +221,8 @@ class CapacityAssessmentStore:
                     (item.hash, assessment.observed_at, assessment.observed_at),
                 )
                 previous = con.execute(
-                    "select reclaimable_since from torrent_health where hash=?",
+                    "select reclaimable_since,capacity_generation "
+                    "from torrent_health where hash=?",
                     (item.hash,),
                 ).fetchone()
                 core = core_by_hash[item.hash]
@@ -230,6 +231,7 @@ class CapacityAssessmentStore:
                     if core
                     and previous
                     and previous["reclaimable_since"] is not None
+                    and previous["capacity_generation"] == generation - 1
                     else int(assessment.observed_at)
                     if core
                     else None
