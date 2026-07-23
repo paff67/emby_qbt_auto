@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from .budget import future_growth_by_hash, resource_claims_from_rows
 from .capacity_assessment import CapacityAssessment
+from .capacity_reclaim import capacity_reclaim_locked_hashes
 from .db import readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
 from .models import LifecycleState
@@ -197,6 +198,7 @@ class DownloadPlanner:
         )
         managed = [dict(t, hash=h if not t.get("hash") else t.get("hash")) for h, t in snapshots.items() if _is_managed(t)]
         now = int(self.now())
+        reclaim_locked_hashes = capacity_reclaim_locked_hashes(self.state_db)
         cooldown_hashes |= active_soak_cooldown_hashes(self.state_db, now)
         active_intents = self.intent_repository.active(now)
         intent_priority: dict[str, int] = {}
@@ -213,12 +215,17 @@ class DownloadPlanner:
                 forced_active_hashes.add(h)
             elif intent.intent == "cooldown":
                 cooldown_hashes.add(h)
+        forced_active_hashes -= reclaim_locked_hashes
+        protected_running_hashes -= reclaim_locked_hashes
+        capacity_probe_hashes -= reclaim_locked_hashes
         previous_allocations = self._allocation_rows()
         dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
         carousel_states = self._carousel_state_rows(now)
         dead_hashes |= {h for h, state in carousel_states.items() if state == "dead"}
         dead_hashes -= {h for h, state in carousel_states.items() if state in {"probing", "soak"}}
         dead_hashes -= forced_active_hashes
+        dead_hashes -= reclaim_locked_hashes
+        cooldown_hashes -= reclaim_locked_hashes
         active_reservations = self._active_reservation_bytes(now, ignored_kinds={"soak_probe"} if int(external_reserved_bytes or 0) > 0 else set())
         mode = self._mode_for_free_bytes(int(free_bytes))
         budget_floor = self.disk_floor_bytes
@@ -246,6 +253,8 @@ class DownloadPlanner:
             dead_hashes |= {h for h, state in carousel_states.items() if state == "dead"}
             dead_hashes -= {h for h, state in carousel_states.items() if state in {"probing", "soak"}}
             dead_hashes -= forced_active_hashes
+            dead_hashes -= reclaim_locked_hashes
+            cooldown_hashes -= reclaim_locked_hashes
             active_reservations = self._active_reservation_bytes(now, ignored_kinds={"soak_probe"} if int(external_reserved_bytes or 0) > 0 else set())
             budget = max(0, int(free_bytes) - int(budget_floor) - int(extra_margin) - sum(active_reservations.values()) - int(external_reserved_bytes or 0))
 
@@ -254,6 +263,7 @@ class DownloadPlanner:
             str(t["hash"])
             for t in managed
             if str(t["hash"]) not in forced_active_hashes
+            and str(t["hash"]) not in reclaim_locked_hashes
             and self._should_mark_dead(str(t["hash"]), t, health_rows.get(str(t["hash"])), previous_allocations.get(str(t["hash"])), now)
         }
         dead_hashes |= auto_dead
@@ -261,6 +271,7 @@ class DownloadPlanner:
             str(t["hash"])
             for t in managed
             if str(t["hash"]) not in auto_dead
+            and str(t["hash"]) not in reclaim_locked_hashes
             and str((previous_allocations.get(str(t["hash"])) or {}).get("desired_state") or "") == "active"
             and self._should_demote_active(str(t["hash"]), t, health_rows.get(str(t["hash"])), now)
         }
@@ -275,6 +286,7 @@ class DownloadPlanner:
             allowed_active_hashes=allowed_active_hashes,
             capacity_assessment=capacity_assessment,
             capacity_probe_hashes=capacity_probe_hashes,
+            reclaim_locked_hashes=reclaim_locked_hashes,
         )
         selected: list[dict[str, Any]] = []
         used = 0
@@ -374,7 +386,15 @@ class DownloadPlanner:
             if self._needs_seq_desired(h, False, previous_allocations):
                 seq_desired_actions.append((h, False))
 
-        self._update_health(managed, selected_set, now, health_rows, dead_set=auto_dead, previous_allocations=previous_allocations)
+        self._update_health(
+            managed,
+            selected_set,
+            now,
+            health_rows,
+            dead_set=auto_dead,
+            previous_allocations=previous_allocations,
+            excluded_hashes=reclaim_locked_hashes,
+        )
         if not self.dry_run:
             self._sync_active_download_reservations(selected, {str(t["hash"]) for t in managed}, now)
         generation = self._flush_persistence_batch()
@@ -408,15 +428,22 @@ class DownloadPlanner:
         allowed_active_hashes: set[str] | None,
         capacity_assessment: CapacityAssessment | None = None,
         capacity_probe_hashes: set[str] | None = None,
+        reclaim_locked_hashes: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         candidates: list[dict[str, Any]] = []
         skipped: dict[str, str] = {}
         capacity_probe_hashes = {
             str(item) for item in (capacity_probe_hashes or set())
         }
+        reclaim_locked_hashes = {
+            str(item) for item in (reclaim_locked_hashes or set())
+        }
         for torrent in managed:
             h = str(torrent.get("hash") or "")
             amount_left = int(torrent.get("amount_left") or 0)
+            if h in reclaim_locked_hashes:
+                skipped[h] = "capacity_reclaim_locked"
+                continue
             if amount_left <= 0 or h in dead_hashes or h in cooldown_hashes:
                 continue
             evidence = (
@@ -610,13 +637,15 @@ class DownloadPlanner:
         previous: dict[str, dict[str, Any]],
         dead_set: set[str] | None = None,
         previous_allocations: dict[str, dict[str, Any]] | None = None,
+        excluded_hashes: set[str] | None = None,
     ) -> None:
         dead_set = dead_set or set()
         previous_allocations = previous_allocations or {}
+        excluded_hashes = excluded_hashes or set()
         rows: list[dict[str, Any]] = []
         for torrent in torrents:
             h = str(torrent.get("hash") or "")
-            if not h:
+            if not h or h in excluded_hashes:
                 continue
             old = previous.get(h) or {}
             dlspeed = int(torrent.get("dlspeed_bps") or torrent.get("dlspeed") or 0)

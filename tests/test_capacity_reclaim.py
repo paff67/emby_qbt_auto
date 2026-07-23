@@ -1306,7 +1306,7 @@ def test_live_reclaim_rechecks_path_after_stop_before_audit(tmp_path):
     _assert_capacity_reclaim_aborted_paused(db, "path_changed")
 
 
-def test_live_reclaim_rechecks_active_protection_after_stop(tmp_path):
+def test_live_reclaim_blocks_active_protection_after_stop(tmp_path):
     from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
     from qbt_orchestrator.db import migrate
 
@@ -1318,18 +1318,22 @@ def test_live_reclaim_rechecks_active_protection_after_stop(tmp_path):
     migrate(db, dry_run=False)
     _capacity_health(db, "h")
     info = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    protection_errors = []
 
     class ProtectionRaceExecutor(RecordingExecutor):
         def qbt_post(self, path, payload):
             super().qbt_post(path, payload)
             if path.endswith("/stop"):
                 con = sqlite3.connect(db)
-                con.execute(
-                    "insert into torrent_jobs(hash,job_type,state,created_at,updated_at) "
-                    "values('h','upload','running',0,0)"
-                )
-                con.commit()
-                con.close()
+                try:
+                    con.execute(
+                        "insert into torrent_jobs(hash,job_type,state,created_at,updated_at) "
+                        "values('h','upload','running',0,0)"
+                    )
+                except sqlite3.IntegrityError as exc:
+                    protection_errors.append(str(exc))
+                finally:
+                    con.close()
 
     executor = ProtectionRaceExecutor({"h": info})
     reclaimer = DeadPartialReclaimer(
@@ -1344,10 +1348,10 @@ def test_live_reclaim_rechecks_active_protection_after_stop(tmp_path):
         free_bytes=0, target_free_bytes=10_000,
     )
 
-    assert result.reclaimed == 0
-    assert result.rejection_counts["active_protection"] == 1
-    assert payload.exists()
-    _assert_capacity_reclaim_aborted_paused(db, "active_protection")
+    assert result.reclaimed == 1
+    assert protection_errors == ["capacity_reclaim_locked"]
+    assert not payload.exists()
+    assert _capacity_reclaim_rows(db)[0]["state"] == "reclaimed"
 
 
 def test_live_revalidation_rejects_torrent_that_became_manually_managed(tmp_path):
@@ -1420,6 +1424,24 @@ def _capacity_reclaim_notifications(db: Path) -> list[dict]:
         ]
     finally:
         con.close()
+
+
+def _direct_reclaim_candidate(tmp_path: Path, torrent_hash: str = "h") -> dict:
+    return {
+        "hash": torrent_hash,
+        "name": f"Reclaim {torrent_hash}",
+        "magnet_uri": "mag" + f"net:?xt=urn:btih:{torrent_hash}",
+        "host_path": str((tmp_path / "incomplete" / torrent_hash).resolve()),
+        "content_path": f"/downloads/incomplete/{torrent_hash}",
+        "allocated_bytes": 4096,
+        "completed_bytes": 100,
+        "progress": 0.0,
+        "no_progress_since": 100,
+        "reclaimable_since": 1_000,
+        "capacity_generation": 4,
+        "capacity_reason": "stale_without_complete_source",
+        "assessment_json": "{}",
+    }
 
 
 @pytest.mark.parametrize("availability", [float("nan"), float("inf"), float("-inf")])
@@ -2717,6 +2739,7 @@ def test_restart_reconciliation_converges_seeded_states(
         "allocated_bytes": 4096,
         "completed_bytes": 100,
         "progress": 0.0,
+        "no_progress_since": 100,
         "reclaimable_since": 1_000,
         "capacity_generation": 4,
         "capacity_reason": "stale_without_complete_source",
@@ -2752,3 +2775,344 @@ def test_restart_reconciliation_converges_seeded_states(
 
     assert _capacity_reclaim_rows(db)[0]["state"] == expected_state
     assert len(_capacity_reclaim_notifications(db)) == warning_count
+
+
+def test_capacity_reclaim_lock_helper_keeps_all_nonreleased_states_locked(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import (
+        RECLAIM_LOCKED_STATES,
+        capacity_reclaim_locked_hashes,
+    )
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    states = sorted(RECLAIM_LOCKED_STATES | {"released", "cancelled"})
+    con = sqlite3.connect(db)
+    for index, state in enumerate(states):
+        con.execute(
+            "insert into capacity_reclaims("
+            "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,created_at,updated_at"
+            ") values(?,?,?,?,?,?,?,?,?)",
+            (
+                f"key-{index}",
+                state,
+                state,
+                "mag" + f"net:?xt=urn:btih:{state}",
+                str(tmp_path / state),
+                f"/downloads/incomplete/{state}",
+                state,
+                1,
+                1,
+            ),
+        )
+    con.commit()
+    con.close()
+
+    assert capacity_reclaim_locked_hashes(db) == set(RECLAIM_LOCKED_STATES)
+    assert {"aborted_paused", "reclaimed", "failed"} <= RECLAIM_LOCKED_STATES
+
+
+def test_capacity_reclaim_migration_installs_idempotent_enforcement_triggers(tmp_path):
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    migrate(db, dry_run=False)
+
+    con = sqlite3.connect(db)
+    triggers = {
+        row[0]
+        for row in con.execute(
+            "select name from sqlite_master where type='trigger'"
+        ).fetchall()
+    }
+    con.close()
+
+    assert {
+        "trg_capacity_reclaim_lock_job_insert",
+        "trg_capacity_reclaim_lock_job_update",
+        "trg_capacity_reclaim_lock_reservation_insert",
+        "trg_capacity_reclaim_lock_reservation_update",
+        "trg_capacity_reclaim_fence_assessment_insert",
+        "trg_capacity_reclaim_fence_assessment_update",
+        "trg_capacity_reclaim_fence_health_update",
+    } <= triggers
+
+
+def test_capacity_reclaim_lease_blocks_open_jobs_but_allows_terminal_jobs(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    audit = CapacityReclaimAuditStore(db, now=lambda: 5_000)
+    assert audit.reserve(_direct_reclaim_candidate(tmp_path))["reserved"] is True
+
+    con = sqlite3.connect(db)
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state) values('h','upload','queued')"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state) values('h','upload','running')"
+        )
+    con.execute(
+        "insert into torrent_jobs(hash,job_type,state) values('h','upload','done')"
+    )
+    terminal_id = con.execute("select last_insert_rowid()").fetchone()[0]
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "update torrent_jobs set state='verify_pending' where id=?", (terminal_id,)
+        )
+    con.commit()
+    assert con.execute(
+        "select state from torrent_jobs where id=?", (terminal_id,)
+    ).fetchone()[0] == "done"
+    con.close()
+
+
+def test_capacity_reclaim_lease_blocks_active_reservations_but_allows_release(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    audit = CapacityReclaimAuditStore(db, now=lambda: 5_000)
+    assert audit.reserve(_direct_reclaim_candidate(tmp_path))["reserved"] is True
+
+    con = sqlite3.connect(db)
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "insert into resource_reservations(hash,kind,bytes,state) "
+            "values('h','batch',1,'active')"
+        )
+    con.execute(
+        "insert into resource_reservations(hash,kind,bytes,state) "
+        "values('h','batch',1,'released')"
+    )
+    released_id = con.execute("select last_insert_rowid()").fetchone()[0]
+    with pytest.raises(sqlite3.IntegrityError, match="capacity_reclaim_locked"):
+        con.execute(
+            "update resource_reservations set state='active' where id=?",
+            (released_id,),
+        )
+    con.commit()
+    assert con.execute(
+        "select state from resource_reservations where id=?", (released_id,)
+    ).fetchone()[0] == "released"
+    con.close()
+
+
+def test_deleting_lease_fences_assessment_and_health_evidence_updates(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _direct_reclaim_candidate(tmp_path)
+    audit = CapacityReclaimAuditStore(db, now=lambda: 5_000)
+    reservation = audit.reserve(candidate)
+    assert audit.mark_deleting(reservation["reclaim_id"], candidate) is True
+
+    con = sqlite3.connect(db)
+    with pytest.raises(
+        sqlite3.IntegrityError, match="capacity_reclaim_delete_in_progress"
+    ):
+        con.execute(
+            "update capacity_assessment_state set current_generation=5 where id=1"
+        )
+    with pytest.raises(
+        sqlite3.IntegrityError, match="capacity_reclaim_delete_in_progress"
+    ):
+        con.execute("update torrent_health set no_progress_since=101 where hash='h'")
+    con.execute("update capacity_reclaims set state='aborted_paused' where id=?", (
+        reservation["reclaim_id"],
+    ))
+    con.execute("update capacity_assessment_state set current_generation=5 where id=1")
+    con.execute("update torrent_health set no_progress_since=101 where hash='h'")
+    con.commit()
+    assert con.execute(
+        "select current_generation from capacity_assessment_state where id=1"
+    ).fetchone()[0] == 5
+    assert con.execute(
+        "select no_progress_since from torrent_health where hash='h'"
+    ).fetchone()[0] == 101
+    con.close()
+
+
+@pytest.mark.parametrize(
+    ("protection", "expected_reason"),
+    [
+        ("job", "open_job"),
+        ("reservation", "active_reservation"),
+        ("cooldown", "active_cooldown"),
+    ],
+)
+def test_reserve_atomically_rejects_existing_protection_without_creating_lease(
+    tmp_path, protection, expected_reason
+):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    con = sqlite3.connect(db)
+    if protection == "job":
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state) values('h','upload','queued')"
+        )
+    elif protection == "reservation":
+        con.execute(
+            "insert into resource_reservations(hash,kind,bytes,state,expires_at) "
+            "values('h','batch',1,'active',6000)"
+        )
+    else:
+        con.execute(
+            "insert into soak_state(hash,state,cooldown_until,updated_at) "
+            "values('h','soak_cooldown',6000,1)"
+        )
+    con.commit()
+    con.close()
+
+    result = CapacityReclaimAuditStore(db, now=lambda: 5_000).reserve(
+        _direct_reclaim_candidate(tmp_path)
+    )
+
+    assert result == {
+        "reclaim_id": None,
+        "state": None,
+        "capacity_generation": 4,
+        "reserved": False,
+        "reason": expected_reason,
+    }
+    assert _capacity_reclaim_rows(db) == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("assessment_generation", "stale_assessment"),
+        ("health_generation", "stale_health_generation"),
+        ("capacity_viable", "capacity_viable"),
+        ("reclaimable_since", "reclaimable_changed"),
+        ("no_progress_since", "progress_evidence_changed"),
+    ],
+)
+def test_reserve_atomically_revalidates_capacity_evidence(
+    tmp_path, mutation, expected_reason
+):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    con = sqlite3.connect(db)
+    if mutation == "assessment_generation":
+        con.execute(
+            "update capacity_assessment_state set current_generation=5 where id=1"
+        )
+    elif mutation == "health_generation":
+        con.execute("update torrent_health set capacity_generation=5 where hash='h'")
+    elif mutation == "capacity_viable":
+        con.execute("update torrent_health set capacity_viable=1 where hash='h'")
+    elif mutation == "reclaimable_since":
+        con.execute("update torrent_health set reclaimable_since=999 where hash='h'")
+    else:
+        con.execute("update torrent_health set no_progress_since=101 where hash='h'")
+    con.commit()
+    con.close()
+
+    result = CapacityReclaimAuditStore(db, now=lambda: 5_000).reserve(
+        _direct_reclaim_candidate(tmp_path)
+    )
+
+    assert result["reserved"] is False
+    assert result["reason"] == expected_reason
+    assert _capacity_reclaim_rows(db) == []
+
+
+def test_mark_deleting_revalidates_protection_inside_final_transaction(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _direct_reclaim_candidate(tmp_path)
+    audit = CapacityReclaimAuditStore(db, now=lambda: 5_000)
+    reservation = audit.reserve(candidate)
+    con = sqlite3.connect(db)
+    con.execute("drop trigger trg_capacity_reclaim_lock_job_insert")
+    con.execute(
+        "insert into torrent_jobs(hash,job_type,state) values('h','upload','running')"
+    )
+    con.commit()
+    con.close()
+
+    assert audit.mark_deleting(reservation["reclaim_id"], candidate) is False
+    assert _capacity_reclaim_rows(db)[0]["state"] == "stopping"
+
+
+def test_final_deleting_fence_blocks_reviewer_job_probe_before_unlink(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    executor = RecordingExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+    probe_errors = []
+
+    def reviewer_probe_then_delete(path):
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "insert into torrent_jobs(hash,job_type,state) "
+                "values('h','upload','running')"
+            )
+        except sqlite3.IntegrityError as exc:
+            probe_errors.append(str(exc))
+        finally:
+            con.close()
+        reclaimer.__class__._delete_path(path)
+
+    reclaimer._delete_path = reviewer_probe_then_delete
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 1
+    assert probe_errors == ["capacity_reclaim_locked"]
+    assert not payload.exists()
+    con = sqlite3.connect(db)
+    assert con.execute(
+        "select count(*) from torrent_jobs where hash='h' and state='running'"
+    ).fetchone()[0] == 0
+    con.close()

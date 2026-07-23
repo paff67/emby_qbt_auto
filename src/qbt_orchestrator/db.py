@@ -464,6 +464,45 @@ def migration_sql() -> list[str]:
         "alter table capacity_reclaims add column capacity_generation integer",
         "alter table capacity_reclaims add column capacity_reason text",
         "alter table capacity_reclaims add column assessment_json text",
+        "create trigger if not exists trg_capacity_reclaim_lock_job_insert "
+        "before insert on torrent_jobs "
+        "when NEW.hash is not null "
+        "and NEW.state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait') "
+        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and cr.state not in ('released','cancelled')) "
+        "begin select raise(abort,'capacity_reclaim_locked'); end",
+        "create trigger if not exists trg_capacity_reclaim_lock_job_update "
+        "before update of hash,state on torrent_jobs "
+        "when NEW.hash is not null "
+        "and NEW.state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait') "
+        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and cr.state not in ('released','cancelled')) "
+        "begin select raise(abort,'capacity_reclaim_locked'); end",
+        "create trigger if not exists trg_capacity_reclaim_lock_reservation_insert "
+        "before insert on resource_reservations "
+        "when NEW.hash is not null and NEW.state='active' "
+        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and cr.state not in ('released','cancelled')) "
+        "begin select raise(abort,'capacity_reclaim_locked'); end",
+        "create trigger if not exists trg_capacity_reclaim_lock_reservation_update "
+        "before update of hash,state on resource_reservations "
+        "when NEW.hash is not null and NEW.state='active' "
+        "and exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash "
+        "and cr.state not in ('released','cancelled')) "
+        "begin select raise(abort,'capacity_reclaim_locked'); end",
+        "create trigger if not exists trg_capacity_reclaim_fence_assessment_insert "
+        "before insert on capacity_assessment_state "
+        "when exists(select 1 from capacity_reclaims where state='deleting') "
+        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
+        "create trigger if not exists trg_capacity_reclaim_fence_assessment_update "
+        "before update on capacity_assessment_state "
+        "when exists(select 1 from capacity_reclaims where state='deleting') "
+        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
+        "create trigger if not exists trg_capacity_reclaim_fence_health_update "
+        "before update of capacity_generation,capacity_viable,reclaimable_since,no_progress_since "
+        "on torrent_health "
+        "when exists(select 1 from capacity_reclaims cr where cr.hash=NEW.hash and cr.state='deleting') "
+        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "insert or ignore into schema_migrations(version,name,applied_at) values(15,'shared_capacity_assessment_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(3,'resource_ledger_v2',strftime('%s','now'))",

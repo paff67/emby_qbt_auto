@@ -22,6 +22,146 @@ def _rows(db: Path, sql: str):
     return rows
 
 
+def _seed_reclaim_lease(db: Path, torrent_hash: str, state: str = "aborted_paused"):
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,created_at,updated_at"
+        ") values(?,?,?,?,?,?,?,?,?)",
+        (
+            f"{torrent_hash}:1",
+            torrent_hash,
+            torrent_hash,
+            "mag" + f"net:?xt=urn:btih:{torrent_hash}",
+            f"/tmp/{torrent_hash}",
+            f"/downloads/incomplete/{torrent_hash}",
+            state,
+            1,
+            1,
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+@pytest.mark.parametrize(
+    ("forced", "intent"),
+    [
+        pytest.param(set(), None, id="ordinary"),
+        pytest.param({"h"}, None, id="caller-forced"),
+        pytest.param(set(), "protect_batch", id="protect-batch"),
+        pytest.param(set(), "probe", id="generic-probe"),
+        pytest.param(set(), "availability_probe", id="availability-probe"),
+    ],
+)
+def test_planner_reclaim_lease_beats_every_forced_start_path(
+    tmp_path, forced, intent
+):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from qbt_orchestrator.scheduler_intents import (
+        SchedulerIntent,
+        SchedulerIntentRepository,
+    )
+    from tests.fakes import FakeExecutor
+    from tests.test_capacity_assessment import nonviable_assessment
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _seed_reclaim_lease(db, "h", "reclaimed")
+    if intent is not None:
+        SchedulerIntentRepository(db).upsert(
+            SchedulerIntent(
+                "batch" if intent == "protect_batch" else "soak",
+                "h",
+                intent,
+                50,
+                30_100,
+                {},
+            )
+        )
+    executor = FakeExecutor()
+    planner = DownloadPlanner(
+        db,
+        executor,
+        dry_run=False,
+        active_slots=1,
+        disk_floor_bytes=0,
+        now=lambda: 30_000,
+    )
+
+    result = planner.plan_and_apply(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "state": "stoppedDL",
+                "amount_left": 100,
+                "size": 200,
+            }
+        },
+        free_bytes=10_000,
+        sync_healthy=True,
+        forced_active_hashes=forced,
+        allowed_active_hashes=set(),
+        capacity_assessment=nonviable_assessment(
+            observed_at=30_000,
+            no_progress_since=1_000,
+        ).with_generation(7),
+    )
+
+    assert result.selected_hashes == []
+    assert all(path != "/api/v2/torrents/start" for path, _ in executor.posts)
+    assert _rows(
+        db,
+        "select reason_code from decision_log where hash='h' order by id desc limit 1",
+    ) == [{"reason_code": "capacity_reclaim_locked"}]
+
+
+def test_planner_stops_running_reclaim_lease_even_when_batch_forced(tmp_path):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from qbt_orchestrator.scheduler_intents import (
+        SchedulerIntent,
+        SchedulerIntentRepository,
+    )
+    from tests.fakes import FakeExecutor
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _seed_reclaim_lease(db, "h")
+    SchedulerIntentRepository(db).upsert(
+        SchedulerIntent("batch", "h", "protect_batch", 50, 30_100, {})
+    )
+    executor = FakeExecutor()
+    planner = DownloadPlanner(
+        db,
+        executor,
+        dry_run=False,
+        active_slots=1,
+        disk_floor_bytes=0,
+        now=lambda: 30_000,
+    )
+
+    result = planner.plan_and_apply(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "state": "downloading",
+                "amount_left": 100,
+                "size": 200,
+            }
+        },
+        free_bytes=10_000,
+        sync_healthy=True,
+    )
+
+    assert result.selected_hashes == []
+    assert result.paused_hashes == ["h"]
+    assert ("/api/v2/torrents/stop", {"hashes": "h"}) in executor.posts
+
+
 @pytest.mark.parametrize(
     ("forced", "intent", "allowed", "selected", "expected_reason"),
     [

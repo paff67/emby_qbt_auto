@@ -32,6 +32,20 @@ OPEN_JOB_STATES = (
     "promotion_wait",
     "cleanup_wait",
 )
+RECLAIM_RELEASE_STATES = frozenset({"released", "cancelled"})
+RECLAIM_LOCKED_STATES = frozenset(
+    {
+        "stopping",
+        "deleting",
+        "deleted",
+        "recheck_pending",
+        "partial_or_unknown",
+        "aborted_paused",
+        "stop_unknown",
+        "reclaimed",
+        "failed",
+    }
+)
 MAGNET_PREFIX = "mag" + "net:?"
 PROGRESS_EPSILON = 1e-9
 CONTENT_SIZE_FIELDS = ("size", "total_size", "wanted_size")
@@ -54,6 +68,24 @@ def _completed_bytes(item: Mapping[str, Any]) -> int | None:
         if field in item and item[field] is not None:
             return _nonnegative_integer(item[field])
     return None
+
+
+def capacity_reclaim_locked_hashes(state_db: str | Path) -> set[str]:
+    """Return hashes held by a durable reclaim lease.
+
+    Unknown states deliberately remain locked.  Only an explicit future human
+    confirmation transition to ``released`` or ``cancelled`` lifts the lease.
+    """
+
+    con = readonly_connect(state_db)
+    try:
+        rows = con.execute(
+            "select distinct hash from capacity_reclaims "
+            "where state not in ('released','cancelled')"
+        ).fetchall()
+        return {str(row["hash"]) for row in rows if str(row["hash"] or "")}
+    finally:
+        con.close()
 
 
 class CapacityReclaimAuditStore:
@@ -165,17 +197,115 @@ class CapacityReclaimAuditStore:
         )
         return notification_ids
 
+    @staticmethod
+    def _reservation_rejected(
+        generation: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        return {
+            "reclaim_id": None,
+            "state": None,
+            "capacity_generation": int(generation),
+            "reserved": False,
+            "reason": str(reason),
+        }
+
+    def _eligibility_reason(
+        self,
+        con,
+        candidate: Mapping[str, Any],
+    ) -> str | None:
+        torrent_hash = str(candidate.get("hash") or "").strip()
+        generation = int(candidate.get("capacity_generation") or 0)
+        assessment = con.execute(
+            "select current_generation from capacity_assessment_state where id=1"
+        ).fetchone()
+        if assessment is None or int(assessment["current_generation"]) != generation:
+            return "stale_assessment"
+        health = con.execute(
+            "select capacity_generation,capacity_viable,reclaimable_since,no_progress_since "
+            "from torrent_health where hash=?",
+            (torrent_hash,),
+        ).fetchone()
+        if health is None:
+            return "health_missing"
+        if int(health["capacity_generation"] or 0) != generation:
+            return "stale_health_generation"
+        if health["capacity_viable"] is None or int(health["capacity_viable"]) != 0:
+            return "capacity_viable"
+        reclaimable_since = candidate.get("reclaimable_since")
+        if (
+            reclaimable_since is None
+            or health["reclaimable_since"] is None
+            or int(health["reclaimable_since"]) != int(reclaimable_since)
+        ):
+            return "reclaimable_changed"
+        no_progress_since = candidate.get("no_progress_since")
+        if (
+            no_progress_since is None
+            or health["no_progress_since"] is None
+            or int(health["no_progress_since"]) != int(no_progress_since)
+        ):
+            return "progress_evidence_changed"
+        placeholders = ",".join("?" for _ in OPEN_JOB_STATES)
+        if con.execute(
+            f"select 1 from torrent_jobs where hash=? and state in ({placeholders}) limit 1",
+            (torrent_hash, *OPEN_JOB_STATES),
+        ).fetchone() is not None:
+            return "open_job"
+        now = int(self.now())
+        if con.execute(
+            "select 1 from resource_reservations where hash=? and state='active' "
+            "and (expires_at is null or expires_at>?) limit 1",
+            (torrent_hash, now),
+        ).fetchone() is not None:
+            return "active_reservation"
+        if con.execute(
+            "select 1 from soak_state where hash=? and cooldown_until is not null "
+            "and cooldown_until>? limit 1",
+            (torrent_hash, now),
+        ).fetchone() is not None:
+            return "active_cooldown"
+        return None
+
     def reserve(self, candidate: Mapping[str, Any]) -> dict[str, Any]:
         identity = self._identity(candidate)
         now = int(self.now())
 
         def txn(con) -> dict[str, Any]:
-            inserted = con.execute(
+            if not con.in_transaction:
+                con.execute("begin immediate")
+            existing = con.execute(
+                "select id,state,capacity_generation from capacity_reclaims where reclaim_key=?",
+                (identity["reclaim_key"],),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "reclaim_id": int(existing["id"]),
+                    "state": str(existing["state"]),
+                    "capacity_generation": int(existing["capacity_generation"] or 0),
+                    "reserved": False,
+                    "reason": "reclaim_already_recorded",
+                }
+            locked = con.execute(
+                "select 1 from capacity_reclaims where hash=? "
+                "and state not in ('released','cancelled') limit 1",
+                (identity["hash"],),
+            ).fetchone()
+            if locked is not None:
+                return self._reservation_rejected(
+                    identity["capacity_generation"], "capacity_reclaim_locked"
+                )
+            reason = self._eligibility_reason(con, candidate)
+            if reason is not None:
+                return self._reservation_rejected(
+                    identity["capacity_generation"], reason
+                )
+            con.execute(
                 "insert into capacity_reclaims(reclaim_key,hash,name,magnet_uri,host_path,content_path,"
                 "allocated_bytes,completed_bytes,progress,dead_since,reclaimable_since,capacity_generation,"
                 "capacity_reason,assessment_json,state,recheck_state,created_at,updated_at) "
-                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'stopping','not_requested',?,?) "
-                "on conflict(reclaim_key) do nothing",
+                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'stopping','not_requested',?,?)",
                 (
                     identity["reclaim_key"],
                     identity["hash"],
@@ -204,7 +334,8 @@ class CapacityReclaimAuditStore:
                 "reclaim_id": int(row["id"]),
                 "state": str(row["state"]),
                 "capacity_generation": int(row["capacity_generation"] or 0),
-                "reserved": int(inserted.rowcount or 0) == 1,
+                "reserved": True,
+                "reason": None,
             }
 
         return dict(write_transaction(self.state_db, txn))
@@ -314,18 +445,45 @@ class CapacityReclaimAuditStore:
             error=error,
         )
 
-    def mark_deleting(self, reclaim_id: int, generation: int) -> bool:
+    def mark_deleting(
+        self,
+        reclaim_id: int,
+        candidate: Mapping[str, Any],
+    ) -> bool:
+        identity = self._identity(candidate)
         now = int(self.now())
-        changed = write_transaction(
-            self.state_db,
-            lambda con: con.execute(
+        generation = int(identity["capacity_generation"])
+
+        def txn(con) -> bool:
+            if not con.in_transaction:
+                con.execute("begin immediate")
+            row = con.execute(
+                "select id from capacity_reclaims where id=? and reclaim_key=? and hash=? "
+                "and capacity_generation=? and state='stopping'",
+                (
+                    int(reclaim_id),
+                    identity["reclaim_key"],
+                    identity["hash"],
+                    generation,
+                ),
+            ).fetchone()
+            if row is None or self._eligibility_reason(con, candidate) is not None:
+                return False
+            changed = con.execute(
                 "update capacity_reclaims set state='deleting',recheck_state='pending',"
                 "recheck_error=null,updated_at=? where id=? and capacity_generation=? "
-                "and state='stopping'",
-                (now, int(reclaim_id), int(generation)),
-            ).rowcount,
-        )
-        return int(changed or 0) == 1
+                "and reclaim_key=? and hash=? and state='stopping'",
+                (
+                    now,
+                    int(reclaim_id),
+                    generation,
+                    identity["reclaim_key"],
+                    identity["hash"],
+                ),
+            )
+            return int(changed.rowcount or 0) == 1
+
+        return bool(write_transaction(self.state_db, txn))
 
     def mark_deleted(self, reclaim_id: int, generation: int) -> bool:
         now = int(self.now())
@@ -835,7 +993,7 @@ class DeadPartialReclaimer:
                 errors.append(f"{torrent_hash}: failed to reserve reclaim: {exc}")
                 continue
             if not reservation["reserved"]:
-                reject("reclaim_already_recorded")
+                reject(str(reservation.get("reason") or "reservation_failed"))
                 continue
             reclaim_id = int(reservation["reclaim_id"])
 
@@ -936,7 +1094,7 @@ class DeadPartialReclaimer:
                 abort_paused(reason)
                 continue
             try:
-                deleting = self.audit.mark_deleting(int(reclaim_id), generation)
+                deleting = self.audit.mark_deleting(int(reclaim_id), candidate)
             except Exception as exc:
                 errors.append(
                     f"{torrent_hash}: failed to persist deleting state: {exc}"
