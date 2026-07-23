@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .capacity_assessment import CapacityAssessment
 from .db import readonly_connect, write_transaction
 from .observability import redact
 
@@ -211,6 +212,50 @@ def build_capacity_observation(
     )
 
 
+def build_capacity_observation_from_assessment(
+    assessment: CapacityAssessment,
+) -> CapacityObservation:
+    """Derive aggregate observation data from already-recorded viability evidence."""
+
+    candidates = [
+        {
+            "hash": item.hash,
+            "required_growth_bytes": max(0, int(item.amount_left)),
+            "viable": bool(item.viable),
+            "viability_reason": str(item.viability_reason),
+        }
+        for item in assessment.torrents.values()
+        if item.managed and item.incomplete
+    ]
+    candidates.sort(key=lambda item: (item["required_growth_bytes"], item["hash"]))
+
+    budget = max(0, int(assessment.available_growth_bytes))
+    selected = {str(item) for item in assessment.selected_hashes}
+    feasible = sum(
+        1
+        for candidate in candidates
+        if candidate["viable"]
+        and (
+            candidate["hash"] in selected
+            or candidate["required_growth_bytes"] <= budget
+        )
+    )
+    viable_finish = sum(1 for candidate in candidates if candidate["viable"])
+    return CapacityObservation(
+        managed_incomplete=len(candidates),
+        viable_finish=viable_finish,
+        nonviable_finish=len(candidates) - viable_finish,
+        feasible_full_finish=feasible,
+        disk_releasing_jobs=max(0, int(assessment.disk_releasing_jobs)),
+        required_minimum_growth_bytes=(
+            candidates[0]["required_growth_bytes"] if candidates else 0
+        ),
+        available_growth_bytes=budget,
+        free_bytes=max(0, int(assessment.free_bytes)),
+        top_manual_candidates=tuple(dict(item) for item in candidates[:3]),
+    )
+
+
 @dataclass(frozen=True)
 class CapacityTransition:
     scheduler_mode: str
@@ -221,6 +266,7 @@ class CapacityTransition:
     details: dict[str, Any]
     transitioned: bool
     previous_state: str | None
+    assessment_generation: int = 0
 
 
 class CapacityStateStore:
@@ -244,6 +290,8 @@ class CapacityStateStore:
         scheduler_mode: str,
         result: CapacityResult,
         details: Mapping[str, Any] | None = None,
+        *,
+        assessment_generation: int = 0,
     ) -> CapacityTransition:
         mode = str(scheduler_mode)
         if mode not in SCHEDULER_MODES:
@@ -258,12 +306,21 @@ class CapacityStateStore:
             transitioned = previous_state != str(result.state)
             entered_at = now if transitioned or previous is None else int(previous["entered_at"])
             con.execute(
-                "insert into capacity_state(id,scheduler_mode,state,entered_at,last_evaluated_at,reason,details_json) "
-                "values(1,?,?,?,?,?,?) "
+                "insert into capacity_state(id,scheduler_mode,state,entered_at,last_evaluated_at,reason,details_json,assessment_generation) "
+                "values(1,?,?,?,?,?,?,?) "
                 "on conflict(id) do update set scheduler_mode=excluded.scheduler_mode,state=excluded.state,"
                 "entered_at=excluded.entered_at,last_evaluated_at=excluded.last_evaluated_at,"
-                "reason=excluded.reason,details_json=excluded.details_json",
-                (mode, str(result.state), entered_at, now, str(result.reason), payload),
+                "reason=excluded.reason,details_json=excluded.details_json,"
+                "assessment_generation=excluded.assessment_generation",
+                (
+                    mode,
+                    str(result.state),
+                    entered_at,
+                    now,
+                    str(result.reason),
+                    payload,
+                    int(assessment_generation),
+                ),
             )
             return CapacityTransition(
                 scheduler_mode=mode,
@@ -274,6 +331,7 @@ class CapacityStateStore:
                 details=safe_details,
                 transitioned=transitioned,
                 previous_state=previous_state,
+                assessment_generation=int(assessment_generation),
             )
 
         return write_transaction(self.state_db, txn)

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .budget import future_growth_by_hash, resource_claims_from_rows
+from .capacity_assessment import CapacityAssessment
 from .db import readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
 from .models import LifecycleState
@@ -154,6 +155,7 @@ class DownloadPlanner:
         cooldown_hashes: set[str] | None = None,
         external_reserved_bytes: int = 0,
         allowed_active_hashes: set[str] | None = None,
+        capacity_assessment: CapacityAssessment | None = None,
     ) -> PlannerResult:
         if self._pending_persistence is not None:
             raise RuntimeError("planner persistence batch is already active")
@@ -168,6 +170,7 @@ class DownloadPlanner:
                 cooldown_hashes=cooldown_hashes,
                 external_reserved_bytes=external_reserved_bytes,
                 allowed_active_hashes=allowed_active_hashes,
+                capacity_assessment=capacity_assessment,
             )
         finally:
             self._pending_persistence = None
@@ -182,6 +185,7 @@ class DownloadPlanner:
         cooldown_hashes: set[str] | None = None,
         external_reserved_bytes: int = 0,
         allowed_active_hashes: set[str] | None = None,
+        capacity_assessment: CapacityAssessment | None = None,
     ) -> PlannerResult:
         protected_running_hashes = {str(h) for h in (protected_running_hashes or set())}
         forced_active_hashes = {str(h) for h in (forced_active_hashes or set())}
@@ -266,6 +270,7 @@ class DownloadPlanner:
             protected_running_hashes=protected_running_hashes,
             forced_active_hashes=forced_active_hashes,
             allowed_active_hashes=allowed_active_hashes,
+            capacity_assessment=capacity_assessment,
         )
         selected: list[dict[str, Any]] = []
         used = 0
@@ -397,6 +402,7 @@ class DownloadPlanner:
         protected_running_hashes: set[str],
         forced_active_hashes: set[str],
         allowed_active_hashes: set[str] | None,
+        capacity_assessment: CapacityAssessment | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         candidates: list[dict[str, Any]] = []
         skipped: dict[str, str] = {}
@@ -410,6 +416,18 @@ class DownloadPlanner:
                 continue
             if h in protected_running_hashes and h not in forced_active_hashes:
                 skipped[h] = "protected_running"
+                continue
+            evidence = (
+                None
+                if capacity_assessment is None
+                else capacity_assessment.torrents.get(h)
+            )
+            if (
+                evidence is not None
+                and not evidence.viable
+                and h not in forced_active_hashes
+            ):
+                skipped[h] = "capacity_nonviable"
                 continue
             if mode == "recovery" and amount_left > int(self.recovery_max_remaining_bytes):
                 skipped[h] = "recovery_remaining_too_large"

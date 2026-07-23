@@ -20,6 +20,105 @@ def _rows(db: Path, sql: str):
     return rows
 
 
+def test_planner_skips_assessment_nonviable_torrent(tmp_path):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from tests.fakes import FakeExecutor
+    from tests.test_capacity_assessment import nonviable_assessment
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    executor = FakeExecutor()
+    planner = DownloadPlanner(
+        state_db=db,
+        executor=executor,
+        dry_run=False,
+        active_slots=1,
+        disk_floor_bytes=0,
+        now=lambda: 30_000,
+    )
+    assessment = nonviable_assessment(
+        observed_at=30_000,
+        no_progress_since=1_000,
+    ).with_generation(7)
+
+    result = planner.plan_and_apply(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "state": "stoppedDL",
+                "amount_left": 100,
+                "size": 200,
+            }
+        },
+        free_bytes=10_000,
+        sync_healthy=True,
+        capacity_assessment=assessment,
+    )
+
+    assert "h" not in result.selected_hashes
+    assert executor.posts == []
+    assert _rows(
+        db,
+        "select reason_code from decision_log where hash='h' order by id desc limit 1",
+    ) == [{"reason_code": "capacity_nonviable"}]
+
+
+def test_planner_allows_assessment_nonviable_availability_probe(tmp_path):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from qbt_orchestrator.scheduler_intents import (
+        SchedulerIntent,
+        SchedulerIntentRepository,
+    )
+    from tests.fakes import FakeExecutor
+    from tests.test_capacity_assessment import nonviable_assessment
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    SchedulerIntentRepository(db).upsert(
+        SchedulerIntent(
+            "soak",
+            "h",
+            "availability_probe",
+            30,
+            30_100,
+            {"exposure_bytes": 100},
+        )
+    )
+    executor = FakeExecutor()
+    planner = DownloadPlanner(
+        state_db=db,
+        executor=executor,
+        dry_run=False,
+        active_slots=1,
+        disk_floor_bytes=0,
+        now=lambda: 30_000,
+    )
+
+    result = planner.plan_and_apply(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "state": "stoppedDL",
+                "amount_left": 100,
+                "size": 200,
+            }
+        },
+        free_bytes=10_000,
+        sync_healthy=True,
+        capacity_assessment=nonviable_assessment(
+            observed_at=30_000,
+            no_progress_since=1_000,
+        ).with_generation(7),
+    )
+
+    assert result.selected_hashes == ["h"]
+    assert ("/api/v2/torrents/start", {"hashes": "h"}) in executor.posts
+
+
 def test_planner_consumes_active_intents_and_owns_one_plan_generation():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner

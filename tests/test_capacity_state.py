@@ -146,6 +146,59 @@ def test_capacity_observation_does_not_count_stale_unavailable_finish_as_feasibl
     assert observation.nonviable_finish == 1
 
 
+def test_capacity_observation_from_assessment_uses_recorded_viability():
+    from qbt_orchestrator.capacity_assessment import (
+        CapacityAssessment,
+        TorrentCapacityEvidence,
+    )
+    from qbt_orchestrator.capacity_state import (
+        build_capacity_observation_from_assessment,
+    )
+
+    evidence = TorrentCapacityEvidence(
+        hash="h",
+        managed=True,
+        incomplete=True,
+        amount_left=40,
+        completed_bytes=60,
+        availability=1.0,
+        complete_sources=1,
+        no_progress_since=None,
+        viable=False,
+        viability_reason="assessment_override",
+    )
+    assessment = CapacityAssessment(
+        generation=9,
+        observed_at=50,
+        scheduler_mode="drain",
+        free_bytes=70,
+        target_free_bytes=100,
+        available_growth_bytes=50,
+        selected_hashes=frozenset({"h"}),
+        disk_releasing_jobs=2,
+        torrents={"h": evidence},
+    )
+
+    observation = build_capacity_observation_from_assessment(assessment)
+
+    assert observation.managed_incomplete == 1
+    assert observation.viable_finish == 0
+    assert observation.nonviable_finish == 1
+    assert observation.feasible_full_finish == 0
+    assert observation.disk_releasing_jobs == 2
+    assert observation.required_minimum_growth_bytes == 40
+    assert observation.available_growth_bytes == 50
+    assert observation.free_bytes == 70
+    assert observation.top_manual_candidates == (
+        {
+            "hash": "h",
+            "required_growth_bytes": 40,
+            "viable": False,
+            "viability_reason": "assessment_override",
+        },
+    )
+
+
 def test_capacity_deadlock_can_be_detected_under_pressure_before_drain_entry():
     from qbt_orchestrator.capacity_state import detect_capacity_state
 
@@ -200,6 +253,32 @@ def test_capacity_state_store_preserves_entered_at_until_real_transition():
         assert row["entered_at"] == 120
         assert row["last_evaluated_at"] == 120
         assert json.loads(row["details_json"]) == {"managed_incomplete": 2}
+
+
+def test_capacity_state_persists_assessment_generation(tmp_path):
+    from qbt_orchestrator.capacity_state import CapacityResult, CapacityStateStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    store = CapacityStateStore(db, now=lambda: 50)
+
+    transition = store.persist(
+        "drain",
+        CapacityResult("capacity_deadlock", "none"),
+        {},
+        assessment_generation=9,
+    )
+
+    assert transition.assessment_generation == 9
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute(
+            "select assessment_generation from capacity_state where id=1"
+        ).fetchone()
+    finally:
+        con.close()
+    assert row == (9,)
 
 
 def test_capacity_deadlock_alert_is_episode_deduplicated_and_contains_no_actions():
