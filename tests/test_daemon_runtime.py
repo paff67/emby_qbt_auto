@@ -955,7 +955,7 @@ def test_capacity_recovery_preflight_dry_run_without_pending_rows_skips_live_rec
     assert daemon._capacity_recovery_preflight_done is True
 
 
-def test_daemon_startup_samples_sync_before_recovery_preflight_and_workers(tmp_path):
+def test_daemon_startup_recovery_failure_precedes_safety_and_workers(tmp_path):
     from qbt_orchestrator.service import DaemonRuntime
 
     class FailingRecovery:
@@ -974,11 +974,12 @@ def test_daemon_startup_samples_sync_before_recovery_preflight_and_workers(tmp_p
             raise RuntimeError("startup recovery failed")
 
     qbt = FakeQbt()
+    executor = FakeExecutor()
     daemon = DaemonRuntime(
         state_db=tmp_path / "state.sqlite",
         qbt=qbt,
-        executor=FakeExecutor(),
-        free_bytes_provider=lambda: 6 * 1024**3,
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
         dry_run=False,
         planner_dry_run=False,
         capacity_reclaimer=FailingRecovery(),
@@ -999,7 +1000,8 @@ def test_daemon_startup_samples_sync_before_recovery_preflight_and_workers(tmp_p
     with pytest.raises(RuntimeError, match="startup recovery failed"):
         daemon.run(max_safety_ticks=1)
 
-    assert qbt.rids == [0]
+    assert qbt.rids == []
+    assert executor.posts == []
     assert daemon._event_worker_threads == []
     assert daemon._periodic_workers == []
     con = sqlite3.connect(daemon.state_db)
@@ -1012,6 +1014,140 @@ def test_daemon_startup_samples_sync_before_recovery_preflight_and_workers(tmp_p
     con.close()
     assert event["rounds"] == 1
     assert event["errors"] == ["startup recovery failed"]
+
+
+def test_daemon_startup_recovery_precedes_emergency_qbt_post(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator.service import DaemonRuntime
+
+    order = []
+
+    class ActiveQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "active": {
+                        "hash": "active",
+                        "name": "active",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "downloading",
+                        "amount_left": 100,
+                        "size": 200,
+                    }
+                },
+                "server_state": {},
+            }
+
+    class OrderedExecutor(FakeExecutor):
+        def qbt_post(self, path, payload):
+            order.append(("qbt_post", path))
+            super().qbt_post(path, payload)
+
+    class SuccessfulRecovery:
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            assert snapshots == {}
+            assert assessment is None
+            assert capacity_state == "recovery_preflight"
+            assert free_bytes == 1024**3
+            order.append(("recovery_preflight", target_free_bytes))
+            con = sqlite3.connect(db)
+            con.execute(
+                "update capacity_reclaims set state='aborted_paused' "
+                "where state='stopping'"
+            )
+            con.commit()
+            con.close()
+            return CapacityReclaimResult(dry_run=False)
+
+    db = tmp_path / "state.sqlite"
+    executor = OrderedExecutor()
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=ActiveQbt(),
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_recovery_reclaimer=SuccessfulRecovery(),
+        loop_tasks=[],
+        safety_interval=0,
+    )
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    assert daemon.run(max_safety_ticks=1) == 1
+
+    assert order == [
+        ("recovery_preflight", daemon.drain_exit_bytes),
+        ("qbt_post", "/api/v2/torrents/stop"),
+    ]
+    assert executor.posts == [
+        ("/api/v2/torrents/stop", {"hashes": "active"})
+    ]
+
+
+def test_daemon_startup_dry_run_pending_recovery_fails_before_safety(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class ForbiddenRecovery:
+        called = False
+
+        def run(self, *_args, **_kwargs):
+            self.called = True
+            raise AssertionError("dry-run startup must not invoke live recovery")
+
+    qbt = FakeQbt()
+    executor = FakeExecutor()
+    recovery = ForbiddenRecovery()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=True,
+        capacity_recovery_reclaimer=recovery,
+        background_event_workers=True,
+        background_periodic_workers=True,
+    )
+    con = sqlite3.connect(daemon.state_db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="dry-run requires live recovery"):
+        daemon.run(max_safety_ticks=1)
+
+    assert recovery.called is False
+    assert qbt.rids == []
+    assert executor.posts == []
+    assert daemon._event_worker_threads == []
+    assert daemon._periodic_workers == []
 
 
 def test_runtime_calls_real_dead_partial_reclaimer_with_committed_assessment(

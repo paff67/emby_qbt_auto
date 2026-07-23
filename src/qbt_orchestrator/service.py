@@ -1733,6 +1733,14 @@ class DaemonRuntime:
                 self._effective_config_snapshot(),
             )
             self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
+            self._capacity_recovery_preflight(
+                {
+                    h: vars(snapshot)
+                    for h, snapshot in self.monitor.sync.snapshots.items()
+                },
+                free_bytes=None,
+                allow_live_recovery=True,
+            )
             try:
                 self.tick_safety()
                 startup_safety_sampled = True
@@ -1744,16 +1752,6 @@ class DaemonRuntime:
                     str(redact(str(exc))),
                     {"dry_run": self.dry_run, "startup": True},
                 )
-            self._capacity_recovery_preflight(
-                {
-                    h: vars(snapshot)
-                    for h, snapshot in self.monitor.sync.snapshots.items()
-                },
-                free_bytes=None,
-                allow_live_recovery=bool(
-                    self.monitor.sync.high_risk_actions_allowed
-                ),
-            )
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.start()
             self._start_background_event_workers()
