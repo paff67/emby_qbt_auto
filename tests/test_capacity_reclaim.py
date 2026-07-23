@@ -2431,7 +2431,7 @@ def test_stop_confirmation_uses_real_deadline_and_max_poll_count(tmp_path):
     _assert_capacity_reclaim_aborted_paused(db, "stop_timeout")
 
 
-def test_final_inventory_receives_configured_request_timeout(tmp_path):
+def test_pre_stop_and_post_quarantine_inventories_receive_request_timeout(tmp_path):
     from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
     from qbt_orchestrator.db import migrate
 
@@ -2467,7 +2467,72 @@ def test_final_inventory_receives_configured_request_timeout(tmp_path):
     )
 
     assert result.reclaimed == 1
-    assert executor.inventory_timeouts == [0.03]
+    assert executor.inventory_timeouts == [0.03, 0.03]
+
+
+def test_post_quarantine_qbt_authorization_calls_are_deadline_capable(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+
+    class TimedFinalExecutor(RecordingExecutor):
+        def __init__(self):
+            super().__init__({"h": candidate})
+            self.after_quarantine = False
+            self.final_calls = []
+
+        def torrent_info(self, torrent_hash, timeout=None):
+            if self.after_quarantine:
+                self.final_calls.append(("torrent_info", timeout))
+            return super().torrent_info(torrent_hash, timeout=timeout)
+
+        def get_maindata(self, rid, timeout=None):
+            if self.after_quarantine:
+                self.final_calls.append(("get_maindata", timeout))
+            return super().get_maindata(rid, timeout=timeout)
+
+        def torrent_files(self, torrent_hash, timeout=None):
+            if self.after_quarantine:
+                self.final_calls.append(("torrent_files", timeout))
+            return super().torrent_files(torrent_hash, timeout=timeout)
+
+    executor = TimedFinalExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, disk_free_bytes=lambda _path: 0,
+        min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        inventory_timeout_sec=0.03, now=lambda: 5_000,
+    )
+    original_mark_quarantined = reclaimer.audit.mark_quarantined
+
+    def mark_then_observe(*args, **kwargs):
+        changed = original_mark_quarantined(*args, **kwargs)
+        executor.after_quarantine = True
+        return changed
+
+    reclaimer.audit.mark_quarantined = mark_then_observe
+
+    result = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(),
+        capacity_state="capacity_deadlock", free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 1
+    assert executor.final_calls == [
+        ("torrent_info", 0.03),
+        ("get_maindata", 0.03),
+        ("torrent_files", 0.03),
+    ]
 
 
 def test_post_stop_progress_abort_is_persisted_and_idempotent(tmp_path):
@@ -4534,3 +4599,181 @@ def test_fresh_inventory_fails_closed_for_unresolved_managed_other_path(tmp_path
 
     assert result.rejection_counts["path_inventory_failed"] == 1
     assert (payload / "part").exists()
+
+
+FINAL_QBT_MUTATIONS = [
+    ({"tags": "auto,hold"}, "protected_tag"),
+    ({"category": "", "tags": "manual"}, "not_managed"),
+    ({"state": "downloading"}, "torrent_not_stopped"),
+    ({"state": "forcedDL"}, "torrent_not_stopped"),
+    ({"availability": 1.0}, "complete_source"),
+    ({"num_seeds": 1}, "complete_source"),
+    ({"completed_bytes": 101}, "progress_evidence_changed"),
+    ({"progress": 0.1}, "progress_evidence_changed"),
+    ({"amount_left": 899}, "content_selection_changed"),
+]
+
+
+@pytest.mark.parametrize(("mutation", "expected_reason"), FINAL_QBT_MUTATIONS)
+def test_live_final_qbt_authorization_restores_quarantine_on_viability_change(
+    tmp_path, mutation, expected_reason
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    marker = payload / "part"
+    marker.write_bytes(b"keep" * 1024)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    executor = RecordingExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, disk_free_bytes=lambda _path: 0,
+        min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+    original_mark_quarantined = reclaimer.audit.mark_quarantined
+
+    def mark_then_mutate(*args, **kwargs):
+        changed = original_mark_quarantined(*args, **kwargs)
+        assert changed is True
+        executor.info["h"].update(mutation)
+        return changed
+
+    reclaimer.audit.mark_quarantined = mark_then_mutate
+    delete_calls = []
+    reclaimer._delete_quarantine_path = lambda *_args: delete_calls.append(_args)
+
+    result = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(),
+        capacity_state="capacity_deadlock", free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert result.reclaimed == 0
+    assert result.rejection_counts[expected_reason] == 1
+    assert row["state"] in {"aborted_paused", "partial_or_unknown"}
+    assert row["state"] != "reclaimed"
+    assert marker.read_bytes() == b"keep" * 1024
+    assert delete_calls == []
+
+
+def _seed_same_generation_quarantined_reclaim(tmp_path, executor):
+    from qbt_orchestrator.capacity_reclaim import (
+        CapacityReclaimAuditStore,
+        DeadPartialReclaimer,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    marker = payload / "part"
+    marker.write_bytes(b"keep")
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, disk_free_bytes=lambda _path: 0,
+        notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+    identity = reclaimer._capture_payload_identity(payload)
+    selection = [{"index": 0, "size": 1, "priority": 1}]
+    candidate = {
+        **_direct_reclaim_candidate(tmp_path),
+        "filesystem_dev": identity.dev,
+        "filesystem_ino": identity.ino,
+        "file_selection_fingerprint": reclaimer._file_selection_fingerprint(
+            selection
+        ),
+        "assessment_json": json.dumps(
+            {
+                "torrent": {"no_progress_since": 100},
+                "live_baseline": {
+                    "amount_left": 900,
+                    "completed_bytes": 100,
+                    "progress": 0.0,
+                },
+            },
+            sort_keys=True,
+        ),
+    }
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: 4_999,
+    )
+    reservation = audit.reserve(candidate)
+    reclaim_id = int(reservation["reclaim_id"])
+    assert audit.mark_deleting(reclaim_id, candidate) is True
+    quarantine_path = reclaimer._quarantine_destination(reclaim_id)
+    reclaimer._rename_to_quarantine(payload, quarantine_path, identity)
+    assert audit.mark_quarantined(
+        reclaim_id, 4, quarantine_path, identity.dev, identity.ino
+    ) is True
+    return reclaimer, db, marker, quarantine_path
+
+
+@pytest.mark.parametrize(("mutation", "expected_reason"), FINAL_QBT_MUTATIONS)
+def test_restart_final_qbt_authorization_restores_on_viability_change(
+    tmp_path, mutation, expected_reason
+):
+    stopped = {
+        **_snapshot("h", content_path="/downloads/incomplete/h")["h"],
+        "state": "stoppedDL",
+    }
+    executor = RecordingExecutor({"h": stopped})
+    reclaimer, db, marker, quarantine_path = (
+        _seed_same_generation_quarantined_reclaim(tmp_path, executor)
+    )
+    executor.info["h"].update(mutation)
+    delete_calls = []
+    reclaimer._delete_quarantine_path = lambda *_args: delete_calls.append(_args)
+
+    reclaimer.run(
+        {}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["state"] in {"aborted_paused", "partial_or_unknown"}
+    assert row["recheck_error"] == expected_reason
+    assert marker.read_bytes() == b"keep"
+    assert not quarantine_path.exists()
+    assert delete_calls == []
+
+
+def test_missing_assessment_restores_same_generation_quarantine_for_confirmation(
+    tmp_path,
+):
+    stopped = {
+        **_snapshot("h", content_path="/downloads/incomplete/h")["h"],
+        "state": "stoppedDL",
+    }
+    executor = RecordingExecutor({"h": stopped})
+    reclaimer, db, marker, quarantine_path = (
+        _seed_same_generation_quarantined_reclaim(tmp_path, executor)
+    )
+    delete_calls = []
+    reclaimer._delete_quarantine_path = lambda *_args: delete_calls.append(_args)
+
+    result = reclaimer.run(
+        {}, capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert result.rejection_counts == {"uncommitted_assessment": 1}
+    assert row["state"] == "aborted_paused"
+    assert row["recheck_error"] == "live_revalidation_unavailable"
+    assert marker.read_bytes() == b"keep"
+    assert not quarantine_path.exists()
+    assert delete_calls == []
+    assert executor.posts == []

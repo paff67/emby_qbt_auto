@@ -906,7 +906,9 @@ class DeadPartialReclaimer:
         target_free_bytes: int,
     ) -> CapacityReclaimResult:
         generation = 0 if assessment is None else int(assessment.generation)
-        recovery_errors = [] if self.dry_run else self._reconcile_reclaims()
+        recovery_errors = (
+            [] if self.dry_run else self._reconcile_reclaims(assessment)
+        )
         if generation <= 0:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
@@ -1102,7 +1104,7 @@ class DeadPartialReclaimer:
                     "capacity_reason": str(row.get("capacity_reason") or ""),
                     "target_free_bytes": max(0, int(target_free_bytes)),
                     "assessment_json": self._assessment_evidence_json(
-                        assessment, evidence
+                        assessment, evidence, torrent
                     ),
                 }
             )
@@ -1382,7 +1384,11 @@ class DeadPartialReclaimer:
                         f"{restore_exc}"
                     )
 
-            reason = self._file_selection_change_reason(candidate)
+            reason = self._final_live_authorization(
+                candidate,
+                assessment,
+                actual_payload_path=quarantine_path,
+            )
             if reason is not None:
                 abort_quarantined(reason)
                 break
@@ -1461,7 +1467,10 @@ class DeadPartialReclaimer:
             return None
         return mapped_path
 
-    def _reconcile_reclaims(self) -> list[str]:
+    def _reconcile_reclaims(
+        self,
+        assessment: CapacityAssessment | None,
+    ) -> list[str]:
         errors: list[str] = []
         try:
             current_generation = self._current_assessment_generation()
@@ -1598,6 +1607,7 @@ class DeadPartialReclaimer:
                             )
 
                     restore_reason: str | None = None
+                    recovery_candidate: Mapping[str, Any] | None = None
                     if not same_generation:
                         restore_reason = "prior_generation_quarantine_restored"
                     else:
@@ -1613,10 +1623,31 @@ class DeadPartialReclaimer:
                             except Exception:
                                 restore_reason = "disk_free_recheck_failed"
                         if restore_reason is None:
-                            restore_reason = self._file_selection_change_reason(row)
+                            if (
+                                assessment is None
+                                or int(assessment.generation) != row_generation
+                            ):
+                                restore_reason = "live_revalidation_unavailable"
+                            else:
+                                recovery_candidate = (
+                                    self._recovery_live_candidate(row)
+                                )
+                                if recovery_candidate is None:
+                                    restore_reason = (
+                                        "live_revalidation_unavailable"
+                                    )
                         if restore_reason is None:
+                            assert assessment is not None
+                            assert recovery_candidate is not None
+                            restore_reason = self._final_live_authorization(
+                                recovery_candidate,
+                                assessment,
+                                actual_payload_path=quarantine_path,
+                            )
+                        if restore_reason is None:
+                            assert recovery_candidate is not None
                             restore_reason = self.audit.authorize_delete(
-                                reclaim_id, row
+                                reclaim_id, recovery_candidate
                             )
                     if restore_reason is not None:
                         if not self._restore_from_quarantine(
@@ -1777,7 +1808,15 @@ class DeadPartialReclaimer:
     def _assessment_evidence_json(
         assessment: CapacityAssessment,
         evidence: TorrentCapacityEvidence,
+        torrent: Mapping[str, Any],
     ) -> str:
+        live_baseline: dict[str, int | float | None] = {
+            "amount_left": _nonnegative_integer(torrent.get("amount_left")),
+            "completed_bytes": _completed_bytes(torrent),
+            "progress": torrent.get("progress"),
+        }
+        for field in CONTENT_SIZE_FIELDS:
+            live_baseline[field] = _nonnegative_integer(torrent.get(field))
         compact = redact(
             {
                 "generation": int(assessment.generation),
@@ -1792,6 +1831,7 @@ class DeadPartialReclaimer:
                     "viable": bool(evidence.viable),
                     "viability_reason": str(evidence.viability_reason),
                 },
+                "live_baseline": live_baseline,
             }
         )
         return json.dumps(
@@ -1880,6 +1920,53 @@ class DeadPartialReclaimer:
         if current != str(candidate.get("file_selection_fingerprint") or ""):
             return "content_selection_changed"
         return None
+
+    @staticmethod
+    def _recovery_live_candidate(
+        row: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            evidence = json.loads(str(row.get("assessment_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(evidence, Mapping):
+            return None
+        baseline = evidence.get("live_baseline")
+        if not isinstance(baseline, Mapping):
+            return None
+        amount_left = _nonnegative_integer(baseline.get("amount_left"))
+        completed_bytes = _nonnegative_integer(
+            baseline.get("completed_bytes")
+        )
+        try:
+            progress = float(baseline.get("progress"))
+        except (TypeError, ValueError):
+            return None
+        if (
+            amount_left is None
+            or completed_bytes is None
+            or not math.isfinite(progress)
+            or progress < 0
+        ):
+            return None
+        candidate = dict(row)
+        candidate.update(
+            {
+                "amount_left": amount_left,
+                "completed_bytes": completed_bytes,
+                "progress": progress,
+            }
+        )
+        for field in CONTENT_SIZE_FIELDS:
+            raw_size = baseline.get(field)
+            if raw_size is None:
+                candidate[field] = None
+                continue
+            size = _nonnegative_integer(raw_size)
+            if size is None:
+                return None
+            candidate[field] = size
+        return candidate
 
     def _has_open_job_or_reservation_or_cooldown(
         self, torrent_hash: str
@@ -2082,6 +2169,69 @@ class DeadPartialReclaimer:
             return reason
         return self._candidate_fence_reason(candidate, assessment)
 
+    def _final_live_authorization(
+        self,
+        candidate: Mapping[str, Any],
+        assessment: CapacityAssessment,
+        *,
+        actual_payload_path: Path,
+    ) -> str | None:
+        torrent_hash = str(candidate["hash"])
+        expected_path = Path(str(candidate.get("host_path") or ""))
+        try:
+            current = self._qbt_call_with_timeout(
+                "torrent_info",
+                torrent_hash,
+                timeout=self.inventory_timeout_sec,
+            )
+        except QbtDeadlineUnsupported:
+            return "qbt_deadline_unsupported"
+        except Exception:
+            return "revalidation_failed"
+        if not isinstance(current, Mapping):
+            return "revalidation_failed"
+        reason = self._live_torrent_rejection(
+            current,
+            candidate=candidate,
+            assessment=assessment,
+        )
+        if reason is not None:
+            return reason
+        if not _is_stopped_download_state(current.get("state")):
+            return "torrent_not_stopped"
+        current_path = self._host_path(current.get("content_path"))
+        if current_path is None:
+            return "unsafe_path"
+        if current_path != expected_path:
+            return "path_changed"
+
+        paths, inventory_candidate, inventory_reason = self._fresh_path_inventory(
+            torrent_hash,
+            allow_missing_candidate_path=expected_path,
+        )
+        if inventory_reason is not None:
+            return inventory_reason
+        assert inventory_candidate is not None
+        reason = self._live_torrent_rejection(
+            inventory_candidate,
+            candidate=candidate,
+            assessment=assessment,
+        )
+        if reason is not None:
+            return reason
+        if not _is_stopped_download_state(inventory_candidate.get("state")):
+            return "torrent_not_stopped"
+        inventory_path = paths.get(torrent_hash.strip().lower())
+        if inventory_path is None:
+            return "path_inventory_failed"
+        if inventory_path != expected_path:
+            return "path_changed"
+        if self._overlaps_other(torrent_hash, expected_path, paths):
+            return "path_overlap"
+        if self._overlaps_other(torrent_hash, actual_payload_path, paths):
+            return "path_overlap"
+        return self._file_selection_change_reason(candidate)
+
     def _wait_until_stopped(
         self,
         torrent_hash: str,
@@ -2135,6 +2285,8 @@ class DeadPartialReclaimer:
     def _fresh_path_inventory(
         self,
         torrent_hash: str,
+        *,
+        allow_missing_candidate_path: Path | None = None,
     ) -> tuple[dict[str, Path], dict[str, Any] | None, str | None]:
         try:
             payload = self._qbt_call_with_timeout(
@@ -2168,6 +2320,21 @@ class DeadPartialReclaimer:
             if not raw_path:
                 return {}, None, "path_inventory_failed"
             path = self._inventory_host_path(raw_path)
+            if path is None and identity == expected_hash:
+                authorized_path = self._host_path(raw_path)
+                try:
+                    candidate_path_missing = (
+                        authorized_path is not None
+                        and not self._path_exists_no_follow(authorized_path)
+                    )
+                except OSError:
+                    candidate_path_missing = False
+                if (
+                    allow_missing_candidate_path is not None
+                    and authorized_path == allow_missing_candidate_path
+                    and candidate_path_missing
+                ):
+                    path = authorized_path
             if path is None:
                 return {}, None, "path_inventory_failed"
             if identity == expected_hash:
