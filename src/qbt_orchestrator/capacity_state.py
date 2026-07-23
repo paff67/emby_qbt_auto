@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 
 from .capacity_assessment import CapacityAssessment
 from .db import readonly_connect, write_transaction
+from .hash_identity import canonical_torrent_hash
 from .observability import redact
 
 
@@ -214,8 +215,11 @@ def build_capacity_observation(
 
 def build_capacity_observation_from_assessment(
     assessment: CapacityAssessment,
+    *,
+    available_growth_bytes: int | None = None,
+    selected_hashes: set[str] | frozenset[str] | None = None,
 ) -> CapacityObservation:
-    """Derive aggregate observation data from already-recorded viability evidence."""
+    """Aggregate recorded evidence in the Planner's actual budget context."""
 
     candidates = [
         {
@@ -229,8 +233,23 @@ def build_capacity_observation_from_assessment(
     ]
     candidates.sort(key=lambda item: (item["required_growth_bytes"], item["hash"]))
 
-    budget = max(0, int(assessment.available_growth_bytes))
-    selected = {str(item) for item in assessment.selected_hashes}
+    budget = max(
+        0,
+        int(
+            assessment.available_growth_bytes
+            if available_growth_bytes is None
+            else available_growth_bytes
+        ),
+    )
+    selected = {
+        canonical
+        for item in (
+            assessment.selected_hashes
+            if selected_hashes is None
+            else selected_hashes
+        )
+        if (canonical := canonical_torrent_hash(item))
+    }
     feasible = sum(
         1
         for candidate in candidates

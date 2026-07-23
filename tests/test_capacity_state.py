@@ -199,6 +199,50 @@ def test_capacity_observation_from_assessment_uses_recorded_viability():
     )
 
 
+def test_capacity_observation_from_assessment_uses_actual_planner_budget_and_selection():
+    from qbt_orchestrator.capacity_assessment import (
+        CapacityAssessment,
+        TorrentCapacityEvidence,
+    )
+    from qbt_orchestrator.capacity_state import (
+        build_capacity_observation_from_assessment,
+    )
+
+    evidence = TorrentCapacityEvidence(
+        hash="planned",
+        managed=True,
+        incomplete=True,
+        amount_left=1 * GIB,
+        completed_bytes=1,
+        availability=1.0,
+        complete_sources=1,
+        no_progress_since=None,
+        viable=True,
+        viability_reason="complete_source",
+    )
+    assessment = CapacityAssessment(
+        generation=7,
+        observed_at=50,
+        scheduler_mode="drain",
+        free_bytes=int(3.2 * GIB),
+        target_free_bytes=5 * GIB,
+        available_growth_bytes=100,
+        selected_hashes=frozenset(),
+        disk_releasing_jobs=0,
+        torrents={"planned": evidence},
+    )
+
+    observation = build_capacity_observation_from_assessment(
+        assessment,
+        available_growth_bytes=int(1.45 * GIB),
+        selected_hashes={"planned"},
+    )
+
+    assert observation.viable_finish == 1
+    assert observation.feasible_full_finish == 1
+    assert observation.available_growth_bytes == int(1.45 * GIB)
+
+
 def test_capacity_deadlock_can_be_detected_under_pressure_before_drain_entry():
     from qbt_orchestrator.capacity_state import detect_capacity_state
 

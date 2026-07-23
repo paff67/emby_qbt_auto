@@ -14,6 +14,7 @@ from .alerts import SchedulerAlertConfig, SchedulerAlertService
 from .budget import calculate_growth_budget, resource_claims_from_rows
 from .capacity_assessment import CapacityAssessmentBuilder, CapacityAssessmentStore
 from .capacity_state import (
+    CapacityResult,
     CapacityStateStore,
     ModeController,
     build_capacity_observation_from_assessment,
@@ -29,7 +30,7 @@ from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .observe_promotion import ObservePromotionService
 from .observability import redact
-from .planner import DownloadPlanner, active_soak_cooldown_hashes
+from .planner import DownloadPlanner, PlannerResult, active_soak_cooldown_hashes
 from .policies.disk import classify_disk
 from .periodic import PeriodicTask, PeriodicWorker
 from .promotion import finalize_canonical_upload
@@ -300,11 +301,17 @@ class DaemonRuntime:
             )
         )
         self.capacity_reclaimer = capacity_reclaimer
-        self._capacity_reclaimer_accepts_assessment = bool(
-            capacity_reclaimer is not None
-            and "assessment"
-            in inspect.signature(capacity_reclaimer.run).parameters
-        )
+        self._capacity_reclaimer_accepts_assessment = False
+        if capacity_reclaimer is not None:
+            try:
+                self._capacity_reclaimer_accepts_assessment = (
+                    "assessment"
+                    in inspect.signature(capacity_reclaimer.run).parameters
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "capacity reclaimer run signature cannot be inspected safely"
+                ) from exc
         self.capacity_recovery_reclaimer = (
             capacity_recovery_reclaimer
             if capacity_recovery_reclaimer is not None
@@ -414,6 +421,8 @@ class DaemonRuntime:
         )
         self._last_safety_event_at: float | None = None
         self._last_safety_event_fingerprint: tuple[object, ...] | None = None
+        self._safety_sampled = False
+        self._safety_tick_lock = threading.RLock()
         self.monitor = SafetyMonitor(
             qbt,
             executor,
@@ -513,12 +522,17 @@ class DaemonRuntime:
         return result
 
     def planner_tick(self) -> dict:
+        self._ensure_initial_safety_sample()
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
         free_bytes = int(self.free_bytes_provider())
         sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
-        self._capacity_recovery_preflight(snapshots, free_bytes=free_bytes)
+        self._capacity_recovery_preflight(
+            snapshots,
+            free_bytes=free_bytes,
+            allow_live_recovery=sync_healthy,
+        )
         scheduler_mode = self._next_scheduler_mode(free_bytes)
-        if self.soak_queue_service is not None:
+        if self.soak_queue_service is not None and sync_healthy:
             soak_result = self.soak_queue_service.run_once(
                 snapshots,
                 free_bytes=free_bytes,
@@ -528,33 +542,47 @@ class DaemonRuntime:
         else:
             soak_result = SoakQueueResult(dry_run=self.dry_run)
         planner_now = int(time.time())
-        capacity_health = self._capacity_health_by_hash()
-        cooldown_hashes = active_soak_cooldown_hashes(
-            self.state_db, planner_now
-        ) | {str(h) for h in soak_result.cooldown_hashes}
-        incumbent_hashes = self._scheduler_incumbent_hashes(planner_now)
+        assessment_snapshots = snapshots if sync_healthy else {}
+        capacity_health = self._capacity_health_by_hash() if sync_healthy else {}
+        cooldown_hashes = (
+            active_soak_cooldown_hashes(self.state_db, planner_now)
+            | {str(h) for h in soak_result.cooldown_hashes}
+            if sync_healthy
+            else set()
+        )
+        incumbent_hashes = (
+            self._scheduler_incumbent_hashes(planner_now)
+            if sync_healthy
+            else set()
+        )
         incumbent_hashes -= cooldown_hashes
         assessment = self.capacity_assessment_builder.build(
-            snapshots,
+            assessment_snapshots,
             capacity_health,
             observed_at=planner_now,
             scheduler_mode=scheduler_mode,
             free_bytes=free_bytes,
             target_free_bytes=self.drain_exit_bytes,
-            available_growth_bytes=max(
-                0,
-                int(free_bytes)
-                - int(self.disk_floor_bytes)
-                - int(soak_result.reserved_bytes),
+            available_growth_bytes=(
+                max(
+                    0,
+                    int(free_bytes)
+                    - int(self.disk_floor_bytes)
+                    - int(soak_result.reserved_bytes),
+                )
+                if sync_healthy
+                else 0
             ),
             selected_hashes=incumbent_hashes,
-            disk_releasing_jobs=self._disk_releasing_job_count(),
+            disk_releasing_jobs=(
+                self._disk_releasing_job_count() if sync_healthy else 0
+            ),
         )
         commit_assessment = getattr(self.capacity_assessment_store, "commit")
         assessment = commit_assessment(assessment)
         engine_plan = None
         engine_budget = None
-        if self.scheduler_engine_mode != "legacy":
+        if self.scheduler_engine_mode != "legacy" and sync_healthy:
             engine_items = [
                 item
                 for item in build_full_finish_work_items(snapshots)
@@ -582,40 +610,56 @@ class DaemonRuntime:
             if self.scheduler_engine_mode == "live" and engine_plan is not None
             else None
         )
-        planner = DownloadPlanner(
-            self.state_db,
-            self.executor,
-            dry_run=self.planner_dry_run,
-            active_slots=self.planner_active_slots,
-            slow_active_demote_sec=self.planner_slow_active_demote_sec,
-            finish_resident_max_remaining_bytes=self.finish_resident_max_remaining_bytes,
-            finish_resident_max_stall_sec=self.finish_resident_max_stall_sec,
-            disk_floor_bytes=self.disk_floor_bytes,
-            recovery_enabled=self.recovery_enabled,
-            recovery_enter_bytes=self.recovery_enter_bytes,
-            emergency_floor_bytes=self.emergency_floor_bytes,
-            recovery_margin_bytes=self.recovery_margin_bytes,
-            recovery_active_slots=self.recovery_active_slots,
-            recovery_max_remaining_bytes=self.recovery_max_remaining_bytes,
-        )
-        result = planner.plan_and_apply(
-            snapshots,
-            free_bytes=free_bytes,
-            sync_healthy=sync_healthy,
-            protected_running_hashes=soak_result.protected_hashes,
-            forced_active_hashes=soak_result.protected_hashes,
-            cooldown_hashes=cooldown_hashes,
-            external_reserved_bytes=soak_result.reserved_bytes,
-            allowed_active_hashes=allowed_active_hashes,
-            capacity_assessment=assessment,
-        )
-        scheduler_payload = self._scheduler_engine_payload(
-            engine_plan,
-            engine_budget,
-            legacy_selected_hashes=result.selected_hashes,
-            legacy_budget_bytes=result.budget_bytes,
-            assessment_generation=assessment.generation,
-        )
+        if sync_healthy:
+            planner = DownloadPlanner(
+                self.state_db,
+                self.executor,
+                dry_run=self.planner_dry_run,
+                active_slots=self.planner_active_slots,
+                slow_active_demote_sec=self.planner_slow_active_demote_sec,
+                finish_resident_max_remaining_bytes=self.finish_resident_max_remaining_bytes,
+                finish_resident_max_stall_sec=self.finish_resident_max_stall_sec,
+                disk_floor_bytes=self.disk_floor_bytes,
+                recovery_enabled=self.recovery_enabled,
+                recovery_enter_bytes=self.recovery_enter_bytes,
+                emergency_floor_bytes=self.emergency_floor_bytes,
+                recovery_margin_bytes=self.recovery_margin_bytes,
+                recovery_active_slots=self.recovery_active_slots,
+                recovery_max_remaining_bytes=self.recovery_max_remaining_bytes,
+            )
+            result = planner.plan_and_apply(
+                snapshots,
+                free_bytes=free_bytes,
+                sync_healthy=True,
+                protected_running_hashes=soak_result.protected_hashes,
+                forced_active_hashes=soak_result.protected_hashes,
+                cooldown_hashes=cooldown_hashes,
+                external_reserved_bytes=soak_result.reserved_bytes,
+                allowed_active_hashes=allowed_active_hashes,
+                capacity_assessment=assessment,
+            )
+            scheduler_payload = self._scheduler_engine_payload(
+                engine_plan,
+                engine_budget,
+                legacy_selected_hashes=result.selected_hashes,
+                legacy_budget_bytes=result.budget_bytes,
+                assessment_generation=assessment.generation,
+            )
+        else:
+            result = PlannerResult(
+                selected_hashes=[],
+                paused_hashes=[],
+                conservative=True,
+                budget_bytes=0,
+                mode="sync_unhealthy",
+            )
+            scheduler_payload = {
+                "mode": self.scheduler_engine_mode,
+                "applied_plan": "none",
+                "selected_hashes": [],
+                "assessment_generation": int(assessment.generation),
+                "reason": "sync_unhealthy",
+            }
         preemption_result = None
         if self.preemption_service is not None and sync_healthy:
             preemption_result = self.preemption_service.evaluate_and_apply(
@@ -625,21 +669,45 @@ class DaemonRuntime:
                 selected_hashes=set(result.selected_hashes),
             )
         capacity_observation = build_capacity_observation_from_assessment(
-            assessment
+            assessment,
+            available_growth_bytes=result.budget_bytes,
+            selected_hashes=set(result.selected_hashes),
         )
         capacity_details = capacity_observation.as_details()
-        capacity_result = detect_capacity_state(
-            mode=scheduler_mode,
-            managed_incomplete=capacity_observation.managed_incomplete,
-            feasible_full_finish=capacity_observation.feasible_full_finish,
-            disk_releasing_jobs=capacity_observation.disk_releasing_jobs,
-            capacity_pressure=free_bytes < self.drain_exit_bytes,
+        capacity_details.update(
+            {
+                "assessment_incumbent_count": len(assessment.selected_hashes),
+                "planned_selected_count": len(result.selected_hashes),
+                "sync_healthy": sync_healthy,
+            }
+        )
+        capacity_result = (
+            detect_capacity_state(
+                mode=scheduler_mode,
+                managed_incomplete=capacity_observation.managed_incomplete,
+                feasible_full_finish=capacity_observation.feasible_full_finish,
+                disk_releasing_jobs=capacity_observation.disk_releasing_jobs,
+                capacity_pressure=free_bytes < self.drain_exit_bytes,
+            )
+            if sync_healthy
+            else CapacityResult(
+                "sync_unhealthy",
+                "fresh_torrent_evidence_unavailable",
+                actions=[],
+            )
         )
         capacity_transition = self.capacity_state_store.persist(
             scheduler_mode,
             capacity_result,
             capacity_details,
             assessment_generation=assessment.generation,
+        )
+        self._record_capacity_assessment_metric(
+            assessment,
+            capacity_observation=capacity_observation,
+            planned_selected_count=len(result.selected_hashes),
+            actual_budget_bytes=result.budget_bytes,
+            sync_healthy=sync_healthy,
         )
         capacity_reclaim_payload = None
         if (
@@ -665,7 +733,7 @@ class DaemonRuntime:
             capacity_reclaim_payload = reclaim_result.as_dict()
             self._last_capacity_reclaim_at = planner_now
         alert_ids = self.scheduler_alert_service.evaluate_and_enqueue(
-            snapshots=snapshots,
+            snapshots=assessment_snapshots,
             free_bytes=free_bytes,
             disk_floor_bytes=self.disk_floor_bytes,
             recovery_enter_bytes=self.recovery_enter_bytes,
@@ -723,14 +791,19 @@ class DaemonRuntime:
         snapshots: Mapping[str, Mapping[str, Any]],
         *,
         free_bytes: int | None,
+        allow_live_recovery: bool = True,
     ) -> None:
-        if self._capacity_recovery_preflight_done:
-            return
-
         pending_rows = self._capacity_recovery_pending_rows()
         if not pending_rows:
             self._capacity_recovery_preflight_done = True
             return
+        self._capacity_recovery_preflight_done = False
+        if not allow_live_recovery:
+            self._fail_capacity_recovery_preflight(
+                "sync unhealthy; live recovery is disabled",
+                rounds=0,
+                pending_rows=pending_rows,
+            )
         if self.dry_run or self.planner_dry_run:
             self._fail_capacity_recovery_preflight(
                 "dry-run requires live recovery for durable capacity reclaim rows",
@@ -971,6 +1044,50 @@ class DaemonRuntime:
         finally:
             con.close()
 
+    def _record_capacity_assessment_metric(
+        self,
+        assessment,
+        *,
+        capacity_observation,
+        planned_selected_count: int,
+        actual_budget_bytes: int,
+        sync_healthy: bool,
+    ) -> None:
+        con = readonly_connect(self.state_db)
+        try:
+            mature_reclaimable_count = int(
+                con.execute(
+                    "select count(*) from torrent_health "
+                    "where capacity_generation=? and reclaimable_since is not null "
+                    "and ?-reclaimable_since>=?",
+                    (
+                        int(assessment.generation),
+                        int(assessment.observed_at),
+                        int(self.capacity_reclaim_min_reclaimable_sec),
+                    ),
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+        self.obs.metric_snapshot(
+            "capacity_assessment",
+            {
+                "generation": int(assessment.generation),
+                "managed_incomplete": int(assessment.managed_incomplete),
+                "viable_finish": int(assessment.viable_finish),
+                "nonviable_finish": int(assessment.nonviable_finish),
+                "feasible_full_finish": int(
+                    capacity_observation.feasible_full_finish
+                ),
+                "free_bytes": int(assessment.free_bytes),
+                "target_free_bytes": int(assessment.target_free_bytes),
+                "actual_budget_bytes": int(actual_budget_bytes),
+                "planned_selected_count": int(planned_selected_count),
+                "mature_reclaimable_count": mature_reclaimable_count,
+                "sync_healthy": bool(sync_healthy),
+            },
+        )
+
     def _scheduler_growth_budget(
         self,
         free_bytes: int,
@@ -1153,8 +1270,20 @@ class DaemonRuntime:
             free_bytes=int(self.free_bytes_provider()),
         )
 
+    def _ensure_initial_safety_sample(self) -> None:
+        if self._safety_sampled:
+            return
+        with self._safety_tick_lock:
+            if not self._safety_sampled:
+                self._tick_safety_locked()
+
     def tick_safety(self) -> None:
+        with self._safety_tick_lock:
+            self._tick_safety_locked()
+
+    def _tick_safety_locked(self) -> None:
         result = self.monitor.tick()
+        self._safety_sampled = True
         free_bytes = int(self.free_bytes_provider())
         self._persist_disk_state(free_bytes, result.disk_state)
         sync_stats = self.monitor.sync.session_stats.as_dict()
@@ -1594,6 +1723,7 @@ class DaemonRuntime:
     def run(self, max_safety_ticks: int | None = None) -> int:
         start_persistent_write_actor(self.state_db)
         ticks = 0
+        startup_safety_sampled = False
         try:
             self.obs.event(
                 "info",
@@ -1603,12 +1733,26 @@ class DaemonRuntime:
                 self._effective_config_snapshot(),
             )
             self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
+            try:
+                self.tick_safety()
+                startup_safety_sampled = True
+            except Exception as exc:
+                self.obs.event(
+                    "error",
+                    "daemon",
+                    "safety_tick_failed",
+                    str(redact(str(exc))),
+                    {"dry_run": self.dry_run, "startup": True},
+                )
             self._capacity_recovery_preflight(
                 {
                     h: vars(snapshot)
                     for h, snapshot in self.monitor.sync.snapshots.items()
                 },
                 free_bytes=None,
+                allow_live_recovery=bool(
+                    self.monitor.sync.high_risk_actions_allowed
+                ),
             )
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.start()
@@ -1616,10 +1760,11 @@ class DaemonRuntime:
             self._start_periodic_workers()
             while not self._stopping:
                 started = self.monotonic()
-                try:
-                    self.tick_safety()
-                except Exception as exc:  # keep safety process supervised and observable
-                    self.obs.event("error", "daemon", "safety_tick_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
+                if not (startup_safety_sampled and ticks == 0):
+                    try:
+                        self.tick_safety()
+                    except Exception as exc:  # keep safety process supervised and observable
+                        self.obs.event("error", "daemon", "safety_tick_failed", str(redact(str(exc))), {"dry_run": self.dry_run})
                 if not self.background_periodic_workers:
                     self.run_due_loop_tasks()
                 try:
