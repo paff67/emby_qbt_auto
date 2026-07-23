@@ -26,6 +26,7 @@ OPEN_JOB_STATES = (
     "cleanup_wait",
 )
 MAGNET_PREFIX = "mag" + "net:?"
+PROGRESS_EPSILON = 1e-9
 
 
 class CapacityReclaimAuditStore:
@@ -400,6 +401,9 @@ class DeadPartialReclaimer:
             if row.get("no_progress_since") is None or evidence.no_progress_since is None:
                 reject("no_progress_unconfirmed")
                 continue
+            if int(row["no_progress_since"]) != int(evidence.no_progress_since):
+                reject("progress_evidence_changed")
+                continue
             reclaimable_since = row.get("reclaimable_since")
             if reclaimable_since is None:
                 reject("reclaimable_unconfirmed")
@@ -460,6 +464,8 @@ class DeadPartialReclaimer:
                         ),
                     ),
                     "progress": float(torrent.get("progress") or 0.0),
+                    "amount_left": max(0, int(evidence.amount_left)),
+                    "no_progress_since": int(evidence.no_progress_since),
                     "reclaimable_since": int(reclaimable_since),
                     "capacity_generation": generation,
                     "capacity_reason": str(row.get("capacity_reason") or ""),
@@ -534,7 +540,14 @@ class DeadPartialReclaimer:
             if host_path != Path(str(candidate["host_path"])):
                 reject("path_changed")
                 continue
-            if self._overlaps_other(torrent_hash, host_path, all_paths):
+            fresh_paths, inventory_reason = self._fresh_path_inventory(
+                torrent_hash,
+                host_path,
+            )
+            if inventory_reason is not None:
+                reject(inventory_reason)
+                continue
+            if self._overlaps_other(torrent_hash, host_path, fresh_paths):
                 reject("path_overlap")
                 continue
             if not host_path.exists():
@@ -706,15 +719,22 @@ class DeadPartialReclaimer:
         con = readonly_connect(self.state_db)
         try:
             row = con.execute(
-                "select reclaimable_since,capacity_viable,capacity_generation "
+                "select reclaimable_since,no_progress_since,capacity_viable,capacity_generation "
                 "from torrent_health where hash=?",
                 (torrent_hash,),
             ).fetchone()
         finally:
             con.close()
+        if row is None:
+            return "eligibility_changed"
         if (
-            row is None
-            or int(row["capacity_generation"] or 0) != int(assessment.generation)
+            row["no_progress_since"] is None
+            or int(row["no_progress_since"])
+            != int(candidate.get("no_progress_since") or 0)
+        ):
+            return "progress_evidence_changed"
+        if (
+            int(row["capacity_generation"] or 0) != int(assessment.generation)
             or row["capacity_viable"] is None
             or int(row["capacity_viable"]) != 0
             or row["reclaimable_since"] is None
@@ -763,8 +783,23 @@ class DeadPartialReclaimer:
             return "protected_tag"
         if str(current.get("category") or "") != "auto" and "auto" not in tags:
             return "not_managed"
-        if int(current.get("amount_left") or 0) <= 0:
+        raw_amount_left = current.get("amount_left")
+        try:
+            amount_left = (
+                None if raw_amount_left is None else float(raw_amount_left)
+            )
+        except (TypeError, ValueError):
+            amount_left = None
+        if (
+            amount_left is None
+            or not math.isfinite(amount_left)
+            or amount_left < 0
+        ):
+            return "progress_evidence_unknown"
+        if amount_left <= 0:
             return "torrent_completed"
+        if amount_left < int(candidate.get("amount_left") or 0):
+            return "progress_resumed"
         raw_availability = current.get("availability")
         try:
             availability = (
@@ -784,6 +819,24 @@ class DeadPartialReclaimer:
         )
         if availability >= 1.0 or complete_sources > 0:
             return "complete_source"
+        raw_progress = current.get("progress")
+        try:
+            current_progress = (
+                None if raw_progress is None else float(raw_progress)
+            )
+            baseline_progress = float(candidate.get("progress"))
+        except (TypeError, ValueError):
+            return "progress_evidence_unknown"
+        if (
+            current_progress is None
+            or not math.isfinite(current_progress)
+            or not math.isfinite(baseline_progress)
+            or current_progress < 0
+            or baseline_progress < 0
+        ):
+            return "progress_evidence_unknown"
+        if current_progress > baseline_progress + PROGRESS_EPSILON:
+            return "progress_resumed"
         for field in ("dlspeed", "dlspeed_bps"):
             raw_speed = current.get(field)
             if raw_speed is None:
@@ -850,6 +903,53 @@ class DeadPartialReclaimer:
             if attempt + 1 < attempts:
                 self.sleep(self.stop_poll_interval_sec)
         return None, "stop_timeout"
+
+    def _fresh_path_inventory(
+        self,
+        torrent_hash: str,
+        current_host_path: Path,
+    ) -> tuple[dict[str, Path], str | None]:
+        try:
+            payload = self.executor.qbt.get_maindata(0)
+        except Exception:
+            return {}, "path_inventory_failed"
+        if not isinstance(payload, Mapping) or payload.get("full_update") is not True:
+            return {}, "path_inventory_failed"
+        torrents = payload.get("torrents")
+        if not isinstance(torrents, Mapping):
+            return {}, "path_inventory_failed"
+
+        expected_hash = str(torrent_hash).strip().lower()
+        paths: dict[str, Path] = {}
+        identities: set[str] = set()
+        candidate_found = False
+        for fallback_hash, raw in torrents.items():
+            if not isinstance(raw, Mapping):
+                return {}, "path_inventory_failed"
+            item = dict(raw)
+            fallback_identity = str(fallback_hash or "").strip().lower()
+            row_identity = str(item.get("hash") or "").strip().lower()
+            if row_identity and fallback_identity and row_identity != fallback_identity:
+                return {}, "path_inventory_failed"
+            identity = row_identity or fallback_identity
+            if not identity or identity in identities:
+                return {}, "path_inventory_failed"
+            identities.add(identity)
+            raw_path = str(item.get("content_path") or "").strip()
+            if not raw_path:
+                return {}, "path_inventory_failed"
+            path = self._host_path(raw_path)
+            if identity == expected_hash:
+                if path is None:
+                    return {}, "path_inventory_failed"
+                candidate_found = True
+                if path != current_host_path:
+                    return {}, "path_changed"
+            if path is not None:
+                paths[identity] = path
+        if not candidate_found:
+            return {}, "path_inventory_failed"
+        return paths, None
 
     def _snapshot_paths(
         self, snapshots: Mapping[str, Mapping[str, Any]]

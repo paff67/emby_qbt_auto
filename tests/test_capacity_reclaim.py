@@ -42,6 +42,14 @@ class RecordingExecutor:
         current.update(self.info.get(torrent_hash, {}))
         return current
 
+    def get_maindata(self, rid):
+        assert rid == 0
+        return {
+            "rid": 1,
+            "full_update": True,
+            "torrents": {key: dict(value) for key, value in self.info.items()},
+        }
+
 
 def _assessment(
     torrent_hash: str = "h",
@@ -174,6 +182,7 @@ def _snapshot(
             "state": "downloading",
             "amount_left": 900,
             "completed_bytes": 100,
+            "progress": 0.0,
             "availability": 0.5,
             "num_seeds": 0,
             "num_complete": 0,
@@ -204,7 +213,7 @@ def _dead_row(db: Path, torrent_hash: str, now: int) -> None:
         ),
     )
     con.execute(
-        "update torrent_health set reclaimable_since=?,capacity_viable=0,"
+        "update torrent_health set reclaimable_since=?,no_progress_since=100,capacity_viable=0,"
         "capacity_reason='stale_without_complete_source',capacity_assessed_at=?,"
         "capacity_generation=1 where hash=?",
         (now - 10_000, now, torrent_hash),
@@ -1629,4 +1638,362 @@ def test_stop_window_missing_torrent_hash_is_revalidated_before_audit(tmp_path):
     assert result.rejection_counts["torrent_identity_unknown"] == 1
     assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h"})]
     assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_stop_window_no_progress_evidence_change_is_fenced_before_audit(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+
+    class ProgressRaceExecutor(RecordingExecutor):
+        def qbt_post(self, path, payload):
+            super().qbt_post(path, payload)
+            if path.endswith("/stop"):
+                con = sqlite3.connect(db)
+                con.execute(
+                    "update torrent_health set no_progress_since=5000 where hash='h'"
+                )
+                con.commit()
+                con.close()
+
+    executor = ProgressRaceExecutor({"h": snapshot})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["progress_evidence_changed"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_live_revalidation_rejects_progress_fraction_growth(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = {**_snapshot("h", content_path="/downloads/incomplete/h")["h"], "progress": 0.2}
+    current = {**snapshot, "progress": 0.3}
+    executor = RecordingExecutor({"h": current})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["progress_resumed"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_live_revalidation_rejects_amount_left_decrease(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    current = {**snapshot, "amount_left": 899}
+    executor = RecordingExecutor({"h": current})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["progress_resumed"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_stop_window_progress_fraction_growth_is_revalidated_before_audit(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = {**_snapshot("h", content_path="/downloads/incomplete/h")["h"], "progress": 0.2}
+    before_stop = {**snapshot, "state": "downloading"}
+    after_stop = {**snapshot, "state": "stoppedDL", "progress": 0.3}
+
+    class StopWindowExecutor(RecordingExecutor):
+        def __init__(self):
+            super().__init__({"h": before_stop})
+            self.responses = [before_stop, after_stop]
+
+        def torrent_info(self, torrent_hash):
+            return dict(self.responses.pop(0))
+
+    executor = StopWindowExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["progress_resumed"] == 1
+    assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h"})]
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_stop_window_fresh_inventory_detects_new_path_overlap(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    old_other = managed / "other"
+    payload.mkdir(parents=True)
+    old_other.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    (old_other / "part").write_bytes(b"y" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    other = _snapshot("other", content_path="/downloads/incomplete/other")["other"]
+
+    class InventoryRaceExecutor(RecordingExecutor):
+        def get_maindata(self, rid):
+            assert rid == 0
+            return {
+                "full_update": True,
+                "torrents": {
+                    "h": dict(self.info["h"]),
+                    "other": {**other, "content_path": "/downloads/incomplete/h"},
+                },
+            }
+
+    executor = InventoryRaceExecutor({"h": candidate, "other": other})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": candidate, "other": other}, assessment=_assessment(),
+        capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["path_overlap"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+@pytest.mark.parametrize("inventory_mode", ["api-error", "missing-torrents", "not-full"])
+def test_live_reclaim_fails_closed_when_fresh_inventory_is_unavailable(
+    tmp_path, inventory_mode
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+
+    class BrokenInventoryExecutor(RecordingExecutor):
+        def get_maindata(self, rid):
+            if inventory_mode == "api-error":
+                raise RuntimeError("sync unavailable")
+            if inventory_mode == "missing-torrents":
+                return {"full_update": True}
+            return {"full_update": False, "torrents": {"h": dict(candidate)}}
+
+    executor = BrokenInventoryExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["path_inventory_failed"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_selection_rejects_no_progress_evidence_mismatch(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h", no_progress_since=101)
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")
+    reclaimer = DeadPartialReclaimer(
+        db, RecordingExecutor(), host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=True, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        snapshot, assessment=_assessment(no_progress_since=100),
+        capacity_state="capacity_deadlock", free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.planned == 0
+    assert result.rejection_counts["progress_evidence_changed"] == 1
+
+
+@pytest.mark.parametrize(
+    "current_progress",
+    [pytest.param("missing", id="missing"), "bad", float("nan"), -0.1],
+)
+def test_live_revalidation_fails_closed_on_unknown_progress(
+    tmp_path, current_progress
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    snapshot = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    current = dict(snapshot)
+    if current_progress == "missing":
+        current.pop("progress")
+    else:
+        current["progress"] = current_progress
+
+    class RawInfoExecutor(RecordingExecutor):
+        def torrent_info(self, torrent_hash):
+            return dict(current)
+
+    executor = RawInfoExecutor({"h": current})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": snapshot}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["progress_evidence_unknown"] == 1
+    assert payload.exists()
+    _assert_no_capacity_reclaim_audit(db)
+
+
+def test_fresh_inventory_candidate_path_must_match_live_info(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    moved = managed / "moved"
+    payload.mkdir(parents=True)
+    moved.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+
+    class InventoryPathRaceExecutor(RecordingExecutor):
+        def get_maindata(self, rid):
+            return {
+                "full_update": True,
+                "torrents": {
+                    "h": {**candidate, "content_path": "/downloads/incomplete/moved"}
+                },
+            }
+
+    executor = InventoryPathRaceExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert result.reclaimed == 0
+    assert result.rejection_counts["path_changed"] == 1
+    assert payload.exists() and moved.exists()
     _assert_no_capacity_reclaim_audit(db)
