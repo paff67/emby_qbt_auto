@@ -67,7 +67,9 @@ def test_cli_status_subcommands_are_readonly_views():
         assert json.loads(run_cli(["status", "perf", "--state-db", str(db), "--json"])[1])["recent_events"] >= 1
 
 
-def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes():
+def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes(
+    monkeypatch,
+):
     from qbt_orchestrator import cli
 
     class FakeQbt:
@@ -85,18 +87,15 @@ def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes():
 
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "state.sqlite"
-        old_qbt = cli.QbtDockerClient
-        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
-        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
-        os.environ["QBT_ORCH_DISK_PATH"] = td
-        try:
-            rc, out = run_cli(["once", "--dry-run", "--state-db", str(db)])
-        finally:
-            cli.QbtDockerClient = old_qbt
-            if old_disk is None:
-                os.environ.pop("QBT_ORCH_DISK_PATH", None)
-            else:
-                os.environ["QBT_ORCH_DISK_PATH"] = old_disk
+        monkeypatch.setattr(cli, "QbtDockerClient", lambda *a, **kw: FakeQbt())
+        monkeypatch.setattr(
+            cli,
+            "_free_bytes_for",
+            lambda _path: lambda: 16 * 1024**3,
+        )
+        monkeypatch.setenv("QBT_ORCH_DISK_PATH", td)
+
+        rc, out = run_cli(["once", "--dry-run", "--state-db", str(db)])
 
         assert rc == 0
         assert "once dry-run completed" in out
