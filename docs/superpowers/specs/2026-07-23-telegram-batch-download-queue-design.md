@@ -16,6 +16,8 @@ The add flow accepts batches of qBittorrent-supported link formats:
 
 Telegram `.torrent` document uploads are explicitly out of scope. One message may contain multiple links, and a user may send several messages into one draft before pressing `提交本批`. Every item is normalized, deduplicated, checked against qBittorrent and the remote media index, and processed through a durable queue that resumes after service restart.
 
+One logical submission accepts at most 500 links and is internally divided into shards of 50 items. The global submitted, non-terminal backlog is capped at 1,000 items. These are validated configuration defaults, not unbounded in-memory collections.
+
 Confidently unique items enter normal orchestrator management. Definite duplicates are not added. A same-ID/different-size result remains stopped and requires an inline confirmation. Confirmation adds it while retaining a manual hold; a later `允许调度` action is required before Planner may start it.
 
 ## 2. Chosen architecture
@@ -29,7 +31,8 @@ Telegram getUpdates
   -> SQLite add batch/items
   -> AddValidationWorker
        -> LinkResolver
-       -> qBT stopped metadata precheck
+       -> MetadataProbeCoordinator
+            -> bounded qBT metadata slots
        -> DuplicateMatcher
   -> ConfirmationGate
   -> EnrollmentService
@@ -87,6 +90,22 @@ updated_at
 
 One chat/user may have only one open draft. An inactive draft expires after 30 minutes into `draft_expired`, remains visible in queue history, and may be reopened into a new batch. Expiry never silently submits links.
 
+Create `bot_add_shards` so a large logical submission is processed and summarized in bounded groups:
+
+```text
+id
+batch_id
+shard_index
+state                     queued | processing | complete | cancelled
+item_count
+processed_count
+created_at
+completed_at
+updated_at
+```
+
+`(batch_id, shard_index)` is unique. Shards are an internal scheduling boundary; the Telegram user continues to see one logical submission and one final submission summary.
+
 ### 4.2 Add items
 
 Create `bot_add_items`:
@@ -98,6 +117,7 @@ source_message_id
 source_index
 input_kind                magnet | http_url | https_url | bc_link
 raw_input                 temporary, root-only SQLite storage
+raw_input_expires_at
 redacted_input
 input_sha256
 canonical_identity
@@ -114,6 +134,13 @@ qbt_hash
 qbt_precheck_tag
 remote_match_json
 approval_generation
+metadata_probe_attempt
+metadata_probe_started_at
+metadata_probe_deadline
+metadata_next_poll_at
+metadata_retry_at
+metadata_lease_owner
+metadata_lease_generation
 approved_by
 approved_at
 attempts
@@ -125,7 +152,7 @@ updated_at
 
 The unique ingress key is `(chat_id, source_message_id, source_index)` through the parent batch. Repeated Telegram updates return the existing item. `input_sha256` deduplicates repeated input in a draft. Canonical torrent identity deduplicates equivalent links after resolution.
 
-Raw input is stored only while resolution or enrollment may need it. On every terminal state it is cleared, while the redacted form, SHA-256, canonical identity, decision, evidence, and timestamps remain. Bot messages and general logs never contain credentials or full private URL query strings.
+Raw input is stored only while resolution, scheduled retry, or an explicit manual-retry window may need it. It expires no later than seven days after receipt and is cleared immediately on enrollment, duplicate, cancellation, permanent failure, or retry expiry. `metadata_unavailable` may retain it only until that deadline so the displayed retry actions remain functional. The state database and backups must be root-readable only. The redacted form, SHA-256, canonical identity, decision, evidence, and timestamps remain after clearing. Bot messages and general logs never contain credentials or full private URL query strings.
 
 ### 4.3 Item state machine
 
@@ -134,7 +161,11 @@ received
   -> invalid
   -> resolving
   -> duplicate_local
-  -> prechecking
+  -> waiting_probe_slot
+  -> metadata_wait
+       -> metadata_retry_wait
+       -> metadata_unavailable
+       -> prechecking
        -> duplicate_remote
        -> needs_confirmation
        -> ready
@@ -146,6 +177,8 @@ received
 ```
 
 `needs_confirmation` does not block validation of later items or other batches. Batch completion waits until every item reaches a terminal result, including an approval or cancellation for each pending confirmation.
+
+`metadata_retry_wait` is deferred, not worker-blocking. `metadata_unavailable` is terminal for automatic processing but exposes manual retry actions.
 
 Create `bot_add_events` as an append-only audit of state changes, callback actor, reason code, and safe evidence. Existing `checked_add_requests/events` data remains readable and may be imported into history, but new writes use the new tables.
 
@@ -160,9 +193,21 @@ Pressing `添加下载` edits the panel into an open-draft view. While a draft i
 - the Bot updates the draft count after each message;
 - `继续添加`, `提交本批`, and `取消整个批次` remain available.
 
+Effective ingress limits are:
+
+```text
+maximum links per logical submission: 500
+internal shard size:                   50
+maximum submitted non-terminal items: 1,000
+maximum encoded link length:           8 KiB
+maximum raw draft input:                2 MiB
+```
+
+The Bot never silently truncates input. If one incoming Telegram message would push a draft above 500 links or 2 MiB, that whole message is rejected and the existing draft remains unchanged. If the global queue is full when `提交本批` is pressed, the batch remains a visible draft and the Bot reports the current capacity instead of partially submitting it. The user may submit the draft after backlog falls or cancel it.
+
 `提交本批` atomically closes ingress and queues the valid items. New links after submission create or join a new draft; they never mutate a processing batch. `取消整个批次` clears temporary raw inputs and cancels only items that have not already been enrolled.
 
-The Bot does not send user-supplied links to qBT in one bulk API request. Items are processed individually so each has an exact result, audit trail, retry policy, and correlation identity.
+The Bot does not send user-supplied links to qBT in one bulk API request. Items are processed individually so each has an exact result, audit trail, retry policy, and correlation identity. Shards bound counters and summaries; they do not cause 50 simultaneous qBT additions.
 
 ## 6. Link resolution
 
@@ -184,20 +229,58 @@ The internally resolved metainfo may be submitted to qBT as multipart data. This
 
 Decode and validate the BitComet link structure, extract its torrent identity, and normalize it into the same identity model. Invalid encoding or missing identity is rejected before qBT. The original redacted link type remains in audit history.
 
-## 7. Stopped metadata precheck
+## 7. Bounded, non-blocking metadata precheck
 
-Every non-duplicate item enters qBT stopped with category/tag isolation:
+### 7.1 Coordinator and slots
+
+Metadata acquisition is a persisted state machine, not a worker call that sleeps until a long timeout. `MetadataProbeCoordinator` has three global active slots. Starting or mutating a qBT precheck remains serialized, but up to three already-correlated magnet probes may acquire metadata concurrently.
+
+The coordinator claims due items with a lease generation, starts a probe, persists `metadata_probe_deadline` and `metadata_next_poll_at`, and returns immediately. During an active window the poll interval is five seconds, and a poller examines only due rows. No worker thread or scheduler tick waits synchronously for metadata.
+
+Slots are assigned round-robin across logical batches, with at most one slot per batch while at least three batches have eligible work. A 500-link submission therefore cannot monopolize all probe capacity. `needs_confirmation`, retry backoff, and unavailable items never occupy a slot.
+
+HTTP/HTTPS metainfo successfully resolved in memory and valid decoded `bc://bt/` identities normally bypass magnet metadata acquisition. They still pass through the same stopped qBT inventory and duplicate checks.
+
+### 7.2 qBT isolation
+
+Every item that requires qBT metadata enters with category/tag isolation:
 
 ```text
 category: precheck
-tags: precheck, add-item-<opaque token>, hold
+tags: precheck, metadata-probe, add-item-<opaque token>, hold
 ```
 
-No payload file receives download priority during precheck. The worker waits for metadata with a bounded timeout, stops the torrent again when metadata becomes available, and reads its file list, total size, main-video candidate, and qBT hash.
+The probe uses a 1 KiB/s temporary payload download limit so metadata extension traffic can proceed while payload transfer remains negligible. As soon as metadata appears, the next due poll stops the torrent, sets every file priority to zero, verifies the opaque item tag/hash correlation, and reads the file list, total size, main-video candidate, and qBT hash. It never changes the torrent to managed `auto` or removes `hold` during precheck.
 
-Video candidates use the existing checked-add policy: recognized media extensions with a preference for files at least 100 MiB. Metadata timeout, invalid file inventory, missing primary video, or qBT identity mismatch moves the item to `failed` and generates an immediate notification.
+Video candidates use the existing checked-add policy: recognized media extensions with a preference for files at least 100 MiB.
 
-Validation concurrency is one item per worker. This avoids ambiguous qBT correlation, limits tracker/metadata bursts, and is sufficient for the expected personal queue. FIFO order is used across submitted item IDs, but `needs_confirmation` items are skipped so they cannot starve later work.
+### 7.3 Probe windows and backoff
+
+Automatic probe policy is:
+
+```text
+attempt 1: active for 5 minutes, then retry after 30 minutes
+attempt 2: active for 10 minutes, then retry after 6 hours
+attempt 3: active for 15 minutes, then metadata_unavailable
+```
+
+On each timed-out attempt the coordinator fences the lease, stops and revalidates the temporary torrent, removes only that temporary qBT registration with payload deletion disabled, persists the next retry time, and releases the slot. The original link remains temporarily available for the scheduled retry. There is no indefinite `observe` task.
+
+After the third timeout, the item becomes `metadata_unavailable` and immediately exposes:
+
+```text
+重新尝试
+24 小时后再试一次
+取消并移除
+```
+
+`重新尝试` resets the approved three-window automatic policy. `24 小时后再试一次` creates a new approval generation and schedules one 15-minute window at `now + 24 hours`; it occupies no slot during the wait and does not resume an unbounded background torrent. Invalid file inventory, missing primary video, qBT identity mismatch, or a fenced-operation conflict moves the item to `failed` and generates an immediate notification.
+
+### 7.4 Submission progress
+
+When all immediately runnable items have either completed validation or entered a persisted retry/confirmation state, the Bot sends an initial processing summary. Deferred metadata items continue in the background without blocking later shards or batches. A final summary is sent after all deferred items become terminal.
+
+The queue panel shows `正在获取元数据`, `等待元数据重试`, and `长时间无元数据` counts. Routine progress edits the existing panel; it does not produce one chat message per poll or per successful item.
 
 ## 8. Duplicate decision
 
@@ -275,13 +358,23 @@ Inline navigation:
 
 `添加队列` shows `正在检查`, `等待确认`, `等待调度`, and `处理失败` counts plus paginated item details. Processed-history pages show processing time and media ID/torrent name for downloads, ingests, errors, and automatic reclaims.
 
+For large or slow submissions it additionally shows shard progress and metadata state, for example:
+
+```text
+本次提交 327 条 · 分为 7 个处理分片
+已完成 83 · 正在获取元数据 3
+等待重试 6 · 长时间无元数据 2
+```
+
 ## 11. Notifications and warning inbox
 
 Notification behavior is:
 
 - `needs_confirmation`: immediate item notification;
 - validation/enrollment failure: immediate item notification;
+- final metadata exhaustion: immediate item notification with retry/cancel buttons;
 - normal success: no per-item chat message;
+- all immediately runnable work exhausted while deferred probes remain: one initial processing summary;
 - batch terminal completion: one proactive summary with success, duplicate, confirmed-hold, cancelled, and failure counts;
 - existing automatic reclaim: immediate completion notification with name, magnet, and released bytes.
 
@@ -297,6 +390,7 @@ On daemon startup:
 
 - recover submitted batches whose items are non-terminal;
 - reset expired worker leases with generation fencing;
+- reclaim expired metadata-probe leases, then reconcile the persisted item with its opaque qBT precheck tag before allocating a slot;
 - inspect qBT for persisted `qbt_hash` or unique precheck tags before retrying an add;
 - never create a second torrent when an earlier call succeeded but its response was lost;
 - recreate missing Telegram panel projections from SQLite state;
@@ -309,21 +403,26 @@ HTTP resolution uses bounded retries only for transient network errors. Invalid 
 Focused tests cover:
 
 1. Multi-line and multi-message draft ingestion, ordering, and batch submission.
-2. Mixed `magnet`, HTTP, HTTPS, and `bc://bt/` parsing; Telegram documents are ignored/rejected.
-3. BTIH hexadecimal/Base32 normalization and supported v2 identity handling.
-4. HTTP timeout, redirect, size, bencode, credential, and restricted-address guards.
-5. Batch/item ingress and callback idempotency under repeated Telegram updates.
-6. Restart recovery at every non-terminal item state.
-7. qBT precheck remains stopped and downloads no selected payload.
-8. Active qBT identity, remote ID/size, same-ID/different-size, and fuzzy-only duplicate decisions.
-9. Same-ID/different-size buttons keep the torrent held after confirmation.
-10. `允许调度` is a separate authorized action and is the only action that removes the manual hold.
-11. A waiting confirmation does not block later queue items.
-12. Immediate confirmation/failure notices and one final batch summary are deduplicated.
-13. Welcome and queue pages show natural language, correct counts, and no internal operational codes.
-14. Warning unread/read state is separate from outbound notification delivery state.
-15. Native copy summaries respect the 256-character Bot API limit, and full warning exports are redacted, bounded, and remove their temporary file after send.
-16. Authorization rejects unknown users, stale callback generations, and role-inappropriate actions.
+2. The 500-link, 50-item-shard, 1,000-global-item, 8-KiB-link, and 2-MiB-draft limits reject atomically without truncation.
+3. Mixed `magnet`, HTTP, HTTPS, and `bc://bt/` parsing; Telegram documents are ignored/rejected.
+4. BTIH hexadecimal/Base32 normalization and supported v2 identity handling.
+5. HTTP timeout, redirect, size, bencode, credential, and restricted-address guards.
+6. Batch/item ingress and callback idempotency under repeated Telegram updates.
+7. Restart recovery at every non-terminal item state.
+8. Three active metadata slots, round-robin batch fairness, due-only polling, and lease-generation fencing.
+9. The 5/10/15-minute windows and 30-minute/6-hour backoffs release slots without blocking later items.
+10. Metadata timeout removes the temporary qBT registration without payload deletion and never leaves an indefinite observer running.
+11. qBT precheck remains held, payload-limited, and stops with all file priorities zero when metadata arrives.
+12. Initial deferred-work and final terminal summaries are independently deduplicated.
+13. Active qBT identity, remote ID/size, same-ID/different-size, and fuzzy-only duplicate decisions.
+14. Same-ID/different-size buttons keep the torrent held after confirmation.
+15. `允许调度` is a separate authorized action and is the only action that removes the manual hold.
+16. A waiting confirmation or metadata backoff does not block later queue items.
+17. Immediate confirmation/failure notices and final batch summaries are deduplicated.
+18. Welcome and queue pages show natural language, correct counts, and no internal operational codes.
+19. Warning unread/read state is separate from outbound notification delivery state.
+20. Native copy summaries respect the 256-character Bot API limit, and full warning exports are redacted, bounded, and remove their temporary file after send.
+21. Authorization rejects unknown users, stale callback generations, and role-inappropriate actions.
 
 The full orchestrator suite must pass in addition to focused Telegram and checked-add tests.
 
@@ -337,8 +436,8 @@ This feature is deployed only after the shared-capacity-assessment release is ac
 4. Deploy schema and code with Bot add callbacks disabled.
 5. Verify `/start`, panel editing, role authorization, warning inbox counts, and notification retries using read-only views.
 6. Enable batch ingress for the configured admin chat.
-7. Submit a canary batch containing one valid unique magnet, one exact duplicate, one same-ID/different-size case if available, and one invalid URL. Keep every canary stopped during validation.
-8. Verify per-item database states, qBT tags/categories, immediate confirmation/failure messages, final batch summary, and restart recovery.
+7. Submit a canary batch containing one valid unique magnet, one exact duplicate, one same-ID/different-size case if available, one invalid URL, and one magnet that does not return metadata within the first probe window. Keep every canary isolated during validation.
+8. Verify per-item database states, qBT tags/categories, slot release/backoff, immediate confirmation/failure messages, initial/final batch summaries, and restart recovery.
 9. Confirm that an approved ambiguous item remains held and that `允许调度` is required to remove the hold.
 10. Leave the feature enabled, monitor one hour of Bot polling, qBT authentication, queue latency, notification delivery, SQLite errors, and service restarts, then continue normal persistent operation if healthy.
 
@@ -356,15 +455,18 @@ The Telegram change is complete only when all of the following are demonstrated:
 
 1. `/start` shows the approved natural-language panel and inline navigation.
 2. A batch can contain multiple mixed supported links across multiple Telegram messages.
-3. Telegram `.torrent` documents are not accepted.
-4. Each submitted item has a durable, restart-safe, idempotent result.
-5. Definite local/remote duplicates are not enrolled.
-6. Same-ID/different-size items expose confirmation buttons and remain stopped and held after approval.
-7. Unique items enter managed scheduling without bypassing capacity allocation.
-8. Waiting confirmations do not block other queue work.
-9. Confirmation and failure messages arrive immediately; normal successes are combined into one proactive terminal batch summary.
-10. The homepage and queue detail show correct live queue counts.
-11. Warnings are persisted with per-chat unread state and do not flood the chat with raw logs.
-12. `复制摘要` copies a bounded native payload, while `导出全部日志` sends a complete redacted text export within configured safety limits.
-13. Unknown users and replayed/stale callbacks cannot inspect or mutate operational state.
-14. The orchestrator remains active with zero unexpected restarts, qBT authentication remains healthy, and live logs contain no unhandled Telegram, queue, or SQLite errors during the one-hour observation.
+3. A logical submission accepts up to 500 links, shards at 50, applies a 1,000-item global backlog cap, and never silently truncates overflow.
+4. Telegram `.torrent` documents are not accepted.
+5. Each submitted item has a durable, restart-safe, idempotent result.
+6. At most three metadata probes run concurrently, with fair batch rotation and no blocking worker wait.
+7. Timed-out probes release their slot, follow the approved retry schedule, and never remain as indefinite running observers.
+8. Definite local/remote duplicates are not enrolled.
+9. Same-ID/different-size items expose confirmation buttons and remain stopped and held after approval.
+10. Unique items enter managed scheduling without bypassing capacity allocation.
+11. Waiting confirmations and metadata backoffs do not block other queue work.
+12. Confirmation and failure messages arrive immediately; deferred work gets an initial summary and all terminal results produce one final summary.
+13. The homepage and queue detail show correct live queue and metadata counts.
+14. Warnings are persisted with per-chat unread state and do not flood the chat with raw logs.
+15. `复制摘要` copies a bounded native payload, while `导出全部日志` sends a complete redacted text export within configured safety limits.
+16. Unknown users and replayed/stale callbacks cannot inspect or mutate operational state.
+17. The orchestrator remains active with zero unexpected restarts, qBT authentication remains healthy, and live logs contain no unhandled Telegram, queue, or SQLite errors during the one-hour observation.
