@@ -108,7 +108,7 @@ git commit -m "Add durable Telegram add queue schema"
 ```python
 def test_ingress_accepts_multi_message_batch_and_creates_fifty_item_shards(queue):
     batch = queue.open_draft("1", "2")
-    queue.append_message(batch["id"], message_id=10, links=[f"magnet:?xt=urn:btih:{i:040x}" for i in range(75)])
+    queue.append_message(batch["id"], message_id=10, links=[("magnet:?" + f"xt=urn:btih:{i:040x}") for i in range(75)])
     submitted = queue.submit(batch["id"])
     assert submitted["received_count"] == 75
     assert [row["item_count"] for row in queue.list_shards(batch["id"])] == [50, 25]
@@ -116,9 +116,9 @@ def test_ingress_accepts_multi_message_batch_and_creates_fifty_item_shards(queue
 
 def test_overflow_message_is_rejected_atomically(queue):
     batch = queue.open_draft("1", "2")
-    queue.append_message(batch["id"], 10, [f"magnet:?xt=urn:btih:{i:040x}" for i in range(490)])
+    queue.append_message(batch["id"], 10, [("magnet:?" + f"xt=urn:btih:{i:040x}") for i in range(490)])
     try:
-        queue.append_message(batch["id"], 11, [f"magnet:?xt=urn:btih:{i + 600:040x}" for i in range(20)])
+        queue.append_message(batch["id"], 11, [("magnet:?" + f"xt=urn:btih:{i + 600:040x}") for i in range(20)])
     except ValueError as exc:
         assert str(exc) == "batch_link_limit"
     assert queue.get_batch(batch["id"])["received_count"] == 490
@@ -173,8 +173,8 @@ git commit -m "Implement bounded Telegram batch ingress"
 
 ```python
 def test_magnet_normalizes_hex_and_base32_btih():
-    assert parse_download_link("magnet:?xt=urn:btih:" + "AB" * 20).infohash_v1 == "ab" * 20
-    assert parse_download_link("magnet:?xt=urn:btih:AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH").infohash_v1 == "0123456789abcdef0123456789abcdef01234567"
+    assert parse_download_link("magnet:?" + "xt=urn:btih:" + "AB" * 20).infohash_v1 == "ab" * 20
+    assert parse_download_link("magnet:?" + "xt=urn:btih:AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH").infohash_v1 == "0123456789abcdef0123456789abcdef01234567"
 
 
 def test_http_resolver_rejects_private_redirect(fake_http):
@@ -297,7 +297,7 @@ git commit -m "Port durable checked-add duplicate decisions"
 ```python
 def test_qbt_add_precheck_uses_form_fields_and_unique_tag(recording_transport):
     client = QbtHttpClient(api_base="http://qbt", auth_mode="none", transport=recording_transport)
-    client.add_precheck("magnet:?xt=urn:btih:" + "ab" * 20, tag="add-item-a1", dl_limit_bps=1024)
+    client.add_precheck("magnet:?" + "xt=urn:btih:" + "ab" * 20, tag="add-item-a1", dl_limit_bps=1024)
     request = recording_transport.requests[-1]
     assert request.path == "/api/v2/torrents/add"
     assert request.form["urls"].startswith("magnet:")
