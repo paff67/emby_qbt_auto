@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
+
+import pytest
 
 
 class RecordingQbt:
@@ -11,6 +14,126 @@ class RecordingQbt:
     def post(self, path, payload):
         self.posts.append((path, dict(payload)))
         return "Ok."
+
+
+def _seed_reclaim(db, torrent_hash, state, generation):
+    con = sqlite3.connect(db)
+    cur = con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+        (
+            f"{torrent_hash}:{state}:{generation}",
+            torrent_hash,
+            torrent_hash,
+            "magnet:?xt=test",
+            f"/data/{torrent_hash}",
+            f"/downloads/{torrent_hash}",
+            state,
+            generation,
+            1,
+            1,
+        ),
+    )
+    reclaim_id = int(cur.lastrowid)
+    con.commit()
+    con.close()
+    return reclaim_id
+
+
+def test_executor_startup_hydrates_all_durable_reclaim_states_before_first_mutation(tmp_path):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    for torrent_hash, state in (
+        ("reclaimed", "reclaimed"),
+        ("aborted", "aborted_paused"),
+        ("quarantined", "quarantined"),
+        ("released", "released"),
+        ("cancelled", "cancelled"),
+    ):
+        _seed_reclaim(db, torrent_hash, state, 4)
+
+    qbt = RecordingQbt()
+    executor = Executor(qbt, dry_run=False, state_db=db)
+    try:
+        assert executor.qbt_post(
+            "/api/v2/torrents/start", {"hashes": "reclaimed"}
+        ) is False
+        assert executor.qbt_post(
+            "/api/v2/torrents/filePrio",
+            {"hash": "aborted", "id": "0", "priority": "1"},
+        ) is False
+        assert executor.qbt_post(
+            "/api/v2/torrents/start", {"hashes": "quarantined"}
+        ) is False
+        assert qbt.posts == []
+
+        assert executor.qbt_post(
+            "/api/v2/torrents/start", {"hashes": "released"}
+        ) is True
+        assert executor.qbt_post(
+            "/api/v2/torrents/start", {"hashes": "cancelled"}
+        ) is True
+    finally:
+        executor.close(timeout=1)
+
+    assert [entry.status for entry in executor.action_log[:3]] == [
+        "skipped_hash_lease",
+        "skipped_hash_lease",
+        "skipped_hash_lease",
+    ]
+    assert [payload["hashes"] for _path, payload in qbt.posts] == [
+        "released",
+        "cancelled",
+    ]
+
+
+def test_executor_startup_duplicate_hash_uses_highest_reclaim_id_and_records_warning(tmp_path, caplog):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    low_id = _seed_reclaim(db, " H ", "reclaimed", 3)
+    high_id = _seed_reclaim(db, "h", "quarantined", 7)
+
+    qbt = RecordingQbt()
+    executor = Executor(qbt, dry_run=False, state_db=db)
+    try:
+        assert executor.qbt_post(
+            "/api/v2/torrents/start",
+            {"hashes": "h"},
+            lease_token=f"reclaim:{low_id}:3",
+        ) is False
+        assert executor.qbt_post(
+            "/api/v2/torrents/start",
+            {"hashes": "h"},
+            lease_token=f"reclaim:{high_id}:7",
+        ) is True
+    finally:
+        executor.close(timeout=1)
+
+    assert qbt.posts == [("/api/v2/torrents/start", {"hashes": "h"})]
+    assert executor.startup_reclaim_lease_warnings
+    assert f"keeping id={high_id}" in executor.startup_reclaim_lease_warnings[0]
+    assert f"ignoring id={low_id}" in executor.startup_reclaim_lease_warnings[0]
+    assert "multiple durable capacity reclaim leases" in caplog.text
+
+
+def test_executor_startup_hydration_fails_closed_when_reclaim_table_is_missing(tmp_path):
+    from qbt_orchestrator.executor import Executor
+
+    db = tmp_path / "unmigrated.sqlite"
+    db.touch()
+
+    with pytest.raises(
+        RuntimeError,
+        match="durable capacity reclaim lease startup hydration failed",
+    ):
+        Executor(RecordingQbt(), dry_run=False, state_db=db)
 
 
 def test_hash_mutation_lease_blocks_non_owner_mutators_and_allows_owner():

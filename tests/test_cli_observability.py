@@ -405,6 +405,48 @@ def test_cli_runtime_disables_batch_pipeline_by_default_and_enables_with_env(mon
         assert runtime.batch_pipeline_enabled is True
 
 
+def test_cli_build_migrates_before_creating_shared_executor_with_state_db(
+    monkeypatch,
+    tmp_path,
+):
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("test should not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = False
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    db = tmp_path / "existing-but-unmigrated.sqlite"
+    db.touch()
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+    monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+
+    runtime, _ = cli._build_runtime(Ns(), db)
+    try:
+        assert runtime.executor.state_db == db
+        con = sqlite3.connect(db)
+        try:
+            assert con.execute(
+                "select count(*) from sqlite_master "
+                "where type='table' and name='capacity_reclaims'"
+            ).fetchone()[0] == 1
+        finally:
+            con.close()
+    finally:
+        runtime.executor.close(timeout=1)
+
+
 def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
     from qbt_orchestrator.cli import _build_runtime
     from qbt_orchestrator.db import migrate

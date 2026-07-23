@@ -5243,6 +5243,58 @@ def test_recovery_hydrates_all_locked_hash_leases_before_first_qbt_call(tmp_path
     assert executor.post_lease_tokens == [executor.expected_leases["h"]]
 
 
+def test_reclaimer_rehydration_matches_startup_highest_id_for_duplicate_hash(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+
+    class Qbt:
+        def post(self, path, payload):
+            raise AssertionError("lease hydration must not post to qBT")
+
+    db = tmp_path / "state.sqlite"
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    for reclaim_key, torrent_hash, state, generation in (
+        ("older", " H ", "reclaimed", 3),
+        ("newer", "h", "quarantined", 7),
+    ):
+        con.execute(
+            "insert into capacity_reclaims("
+            "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+            "capacity_generation,created_at,updated_at) "
+            "values(?,?,?,?,?,?,?,?,?,?)",
+            (
+                reclaim_key,
+                torrent_hash,
+                torrent_hash,
+                "magnet:?xt=test",
+                str(managed / "h"),
+                "/downloads/incomplete/h",
+                state,
+                generation,
+                1,
+                1,
+            ),
+        )
+    con.commit()
+    con.close()
+
+    executor = Executor(Qbt(), dry_run=True, state_db=db)
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=True,
+    )
+
+    assert reclaimer._hydrate_reclaim_mutation_leases() == []
+
+
 def test_restore_failure_persists_restore_error_with_original_failure(tmp_path):
     from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
     from qbt_orchestrator.db import migrate

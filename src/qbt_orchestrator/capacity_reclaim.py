@@ -946,8 +946,21 @@ class DeadPartialReclaimer:
             return ["qbt_mutation_lease_unsupported"]
         hydrate = self.executor.hydrate_hash_mutation_lease
         errors: list[str] = []
+        selected_rows: dict[str, dict[str, Any]] = {}
         for row in rows:
-            torrent_hash = str(row.get("hash") or "")
+            torrent_hash = str(row.get("hash") or "").strip().lower()
+            if not torrent_hash:
+                errors.append(
+                    f"capacity reclaim row {row.get('id')} has empty hash"
+                )
+                continue
+            current = selected_rows.get(torrent_hash)
+            if current is None or int(row["id"]) > int(current["id"]):
+                selected_rows[torrent_hash] = row
+        for torrent_hash, row in sorted(
+            selected_rows.items(),
+            key=lambda item: int(item[1]["id"]),
+        ):
             token = self._reclaim_mutation_lease_token(
                 int(row["id"]),
                 int(row.get("capacity_generation") or 0),

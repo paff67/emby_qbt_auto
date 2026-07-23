@@ -1,20 +1,34 @@
 from __future__ import annotations
 
 import copy
+import logging
 import threading
+from pathlib import Path
 from typing import Any, Callable, Dict
 
 from .action_dispatcher import ActionDispatcher, ActionPriority
+from .db import readonly_connect
 from .models import ActionLogEntry
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Executor:
     """Apply qBT writes through one ordered dispatcher and retain an audit log."""
 
-    def __init__(self, qbt, dry_run: bool = True, dispatcher: ActionDispatcher | None = None):
+    def __init__(
+        self,
+        qbt,
+        dry_run: bool = True,
+        dispatcher: ActionDispatcher | None = None,
+        state_db: str | Path | None = None,
+    ):
         self.qbt = qbt
         self.dry_run = dry_run
+        self.state_db = None if state_db is None else Path(state_db)
         self.action_log: list[ActionLogEntry] = []
+        self.startup_reclaim_lease_warnings: list[str] = []
         self._hash_mutation_leases: dict[str, str] = {}
         self._hash_mutation_lease_lock = threading.RLock()
         self._hash_mutation_condition = threading.Condition(
@@ -22,6 +36,8 @@ class Executor:
         )
         self._hash_mutations_inflight: dict[str, int] = {}
         self._dispatch_context = threading.local()
+        if self.state_db is not None:
+            self._hydrate_durable_reclaim_leases_at_startup()
         self._qbt_post_handler = (
             self.qbt.post if dispatcher is None else dispatcher.handler
         )
@@ -30,6 +46,62 @@ class Executor:
         )
         if dispatcher is not None and not dry_run:
             dispatcher.handler = self._execute_qbt_post
+
+    def _hydrate_durable_reclaim_leases_at_startup(self) -> None:
+        """Load durable reclaim fences before a dispatcher can accept work."""
+        assert self.state_db is not None
+        try:
+            con = readonly_connect(self.state_db)
+            try:
+                rows = con.execute(
+                    "select id,hash,capacity_generation,state "
+                    "from capacity_reclaims "
+                    "where state is null or state not in ('released','cancelled') "
+                    "order by id desc"
+                ).fetchall()
+            finally:
+                con.close()
+
+            rows_by_hash: dict[str, list[tuple[int, int]]] = {}
+            for row in rows:
+                torrent_hash = self._normalized_hash(row["hash"])
+                if not torrent_hash:
+                    raise ValueError(
+                        f"locked capacity_reclaims row id={row['id']} has empty hash"
+                    )
+                reclaim_id = int(row["id"])
+                generation = int(row["capacity_generation"] or 0)
+                rows_by_hash.setdefault(torrent_hash, []).append(
+                    (reclaim_id, generation)
+                )
+
+            for torrent_hash in sorted(rows_by_hash):
+                candidates = sorted(
+                    rows_by_hash[torrent_hash],
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                reclaim_id, generation = candidates[0]
+                if len(candidates) > 1:
+                    ignored = ",".join(str(item[0]) for item in candidates[1:])
+                    warning = (
+                        "multiple durable capacity reclaim leases for hash "
+                        f"{torrent_hash}; keeping id={reclaim_id}; "
+                        f"ignoring id={ignored}"
+                    )
+                    self.startup_reclaim_lease_warnings.append(warning)
+                    LOGGER.warning(warning)
+                token = f"reclaim:{reclaim_id}:{generation}"
+                if not self.hydrate_hash_mutation_lease(torrent_hash, token):
+                    raise RuntimeError(
+                        "could not install durable capacity reclaim lease "
+                        f"for hash {torrent_hash}"
+                    )
+        except Exception as exc:
+            raise RuntimeError(
+                "durable capacity reclaim lease startup hydration failed "
+                f"for {self.state_db}: {exc}"
+            ) from exc
 
     def _execute_qbt_post(
         self,

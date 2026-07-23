@@ -349,9 +349,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     env_dry_run = _truthy(os.environ.get("QBT_ORCH_DRY_RUN"))
     dry_run = bool(ns.dry_run or (force_dry_run if force_dry_run is not None else (env_dry_run if env_dry_run is not None else (cfg.dry_run if cfg else True))))
     state_db = Path(os.environ.get("QBT_ORCH_STATE_DB") or (cfg.state_db if cfg else str(db)))
+    # Startup reclaim fences are hydrated by Executor, so the durable schema
+    # must exist before the shared mutation gateway is constructed.
+    migrate(state_db, dry_run=False)
     qbt_cfg = cfg.qbt if cfg else None
     qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)
-    executor = Executor(qbt, dry_run=dry_run)
+    executor = Executor(qbt, dry_run=dry_run, state_db=state_db)
     capacity_reclaim_chat_ids = (
         _csv_list(os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_TG_CHAT_IDS"))
         or _csv_list(os.environ.get("QBT_ORCH_TG_ALERT_CHAT_IDS"))
