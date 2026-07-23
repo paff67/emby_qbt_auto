@@ -530,6 +530,104 @@ def test_planner_safety_capture_is_atomic_while_next_sync_is_in_flight(tmp_path)
     assert new_sampled is True
 
 
+def test_concurrent_safety_ticks_serialize_rid_and_publish_in_poll_order(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    slow_poll_started = threading.Event()
+    release_slow_poll = threading.Event()
+    second_poll_started = threading.Event()
+
+    class OrderedBarrierQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            call = len(self.rids)
+            if call == 1:
+                return {
+                    "rid": 1,
+                    "full_update": True,
+                    "torrents": {
+                        "baseline": {
+                            "hash": "baseline",
+                            "category": "auto",
+                            "state": "stoppedDL",
+                        }
+                    },
+                    "server_state": {},
+                }
+            if call == 2:
+                slow_poll_started.set()
+                assert release_slow_poll.wait(2)
+                return {
+                    "rid": 2,
+                    "full_update": True,
+                    "torrents": {
+                        "old": {
+                            "hash": "old",
+                            "category": "auto",
+                            "state": "stoppedDL",
+                        }
+                    },
+                    "server_state": {},
+                }
+            second_poll_started.set()
+            return {
+                "rid": 3,
+                "full_update": True,
+                "torrents": {
+                    "new": {
+                        "hash": "new",
+                        "category": "auto",
+                        "state": "stoppedDL",
+                    }
+                },
+                "server_state": {},
+            }
+
+    qbt = OrderedBarrierQbt()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+    )
+    daemon.tick_safety()
+    first = threading.Thread(target=daemon.tick_safety)
+    second = threading.Thread(target=daemon.tick_safety)
+    first.start()
+    assert slow_poll_started.wait(1)
+    second.start()
+
+    captured = []
+    capture_done = threading.Event()
+
+    def capture_for_planner():
+        captured.append(daemon._capture_safety_snapshot())
+        capture_done.set()
+
+    capture = threading.Thread(target=capture_for_planner)
+    capture.start()
+    assert capture_done.wait(0.5), "slow poll blocked planner snapshot capture"
+    snapshots, healthy, sampled = captured[0]
+    assert set(snapshots) == {"baseline"}
+    assert healthy is True
+    assert sampled is True
+    assert not second_poll_started.wait(0.1), "second sync poll was not serialized"
+
+    release_slow_poll.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    capture.join(timeout=2)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    final_snapshots, final_healthy, final_sampled = daemon._capture_safety_snapshot()
+    assert qbt.rids == [0, 1, 2]
+    assert daemon.monitor.sync.rid == 3
+    assert set(final_snapshots) == {"new"}
+    assert final_healthy is True
+    assert final_sampled is True
+
+
 def test_direct_planner_tick_recovery_precedes_emergency_qbt_post(
     tmp_path,
     monkeypatch,

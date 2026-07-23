@@ -426,6 +426,7 @@ class DaemonRuntime:
         self._last_safety_event_at: float | None = None
         self._last_safety_event_fingerprint: tuple[object, ...] | None = None
         self._safety_sampled = False
+        self._safety_poll_lock = threading.Lock()
         self._safety_tick_lock = threading.RLock()
         self._published_safety_snapshots: dict[str, dict[str, Any]] = {}
         self._published_sync_healthy = False
@@ -1337,16 +1338,17 @@ class DaemonRuntime:
             )
 
     def tick_safety(self) -> None:
-        result = self.monitor.tick()
-        snapshots = {
-            torrent_hash: dict(vars(snapshot))
-            for torrent_hash, snapshot in self.monitor.sync.snapshots.items()
-        }
-        sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
-        with self._safety_tick_lock:
-            self._published_safety_snapshots = snapshots
-            self._published_sync_healthy = sync_healthy
-            self._safety_sampled = True
+        with self._safety_poll_lock:
+            result = self.monitor.tick()
+            snapshots = {
+                torrent_hash: dict(vars(snapshot))
+                for torrent_hash, snapshot in self.monitor.sync.snapshots.items()
+            }
+            sync_healthy = bool(self.monitor.sync.high_risk_actions_allowed)
+            with self._safety_tick_lock:
+                self._published_safety_snapshots = snapshots
+                self._published_sync_healthy = sync_healthy
+                self._safety_sampled = True
         free_bytes = int(self.free_bytes_provider())
         self._persist_disk_state(free_bytes, result.disk_state)
         sync_stats = self.monitor.sync.session_stats.as_dict()
