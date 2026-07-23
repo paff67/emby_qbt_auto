@@ -27,7 +27,11 @@ from .promotion import MediaPromotionRepository, MediaPromotionRunner
 from .runtime import BotCommandRepository, BotNotificationRepository, CleanupRequestRunner, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
 from .seeding_preemption import PreemptionConfig, SeedingPreemptionService
-from .service import DaemonRuntime, build_telegram_supervisor_from_env
+from .service import (
+    CAPACITY_RECOVERY_PENDING_STATES,
+    DaemonRuntime,
+    build_telegram_supervisor_from_env,
+)
 from .soak_queue import SoakQueueConfig
 
 
@@ -434,11 +438,14 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         )
     con = readonly_connect(state_db)
     try:
+        recovery_placeholders = ",".join(
+            "?" for _ in CAPACITY_RECOVERY_PENDING_STATES
+        )
         capacity_recovery_required = bool(
             con.execute(
-                "select 1 from capacity_reclaims where state in "
-                "('stopping','deleting','quarantined','deleted',"
-                "'recheck_pending','partial_or_unknown') limit 1"
+                f"select 1 from capacity_reclaims where state in "
+                f"({recovery_placeholders}) limit 1",
+                CAPACITY_RECOVERY_PENDING_STATES,
             ).fetchone()
         )
     finally:

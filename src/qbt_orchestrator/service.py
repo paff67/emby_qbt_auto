@@ -46,6 +46,16 @@ from .telegram_control import TelegramAuthorizer
 from .work_items import build_full_finish_work_items
 
 
+CAPACITY_RECOVERY_PENDING_STATES = (
+    "stopping",
+    "deleting",
+    "quarantined",
+    "deleted",
+    "recheck_pending",
+)
+CAPACITY_RECOVERY_PREFLIGHT_MAX_ROUNDS = 8
+
+
 @dataclass
 class LoopTask:
     name: str
@@ -549,7 +559,9 @@ class DaemonRuntime:
                 item
                 for item in build_full_finish_work_items(snapshots)
                 if item.hash not in cooldown_hashes
-                and assessment.torrents[item.hash].viable
+                and assessment.torrents[
+                    canonical_torrent_hash(item.hash)
+                ].viable
             ]
             engine_budget = self._scheduler_growth_budget(
                 free_bytes,
@@ -710,49 +722,133 @@ class DaemonRuntime:
         self,
         snapshots: Mapping[str, Mapping[str, Any]],
         *,
-        free_bytes: int,
+        free_bytes: int | None,
     ) -> None:
-        if (
-            self._capacity_recovery_preflight_done
-            or self.capacity_recovery_reclaimer is None
-        ):
+        if self._capacity_recovery_preflight_done:
             return
-        recovery_result = self.capacity_recovery_reclaimer.run(
-            snapshots,
-            assessment=None,
-            capacity_state="recovery_preflight",
-            free_bytes=int(free_bytes),
-            target_free_bytes=self.drain_exit_bytes,
+
+        pending_rows = self._capacity_recovery_pending_rows()
+        if not pending_rows:
+            self._capacity_recovery_preflight_done = True
+            return
+        if self.dry_run or self.planner_dry_run:
+            self._fail_capacity_recovery_preflight(
+                "dry-run requires live recovery for durable capacity reclaim rows",
+                rounds=0,
+                pending_rows=pending_rows,
+            )
+        if self.capacity_recovery_reclaimer is None:
+            self._fail_capacity_recovery_preflight(
+                "capacity recovery reclaimer is unavailable",
+                rounds=0,
+                pending_rows=pending_rows,
+            )
+
+        observed_free_bytes = (
+            int(self.free_bytes_provider())
+            if free_bytes is None
+            else int(free_bytes)
         )
-        recovery_errors = list(getattr(recovery_result, "errors", ()))
+        rounds = 0
+        initial_count = len(pending_rows)
+        while pending_rows and rounds < CAPACITY_RECOVERY_PREFLIGHT_MAX_ROUNDS:
+            before = tuple(
+                (int(row["id"]), str(row["state"])) for row in pending_rows
+            )
+            rounds += 1
+            try:
+                recovery_result = self.capacity_recovery_reclaimer.run(
+                    snapshots,
+                    assessment=None,
+                    capacity_state="recovery_preflight",
+                    free_bytes=observed_free_bytes,
+                    target_free_bytes=self.drain_exit_bytes,
+                )
+            except Exception as exc:
+                self._fail_capacity_recovery_preflight(
+                    str(exc),
+                    rounds=rounds,
+                    pending_rows=self._capacity_recovery_pending_rows(),
+                    errors=[exc],
+                )
+            recovery_errors = list(getattr(recovery_result, "errors", ()))
+            pending_rows = self._capacity_recovery_pending_rows()
+            if recovery_errors:
+                self._fail_capacity_recovery_preflight(
+                    "; ".join(str(error) for error in recovery_errors),
+                    rounds=rounds,
+                    pending_rows=pending_rows,
+                    errors=recovery_errors,
+                )
+            if not pending_rows:
+                self._capacity_recovery_preflight_done = True
+                self.obs.event(
+                    "info",
+                    "capacity_reclaim",
+                    "recovery_preflight_completed",
+                    "capacity reclaim recovery preflight completed",
+                    {
+                        "dry_run": self.dry_run,
+                        "rounds": rounds,
+                        "recovery_rows": initial_count,
+                    },
+                )
+                return
+            after = tuple(
+                (int(row["id"]), str(row["state"])) for row in pending_rows
+            )
+            if after == before:
+                self._fail_capacity_recovery_preflight(
+                    "capacity recovery made no durable state progress",
+                    rounds=rounds,
+                    pending_rows=pending_rows,
+                )
+
+        self._fail_capacity_recovery_preflight(
+            "capacity recovery exceeded bounded preflight rounds",
+            rounds=rounds,
+            pending_rows=pending_rows,
+        )
+
+    def _capacity_recovery_pending_rows(self) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in CAPACITY_RECOVERY_PENDING_STATES)
         con = readonly_connect(self.state_db)
         try:
-            unresolved_recovery = con.execute(
-                "select id,state from capacity_reclaims where state in "
-                "('stopping','deleting','quarantined') order by id limit 1"
-            ).fetchone()
+            rows = con.execute(
+                f"select id,state from capacity_reclaims "
+                f"where state in ({placeholders}) order by id",
+                CAPACITY_RECOVERY_PENDING_STATES,
+            ).fetchall()
+            return [dict(row) for row in rows]
         finally:
             con.close()
-        if unresolved_recovery is not None:
-            recovery_errors.append(
-                "durable recovery row remains unresolved: "
-                f"id={int(unresolved_recovery['id'])} "
-                f"state={unresolved_recovery['state']}"
-            )
-        if recovery_errors:
-            message = (
-                "capacity reclaim recovery preflight failed: "
-                + "; ".join(str(error) for error in recovery_errors)
-            )
-            self.obs.event(
-                "error",
-                "capacity_reclaim",
-                "recovery_preflight_failed",
-                str(redact(message)),
-                {"dry_run": self.dry_run},
-            )
-            raise RuntimeError(message)
-        self._capacity_recovery_preflight_done = True
+
+    def _fail_capacity_recovery_preflight(
+        self,
+        reason: str,
+        *,
+        rounds: int,
+        pending_rows: list[dict[str, Any]],
+        errors: list[Any] | None = None,
+    ) -> None:
+        message = f"capacity reclaim recovery preflight failed: {reason}"
+        self.obs.event(
+            "error",
+            "capacity_reclaim",
+            "recovery_preflight_failed",
+            str(redact(message)),
+            {
+                "dry_run": self.dry_run,
+                "planner_dry_run": self.planner_dry_run,
+                "rounds": int(rounds),
+                "pending": [
+                    {"id": int(row["id"]), "state": str(row["state"])}
+                    for row in pending_rows
+                ],
+                "errors": [str(redact(str(error))) for error in (errors or [])],
+            },
+        )
+        raise RuntimeError(message)
 
     def file_batch_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
@@ -1507,17 +1603,13 @@ class DaemonRuntime:
                 self._effective_config_snapshot(),
             )
             self.obs.event("info", "daemon", "started", "qbt orchestrator daemon started", {"dry_run": self.dry_run})
-            if (
-                not self._capacity_recovery_preflight_done
-                and self.capacity_recovery_reclaimer is not None
-            ):
-                self._capacity_recovery_preflight(
-                    {
-                        h: vars(snapshot)
-                        for h, snapshot in self.monitor.sync.snapshots.items()
-                    },
-                    free_bytes=int(self.free_bytes_provider()),
-                )
+            self._capacity_recovery_preflight(
+                {
+                    h: vars(snapshot)
+                    for h, snapshot in self.monitor.sync.snapshots.items()
+                },
+                free_bytes=None,
+            )
             if self.telegram_supervisor is not None:
                 self.telegram_supervisor.start()
             self._start_background_event_workers()

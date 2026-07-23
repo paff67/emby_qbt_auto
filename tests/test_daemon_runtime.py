@@ -154,7 +154,8 @@ def runtime_fixture(tmp_path, monkeypatch):
             qbt=SnapshotQbt(),
             executor=FakeExecutor(),
             free_bytes_provider=lambda: 6 * 1024**3,
-            dry_run=True,
+            dry_run=False,
+            planner_dry_run=False,
             safety_interval=0,
             capacity_assessment_builder=fixture.builder,
             capacity_assessment_store=fixture.store,
@@ -176,8 +177,7 @@ def test_planner_capacity_and_reclaimer_share_generation(runtime_fixture):
     generation = payload["capacity"]["assessment_generation"]
     assert generation > 0
     assert runtime_fixture.planner_assessment.generation == generation
-    assert runtime_fixture.reclaimer.calls[0]["assessment"] is None
-    reclaim_call = runtime_fixture.reclaimer.calls[1]
+    reclaim_call = runtime_fixture.reclaimer.calls[0]
     assert reclaim_call["assessment"] is runtime_fixture.store.committed[0][1]
     assert reclaim_call["assessment"] is runtime_fixture.planner_assessment
     assert reclaim_call["assessment"].generation == generation
@@ -208,6 +208,64 @@ def test_planner_capacity_and_reclaimer_share_generation(runtime_fixture):
     assert json.loads(metric)["assessment_generation"] == generation
 
 
+def test_scheduler_engine_canonicalizes_assessment_hash_lookup(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+
+    class MixedCaseQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    " ABCDEF ": {
+                        "name": "mixed",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 1,
+                        "size": 2,
+                        "progress": 0.5,
+                        "num_seeds": 1,
+                    }
+                },
+                "server_state": {},
+            }
+
+    original_planner = service.DownloadPlanner
+    planner_assessments = []
+
+    class RecordingPlanner(original_planner):
+        def plan_and_apply(self, *args, capacity_assessment=None, **kwargs):
+            planner_assessments.append(capacity_assessment)
+            return super().plan_and_apply(
+                *args,
+                capacity_assessment=capacity_assessment,
+                **kwargs,
+            )
+
+    monkeypatch.setattr(service, "DownloadPlanner", RecordingPlanner)
+    daemon = service.DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=MixedCaseQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+        scheduler_engine_mode="shadow",
+    )
+    daemon.tick_safety()
+
+    payload = daemon.planner_tick()
+
+    generation = payload["capacity"]["assessment_generation"]
+    assert planner_assessments[0].generation == generation
+    assert planner_assessments[0].torrents["abcdef"].viable is True
+    assert payload["scheduler_engine"]["assessment_generation"] == generation
+
+
 def test_capacity_recovery_preflight_failure_retries_without_committing_or_planning(
     tmp_path,
 ):
@@ -231,6 +289,14 @@ def test_capacity_recovery_preflight_failure_retries_without_committing_or_plann
             target_free_bytes,
         ):
             self.calls.append(assessment)
+            if assessment is None and not self.fail:
+                con = sqlite3.connect(db)
+                con.execute(
+                    "update capacity_reclaims set state='aborted_paused' "
+                    "where state='stopping'"
+                )
+                con.commit()
+                con.close()
             return CapacityReclaimResult(
                 dry_run=True,
                 assessment_generation=(
@@ -246,10 +312,21 @@ def test_capacity_recovery_preflight_failure_retries_without_committing_or_plann
         qbt=FakeQbt(),
         executor=FakeExecutor(),
         free_bytes_provider=lambda: 6 * 1024**3,
-        dry_run=True,
+        dry_run=False,
+        planner_dry_run=False,
         capacity_reclaimer=reclaimer,
     )
     daemon.tick_safety()
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
 
     with pytest.raises(RuntimeError, match="recovery preflight failed"):
         daemon.planner_tick()
@@ -274,8 +351,226 @@ def test_capacity_recovery_preflight_failure_retries_without_committing_or_plann
     assert daemon._capacity_recovery_preflight_done is True
 
 
-def test_daemon_startup_recovery_preflight_runs_before_safety_or_workers(tmp_path):
+def test_capacity_recovery_preflight_fails_closed_without_reclaimer(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class LockedQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "h": {
+                        "name": "locked",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 1,
+                        "size": 2,
+                        "num_seeds": 1,
+                    }
+                },
+                "server_state": {},
+            }
+
+    db = tmp_path / "state.sqlite"
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=LockedQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+    )
+    daemon.tick_safety()
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="recovery reclaimer is unavailable"):
+        daemon.planner_tick()
+
+    con = sqlite3.connect(db)
+    assert con.execute("select count(*) from capacity_assessment_state").fetchone()[0] == 0
+    assert con.execute("select count(*) from scheduler_allocations").fetchone()[0] == 0
+    con.execute(
+        "update capacity_reclaims set state='aborted_paused' where id=1"
+    )
+    con.commit()
+    con.close()
+    assert daemon._capacity_recovery_preflight_done is False
+
+    payload = daemon.planner_tick()
+
+    assert payload["capacity"]["assessment_generation"] == 1
+    assert payload["planner"]["selected_hashes"] == []
+    assert daemon._capacity_recovery_preflight_done is True
+
+
+@pytest.mark.parametrize(
+    ("runtime_dry_run", "planner_dry_run"),
+    [(True, False), (False, True)],
+)
+def test_capacity_recovery_preflight_dry_run_never_calls_live_reclaimer(
+    tmp_path,
+    runtime_dry_run,
+    planner_dry_run,
+):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class LiveRecovery:
+        dry_run = False
+
+        def __init__(self):
+            self.called = False
+
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            self.called = True
+            raise AssertionError("dry-run runtime must not invoke live recovery")
+
+    db = tmp_path / "state.sqlite"
+    live_recovery = LiveRecovery()
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=runtime_dry_run,
+        planner_dry_run=planner_dry_run,
+        capacity_recovery_reclaimer=live_recovery,
+    )
+    daemon.tick_safety()
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="dry-run requires live recovery"):
+        daemon.planner_tick()
+
+    assert live_recovery.called is False
+    con = sqlite3.connect(db)
+    assert con.execute("select count(*) from capacity_assessment_state").fetchone()[0] == 0
+    con.close()
+    assert daemon._capacity_recovery_preflight_done is False
+
+
+def test_capacity_recovery_preflight_fails_on_no_durable_progress(tmp_path):
     from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class StalledRecovery:
+        dry_run = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            self.calls += 1
+            return CapacityReclaimResult(dry_run=False)
+
+    db = tmp_path / "state.sqlite"
+    recovery = StalledRecovery()
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_recovery_reclaimer=recovery,
+    )
+    daemon.tick_safety()
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="no durable state progress"):
+        daemon.planner_tick()
+
+    con = sqlite3.connect(db)
+    event = json.loads(
+        con.execute(
+            "select data_json from events_v2 where "
+            "event_type='recovery_preflight_failed' order by id desc limit 1"
+        ).fetchone()[0]
+    )
+    con.close()
+    assert recovery.calls == 1
+    assert event["rounds"] == 1
+    assert event["pending"] == [{"id": 1, "state": "stopping"}]
+    assert daemon._capacity_recovery_preflight_done is False
+
+
+def test_capacity_recovery_preflight_dry_run_without_pending_rows_skips_live_recovery(
+    tmp_path,
+):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class LiveRecovery:
+        dry_run = False
+        called = False
+
+        def run(self, *_args, **_kwargs):
+            self.called = True
+            raise AssertionError("no recovery call is needed without pending rows")
+
+    recovery = LiveRecovery()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+        capacity_recovery_reclaimer=recovery,
+    )
+    daemon.tick_safety()
+
+    payload = daemon.planner_tick()
+
+    assert payload["capacity"]["assessment_generation"] == 1
+    assert recovery.called is False
+    assert daemon._capacity_recovery_preflight_done is True
+
+
+def test_daemon_startup_recovery_preflight_runs_before_safety_or_workers(tmp_path):
     from qbt_orchestrator.service import DaemonRuntime
 
     class FailingRecovery:
@@ -291,10 +586,7 @@ def test_daemon_startup_recovery_preflight_runs_before_safety_or_workers(tmp_pat
             target_free_bytes,
         ):
             assert assessment is None
-            return CapacityReclaimResult(
-                dry_run=True,
-                errors=["startup recovery failed"],
-            )
+            raise RuntimeError("startup recovery failed")
 
     qbt = FakeQbt()
     daemon = DaemonRuntime(
@@ -302,11 +594,22 @@ def test_daemon_startup_recovery_preflight_runs_before_safety_or_workers(tmp_pat
         qbt=qbt,
         executor=FakeExecutor(),
         free_bytes_provider=lambda: 6 * 1024**3,
-        dry_run=True,
+        dry_run=False,
+        planner_dry_run=False,
         capacity_reclaimer=FailingRecovery(),
         background_event_workers=True,
         background_periodic_workers=True,
     )
+    con = sqlite3.connect(daemon.state_db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
 
     with pytest.raises(RuntimeError, match="startup recovery failed"):
         daemon.run(max_safety_ticks=1)
@@ -314,6 +617,16 @@ def test_daemon_startup_recovery_preflight_runs_before_safety_or_workers(tmp_pat
     assert qbt.rids == []
     assert daemon._event_worker_threads == []
     assert daemon._periodic_workers == []
+    con = sqlite3.connect(daemon.state_db)
+    event = json.loads(
+        con.execute(
+            "select data_json from events_v2 where "
+            "event_type='recovery_preflight_failed' order by id desc limit 1"
+        ).fetchone()[0]
+    )
+    con.close()
+    assert event["rounds"] == 1
+    assert event["errors"] == ["startup recovery failed"]
 
 
 def test_runtime_calls_real_dead_partial_reclaimer_with_committed_assessment(
@@ -438,7 +751,7 @@ def test_real_capacity_recovery_preflight_converges_before_new_generation(
         executor=executor,
         free_bytes_provider=lambda: 6 * 1024**3,
         dry_run=False,
-        planner_dry_run=True,
+        planner_dry_run=False,
         capacity_reclaimer=reclaimer,
     )
     try:
@@ -458,6 +771,190 @@ def test_real_capacity_recovery_preflight_converges_before_new_generation(
         if lease_state == "quarantined":
             assert host_path.exists()
             assert not quarantine_path.exists()
+    finally:
+        executor.close(timeout=1)
+
+
+def test_real_capacity_recovery_preflight_runs_multiple_rounds_to_reclaimed(
+    tmp_path,
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.service import DaemonRuntime
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_assessment_state("
+        "id,current_generation,observed_at,summary_json) values(1,1,1,'{}')"
+    )
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'deleting',1,1,1)",
+        (str((managed / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    class RecoveryQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, payload))
+            return True
+
+    qbt = RecoveryQbt()
+    executor = Executor(qbt, dry_run=False, state_db=db)
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        max_per_tick=0,
+        disk_free_bytes=lambda _path: 0,
+    )
+    real_run = reclaimer.run
+    recovery_assessments = []
+
+    def recording_run(
+        snapshots,
+        *,
+        assessment=None,
+        capacity_state,
+        free_bytes,
+        target_free_bytes,
+    ):
+        recovery_assessments.append(assessment)
+        return real_run(
+            snapshots,
+            assessment=assessment,
+            capacity_state=capacity_state,
+            free_bytes=free_bytes,
+            target_free_bytes=target_free_bytes,
+        )
+
+    reclaimer.run = recording_run
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=reclaimer,
+    )
+    try:
+        daemon.tick_safety()
+        payload = daemon.planner_tick()
+
+        con = sqlite3.connect(db)
+        state = con.execute(
+            "select state from capacity_reclaims where id=1"
+        ).fetchone()[0]
+        event = con.execute(
+            "select data_json from events_v2 where "
+            "component='capacity_reclaim' and "
+            "event_type='recovery_preflight_completed' "
+            "order by id desc limit 1"
+        ).fetchone()[0]
+        con.close()
+        assert state == "reclaimed"
+        assert recovery_assessments[0:2] == [None, None]
+        assert recovery_assessments[2].generation == payload["capacity"]["assessment_generation"]
+        assert json.loads(event)["rounds"] == 2
+        assert qbt.posts == [("/api/v2/torrents/recheck", {"hashes": "h"})]
+    finally:
+        executor.close(timeout=1)
+
+
+def test_real_capacity_recovery_recheck_failure_retries_without_generation(
+    tmp_path,
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.service import DaemonRuntime
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_assessment_state("
+        "id,current_generation,observed_at,summary_json) values(1,1,1,'{}')"
+    )
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'deleted',1,1,1)",
+        (str((managed / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    class FailingRecheckQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, payload))
+            raise RuntimeError("recheck failed")
+
+    qbt = FailingRecheckQbt()
+    executor = Executor(qbt, dry_run=False, state_db=db)
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        max_per_tick=0,
+        disk_free_bytes=lambda _path: 0,
+    )
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=reclaimer,
+    )
+    try:
+        daemon.tick_safety()
+        with pytest.raises(RuntimeError, match="recovery preflight failed"):
+            daemon.planner_tick()
+        with pytest.raises(RuntimeError, match="recovery preflight failed"):
+            daemon.planner_tick()
+
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select state from capacity_reclaims where id=1"
+        ).fetchone()
+        generation = con.execute(
+            "select current_generation from capacity_assessment_state where id=1"
+        ).fetchone()[0]
+        capacity_count = con.execute("select count(*) from capacity_state").fetchone()[0]
+        con.close()
+        assert row[0] == "recheck_pending"
+        assert generation == 1
+        assert capacity_count == 0
+        assert len(qbt.posts) == 2
+        assert daemon._capacity_recovery_preflight_done is False
     finally:
         executor.close(timeout=1)
 
