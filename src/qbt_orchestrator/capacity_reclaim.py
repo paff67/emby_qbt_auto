@@ -109,22 +109,73 @@ class CapacityReclaimAuditStore:
             "assessment_json": assessment_json,
         }
 
-    def begin(self, candidate: Mapping[str, Any]) -> int:
+    @staticmethod
+    def _safe_error(error: str | None) -> str | None:
+        if error is None:
+            return None
+        return str(redact(str(error)))[:2000]
+
+    @staticmethod
+    def _notification_ids(row: Mapping[str, Any]) -> list[int]:
+        try:
+            values = json.loads(str(row["notification_ids_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            values = []
+        return [int(value) for value in values if str(value).isdigit()]
+
+    def _enqueue_notification(
+        self,
+        con,
+        row: Mapping[str, Any],
+        *,
+        kind: str,
+        level: str,
+        message: str,
+        payload: Mapping[str, Any],
+        now: int,
+    ) -> list[int]:
+        notification_ids = self._notification_ids(row)
+        for chat_id in self.notification_chat_ids:
+            dedupe_key = f"capacity-reclaim:{int(row['id'])}:{kind}:{chat_id}"
+            con.execute(
+                "insert or ignore into bot_notifications(dedupe_key,chat_id,level,topic,message,"
+                "payload_json,state,attempts,created_at,updated_at) "
+                "values(?,?,?,?,?,?,'queued',0,?,?)",
+                (
+                    dedupe_key,
+                    chat_id,
+                    level,
+                    "capacity_reclaim",
+                    message,
+                    json.dumps(dict(payload), ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            notice = con.execute(
+                "select id from bot_notifications where dedupe_key=?", (dedupe_key,)
+            ).fetchone()
+            assert notice is not None
+            notice_id = int(notice["id"])
+            if notice_id not in notification_ids:
+                notification_ids.append(notice_id)
+        con.execute(
+            "update capacity_reclaims set notification_ids_json=?,updated_at=? where id=?",
+            (json.dumps(notification_ids), now, int(row["id"])),
+        )
+        return notification_ids
+
+    def reserve(self, candidate: Mapping[str, Any]) -> dict[str, Any]:
         identity = self._identity(candidate)
         now = int(self.now())
 
-        def txn(con) -> int:
-            con.execute(
+        def txn(con) -> dict[str, Any]:
+            inserted = con.execute(
                 "insert into capacity_reclaims(reclaim_key,hash,name,magnet_uri,host_path,content_path,"
                 "allocated_bytes,completed_bytes,progress,dead_since,reclaimable_since,capacity_generation,"
                 "capacity_reason,assessment_json,state,recheck_state,created_at,updated_at) "
-                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'deleting','pending',?,?) "
-                "on conflict(reclaim_key) do update set name=excluded.name,magnet_uri=excluded.magnet_uri,"
-                "host_path=excluded.host_path,content_path=excluded.content_path,allocated_bytes=excluded.allocated_bytes,"
-                "completed_bytes=excluded.completed_bytes,progress=excluded.progress,dead_since=excluded.dead_since,"
-                "reclaimable_since=excluded.reclaimable_since,capacity_generation=excluded.capacity_generation,"
-                "capacity_reason=excluded.capacity_reason,assessment_json=excluded.assessment_json,state='deleting',"
-                "recheck_state='pending',recheck_error=null,updated_at=excluded.updated_at",
+                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'stopping','not_requested',?,?) "
+                "on conflict(reclaim_key) do nothing",
                 (
                     identity["reclaim_key"],
                     identity["hash"],
@@ -145,25 +196,231 @@ class CapacityReclaimAuditStore:
                 ),
             )
             row = con.execute(
-                "select id from capacity_reclaims where reclaim_key=?",
+                "select id,state,capacity_generation from capacity_reclaims where reclaim_key=?",
                 (identity["reclaim_key"],),
             ).fetchone()
             assert row is not None
-            return int(row["id"])
+            return {
+                "reclaim_id": int(row["id"]),
+                "state": str(row["state"]),
+                "capacity_generation": int(row["capacity_generation"] or 0),
+                "reserved": int(inserted.rowcount or 0) == 1,
+            }
 
-        return int(write_transaction(self.state_db, txn))
+        return dict(write_transaction(self.state_db, txn))
 
-    def mark_failed(self, reclaim_id: int, error: str) -> None:
+    def _mark_warning_state(
+        self,
+        reclaim_id: int,
+        generation: int,
+        *,
+        target_state: str,
+        allowed_states: tuple[str, ...],
+        reason: str,
+        error: str | None = None,
+    ) -> bool:
         now = int(self.now())
-        safe_error = str(redact(error))[:2000]
-        write_transaction(
+        safe_error = self._safe_error(error)
+
+        def txn(con) -> bool:
+            row = con.execute(
+                "select * from capacity_reclaims where id=? and capacity_generation=?",
+                (int(reclaim_id), int(generation)),
+            ).fetchone()
+            if row is None:
+                return False
+            current_state = str(row["state"])
+            if current_state not in {*allowed_states, target_state}:
+                return False
+            if current_state != target_state:
+                placeholders = ",".join("?" for _ in allowed_states)
+                changed = con.execute(
+                    "update capacity_reclaims set state=?,recheck_state='not_requested',"
+                    f"recheck_error=?,updated_at=? where id=? and capacity_generation=? and state in ({placeholders})",
+                    (
+                        target_state,
+                        safe_error or str(reason)[:2000],
+                        now,
+                        int(reclaim_id),
+                        int(generation),
+                        *allowed_states,
+                    ),
+                )
+                if int(changed.rowcount or 0) != 1:
+                    return False
+                row = con.execute(
+                    "select * from capacity_reclaims where id=?", (int(reclaim_id),)
+                ).fetchone()
+                assert row is not None
+            if target_state == "stop_unknown":
+                status_text = "停止结果未知，未执行删除，需人工确认任务状态。"
+            else:
+                status_text = "任务已保持暂停，需人工确认继续或保留暂停。"
+            message = (
+                f"qBT 容量回收已中止；{status_text}\n"
+                f"种子名：{row['name']}\nHash：{row['hash']}\n原因：{reason}"
+            )
+            payload = {
+                "hash": str(row["hash"]),
+                "name": str(row["name"]),
+                "reason": str(reason),
+                "error": safe_error,
+                "reclaim_id": int(row["id"]),
+                "requires_confirmation": True,
+                "allowed_actions": ["resume", "keep_paused"],
+            }
+            self._enqueue_notification(
+                con,
+                row,
+                kind=target_state,
+                level="warning",
+                message=message,
+                payload=payload,
+                now=now,
+            )
+            return True
+
+        return bool(write_transaction(self.state_db, txn))
+
+    def mark_aborted_paused(
+        self,
+        reclaim_id: int,
+        generation: int,
+        reason: str,
+        error: str | None = None,
+    ) -> bool:
+        return self._mark_warning_state(
+            reclaim_id,
+            generation,
+            target_state="aborted_paused",
+            allowed_states=("stopping",),
+            reason=reason,
+            error=error,
+        )
+
+    def mark_stop_unknown(
+        self,
+        reclaim_id: int,
+        generation: int,
+        reason: str,
+        error: str | None = None,
+    ) -> bool:
+        return self._mark_warning_state(
+            reclaim_id,
+            generation,
+            target_state="stop_unknown",
+            allowed_states=("stopping",),
+            reason=reason,
+            error=error,
+        )
+
+    def mark_deleting(self, reclaim_id: int, generation: int) -> bool:
+        now = int(self.now())
+        changed = write_transaction(
             self.state_db,
             lambda con: con.execute(
-                "update capacity_reclaims set state='failed',recheck_state='not_requested',"
-                "recheck_error=?,updated_at=? where id=?",
-                (safe_error, now, int(reclaim_id)),
-            ),
+                "update capacity_reclaims set state='deleting',recheck_state='pending',"
+                "recheck_error=null,updated_at=? where id=? and capacity_generation=? "
+                "and state='stopping'",
+                (now, int(reclaim_id), int(generation)),
+            ).rowcount,
         )
+        return int(changed or 0) == 1
+
+    def mark_deleted(self, reclaim_id: int, generation: int) -> bool:
+        now = int(self.now())
+        changed = write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update capacity_reclaims set state='deleted',recheck_state='pending',"
+                "recheck_error=null,updated_at=? where id=? and capacity_generation=? "
+                "and state='deleting'",
+                (now, int(reclaim_id), int(generation)),
+            ).rowcount,
+        )
+        return int(changed or 0) == 1
+
+    def mark_partial_or_unknown(
+        self,
+        reclaim_id: int,
+        generation: int,
+        reason: str,
+        error: str | None = None,
+    ) -> bool:
+        return self._mark_warning_state(
+            reclaim_id,
+            generation,
+            target_state="partial_or_unknown",
+            allowed_states=("deleting", "deleted", "recheck_pending"),
+            reason=reason,
+            error=error,
+        )
+
+    def recovery_rows(self, generation: int) -> list[dict[str, Any]]:
+        con = readonly_connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select * from capacity_reclaims where capacity_generation=? "
+                "and state in ('stopping','deleting','deleted','recheck_pending','partial_or_unknown') "
+                "order by id",
+                (int(generation),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            con.close()
+
+    def mark_recheck_pending(
+        self,
+        reclaim_id: int,
+        generation: int,
+        error: str,
+    ) -> dict[str, Any]:
+        now = int(self.now())
+        safe_error = self._safe_error(error)
+
+        def txn(con) -> dict[str, Any]:
+            row = con.execute(
+                "select * from capacity_reclaims where id=? and capacity_generation=?",
+                (int(reclaim_id), int(generation)),
+            ).fetchone()
+            if row is None or str(row["state"]) not in {"deleted", "recheck_pending"}:
+                raise RuntimeError("capacity reclaim recheck state changed")
+            con.execute(
+                "update capacity_reclaims set state='recheck_pending',recheck_state='failed',"
+                "recheck_error=?,updated_at=? where id=? and capacity_generation=? "
+                "and state in ('deleted','recheck_pending')",
+                (safe_error, now, int(reclaim_id), int(generation)),
+            )
+            row = con.execute(
+                "select * from capacity_reclaims where id=?", (int(reclaim_id),)
+            ).fetchone()
+            assert row is not None
+            notification_ids = self._enqueue_notification(
+                con,
+                row,
+                kind="recheck_pending",
+                level="warning",
+                message=(
+                    "qBT 容量回收已删除文件，但重新校验请求失败，将在后续运行重试。\n"
+                    f"种子名：{row['name']}\nHash：{row['hash']}"
+                ),
+                payload={
+                    "hash": str(row["hash"]),
+                    "name": str(row["name"]),
+                    "reason": "recheck_failed",
+                    "error": safe_error,
+                    "reclaim_id": int(row["id"]),
+                },
+                now=now,
+            )
+            return {
+                "reclaim_id": int(row["id"]),
+                "notification_ids": notification_ids,
+                "state": "recheck_pending",
+                "recheck_state": "failed",
+            }
+
+        return dict(write_transaction(self.state_db, txn))
 
     def complete(
         self,
@@ -172,18 +429,20 @@ class CapacityReclaimAuditStore:
         *,
         recheck_error: str | None,
     ) -> dict[str, Any]:
+        generation = int(candidate.get("capacity_generation") or 0)
+        if recheck_error is not None:
+            return self.mark_recheck_pending(
+                reclaim_id, generation, recheck_error
+            )
         identity = self._identity(candidate)
         now = int(self.now())
-        recheck_state = "failed" if recheck_error else "requested"
-        safe_recheck_error = None if recheck_error is None else str(redact(recheck_error))[:2000]
-        status_text = "重新校验失败" if recheck_error else "已请求重新校验"
         full_magnet = identity["magnet_uri"]
         prefix = (
             "qBT 编排器自动容量回收完成\n"
             f"种子名：{identity['name']}\n"
             f"Hash：{identity['hash']}\n"
             f"释放空间：{identity['allocated_bytes'] / 1024**3:.2f} GiB\n"
-            f"状态：{status_text}\n"
+            "状态：已请求重新校验\n"
             "磁力链接：\n"
         )
         push_magnet = full_magnet
@@ -199,47 +458,38 @@ class CapacityReclaimAuditStore:
         payload = {
             **identity,
             "reclaim_id": int(reclaim_id),
-            "recheck_state": recheck_state,
-            "recheck_error": safe_recheck_error,
+            "recheck_state": "requested",
+            "recheck_error": None,
         }
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
         def txn(con) -> dict[str, Any]:
-            con.execute(
-                "update capacity_reclaims set state='reclaimed',recheck_state=?,recheck_error=?,"
-                "reclaimed_at=?,updated_at=? where id=?",
-                (recheck_state, safe_recheck_error, now, now, int(reclaim_id)),
+            changed = con.execute(
+                "update capacity_reclaims set state='reclaimed',recheck_state='requested',"
+                "recheck_error=null,reclaimed_at=?,updated_at=? where id=? "
+                "and capacity_generation=? and state in ('deleted','recheck_pending')",
+                (now, now, int(reclaim_id), generation),
             )
-            notification_ids: list[int] = []
-            for chat_id in self.notification_chat_ids:
-                dedupe_key = f"capacity-reclaim:{reclaim_id}:{chat_id}"
-                con.execute(
-                    "insert or ignore into bot_notifications(dedupe_key,chat_id,level,topic,message,"
-                    "payload_json,state,attempts,created_at,updated_at) values(?,?,?,?,?,?,'queued',0,?,?)",
-                    (
-                        dedupe_key,
-                        chat_id,
-                        "warning" if recheck_error else "info",
-                        "capacity_reclaim",
-                        message,
-                        payload_json,
-                        now,
-                        now,
-                    ),
-                )
-                row = con.execute(
-                    "select id from bot_notifications where dedupe_key=?", (dedupe_key,)
-                ).fetchone()
-                assert row is not None
-                notification_ids.append(int(row["id"]))
-            con.execute(
-                "update capacity_reclaims set notification_ids_json=?,updated_at=? where id=?",
-                (json.dumps(notification_ids), now, int(reclaim_id)),
+            if int(changed.rowcount or 0) != 1:
+                raise RuntimeError("capacity reclaim completion state changed")
+            row = con.execute(
+                "select * from capacity_reclaims where id=?", (int(reclaim_id),)
+            ).fetchone()
+            assert row is not None
+            notification_ids = self._enqueue_notification(
+                con,
+                row,
+                kind="reclaimed",
+                level="info",
+                message=message,
+                payload=json.loads(payload_json),
+                now=now,
             )
             return {
                 "reclaim_id": int(reclaim_id),
                 "notification_ids": notification_ids,
-                "recheck_state": recheck_state,
+                "state": "reclaimed",
+                "recheck_state": "requested",
             }
 
         return dict(write_transaction(self.state_db, txn))
@@ -355,6 +605,16 @@ class DeadPartialReclaimer:
                 assessment_generation=generation,
                 rejection_counts={"stale_assessment": 1},
             )
+        recovery_errors = (
+            [] if self.dry_run else self._reconcile_reclaims(assessment)
+        )
+        if recovery_errors:
+            return CapacityReclaimResult(
+                dry_run=self.dry_run,
+                assessment_generation=generation,
+                rejection_counts={"reconciliation_failed": 1},
+                errors=recovery_errors,
+            )
         if (
             str(capacity_state) != "capacity_deadlock"
             or int(free_bytes) >= int(target_free_bytes)
@@ -363,6 +623,7 @@ class DeadPartialReclaimer:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
                 assessment_generation=generation,
+                errors=recovery_errors,
             )
 
         (
@@ -559,15 +820,39 @@ class DeadPartialReclaimer:
 
         reclaimed = 0
         reclaimed_bytes = 0
-        errors: list[str] = []
+        errors: list[str] = list(recovery_errors)
         completed: list[dict[str, Any]] = []
         for candidate in selected:
             torrent_hash = str(candidate["hash"])
-            reclaim_id: int | None = None
             reason = self._revalidate_candidate(candidate, assessment)
             if reason is not None:
                 reject(reason)
                 continue
+            try:
+                reservation = self.audit.reserve(candidate)
+            except Exception as exc:
+                reject("reservation_failed")
+                errors.append(f"{torrent_hash}: failed to reserve reclaim: {exc}")
+                continue
+            if not reservation["reserved"]:
+                reject("reclaim_already_recorded")
+                continue
+            reclaim_id = int(reservation["reclaim_id"])
+
+            def abort_paused(reason: str, error: str | None = None) -> None:
+                reject(reason)
+                try:
+                    if not self.audit.mark_aborted_paused(
+                        int(reclaim_id), generation, reason, error
+                    ):
+                        errors.append(
+                            f"{torrent_hash}: failed to fence paused abort state"
+                        )
+                except Exception as exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to persist paused abort: {exc}"
+                    )
+
             try:
                 self.executor.qbt_post(
                     "/api/v2/torrents/stop", {"hashes": torrent_hash}
@@ -575,10 +860,18 @@ class DeadPartialReclaimer:
             except Exception as exc:
                 reject("stop_failed")
                 errors.append(f"{torrent_hash}: {exc}")
+                try:
+                    self.audit.mark_stop_unknown(
+                        int(reclaim_id), generation, "stop_failed", str(exc)
+                    )
+                except Exception as audit_exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to persist unknown stop: {audit_exc}"
+                    )
                 continue
             current, stop_reason = self._wait_until_stopped(torrent_hash)
             if stop_reason is not None:
-                reject(stop_reason)
+                abort_paused(stop_reason)
                 continue
             assert current is not None
             reason = self._live_torrent_rejection(
@@ -587,14 +880,14 @@ class DeadPartialReclaimer:
                 assessment=assessment,
             )
             if reason is not None:
-                reject(reason)
+                abort_paused(reason)
                 continue
             host_path = self._host_path(current.get("content_path"))
             if host_path is None:
-                reject("unsafe_path")
+                abort_paused("unsafe_path")
                 continue
             if host_path != Path(str(candidate["host_path"])):
-                reject("path_changed")
+                abort_paused("path_changed")
                 continue
             (
                 fresh_paths,
@@ -602,7 +895,7 @@ class DeadPartialReclaimer:
                 inventory_reason,
             ) = self._fresh_path_inventory(torrent_hash)
             if inventory_reason is not None:
-                reject(inventory_reason)
+                abort_paused(inventory_reason)
                 continue
             assert inventory_candidate is not None
             reason = self._live_torrent_rejection(
@@ -611,50 +904,68 @@ class DeadPartialReclaimer:
                 assessment=assessment,
             )
             if reason is not None:
-                reject(reason)
+                abort_paused(reason)
                 continue
             if not _is_stopped_download_state(inventory_candidate.get("state")):
-                reject("torrent_not_stopped")
+                abort_paused("torrent_not_stopped")
                 continue
             inventory_host_path = fresh_paths.get(torrent_hash.strip().lower())
             if inventory_host_path is None:
-                reject("path_inventory_failed")
+                abort_paused("path_inventory_failed")
                 continue
             if inventory_host_path != host_path:
-                reject("path_changed")
+                abort_paused("path_changed")
                 continue
             if self._overlaps_other(torrent_hash, host_path, fresh_paths):
-                reject("path_overlap")
+                abort_paused("path_overlap")
                 continue
             if not host_path.exists():
-                reject("path_missing")
+                abort_paused("path_missing")
                 continue
             try:
                 allocated = self._allocated_bytes(host_path)
-            except OSError:
-                reject("path_inspection_failed")
+            except OSError as exc:
+                abort_paused("path_inspection_failed", str(exc))
                 continue
             if allocated < self.min_reclaim_bytes:
-                reject("below_min_reclaim")
+                abort_paused("below_min_reclaim")
                 continue
             candidate = {**candidate, "allocated_bytes": int(allocated)}
             reason = self._candidate_fence_reason(candidate, assessment)
             if reason is not None:
-                reject(reason)
+                abort_paused(reason)
                 continue
             try:
-                reclaim_id = self.audit.begin(candidate)
-                self._delete_path(host_path)
-                reclaimed += 1
-                reclaimed_bytes += int(candidate["allocated_bytes"])
+                deleting = self.audit.mark_deleting(int(reclaim_id), generation)
             except Exception as exc:
-                if reclaim_id is not None:
-                    try:
-                        self.audit.mark_failed(reclaim_id, str(exc))
-                    except Exception as audit_exc:
-                        errors.append(f"{torrent_hash}: failed to persist reclaim failure: {audit_exc}")
+                errors.append(
+                    f"{torrent_hash}: failed to persist deleting state: {exc}"
+                )
+                abort_paused("reclaim_state_changed", str(exc))
+                continue
+            if not deleting:
+                abort_paused("reclaim_state_changed")
+                continue
+            try:
+                self._delete_path(host_path)
+            except Exception as exc:
+                try:
+                    self.audit.mark_partial_or_unknown(
+                        int(reclaim_id), generation, "delete_partial_or_unknown", str(exc)
+                    )
+                except Exception as audit_exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to persist partial deletion: {audit_exc}"
+                    )
                 errors.append(f"{torrent_hash}: {exc}")
                 continue
+            try:
+                if not self.audit.mark_deleted(int(reclaim_id), generation):
+                    raise RuntimeError("capacity reclaim deleted state changed")
+            except Exception as exc:
+                errors.append(f"{torrent_hash}: failed to persist deleted state: {exc}")
+                continue
+            reclaimed_bytes += int(candidate["allocated_bytes"])
             recheck_error: str | None = None
             try:
                 self.executor.qbt_post(
@@ -668,9 +979,11 @@ class DeadPartialReclaimer:
                     int(reclaim_id), candidate, recheck_error=recheck_error
                 )
                 completed.append({**candidate, **audit})
+                if recheck_error is None:
+                    reclaimed += 1
             except Exception as exc:
                 errors.append(f"{torrent_hash}: failed to persist completed reclaim: {exc}")
-                completed.append(candidate)
+                completed.append({**candidate, "state": "deleted"})
         return CapacityReclaimResult(
             dry_run=False,
             planned=len(selected),
@@ -682,6 +995,149 @@ class DeadPartialReclaimer:
             errors=errors,
             assessment_generation=generation,
         )
+
+    def _recovery_path(self, row: Mapping[str, Any]) -> Path | None:
+        mapped_path = self._host_path(row.get("content_path"))
+        if mapped_path is None:
+            return None
+        try:
+            stored_path = Path(str(row.get("host_path") or "")).resolve()
+        except OSError:
+            return None
+        if stored_path != mapped_path:
+            return None
+        return mapped_path
+
+    def _reconcile_reclaims(
+        self,
+        assessment: CapacityAssessment,
+    ) -> list[str]:
+        generation = int(assessment.generation)
+        errors: list[str] = []
+        try:
+            recovery_rows = self.audit.recovery_rows(generation)
+        except Exception as exc:
+            return [f"capacity reclaim recovery scan failed: {exc}"]
+        for row in recovery_rows:
+            reclaim_id = int(row["id"])
+            torrent_hash = str(row["hash"])
+            state = str(row["state"])
+            if state == "stopping":
+                try:
+                    current = self._qbt_call_with_timeout(
+                        "torrent_info",
+                        torrent_hash,
+                        timeout=self.inventory_timeout_sec,
+                    )
+                    if _is_stopped_download_state(current.get("state")):
+                        changed = self.audit.mark_aborted_paused(
+                            reclaim_id,
+                            generation,
+                            "restart_after_stopping",
+                        )
+                    else:
+                        changed = self.audit.mark_stop_unknown(
+                            reclaim_id,
+                            generation,
+                            "restart_stop_state_unknown",
+                        )
+                    if not changed:
+                        errors.append(
+                            f"{torrent_hash}: stopping reconciliation fence changed"
+                        )
+                except Exception as exc:
+                    try:
+                        changed = self.audit.mark_stop_unknown(
+                            reclaim_id,
+                            generation,
+                            "restart_stop_state_unknown",
+                            str(exc),
+                        )
+                        if not changed:
+                            errors.append(
+                                f"{torrent_hash}: stopping reconciliation fence changed"
+                            )
+                    except Exception as audit_exc:
+                        errors.append(
+                            f"{torrent_hash}: failed to reconcile stopping state: {audit_exc}"
+                        )
+                continue
+
+            host_path = self._recovery_path(row)
+            if state == "deleting":
+                try:
+                    if host_path is not None and not host_path.exists():
+                        if not self.audit.mark_deleted(reclaim_id, generation):
+                            errors.append(
+                                f"{torrent_hash}: deleting reconciliation fence changed"
+                            )
+                    else:
+                        changed = self.audit.mark_partial_or_unknown(
+                            reclaim_id,
+                            generation,
+                            "restart_during_delete",
+                        )
+                        if not changed:
+                            errors.append(
+                                f"{torrent_hash}: deleting reconciliation fence changed"
+                            )
+                except Exception as exc:
+                    errors.append(f"{torrent_hash}: deleting reconciliation failed: {exc}")
+                continue
+
+            if state in {"deleted", "recheck_pending"}:
+                if host_path is None or host_path.exists():
+                    try:
+                        changed = self.audit.mark_partial_or_unknown(
+                            reclaim_id,
+                            generation,
+                            "deleted_path_present_or_unsafe",
+                        )
+                        if not changed:
+                            errors.append(
+                                f"{torrent_hash}: deleted reconciliation fence changed"
+                            )
+                    except Exception as exc:
+                        errors.append(
+                            f"{torrent_hash}: failed to fence inconsistent deleted path: {exc}"
+                        )
+                    continue
+                recheck_error: str | None = None
+                try:
+                    self.executor.qbt_post(
+                        "/api/v2/torrents/recheck", {"hashes": torrent_hash}
+                    )
+                except Exception as exc:
+                    recheck_error = str(exc)
+                    errors.append(f"{torrent_hash}: {exc}")
+                try:
+                    self.audit.complete(
+                        reclaim_id,
+                        row,
+                        recheck_error=recheck_error,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to reconcile recheck state: {exc}"
+                    )
+                continue
+
+            if state == "partial_or_unknown":
+                try:
+                    changed = self.audit.mark_partial_or_unknown(
+                        reclaim_id,
+                        generation,
+                        "partial_or_unknown_requires_confirmation",
+                    )
+                    if not changed:
+                        errors.append(
+                            f"{torrent_hash}: partial reconciliation fence changed"
+                        )
+                except Exception as exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to ensure partial deletion warning: {exc}"
+                    )
+        return errors
 
     def _eligibility_state(
         self,

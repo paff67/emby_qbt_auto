@@ -646,7 +646,7 @@ def test_dead_partial_reclaimer_reports_reclaimed_bytes_when_recheck_fails():
         )
 
         assert not payload.exists()
-        assert result.reclaimed == 1
+        assert result.reclaimed == 0
         assert result.reclaimed_bytes >= 4096
         assert "recheck unavailable" in result.errors[0]
 
@@ -862,7 +862,7 @@ def test_recheck_failure_is_persisted_and_notified_after_payload_reclaim():
             target_free_bytes=10_000,
         )
 
-        assert result.reclaimed == 1
+        assert result.reclaimed == 0
         con = sqlite3.connect(db)
         con.row_factory = sqlite3.Row
         reclaim = dict(con.execute("select * from capacity_reclaims").fetchone())
@@ -872,9 +872,10 @@ def test_recheck_failure_is_persisted_and_notified_after_payload_reclaim():
             ).fetchone()
         )
         con.close()
+        assert reclaim["state"] == "recheck_pending"
         assert reclaim["recheck_state"] == "failed"
         assert "recheck unavailable" in reclaim["recheck_error"]
-        assert "重新校验失败" in notice["message"]
+        assert "重新校验请求失败" in notice["message"]
 
 
 def test_nonviable_soak_allocation_matures_and_leech_peers_do_not_block(tmp_path):
@@ -1217,9 +1218,7 @@ def test_live_reclaim_waits_for_stopped_state_with_bounded_timeout(tmp_path):
     assert result.reclaimed == 0
     assert result.rejection_counts["stop_timeout"] == 1
     assert payload.exists()
-    con = sqlite3.connect(db)
-    assert con.execute("select count(*) from capacity_reclaims").fetchone()[0] == 0
-    con.close()
+    _assert_capacity_reclaim_aborted_paused(db, "stop_timeout")
 
 
 def test_live_reclaim_fences_generation_change_during_stop_window(tmp_path):
@@ -1263,9 +1262,7 @@ def test_live_reclaim_fences_generation_change_during_stop_window(tmp_path):
     assert result.reclaimed == 0
     assert result.rejection_counts["stale_assessment"] == 1
     assert payload.exists()
-    con = sqlite3.connect(db)
-    assert con.execute("select count(*) from capacity_reclaims").fetchone()[0] == 0
-    con.close()
+    _assert_capacity_reclaim_aborted_paused(db, "stale_assessment")
 
 
 def test_live_reclaim_rechecks_path_after_stop_before_audit(tmp_path):
@@ -1306,9 +1303,7 @@ def test_live_reclaim_rechecks_path_after_stop_before_audit(tmp_path):
     assert result.reclaimed == 0
     assert result.rejection_counts["path_changed"] == 1
     assert original.exists() and changed.exists()
-    con = sqlite3.connect(db)
-    assert con.execute("select count(*) from capacity_reclaims").fetchone()[0] == 0
-    con.close()
+    _assert_capacity_reclaim_aborted_paused(db, "path_changed")
 
 
 def test_live_reclaim_rechecks_active_protection_after_stop(tmp_path):
@@ -1352,9 +1347,7 @@ def test_live_reclaim_rechecks_active_protection_after_stop(tmp_path):
     assert result.reclaimed == 0
     assert result.rejection_counts["active_protection"] == 1
     assert payload.exists()
-    con = sqlite3.connect(db)
-    assert con.execute("select count(*) from capacity_reclaims").fetchone()[0] == 0
-    con.close()
+    _assert_capacity_reclaim_aborted_paused(db, "active_protection")
 
 
 def test_live_revalidation_rejects_torrent_that_became_manually_managed(tmp_path):
@@ -1393,6 +1386,38 @@ def _assert_no_capacity_reclaim_audit(db: Path) -> None:
     con = sqlite3.connect(db)
     try:
         assert con.execute("select count(*) from capacity_reclaims").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def _assert_capacity_reclaim_aborted_paused(db: Path, reason: str | None = None) -> None:
+    rows = _capacity_reclaim_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["state"] == "aborted_paused"
+    assert rows[0]["recheck_state"] == "not_requested"
+    if reason is not None:
+        assert rows[0]["recheck_error"] == reason
+
+
+def _capacity_reclaim_rows(db: Path) -> list[dict]:
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in con.execute("select * from capacity_reclaims order by id")]
+    finally:
+        con.close()
+
+
+def _capacity_reclaim_notifications(db: Path) -> list[dict]:
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    try:
+        return [
+            dict(row)
+            for row in con.execute(
+                "select * from bot_notifications where topic='capacity_reclaim' order by id"
+            )
+        ]
     finally:
         con.close()
 
@@ -1571,7 +1596,7 @@ def test_stop_window_completed_growth_is_revalidated_before_audit(tmp_path):
     assert result.rejection_counts["progress_evidence_changed"] == 1
     assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h"})]
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, "progress_evidence_changed")
 
 
 @pytest.mark.parametrize("live_hash", [pytest.param("missing", id="missing-key"), None, "", "   "])
@@ -1659,7 +1684,7 @@ def test_stop_window_missing_torrent_hash_is_revalidated_before_audit(tmp_path):
     assert result.rejection_counts["torrent_identity_unknown"] == 1
     assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h"})]
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, "torrent_identity_unknown")
 
 
 def test_stop_window_no_progress_evidence_change_is_fenced_before_audit(tmp_path):
@@ -1702,7 +1727,7 @@ def test_stop_window_no_progress_evidence_change_is_fenced_before_audit(tmp_path
     assert result.reclaimed == 0
     assert result.rejection_counts["progress_evidence_changed"] == 1
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, "progress_evidence_changed")
 
 
 def test_live_revalidation_rejects_progress_fraction_growth(tmp_path):
@@ -1809,7 +1834,7 @@ def test_stop_window_progress_fraction_growth_is_revalidated_before_audit(tmp_pa
     assert result.rejection_counts["progress_evidence_changed"] == 1
     assert executor.posts == [("/api/v2/torrents/stop", {"hashes": "h"})]
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, "progress_evidence_changed")
 
 
 def test_stop_window_fresh_inventory_detects_new_path_overlap(tmp_path):
@@ -1856,7 +1881,7 @@ def test_stop_window_fresh_inventory_detects_new_path_overlap(tmp_path):
     assert result.reclaimed == 0
     assert result.rejection_counts["path_overlap"] == 1
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, "path_overlap")
 
 
 @pytest.mark.parametrize("inventory_mode", ["api-error", "missing-torrents", "not-full"])
@@ -1899,7 +1924,7 @@ def test_live_reclaim_fails_closed_when_fresh_inventory_is_unavailable(
     assert result.reclaimed == 0
     assert result.rejection_counts["path_inventory_failed"] == 1
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, "path_inventory_failed")
 
 
 def test_selection_rejects_no_progress_evidence_mismatch(tmp_path):
@@ -2021,7 +2046,7 @@ def test_fresh_inventory_candidate_path_must_match_live_info(tmp_path):
     assert result.reclaimed == 0
     assert result.rejection_counts["path_changed"] == 1
     assert payload.exists() and moved.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, "path_changed")
 
 
 @pytest.mark.parametrize(
@@ -2078,7 +2103,7 @@ def test_fresh_inventory_candidate_evidence_is_revalidated_before_audit(
     assert result.reclaimed == 0
     assert result.rejection_counts[reason] == 1
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, reason)
 
 
 @pytest.mark.parametrize(
@@ -2137,7 +2162,7 @@ def test_fresh_inventory_candidate_must_still_be_stopped_before_audit(
     else:
         assert result.rejection_counts["torrent_not_stopped"] == 1
         assert payload.exists()
-        _assert_no_capacity_reclaim_audit(db)
+        _assert_capacity_reclaim_aborted_paused(db, "torrent_not_stopped")
 
 
 @pytest.mark.parametrize(
@@ -2223,7 +2248,10 @@ def test_reclaim_fences_exact_content_baseline_before_audit(
     assert result.reclaimed == 0
     assert result.rejection_counts[reason] == 1
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    if phase == "initial":
+        _assert_no_capacity_reclaim_audit(db)
+    else:
+        _assert_capacity_reclaim_aborted_paused(db, reason)
 
 
 def test_reclaim_candidate_records_missing_optional_size_fields_as_none(tmp_path):
@@ -2349,7 +2377,7 @@ def test_stop_confirmation_uses_real_deadline_and_max_poll_count(tmp_path):
     assert 1 <= executor.stop_polls <= 10
     assert all(0 < timeout <= 0.05 for timeout in executor.poll_timeouts)
     assert payload.exists()
-    _assert_no_capacity_reclaim_audit(db)
+    _assert_capacity_reclaim_aborted_paused(db, "stop_timeout")
 
 
 def test_final_inventory_receives_configured_request_timeout(tmp_path):
@@ -2389,3 +2417,338 @@ def test_final_inventory_receives_configured_request_timeout(tmp_path):
 
     assert result.reclaimed == 1
     assert executor.inventory_timeouts == [0.03]
+
+
+def test_post_stop_progress_abort_is_persisted_and_idempotent(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    after_stop = {**candidate, "state": "stoppedDL", "completed_bytes": 101}
+
+    class StopProgressExecutor(RecordingExecutor):
+        def __init__(self):
+            super().__init__({"h": candidate})
+            self.info_calls = 0
+
+        def torrent_info(self, torrent_hash):
+            self.info_calls += 1
+            if self.info_calls == 2:
+                return dict(after_stop)
+            return dict(candidate)
+
+    executor = StopProgressExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+
+    first = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+    second = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    rows = _capacity_reclaim_rows(db)
+    notifications = _capacity_reclaim_notifications(db)
+    assert first.reclaimed == 0
+    assert first.rejection_counts["progress_evidence_changed"] == 1
+    assert second.rejection_counts["reclaim_already_recorded"] == 1
+    assert rows[0]["state"] == "aborted_paused"
+    assert rows[0]["recheck_state"] == "not_requested"
+    assert len(notifications) == 1
+    warning_payload = json.loads(notifications[0]["payload_json"])
+    assert warning_payload["reason"] == "progress_evidence_changed"
+    assert warning_payload["requires_confirmation"] is True
+    assert warning_payload["allowed_actions"] == ["resume", "keep_paused"]
+    assert "保持暂停" in notifications[0]["message"]
+    assert [post for post in executor.posts if post[0].endswith("/stop")] == [
+        ("/api/v2/torrents/stop", {"hashes": "h"})
+    ]
+    assert payload.exists()
+
+
+def test_stop_post_failure_is_persisted_as_unknown_once(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+
+    class StopFailureExecutor(RecordingExecutor):
+        def qbt_post(self, path, body):
+            self.posts.append((path, body))
+            if path.endswith("/stop"):
+                raise RuntimeError("123456:secret stop unavailable")
+
+    executor = StopFailureExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+
+    reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+    reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    notifications = _capacity_reclaim_notifications(db)
+    assert row["state"] == "stop_unknown"
+    assert "123456:secret" not in row["recheck_error"]
+    assert len(notifications) == 1
+    assert len([post for post in executor.posts if post[0].endswith("/stop")]) == 1
+    assert payload.exists()
+
+
+def test_partial_delete_exception_is_persisted_without_claiming_bytes(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    first_part = payload / "first.part"
+    second_part = payload / "second.part"
+    first_part.write_bytes(b"x" * 4096)
+    second_part.write_bytes(b"y" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    executor = RecordingExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+    delete_calls = []
+
+    def partial_delete(_path):
+        delete_calls.append(_path)
+        first_part.unlink()
+        raise OSError("partial deletion")
+
+    reclaimer._delete_path = partial_delete
+
+    first = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+    second = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert first.reclaimed == 0
+    assert first.reclaimed_bytes == 0
+    assert second.rejection_counts["reclaim_already_recorded"] == 1
+    assert row["state"] == "partial_or_unknown"
+    assert row["recheck_state"] == "not_requested"
+    assert len(_capacity_reclaim_notifications(db)) == 1
+    assert delete_calls == [payload]
+    assert not first_part.exists() and second_part.exists()
+
+
+def test_deleted_state_survives_completion_failure_and_reconciles(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+    executor = RecordingExecutor({"h": candidate})
+    first_reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+
+    def fail_complete(*_args, **_kwargs):
+        raise RuntimeError("notification transaction unavailable")
+
+    first_reclaimer.audit.complete = fail_complete
+    first = first_reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert _capacity_reclaim_rows(db)[0]["state"] == "deleted"
+    assert first.reclaimed == 0
+    assert first.reclaimed_bytes >= 4096
+    assert not payload.exists()
+
+    recovery = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        notification_chat_ids=["100"], now=lambda: 5_001,
+    )
+    recovery.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert _capacity_reclaim_rows(db)[0]["state"] == "reclaimed"
+    assert len(_capacity_reclaim_notifications(db)) == 1
+    assert len([post for post in executor.posts if post[0].endswith("/recheck")]) == 2
+
+
+def test_recheck_failure_persists_pending_and_next_run_completes_once(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _snapshot("h", content_path="/downloads/incomplete/h")["h"]
+
+    class RetryRecheckExecutor(RecordingExecutor):
+        def __init__(self):
+            super().__init__({"h": candidate})
+            self.fail_recheck = True
+
+        def qbt_post(self, path, body):
+            super().qbt_post(path, body)
+            if path.endswith("/recheck") and self.fail_recheck:
+                self.fail_recheck = False
+                raise RuntimeError("recheck unavailable")
+
+    executor = RetryRecheckExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db, executor, host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+
+    first = reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+    assert first.reclaimed == 0
+    assert first.reclaimed_bytes >= 4096
+    assert _capacity_reclaim_rows(db)[0]["state"] == "recheck_pending"
+    assert len(_capacity_reclaim_notifications(db)) == 1
+
+    reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+    reclaimer.run(
+        {"h": candidate}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert _capacity_reclaim_rows(db)[0]["state"] == "reclaimed"
+    assert len(_capacity_reclaim_notifications(db)) == 2
+    assert len([post for post in executor.posts if post[0].endswith("/recheck")]) == 2
+
+
+@pytest.mark.parametrize(
+    ("seed_state", "path_exists", "expected_state", "warning_count"),
+    [
+        ("stopping", True, "aborted_paused", 1),
+        ("stopping", False, "aborted_paused", 1),
+        ("deleting", True, "partial_or_unknown", 1),
+        ("deleting", False, "deleted", 0),
+    ],
+)
+def test_restart_reconciliation_converges_seeded_states(
+    tmp_path, seed_state, path_exists, expected_state, warning_count
+):
+    from qbt_orchestrator.capacity_reclaim import (
+        CapacityReclaimAuditStore,
+        DeadPartialReclaimer,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    payload = managed / "h"
+    if path_exists:
+        payload.mkdir()
+        (payload / "part").write_bytes(b"x" * 4096)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = {
+        "hash": "h",
+        "name": "Recovery Name",
+        "magnet_uri": "mag" + "net:?xt=urn:btih:h",
+        "host_path": str(payload),
+        "content_path": "/downloads/incomplete/h",
+        "allocated_bytes": 4096,
+        "completed_bytes": 100,
+        "progress": 0.0,
+        "reclaimable_since": 1_000,
+        "capacity_generation": 4,
+        "capacity_reason": "stale_without_complete_source",
+        "assessment_json": "{}",
+    }
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: 4_999,
+    )
+    reservation = audit.reserve(candidate)
+    if seed_state != "stopping":
+        con = sqlite3.connect(db)
+        con.execute(
+            "update capacity_reclaims set state=? where id=?",
+            (seed_state, reservation["reclaim_id"]),
+        )
+        con.commit()
+        con.close()
+
+    stopped = {
+        **_snapshot("h", content_path="/downloads/incomplete/h")["h"],
+        "state": "stoppedDL",
+    }
+    reclaimer = DeadPartialReclaimer(
+        db, RecordingExecutor({"h": stopped}), host_downloads=tmp_path,
+        container_downloads="/downloads", managed_root=managed,
+        dry_run=False, min_reclaimable_age_sec=3_600, min_reclaim_bytes=1,
+        notification_chat_ids=["100"], now=lambda: 5_000,
+    )
+    reclaimer.run(
+        {}, assessment=_assessment(), capacity_state="capacity_deadlock",
+        free_bytes=0, target_free_bytes=10_000,
+    )
+
+    assert _capacity_reclaim_rows(db)[0]["state"] == expected_state
+    assert len(_capacity_reclaim_notifications(db)) == warning_count
