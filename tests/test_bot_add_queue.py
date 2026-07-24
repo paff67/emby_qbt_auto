@@ -1819,6 +1819,210 @@ def test_metadata_retry_24h_is_persisted_and_does_not_claim_probe_slot(queue_fix
     assert claimed["metadata_lease_owner"] == "worker"
 
 
+def test_metadata_retry_24h_requires_raw_ttl_through_approval_window(tmp_path):
+    retry_delay = 24 * 60 * 60
+    approval_window = 15 * 60
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(
+            raw_input_ttl_sec=retry_delay + approval_window - 1
+        ),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    unavailable = queue.transition_item(
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
+    )
+    before_batch = queue.get_batch(batch["id"])
+
+    with pytest.raises(ValueError, match="^raw_input_ttl_insufficient$"):
+        queue.transition_item(
+            item["id"],
+            {"metadata_unavailable"},
+            "metadata_retry_wait",
+            "retry_later",
+            metadata_action="retry_24h",
+            approval_generation=unavailable["approval_generation"],
+        )
+
+    unchanged = queue.get_item(item["id"], include_raw=True)
+    assert unchanged["state"] == "metadata_unavailable"
+    assert unchanged["approval_generation"] == unavailable["approval_generation"]
+    assert unchanged["raw_input"] is not None
+    assert queue.get_batch(batch["id"]) == before_batch
+    assert queue.submitted_nonterminal_count() == 0
+
+
+def test_metadata_retry_24h_accepts_exact_raw_ttl_boundary(tmp_path):
+    retry_delay = 24 * 60 * 60
+    approval_window = 15 * 60
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(
+            raw_input_ttl_sec=retry_delay + approval_window
+        ),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    unavailable = queue.transition_item(
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
+    )
+
+    delayed = queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        "metadata_retry_wait",
+        "retry_later",
+        metadata_action="retry_24h",
+        approval_generation=unavailable["approval_generation"],
+    )
+
+    assert delayed["metadata_retry_at"] == clock.value + retry_delay
+    assert delayed["raw_input"] is None  # safe output remains redacted
+    assert delayed["raw_input_expires_at"] == clock.value + retry_delay + approval_window
+    persisted = queue.get_item(item["id"], include_raw=True)
+    assert persisted["raw_input_expires_at"] == clock.value + retry_delay + approval_window
+
+
+def test_delayed_metadata_claim_with_expired_raw_terminalizes_without_lease(tmp_path):
+    retry_delay = 24 * 60 * 60
+    approval_window = 15 * 60
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(
+            raw_input_ttl_sec=retry_delay + approval_window
+        ),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    unavailable = queue.transition_item(
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
+    )
+    delayed = queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        "metadata_retry_wait",
+        "retry_later",
+        metadata_action="retry_24h",
+        approval_generation=unavailable["approval_generation"],
+    )
+    clock.advance(retry_delay + approval_window)
+
+    with pytest.raises(ValueError, match="^raw_input_unavailable$"):
+        queue.claim_metadata_lease(item["id"], "late-worker", clock.value + 60)
+
+    terminal = queue.get_item(item["id"], include_raw=True)
+    assert terminal["state"] == "metadata_unavailable"
+    assert terminal["raw_input"] is None
+    assert terminal["raw_input_expires_at"] is None
+    assert terminal["metadata_lease_owner"] is None
+    assert terminal["metadata_lease_until"] is None
+    assert terminal["approval_generation"] == delayed["approval_generation"] + 1
+    terminal_batch = queue.get_batch(batch["id"])
+    assert terminal_batch["state"] == "complete"
+    assert terminal_batch["failed_count"] == 1
+    assert queue.submitted_nonterminal_count() == 0
+    with pytest.raises(ValueError, match="^approval_generation_conflict$"):
+        queue.transition_item(
+            item["id"],
+            {"metadata_unavailable"},
+            "cancelled",
+            "stale_callback",
+            metadata_action="cancel",
+            approval_generation=delayed["approval_generation"],
+        )
+
+
+def test_metadata_renewal_cannot_extend_lease_past_raw_window(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(raw_input_ttl_sec=100),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    claimed = queue.claim_metadata_lease(item["id"], "worker", 150)
+
+    with pytest.raises(ValueError, match="^raw_input_unavailable$"):
+        queue.renew_metadata_lease(
+            item["id"],
+            "worker",
+            claimed["metadata_lease_generation"],
+            201,
+        )
+
+    terminal = queue.get_item(item["id"], include_raw=True)
+    assert terminal["state"] == "metadata_unavailable"
+    assert terminal["raw_input"] is None
+    assert terminal["metadata_lease_owner"] is None
+    assert terminal["metadata_lease_until"] is None
+    assert terminal["metadata_lease_generation"] == (
+        claimed["metadata_lease_generation"] + 1
+    )
+    assert terminal["approval_generation"] == 1
+    assert queue.get_batch(batch["id"])["state"] == "complete"
+    assert queue.submitted_nonterminal_count() == 0
+
+
+def test_metadata_claim_requires_raw_through_probe_deadline(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(raw_input_ttl_sec=100),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(
+        item["id"],
+        {"received"},
+        "resolving",
+        "resolve",
+        {"metadata_probe_deadline": 201},
+    )
+
+    with pytest.raises(ValueError, match="^raw_input_unavailable$"):
+        queue.claim_metadata_lease(item["id"], "worker", 150)
+
+    terminal = queue.get_item(item["id"], include_raw=True)
+    assert terminal["state"] == "metadata_unavailable"
+    assert terminal["raw_input"] is None
+    assert terminal["metadata_probe_deadline"] is None
+    assert terminal["approval_generation"] == 1
+    assert queue.get_batch(batch["id"])["state"] == "complete"
+
+
 def test_metadata_cancel_consumes_token_without_reopening_complete_batch(queue_fixture):
     queue, _clock, _db = queue_fixture
     batch = queue.open_draft("1", "1")

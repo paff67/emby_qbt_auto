@@ -60,6 +60,7 @@ _METADATA_CALLBACK_TARGETS = {
     "cancel": "cancelled",
 }
 _METADATA_RETRY_DELAY_SEC = 24 * 60 * 60
+_METADATA_APPROVAL_WINDOW_SEC = 15 * 60
 _METADATA_LEASE_STATES = frozenset(
     {
         "resolving",
@@ -97,7 +98,15 @@ _ALLOWED_TRANSITIONS = {
     ),
     "metadata_unavailable": _MANUAL_RETRY_TARGET_STATES | {"cancelled"},
     "prechecking": frozenset(
-        {"duplicate_local", "duplicate_remote", "needs_confirmation", "ready", "failed", "cancelled"}
+        {
+            "duplicate_local",
+            "duplicate_remote",
+            "needs_confirmation",
+            "ready",
+            "metadata_unavailable",
+            "failed",
+            "cancelled",
+        }
     ),
     "needs_confirmation": frozenset({"duplicate_remote", "ready", "failed", "cancelled"}),
     "ready": frozenset({"enrolling", "cancelled"}),
@@ -548,7 +557,6 @@ class BotAddQueueRepository:
         def txn(con: sqlite3.Connection) -> dict[str, Any]:
             self._begin_immediate(con)
             row = self._item_in_transaction(con, item_key)
-            row = self._expire_item_raw_in_transaction(con, row, now)
             if str(row["state"]) not in _METADATA_LEASE_STATES:
                 raise ValueError("metadata_lease_state")
             batch_state = self._batch_state_in_transaction(con, int(row["batch_id"]))
@@ -563,6 +571,23 @@ class BotAddQueueRepository:
                 )
             ):
                 raise ValueError("metadata_retry_not_due")
+            required_raw_until = max(
+                until,
+                int(row["metadata_probe_deadline"] or 0),
+            )
+            raw_expires_at = row["raw_input_expires_at"]
+            if (
+                row["raw_input"] is None
+                or raw_expires_at is None
+                or int(raw_expires_at) < required_raw_until
+            ):
+                self._terminalize_metadata_operation_without_raw(
+                    con,
+                    row,
+                    now=now,
+                    required_raw_until=required_raw_until,
+                )
+                return {"__error__": "raw_input_unavailable"}
             current_owner = row["metadata_lease_owner"]
             current_until = row["metadata_lease_until"]
             if (
@@ -603,7 +628,9 @@ class BotAddQueueRepository:
             )
             return self._safe_item_in_transaction(con, item_key)
 
-        return dict(write_transaction(self.state_db, txn))
+        result = dict(write_transaction(self.state_db, txn))
+        self._raise_result_error(result)
+        return result
 
     def renew_metadata_lease(
         self,
@@ -621,7 +648,30 @@ class BotAddQueueRepository:
         def txn(con: sqlite3.Connection) -> dict[str, Any]:
             self._begin_immediate(con)
             row = self._item_in_transaction(con, item_key)
-            row = self._expire_item_raw_in_transaction(con, row, now)
+            if (
+                str(row["metadata_lease_owner"] or "") != lease_owner
+                or int(row["metadata_lease_generation"] or 0) != token_generation
+                or row["metadata_lease_until"] is None
+                or int(row["metadata_lease_until"]) <= now
+            ):
+                raise ValueError("metadata_lease_conflict")
+            required_raw_until = max(
+                until,
+                int(row["metadata_probe_deadline"] or 0),
+            )
+            raw_expires_at = row["raw_input_expires_at"]
+            if (
+                row["raw_input"] is None
+                or raw_expires_at is None
+                or int(raw_expires_at) < required_raw_until
+            ):
+                self._terminalize_metadata_operation_without_raw(
+                    con,
+                    row,
+                    now=now,
+                    required_raw_until=required_raw_until,
+                )
+                return {"__error__": "raw_input_unavailable"}
             cursor = con.execute(
                 "update bot_add_items set metadata_lease_until=?,updated_at=? "
                 "where id=? and metadata_lease_owner=? and metadata_lease_generation=? "
@@ -643,7 +693,9 @@ class BotAddQueueRepository:
             )
             return self._safe_item_in_transaction(con, item_key)
 
-        return dict(write_transaction(self.state_db, txn))
+        result = dict(write_transaction(self.state_db, txn))
+        self._raise_result_error(result)
+        return result
 
     def release_metadata_lease(
         self, item_id: int, owner: str, generation: int
@@ -860,6 +912,16 @@ class BotAddQueueRepository:
                     or int(raw_expires_at) <= now
                 ):
                     return {"__error__": "raw_input_expired"}
+                retry_approval_deadline = (
+                    now
+                    + _METADATA_RETRY_DELAY_SEC
+                    + _METADATA_APPROVAL_WINDOW_SEC
+                )
+                if (
+                    expected_metadata_action == "retry_24h"
+                    and int(raw_expires_at) < retry_approval_deadline
+                ):
+                    raise ValueError("raw_input_ttl_insufficient")
                 if (
                     self._submitted_nonterminal_in_transaction(con) + 1
                     > self.limits.max_submitted_items
@@ -1420,6 +1482,76 @@ class BotAddQueueRepository:
         return self._item_for_output(
             self._item_in_transaction(con, item_id), include_raw=False
         )
+
+    def _terminalize_metadata_operation_without_raw(
+        self,
+        con: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        now: int,
+        required_raw_until: int,
+    ) -> None:
+        item_id = int(row["id"])
+        batch_id = int(row["batch_id"])
+        old_state = str(row["state"])
+        old_lease_generation = int(row["metadata_lease_generation"] or 0)
+        assignments: dict[str, Any] = {
+            field: None for field in _AUTOMATIC_TERMINAL_CLEAR_FIELDS
+        }
+        assignments.update(
+            {
+                "approval_generation": int(row["approval_generation"] or 0) + 1,
+                "last_error": "raw_input_unavailable",
+                "metadata_lease_generation": old_lease_generation + 1,
+                "metadata_probe_started_at": None,
+                "raw_input": None,
+                "raw_input_expires_at": None,
+                "state": "metadata_unavailable",
+                "updated_at": now,
+            }
+        )
+        ordered = sorted(assignments)
+        cursor = con.execute(
+            f"update bot_add_items set {','.join(f'{field}=?' for field in ordered)} "
+            "where id=? and state=? and metadata_lease_generation=?",
+            (
+                *(assignments[field] for field in ordered),
+                item_id,
+                old_state,
+                old_lease_generation,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("metadata_lease_conflict")
+        raw_expires_at = row["raw_input_expires_at"]
+        if (
+            row["raw_input"] is not None
+            and raw_expires_at is not None
+            and int(raw_expires_at) <= now
+        ):
+            self._event(
+                con,
+                batch_id=batch_id,
+                item_id=item_id,
+                event_type="raw_input_expired",
+                from_state=old_state,
+                to_state=old_state,
+                reason="raw_input_ttl_elapsed",
+                now=now,
+            )
+        self._event(
+            con,
+            batch_id=batch_id,
+            item_id=item_id,
+            event_type="state_transition",
+            from_state=old_state,
+            to_state="metadata_unavailable",
+            reason="raw_input_unavailable",
+            now=now,
+            evidence={"required_raw_until": required_raw_until},
+        )
+        self._refresh_batch_counters(con, batch_id, now)
+        self._refresh_shards_and_batch_state(con, batch_id, now)
 
     def _expire_item_raw_in_transaction(
         self, con: sqlite3.Connection, row: sqlite3.Row, now: int
