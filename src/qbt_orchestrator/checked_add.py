@@ -6,6 +6,7 @@ import sqlite3
 import time
 import unicodedata
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
@@ -19,10 +20,8 @@ _MAX_REMOTE_MATCHES = 20
 _MAX_EVIDENCE = 20
 _MAX_PATH_CHARS = 1024
 _MAX_NAME_CHARS = 512
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
 _MEDIA_ID = re.compile(r"(?:[A-Z0-9]{1,16}-){1,2}\d{2,9}")
-_NON_PRIMARY_VIDEO = re.compile(
-    r"(?i)(?:^|[\\/._ -])(?:sample|trailer|preview|teaser)(?:$|[\\/._ -])"
-)
 
 
 class FilenameNormalizer(Protocol):
@@ -75,6 +74,13 @@ class DuplicateDecision:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _RemoteMatchScan:
+    total_count: int
+    matches: tuple[RemoteMediaMatch, ...]
+    decisive_match: RemoteMediaMatch | None
+
+
 def _safe_text(
     value: Any, *, limit: int, allow_empty: bool = False, truncate: bool = False
 ) -> str | None:
@@ -99,13 +105,11 @@ def _canonical_media_id(value: Any) -> str | None:
 
 
 def _known_positive_size(value: Any) -> int | None:
-    if isinstance(value, bool):
+    if type(value) is not int:
         return None
-    try:
-        size = int(value)
-    except (TypeError, ValueError, OverflowError):
+    if value <= 0 or value > _SQLITE_MAX_INTEGER:
         return None
-    return size if size > 0 else None
+    return value
 
 
 def _mapping_value(item: Any, *names: str) -> Any:
@@ -139,8 +143,6 @@ def select_primary_video(
             continue
         normalized_path = name.replace("\\", "/")
         if PurePosixPath(normalized_path).suffix.lower() not in _MEDIA_EXTS:
-            continue
-        if _NON_PRIMARY_VIDEO.search(normalized_path):
             continue
         raw_index = _mapping_value(item, "index")
         if raw_index is None:
@@ -231,7 +233,14 @@ class RemoteMediaIndex:
     def replace_rows(self, rows: Iterable[Mapping[str, Any]]) -> RemoteIndexRefreshResult:
         now = int(self.now())
         generation, _ = self._begin_refresh(now, force=True)
-        return self._apply_snapshot(generation, now, self._prepare_rows(rows, updated_at=now))
+        try:
+            prepared = self._prepare_rows(rows, updated_at=now)
+        except Exception:
+            return self._preserve(generation, now, "source_snapshot_invalid")
+        try:
+            return self._apply_snapshot(generation, now, prepared)
+        except Exception:
+            return self._preserve(generation, now, "snapshot_apply_failed")
 
     def refresh(self, *, force: bool = False) -> RemoteIndexRefreshResult:
         now = int(self.now())
@@ -248,7 +257,12 @@ class RemoteMediaIndex:
             return self._preserve(generation, now, code)
         except (OSError, ValueError, TypeError):
             return self._preserve(generation, now, "source_unavailable")
-        return self._apply_snapshot(generation, now, rows)
+        except Exception:
+            return self._preserve(generation, now, "source_snapshot_invalid")
+        try:
+            return self._apply_snapshot(generation, now, rows)
+        except Exception:
+            return self._preserve(generation, now, "snapshot_apply_failed")
 
     def matches(self, normalized_id: str) -> tuple[dict[str, Any], ...]:
         media_id = _canonical_media_id(normalized_id)
@@ -320,7 +334,7 @@ class RemoteMediaIndex:
                 "from remote_media_index_refresh_state where source=?",
                 (_REMOTE_SOURCE,),
             ).fetchone()
-            if state is None or int(state["requested_generation"]) != generation:
+            if state is None or generation <= int(state["applied_generation"]):
                 return RemoteIndexRefreshResult(
                     "superseded",
                     int(state["row_count"]) if state else 0,
@@ -337,7 +351,7 @@ class RemoteMediaIndex:
             con.execute(
                 "update remote_media_index_refresh_state set applied_generation=?,"
                 "refreshed_at=?,row_count=?,last_attempt_at=?,last_result='refreshed' "
-                "where source=? and requested_generation=?",
+                "where source=? and applied_generation<?",
                 (generation, now, len(rows), now, _REMOTE_SOURCE, generation),
             )
             return RemoteIndexRefreshResult("refreshed", len(rows), generation, now)
@@ -353,18 +367,16 @@ class RemoteMediaIndex:
                 "from remote_media_index_refresh_state where source=?",
                 (_REMOTE_SOURCE,),
             ).fetchone()
-            if state is None or int(state["requested_generation"]) != generation:
+            if state is None:
                 return RemoteIndexRefreshResult(
-                    "superseded",
-                    int(state["row_count"]) if state else 0,
-                    generation,
-                    int(state["refreshed_at"]) if state and state["refreshed_at"] is not None else None,
+                    "preserved", 0, 0, None, error_code
                 )
-            con.execute(
-                "update remote_media_index_refresh_state set last_attempt_at=?,last_result=? "
-                "where source=? and requested_generation=?",
-                (now, error_code, _REMOTE_SOURCE, generation),
-            )
+            if int(state["requested_generation"]) == generation:
+                con.execute(
+                    "update remote_media_index_refresh_state set last_attempt_at=?,last_result=? "
+                    "where source=? and requested_generation=?",
+                    (now, error_code, _REMOTE_SOURCE, generation),
+                )
             return RemoteIndexRefreshResult(
                 "preserved",
                 int(state["row_count"]),
@@ -432,6 +444,7 @@ class DuplicateMatcher:
             else FilenameNormalizerAdapter(normalizer)
         )
         self.size_tolerance_ratio = tolerance
+        self._tolerance_decimal = Decimal(str(tolerance))
         self.remote_index = RemoteMediaIndex(
             self.state_db, backfill_db=None, now=lambda: int(time.time())
         )
@@ -471,8 +484,9 @@ class DuplicateMatcher:
                 warnings=tuple(dict.fromkeys(warnings)),
             )
 
-        rows = self.remote_index.matches(normalized.normalized_id)
-        if not rows:
+        candidate_size = _known_positive_size(primary_size)
+        scan = self._scan_remote_matches(normalized.normalized_id, candidate_size)
+        if scan.total_count == 0:
             return DuplicateDecision(
                 "ready",
                 "no_exact_remote_media_id",
@@ -481,44 +495,97 @@ class DuplicateMatcher:
                 warnings=tuple(dict.fromkeys(warnings)),
             )
 
-        candidate_size = _known_positive_size(primary_size)
-        matches: list[RemoteMediaMatch] = []
-        any_close = False
-        for row in rows:
-            remote_size = _known_positive_size(row.get("size"))
-            ratio: float | None = None
-            close = False
-            if candidate_size is not None and remote_size is not None:
-                ratio = abs(candidate_size - remote_size) / max(candidate_size, remote_size)
-                close = ratio <= self.size_tolerance_ratio
-            any_close = any_close or close
-            path = _safe_text(row.get("video_path"), limit=_MAX_PATH_CHARS) or "[invalid-path]"
-            match = RemoteMediaMatch(
-                video_path=path,
-                normalized_id=normalized.normalized_id,
-                size=remote_size,
-                status=_safe_text(
-                    row.get("status"), limit=64, allow_empty=True, truncate=True
-                ) or "",
-                source=_safe_text(
-                    row.get("source"), limit=64, allow_empty=True, truncate=True
-                ) or "",
-                updated_at=int(row.get("updated_at") or 0),
-                size_close=close,
-                size_diff_ratio=ratio,
+        remote_evidence: list[str] = []
+        if scan.total_count > len(scan.matches):
+            remote_evidence.append(
+                f"remote_matches:count={scan.total_count}:truncated=true"
             )
-            matches.append(match)
-            ratio_text = "unknown" if ratio is None else f"{ratio:.6f}"
-            evidence.append(f"remote:{path[:160]}:size={remote_size}:diff={ratio_text}")
-        matches.sort(key=lambda row: row.video_path)
+        evidence_matches = list(scan.matches)
+        if scan.decisive_match is not None:
+            evidence_matches.sort(
+                key=lambda item: (
+                    item != scan.decisive_match,
+                    item.video_path,
+                )
+            )
+        for match in evidence_matches:
+            ratio_text = (
+                "unknown"
+                if match.size_diff_ratio is None
+                else f"{match.size_diff_ratio:.6f}"
+            )
+            remote_evidence.append(
+                f"remote:{match.video_path[:160]}:size={match.size}:diff={ratio_text}"
+            )
+        evidence = remote_evidence + evidence
         return DuplicateDecision(
-            "duplicate_remote" if any_close else "needs_confirmation",
-            "exact_media_id_size_within_tolerance" if any_close else "exact_media_id_size_differs_or_unknown",
+            "duplicate_remote" if scan.decisive_match is not None else "needs_confirmation",
+            "exact_media_id_size_within_tolerance" if scan.decisive_match is not None else "exact_media_id_size_differs_or_unknown",
             normalized.normalized_id,
-            matches=tuple(matches),
+            matches=scan.matches,
             evidence=tuple(evidence[:_MAX_EVIDENCE]),
             warnings=tuple(dict.fromkeys(warnings)),
         )
+
+    def _scan_remote_matches(
+        self, normalized_id: str, candidate_size: int | None
+    ) -> _RemoteMatchScan:
+        con = readonly_connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select video_path,normalized_id,size,raw_basename,status,source,updated_at "
+                "from remote_media_index where normalized_id=? order by video_path",
+                (normalized_id,),
+            )
+            total_count = 0
+            samples: list[RemoteMediaMatch] = []
+            decisive: RemoteMediaMatch | None = None
+            for raw_row in rows:
+                total_count += 1
+                row = dict(raw_row)
+                remote_size = _known_positive_size(row.get("size"))
+                ratio: float | None = None
+                close = False
+                if candidate_size is not None and remote_size is not None:
+                    difference = abs(candidate_size - remote_size)
+                    ratio = float(Decimal(difference) / Decimal(remote_size))
+                    close = Decimal(difference) <= self._tolerance_decimal * Decimal(
+                        remote_size
+                    )
+                updated_at = row.get("updated_at")
+                match = RemoteMediaMatch(
+                    video_path=_safe_text(
+                        row.get("video_path"), limit=_MAX_PATH_CHARS
+                    ) or "[invalid-path]",
+                    normalized_id=normalized_id,
+                    size=remote_size,
+                    status=_safe_text(
+                        row.get("status"), limit=64, allow_empty=True, truncate=True
+                    ) or "",
+                    source=_safe_text(
+                        row.get("source"), limit=64, allow_empty=True, truncate=True
+                    ) or "",
+                    updated_at=(
+                        updated_at
+                        if type(updated_at) is int and 0 <= updated_at <= _SQLITE_MAX_INTEGER
+                        else 0
+                    ),
+                    size_close=close,
+                    size_diff_ratio=ratio,
+                )
+                if len(samples) < _MAX_REMOTE_MATCHES:
+                    samples.append(match)
+                if close and decisive is None:
+                    decisive = match
+            if decisive is not None and decisive not in samples:
+                if samples:
+                    samples[-1] = decisive
+                else:
+                    samples.append(decisive)
+            samples.sort(key=lambda item: item.video_path)
+            return _RemoteMatchScan(total_count, tuple(samples), decisive)
+        finally:
+            con.close()
 
     def _successful_identity_exists(self, identity: str) -> bool:
         con = readonly_connect(self.state_db)
