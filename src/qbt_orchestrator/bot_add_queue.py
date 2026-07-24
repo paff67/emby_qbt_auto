@@ -35,7 +35,7 @@ _ITEM_STATES = frozenset(
         "cancelled",
     }
 )
-_TERMINAL_ITEM_STATES = frozenset(
+_AUTOMATIC_TERMINAL_ITEM_STATES = frozenset(
     {
         "invalid",
         "duplicate_local",
@@ -47,11 +47,13 @@ _TERMINAL_ITEM_STATES = frozenset(
         "cancelled",
     }
 )
+_RAW_CLEAR_ITEM_STATES = _AUTOMATIC_TERMINAL_ITEM_STATES - {"metadata_unavailable"}
 _SUBMITTED_BATCH_STATES = frozenset(
     {"queued", "processing", "awaiting_confirmation"}
 )
 _IDEMPOTENT_SUBMIT_STATES = _SUBMITTED_BATCH_STATES | {"complete"}
-_CANCELLABLE_ITEM_STATES = _ITEM_STATES - _TERMINAL_ITEM_STATES - {"enrolling"}
+_CANCELLABLE_ITEM_STATES = _ITEM_STATES - {"enrolled", "enrolled_hold", "cancelled"}
+_MANUAL_RETRY_TARGET_STATES = frozenset({"waiting_probe_slot", "metadata_retry_wait"})
 _FIELD_ALLOWLIST = frozenset(
     {
         "canonical_identity",
@@ -82,10 +84,8 @@ _FIELD_ALLOWLIST = frozenset(
         "last_error",
     }
 )
-_TERMINAL_CLEAR_FIELDS = frozenset(
+_AUTOMATIC_TERMINAL_CLEAR_FIELDS = frozenset(
     {
-        "raw_input",
-        "raw_input_expires_at",
         "metadata_probe_deadline",
         "metadata_next_poll_at",
         "metadata_retry_at",
@@ -95,7 +95,9 @@ _TERMINAL_CLEAR_FIELDS = frozenset(
         "qbt_precheck_tag",
     }
 )
+_RAW_INPUT_FIELDS = frozenset({"raw_input", "raw_input_expires_at"})
 _SAFE_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_MAX_RAW_INPUT_TTL_SEC = 7 * 86400
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,8 @@ class AddQueueLimits:
                 raise ValueError(field.name)
         if self.shard_size > self.max_links_per_batch:
             raise ValueError("shard_size")
+        if self.raw_input_ttl_sec > _MAX_RAW_INPUT_TTL_SEC:
+            raise ValueError("raw_input_ttl_sec")
 
 
 class BotAddQueueRepository:
@@ -235,17 +239,10 @@ class BotAddQueueRepository:
                 raise ValueError("draft_byte_limit")
 
             input_hashes = [str(link["input_sha256"]) for link in proposed]
-            placeholders = ",".join("?" for _ in input_hashes)
-            if con.execute(
-                f"select 1 from bot_add_items where batch_id=? and input_sha256 in ({placeholders}) limit 1",
-                (batch_key, *input_hashes),
-            ).fetchone():
-                raise ValueError("duplicate_input")
-
             expires_at = now + self.limits.raw_input_ttl_sec
             for source_index, link in enumerate(proposed):
-                con.execute(
-                    "insert into bot_add_items("
+                cursor = con.execute(
+                    "insert or ignore into bot_add_items("
                     "batch_id,source_message_id,source_index,input_kind,raw_input,"
                     "raw_input_expires_at,redacted_input,input_sha256,state,created_at,updated_at"
                     ") values(?,?,?,?,?,?,?,?,?,?,?)",
@@ -263,6 +260,23 @@ class BotAddQueueRepository:
                         now,
                     ),
                 )
+                stored_source = con.execute(
+                    "select input_sha256 from bot_add_items "
+                    "where batch_id=? and source_message_id=? and source_index=?",
+                    (batch_key, source_message_id, source_index),
+                ).fetchone()
+                if stored_source is not None and str(stored_source["input_sha256"]) != str(
+                    link["input_sha256"]
+                ):
+                    raise ValueError("source_message_conflict")
+                if cursor.rowcount != 1:
+                    duplicate = con.execute(
+                        "select 1 from bot_add_items where batch_id=? and input_sha256=?",
+                        (batch_key, str(link["input_sha256"])),
+                    ).fetchone()
+                    if duplicate is not None:
+                        raise ValueError("duplicate_input")
+                    raise ValueError("ingress_conflict")
             self._refresh_batch_counters(con, batch_key, now)
             con.execute(
                 "update bot_add_batches set updated_at=? where id=?",
@@ -488,10 +502,68 @@ class BotAddQueueRepository:
                 raise ValueError("state_conflict")
             batch_id = int(row["batch_id"])
 
+            manual_retry = (
+                old_state == "metadata_unavailable"
+                and target_state in _MANUAL_RETRY_TARGET_STATES
+            )
+            if manual_retry:
+                raw_input = row["raw_input"]
+                raw_expires_at = row["raw_input_expires_at"]
+                if (
+                    raw_input is None
+                    or raw_expires_at is None
+                    or int(raw_expires_at) <= now
+                ):
+                    if raw_input is not None or raw_expires_at is not None:
+                        con.execute(
+                            "update bot_add_items set raw_input=null,raw_input_expires_at=null,"
+                            "updated_at=? where id=? and state=?",
+                            (now, item_key, old_state),
+                        )
+                        self._event(
+                            con,
+                            batch_id=batch_id,
+                            item_id=item_key,
+                            event_type="raw_input_expired",
+                            from_state=old_state,
+                            to_state=old_state,
+                            reason="raw_input_ttl_elapsed",
+                            now=now,
+                        )
+                    return {"__error__": "raw_input_expired"}
+
+                batch = con.execute(
+                    "select state from bot_add_batches where id=?", (batch_id,)
+                ).fetchone()
+                if batch is None:  # pragma: no cover - protected by the FK
+                    raise ValueError("batch_not_found")
+                batch_state = str(batch["state"])
+                if batch_state not in _SUBMITTED_BATCH_STATES | {"complete"}:
+                    raise ValueError("batch_not_reopenable")
+                if (
+                    self._submitted_nonterminal_in_transaction(con) + 1
+                    > self.limits.max_submitted_items
+                ):
+                    raise ValueError("global_backlog_limit")
+                if batch_state == "complete":
+                    con.execute(
+                        "update bot_add_batches set state='processing',completed_at=null,"
+                        "updated_at=? where id=? and state='complete'",
+                        (now, batch_id),
+                    )
+
             assignments: dict[str, Any] = dict(proposed_fields)
-            if target_state in _TERMINAL_ITEM_STATES:
-                for field in _TERMINAL_CLEAR_FIELDS:
+            if target_state in _AUTOMATIC_TERMINAL_ITEM_STATES:
+                for field in _AUTOMATIC_TERMINAL_CLEAR_FIELDS:
                     assignments[field] = None
+                if target_state in _RAW_CLEAR_ITEM_STATES:
+                    for field in _RAW_INPUT_FIELDS:
+                        assignments[field] = None
+                elif target_state == "metadata_unavailable":
+                    raw_expires_at = row["raw_input_expires_at"]
+                    if raw_expires_at is None or int(raw_expires_at) <= now:
+                        for field in _RAW_INPUT_FIELDS:
+                            assignments[field] = None
             assignments["state"] = target_state
             assignments["updated_at"] = now
             ordered = sorted(assignments)
@@ -521,7 +593,9 @@ class BotAddQueueRepository:
                 include_raw=False,
             )
 
-        return dict(write_transaction(self.state_db, txn))
+        result = dict(write_transaction(self.state_db, txn))
+        self._raise_result_error(result)
+        return result
 
     def expire_drafts(self) -> int:
         now = self._timestamp()
@@ -855,7 +929,7 @@ class BotAddQueueRepository:
             if len(states) != item_count:
                 raise ValueError("shard_layout_invalid")
             offset += item_count
-            processed = sum(state in _TERMINAL_ITEM_STATES for state in states)
+            processed = sum(state in _AUTOMATIC_TERMINAL_ITEM_STATES for state in states)
             if processed == len(states):
                 shard_state = "complete"
                 completed_at = now
@@ -879,7 +953,10 @@ class BotAddQueueRepository:
             )
         if shards and offset != len(items):
             raise ValueError("shard_layout_invalid")
-        nonterminal = sum(str(row["state"]) not in _TERMINAL_ITEM_STATES for row in items)
+        nonterminal = sum(
+            str(row["state"]) not in _AUTOMATIC_TERMINAL_ITEM_STATES
+            for row in items
+        )
         if nonterminal == 0:
             state = "complete"
             completed_at = now
@@ -896,7 +973,7 @@ class BotAddQueueRepository:
 
     @staticmethod
     def _submitted_nonterminal_in_transaction(con: sqlite3.Connection) -> int:
-        terminal = sorted(_TERMINAL_ITEM_STATES)
+        terminal = sorted(_AUTOMATIC_TERMINAL_ITEM_STATES)
         terminal_placeholders = ",".join("?" for _ in terminal)
         submitted = sorted(_SUBMITTED_BATCH_STATES)
         submitted_placeholders = ",".join("?" for _ in submitted)

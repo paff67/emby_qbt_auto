@@ -818,6 +818,8 @@ def test_queue_limits_validate_positive_integer_relationships():
             AddQueueLimits(**{field: value})
     with pytest.raises(ValueError, match="shard_size"):
         AddQueueLimits(max_links_per_batch=10, shard_size=11)
+    with pytest.raises(ValueError, match="raw_input_ttl_sec"):
+        AddQueueLimits(raw_input_ttl_sec=8 * 86400)
 
 
 def test_ingress_accepts_multi_message_batch_and_creates_fifty_item_shards(queue_fixture):
@@ -1077,6 +1079,27 @@ def test_append_rejects_empty_non_string_unsupported_and_duplicate_inputs_atomic
     assert queue.get_batch(batch["id"])["received_count"] == 1
 
 
+def test_ignored_insert_rolls_back_the_entire_message(queue_fixture):
+    queue, _clock, db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    write_transaction = db_module.write_transaction
+    write_transaction(
+        db,
+        lambda con: con.execute(
+            "create trigger ignore_second_bot_add_item before insert on bot_add_items "
+            "when new.source_message_id=99 and new.source_index=1 "
+            "begin select raise(ignore); end"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="^ingress_conflict$"):
+        queue.append_message(batch["id"], 99, _magnets(0, 2))
+
+    assert queue.get_batch(batch["id"])["received_count"] == 0
+    assert queue.list_items(batch["id"]) == []
+    assert queue.list_events(batch["id"]) == []
+
+
 def test_redacted_inputs_never_retain_url_credentials_or_query(queue_fixture):
     queue, _clock, _db = queue_fixture
     batch = queue.open_draft("1", "2")
@@ -1178,7 +1201,7 @@ def test_expiry_wins_over_conflicting_replay_and_is_not_rolled_back(queue_fixtur
     assert queue.get_batch(batch["id"])["state"] == "draft_expired"
 
 
-def test_cancel_clears_raw_and_preserves_enrolling_or_enrolled_items(queue_fixture):
+def test_cancel_clears_raw_cancels_enrolling_and_preserves_only_enrolled_items(queue_fixture):
     queue, _clock, db = queue_fixture
     batch = queue.open_draft("1", "2")
     queue.append_message(batch["id"], 1, _magnets(0, 4))
@@ -1193,10 +1216,13 @@ def test_cancel_clears_raw_and_preserves_enrolling_or_enrolled_items(queue_fixtu
     assert cancelled["state"] == "cancelled"
     assert [row["state"] for row in queue.list_items(batch["id"])] == [
         "cancelled",
-        "enrolling",
+        "cancelled",
         "enrolled",
         "enrolled_hold",
     ]
+    with pytest.raises(ValueError, match="^state_conflict$"):
+        queue.transition_item(items[1]["id"], {"enrolling"}, "enrolled", "late_result")
+    assert queue.submitted_nonterminal_count() == 0
     con = readonly_connect(db)
     try:
         assert con.execute(
@@ -1205,6 +1231,30 @@ def test_cancel_clears_raw_and_preserves_enrolling_or_enrolled_items(queue_fixtu
         ).fetchone()[0] == 0
     finally:
         con.close()
+
+
+def test_cancel_rewrites_every_non_enrolled_outcome_to_cancelled(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    queue.append_message(batch["id"], 1, _magnets(0, 6))
+    queue.submit(batch["id"])
+    items = queue.list_items(batch["id"])
+    for item, state in zip(
+        items,
+        ("invalid", "duplicate_local", "metadata_unavailable", "failed", "enrolled"),
+    ):
+        queue.transition_item(item["id"], {"received"}, state, "outcome")
+
+    queue.cancel_batch(batch["id"], "operator")
+
+    assert [row["state"] for row in queue.list_items(batch["id"])] == [
+        "cancelled",
+        "cancelled",
+        "cancelled",
+        "cancelled",
+        "enrolled",
+        "cancelled",
+    ]
 
 
 def test_transition_uses_cas_field_allowlist_and_item_batch_for_events(queue_fixture):
@@ -1268,6 +1318,132 @@ def test_terminal_transition_clears_raw_expiry_and_retry_secrets(queue_fixture):
         assert tuple(row) == (None,) * 8
     finally:
         con.close()
+
+
+def test_metadata_unavailable_retains_raw_and_manual_retry_reopens_complete_batch(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"], include_raw=True)[0]
+    raw = item["raw_input"]
+
+    unavailable = queue.transition_item(
+        item["id"], {"received"}, "metadata_unavailable", "probe_exhausted"
+    )
+
+    assert unavailable["raw_input"] is None  # safe return view
+    persisted = queue.get_item(item["id"], include_raw=True)
+    assert persisted["raw_input"] == raw
+    assert persisted["raw_input_expires_at"] is not None
+    terminal_batch = queue.get_batch(batch["id"])
+    assert terminal_batch["state"] == "complete"
+    assert terminal_batch["failed_count"] == 1
+    assert queue.submitted_nonterminal_count() == 0
+
+    retried = queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        "metadata_retry_wait",
+        "manual_retry",
+        {"metadata_retry_at": 1_800_000_300},
+    )
+
+    assert retried["state"] == "metadata_retry_wait"
+    assert queue.get_item(item["id"], include_raw=True)["raw_input"] == raw
+    reopened_batch = queue.get_batch(batch["id"])
+    assert reopened_batch["state"] == "processing"
+    assert reopened_batch["failed_count"] == 0
+    assert queue.submitted_nonterminal_count() == 1
+    assert queue.list_shards(batch["id"])[0]["processed_count"] == 0
+
+
+def test_expired_metadata_unavailable_raw_is_cleared_and_cannot_retry(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(raw_input_ttl_sec=10),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(
+        item["id"], {"received"}, "metadata_unavailable", "probe_exhausted"
+    )
+    clock.advance(10)
+
+    with pytest.raises(ValueError, match="^raw_input_expired$"):
+        queue.transition_item(
+            item["id"],
+            {"metadata_unavailable"},
+            "metadata_retry_wait",
+            "manual_retry",
+            {"metadata_retry_at": 200, "attempts": 9},
+        )
+
+    persisted = queue.get_item(item["id"], include_raw=True)
+    assert persisted["state"] == "metadata_unavailable"
+    assert persisted["raw_input"] is None
+    assert persisted["raw_input_expires_at"] is None
+    assert persisted["metadata_retry_at"] is None
+    assert persisted["attempts"] == 0
+    assert queue.get_batch(batch["id"])["state"] == "complete"
+    assert queue.submitted_nonterminal_count() == 0
+
+
+def test_manual_retry_reopen_respects_global_backlog_atomically(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(
+            max_links_per_batch=10,
+            shard_size=5,
+            max_submitted_items=1,
+        ),
+        now=lambda: 100,
+    )
+    retry_batch = queue.open_draft("1", "1")
+    queue.append_message(retry_batch["id"], 1, _magnets(0, 1))
+    queue.submit(retry_batch["id"])
+    retry_item = queue.list_items(retry_batch["id"])[0]
+    queue.transition_item(
+        retry_item["id"], {"received"}, "metadata_unavailable", "probe_exhausted"
+    )
+    blocking_batch = queue.open_draft("2", "2")
+    queue.append_message(blocking_batch["id"], 2, _magnets(10, 1))
+    queue.submit(blocking_batch["id"])
+
+    with pytest.raises(ValueError, match="^global_backlog_limit$"):
+        queue.transition_item(
+            retry_item["id"],
+            {"metadata_unavailable"},
+            "waiting_probe_slot",
+            "manual_retry",
+            {"attempts": 7},
+        )
+
+    unchanged = queue.get_item(retry_item["id"], include_raw=True)
+    assert unchanged["state"] == "metadata_unavailable"
+    assert unchanged["attempts"] == 0
+    assert unchanged["raw_input"] is not None
+    assert queue.get_batch(retry_batch["id"])["state"] == "complete"
+    assert queue.submitted_nonterminal_count() == 1
+
+    blocking_item = queue.list_items(blocking_batch["id"])[0]
+    queue.transition_item(blocking_item["id"], {"received"}, "invalid", "invalid")
+    queue.transition_item(
+        retry_item["id"],
+        {"metadata_unavailable"},
+        "waiting_probe_slot",
+        "manual_retry",
+    )
+    assert queue.get_batch(retry_batch["id"])["state"] == "processing"
+    assert queue.submitted_nonterminal_count() == 1
 
 
 def test_persisted_shard_counts_survive_runtime_limit_changes(tmp_path):
