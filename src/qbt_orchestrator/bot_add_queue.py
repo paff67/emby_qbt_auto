@@ -163,7 +163,6 @@ _AUTOMATIC_TERMINAL_CLEAR_FIELDS = frozenset(
         "metadata_lease_owner",
         "metadata_lease_until",
         "next_run_at",
-        "qbt_precheck_tag",
     }
 )
 _RAW_INPUT_FIELDS = frozenset({"raw_input", "raw_input_expires_at"})
@@ -1059,6 +1058,8 @@ class BotAddQueueRepository:
             if target_state in _AUTOMATIC_TERMINAL_ITEM_STATES:
                 for field in _AUTOMATIC_TERMINAL_CLEAR_FIELDS:
                     assignments[field] = None
+                if target_state not in {"enrolled", "enrolled_hold"}:
+                    assignments["qbt_precheck_tag"] = None
                 if target_state in _RAW_CLEAR_ITEM_STATES:
                     for field in _RAW_INPUT_FIELDS:
                         assignments[field] = None
@@ -1137,6 +1138,36 @@ class BotAddQueueRepository:
             self._begin_immediate(con)
             self._expire_drafts_in_transaction(con, now, min(10, maintenance_limit))
             return self._expire_raw_inputs_in_transaction(con, now, maintenance_limit)
+
+        return dict(write_transaction(self.state_db, txn))
+
+    def finalize_enrollment_marker(
+        self, item_id: int, state: str, qbt_precheck_tag: str
+    ) -> dict[str, Any]:
+        item_key = self._positive_id(item_id, "item_id")
+        expected_state = str(state)
+        if expected_state not in {"enrolled", "enrolled_hold"}:
+            raise ValueError("enrollment_state")
+        tag = str(qbt_precheck_tag or "").strip()
+        if not tag:
+            raise ValueError("qbt_precheck_tag")
+        now = self._timestamp()
+
+        def txn(con: sqlite3.Connection) -> dict[str, Any]:
+            self._begin_immediate(con)
+            row = self._item_in_transaction(con, item_key)
+            if str(row["state"]) != expected_state:
+                raise ValueError("state_conflict")
+            if row["qbt_precheck_tag"] is None:
+                return self._safe_item_in_transaction(con, item_key)
+            cursor = con.execute(
+                "update bot_add_items set qbt_precheck_tag=null,updated_at=? "
+                "where id=? and state=? and qbt_precheck_tag=?",
+                (now, item_key, expected_state, tag),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("enrollment_marker_conflict")
+            return self._safe_item_in_transaction(con, item_key)
 
         return dict(write_transaction(self.state_db, txn))
 

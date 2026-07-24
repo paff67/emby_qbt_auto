@@ -34,6 +34,8 @@ class FakeGateway:
         self.files = [{"index": 0, "name": name, "size": size, "priority": 0}]
         self.posts: list[tuple[str, dict]] = []
         self.removed = False
+        self.fail_next_priority_write = False
+        self.fail_remove_tag: str | None = None
 
     def torrent_info(self, torrent_hash):
         if self.removed:
@@ -68,6 +70,9 @@ class FakeGateway:
         return ok
 
     def remove_tags(self, torrent_hash, tags, *, guard=None):
+        if self.fail_remove_tag and self.fail_remove_tag in str(tags).split(","):
+            self.fail_remove_tag = None
+            return False
         ok = self._write("remove_tags", {"hashes": torrent_hash, "tags": tags}, guard)
         if ok:
             current = self._tags() - set(str(tags).split(","))
@@ -81,6 +86,9 @@ class FakeGateway:
         return ok
 
     def set_file_priorities(self, torrent_hash, indices, priority, *, guard=None):
+        if self.fail_next_priority_write:
+            self.fail_next_priority_write = False
+            return False
         ok = self._write(
             "file_priority",
             {"hash": torrent_hash, "id": "|".join(str(i) for i in indices), "priority": str(priority)},
@@ -174,6 +182,68 @@ def test_unique_prechecked_item_is_enrolled_stopped_without_direct_start(tmp_pat
     assert not any(name == "start" for name, _ in gateway.posts)
 
 
+def test_unique_enrollment_keeps_hold_until_database_is_enrolled(tmp_path, monkeypatch):
+    queue, gateway, service, item_id = _fixture(tmp_path)
+    original = queue.transition_item
+
+    def observe_commit(item, expected, new_state, *args, **kwargs):
+        if new_state == "enrolled":
+            assert "hold" in gateway._tags()
+        return original(item, expected, new_state, *args, **kwargs)
+
+    monkeypatch.setattr(queue, "transition_item", observe_commit)
+
+    assert service.tick()["enrolled"] == [item_id]
+    assert "hold" not in gateway._tags()
+
+
+def test_enrollment_zeroes_every_file_then_selects_only_primary_and_verifies(tmp_path):
+    queue, gateway, service, item_id = _fixture(tmp_path)
+    gateway.files = [
+        {"index": 0, "name": "sample.mkv", "size": 200 * 1024**2, "priority": 7},
+        {"index": 1, "name": "SONE-792.mkv", "size": 2_000 * 1024**2, "priority": 6},
+        {"index": 2, "name": "notes.txt", "size": 1024, "priority": 1},
+    ]
+
+    assert service.tick()["enrolled"] == [item_id]
+
+    assert [row["priority"] for row in gateway.files] == [0, 1, 0]
+    priority_posts = [payload for name, payload in gateway.posts if name == "file_priority"]
+    assert priority_posts[:2] == [
+        {"hash": "a" * 40, "id": "0|1|2", "priority": "0"},
+        {"hash": "a" * 40, "id": "1", "priority": "1"},
+    ]
+
+
+def test_priority_write_failure_leaves_enrolling_held_and_retry_recovers(tmp_path):
+    queue, gateway, service, item_id = _fixture(tmp_path)
+    gateway.fail_next_priority_write = True
+
+    assert service.tick()["errors"] == 1
+    assert queue.get_item(item_id)["state"] == "enrolling"
+    assert "hold" in gateway._tags()
+
+    assert service.tick()["enrolled"] == [item_id]
+    assert gateway.files[0]["priority"] == 1
+
+
+def test_unique_finalization_failure_leaves_enrolled_held_then_tick_reconciles(tmp_path):
+    queue, gateway, service, item_id = _fixture(tmp_path)
+    gateway.fail_remove_tag = "hold"
+
+    assert service.tick()["enrolled"] == [item_id]
+    stored = queue.get_item(item_id)
+    assert stored["state"] == "enrolled"
+    assert stored["qbt_precheck_tag"]
+    assert "hold" in gateway._tags()
+
+    reconciled = service.tick()
+
+    assert reconciled["finalized"] == [item_id]
+    assert queue.get_item(item_id)["qbt_precheck_tag"] is None
+    assert "hold" not in gateway._tags()
+
+
 def test_different_remote_size_requires_confirmation_then_approval_stays_held(tmp_path):
     queue, gateway, service, item_id = _fixture(
         tmp_path, size=2_000 * 1024**2, remote_size=1_000 * 1024**2
@@ -222,6 +292,50 @@ def test_allow_scheduling_only_removes_hold_and_is_idempotent(tmp_path):
     assert first["state"] == second["state"] == "enrolled"
     assert "hold" not in gateway._tags()
     assert gateway.posts[before:] == [("remove_tags", {"hashes": "a" * 40, "tags": "hold"})]
+
+
+def test_allow_scheduling_commits_enrolled_before_removing_hold(tmp_path, monkeypatch):
+    queue, gateway, service, item_id = _fixture(
+        tmp_path, size=2_000 * 1024**2, remote_size=1_000 * 1024**2
+    )
+    service.tick()
+    pending = queue.get_item(item_id)
+    held = service.approve_hold(item_id, "123", pending["approval_generation"])
+    original = queue.transition_item
+
+    def observe_commit(item, expected, new_state, *args, **kwargs):
+        if expected == {"enrolled_hold"} and new_state == "enrolled":
+            assert "hold" in gateway._tags()
+        return original(item, expected, new_state, *args, **kwargs)
+
+    monkeypatch.setattr(queue, "transition_item", observe_commit)
+
+    result = service.allow_scheduling(
+        item_id, "123", held["approval_generation"]
+    )
+    assert result["state"] == "enrolled"
+    assert "hold" not in gateway._tags()
+
+
+def test_allow_scheduling_remove_failure_is_safe_and_same_callback_retries(tmp_path):
+    queue, gateway, service, item_id = _fixture(
+        tmp_path, size=2_000 * 1024**2, remote_size=1_000 * 1024**2
+    )
+    service.tick()
+    pending = queue.get_item(item_id)
+    held = service.approve_hold(item_id, "123", pending["approval_generation"])
+    gateway.fail_remove_tag = "hold"
+
+    with pytest.raises(ValueError, match="qbt_write_fenced"):
+        service.allow_scheduling(item_id, "123", held["approval_generation"])
+    assert queue.get_item(item_id)["state"] == "enrolled"
+    assert "hold" in gateway._tags()
+
+    retried = service.allow_scheduling(
+        item_id, "123", held["approval_generation"]
+    )
+    assert retried["state"] == "enrolled"
+    assert "hold" not in gateway._tags()
 
 
 def test_stale_approval_token_has_no_qbt_side_effect(tmp_path):

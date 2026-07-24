@@ -871,10 +871,18 @@ class CheckedAddService:
             "duplicates": [],
             "confirmations": [],
             "recovered": [],
+            "finalized": [],
             "errors": 0,
         }
         if not sync_healthy:
             return result
+
+        for item in self._items_needing_finalization(max_items):
+            try:
+                self._finalize_enrollment(dict(item))
+                result["finalized"].append(int(item["id"]))
+            except (ValueError, RuntimeError):
+                result["errors"] += 1
 
         for item in self._items_in_states({"enrolling"}, max_items):
             try:
@@ -965,26 +973,17 @@ class CheckedAddService:
                 raise ValueError("state_conflict")
             if int(approval_generation) != int(current["approval_generation"]):
                 raise ValueError("approval_generation_conflict")
-            return current
+            return self._release_enrolled_hold(current, approval_generation)
         self._approval_token(current, approval_generation, "enrolled_hold")
-        snapshot = self._managed_snapshot(current)
-        tags = self._tags(snapshot)
-        if "hold" in tags:
-            if not self.gateway.remove_tags(
-                str(current["qbt_hash"]),
-                "hold",
-                guard=lambda: self._managed_guard(
-                    item_id, approval_generation, require_hold=True
-                ),
-            ):
-                raise ValueError("qbt_write_fenced")
-        return self.repository.transition_item(
+        self._managed_snapshot(current)
+        enrolled = self.repository.transition_item(
             item_id,
             {"enrolled_hold"},
             "enrolled",
             "scheduling_allowed",
             approval_generation=approval_generation,
         )
+        return self._release_enrolled_hold(enrolled, approval_generation)
 
     def _validate_one(self, item_id: int) -> dict[str, Any]:
         now = int(self.now())
@@ -1105,19 +1104,29 @@ class CheckedAddService:
         opaque_tag = str(current.get("qbt_precheck_tag") or "")
         self._owned_snapshot(current)
         held = bool(current.get("approved_by")) or current.get("decision") == "needs_confirmation"
-        added_tags = "checked,maybe-duplicate" if held else "checked"
-        removed_tags = "precheck,metadata-probe" if held else "precheck,metadata-probe,hold"
+        added_tags = "checked,maybe-duplicate,hold" if held else "checked,hold"
+        removed_tags = "precheck,metadata-probe"
         guard = lambda: self._lease_owned_guard(item_id, token)
-        primary = select_primary_video(
-            self.gateway.torrent_files(str(current["qbt_hash"]))
-        )
+        files = self.gateway.torrent_files(str(current["qbt_hash"]))
+        primary = select_primary_video(files)
         if primary is None:
             raise ValueError("primary_video_not_found")
-        actions = (
-            (
-                self.gateway.set_file_priorities,
-                (str(current["qbt_hash"]), [primary.index], 1),
-            ),
+        all_indices = [
+            int(row["index"])
+            for row in files
+            if type(row.get("index")) is int and row["index"] >= 0
+        ]
+        if len(all_indices) != len(files) or not all_indices:
+            raise ValueError("file_index")
+        priority_actions = []
+        if any(int(row.get("priority") or 0) != 0 for row in files):
+            priority_actions.append(
+                (self.gateway.set_file_priorities, (str(current["qbt_hash"]), all_indices, 0))
+            )
+        priority_actions.append(
+            (self.gateway.set_file_priorities, (str(current["qbt_hash"]), [primary.index], 1))
+        )
+        actions = tuple(priority_actions) + (
             (self.gateway.set_category, (str(current["qbt_hash"]), "auto")),
             (self.gateway.add_tags, (str(current["qbt_hash"]), added_tags)),
             (self.gateway.remove_tags, (str(current["qbt_hash"]), removed_tags)),
@@ -1127,6 +1136,12 @@ class CheckedAddService:
         for action, args in actions:
             if not action(*args, guard=guard):
                 raise ValueError("qbt_write_fenced")
+        verified_files = self.gateway.torrent_files(str(current["qbt_hash"]))
+        if not verified_files or any(
+            int(row.get("priority") or 0) != (1 if int(row.get("index", -1)) == primary.index else 0)
+            for row in verified_files
+        ):
+            raise ValueError("file_priority_verification_failed")
         approval_generation = int(current["approval_generation"])
         finished = self.repository.transition_item(
             item_id,
@@ -1137,18 +1152,10 @@ class CheckedAddService:
             metadata_lease_generation=token[1],
             approval_generation=approval_generation,
         )
-        # The terminal database state is authoritative.  Leaving an opaque tag
-        # is harmless, so removal is intentionally best effort after commit.
         try:
-            self.gateway.remove_tags(
-                str(current["qbt_hash"]),
-                opaque_tag,
-                guard=lambda: self.repository.get_item(item_id)["state"]
-                == finished["state"],
-            )
+            return self._finalize_enrollment(finished, opaque_tag=opaque_tag)
         except Exception:
-            pass
-        return finished
+            return finished
 
     def _notify_confirmation(self, item: Mapping[str, Any]) -> None:
         if self.notifications is None:
@@ -1186,6 +1193,68 @@ class CheckedAddService:
             ]
         finally:
             con.close()
+
+    def _items_needing_finalization(self, limit: int) -> list[dict[str, Any]]:
+        con = readonly_connect(self.repository.state_db)
+        try:
+            return [
+                dict(row)
+                for row in con.execute(
+                    "select * from bot_add_items where state in ('enrolled','enrolled_hold') "
+                    "and qbt_precheck_tag is not null order by updated_at,id limit ?",
+                    (int(limit),),
+                )
+            ]
+        finally:
+            con.close()
+
+    def _finalize_enrollment(
+        self, item: Mapping[str, Any], *, opaque_tag: str | None = None
+    ) -> dict[str, Any]:
+        current = self.repository.get_item(int(item["id"]))
+        state = str(current["state"])
+        if state not in {"enrolled", "enrolled_hold"}:
+            raise ValueError("state_conflict")
+        tag = str(opaque_tag or current.get("qbt_precheck_tag") or "")
+        if not tag:
+            return current
+        snapshot = self._managed_snapshot(current)
+        tags = self._tags(snapshot)
+        guard = lambda: self._finalization_guard(int(current["id"]), state, tag)
+        if state == "enrolled_hold" and "hold" not in tags:
+            if not self.gateway.add_tags(
+                str(current["qbt_hash"]), "hold", guard=guard
+            ):
+                raise ValueError("qbt_write_fenced")
+        if state == "enrolled" and "hold" in tags:
+            if not self.gateway.remove_tags(
+                str(current["qbt_hash"]), "hold", guard=guard
+            ):
+                raise ValueError("qbt_write_fenced")
+        if tag in self._tags(self._managed_snapshot(current)):
+            if not self.gateway.remove_tags(
+                str(current["qbt_hash"]), tag, guard=guard
+            ):
+                raise ValueError("qbt_write_fenced")
+        return self.repository.finalize_enrollment_marker(
+            int(current["id"]), state, tag
+        )
+
+    def _release_enrolled_hold(
+        self, item: Mapping[str, Any], approval_generation: int
+    ) -> dict[str, Any]:
+        current = self.repository.get_item(int(item["id"]))
+        snapshot = self._managed_snapshot(current)
+        if "hold" in self._tags(snapshot):
+            if not self.gateway.remove_tags(
+                str(current["qbt_hash"]),
+                "hold",
+                guard=lambda: self._managed_release_guard(
+                    int(current["id"]), approval_generation
+                ),
+            ):
+                raise ValueError("qbt_write_fenced")
+        return self.repository.get_item(int(current["id"]))
 
     def _claim_or_renew(self, item_id: int, now: int) -> dict[str, Any]:
         current = self.repository.get_item(item_id)
@@ -1256,14 +1325,25 @@ class CheckedAddService:
         except Exception:
             return False
 
-    def _managed_guard(self, item_id: int, generation: int, *, require_hold: bool) -> bool:
+    def _managed_release_guard(self, item_id: int, generation: int) -> bool:
         try:
             current = self.repository.get_item(item_id)
-            snapshot = self._managed_snapshot(current)
             return (
-                current["state"] == "enrolled_hold"
+                current["state"] == "enrolled"
+                and bool(current.get("approved_by"))
                 and int(current["approval_generation"]) == int(generation)
-                and (not require_hold or "hold" in self._tags(snapshot))
+                and "hold" in self._tags(self._managed_snapshot(current))
+            )
+        except Exception:
+            return False
+
+    def _finalization_guard(self, item_id: int, state: str, tag: str) -> bool:
+        try:
+            current = self.repository.get_item(item_id)
+            return (
+                current["state"] == state
+                and str(current.get("qbt_precheck_tag") or "") == tag
+                and self._managed_snapshot(current) is not None
             )
         except Exception:
             return False
