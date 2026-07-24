@@ -7,12 +7,15 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 import qbt_orchestrator.db as db_module
+import qbt_orchestrator.bot_add_queue as queue_module
 from qbt_orchestrator.db import migrate, migration_sql, readonly_connect
+from qbt_orchestrator.bot_add_queue import AddQueueLimits, BotAddQueueRepository
 
 
 EXPECTED_TABLES = {
@@ -760,3 +763,613 @@ def test_remote_media_index_has_primary_key_and_normalized_id_index(tmp_path):
         ).values()
     finally:
         con.close()
+
+
+class _QueueClock:
+    def __init__(self, now: int = 1_800_000_000):
+        self.value = now
+
+    def __call__(self) -> int:
+        return self.value
+
+    def advance(self, seconds: int) -> None:
+        self.value += seconds
+
+
+@pytest.fixture
+def queue_fixture(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock()
+    return BotAddQueueRepository(db, now=clock), clock, db
+
+
+def _magnets(start: int, count: int) -> list[str]:
+    prefix = "magnet:?xt=" + "urn:btih:"
+    return [f"{prefix}{value:040x}" for value in range(start, start + count)]
+
+
+def _independent_write_transaction(path, callback):
+    con = sqlite3.connect(path, timeout=5)
+    con.row_factory = sqlite3.Row
+    con.execute("pragma busy_timeout=5000")
+    try:
+        result = callback(con)
+        con.commit()
+        return result
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def test_queue_limits_validate_positive_integer_relationships():
+    for field, value in (
+        ("max_links_per_batch", 0),
+        ("shard_size", 0),
+        ("max_submitted_items", -1),
+        ("max_link_bytes", True),
+        ("max_draft_bytes", 0),
+        ("draft_ttl_sec", 0),
+        ("raw_input_ttl_sec", 0),
+    ):
+        with pytest.raises(ValueError, match=field):
+            AddQueueLimits(**{field: value})
+    with pytest.raises(ValueError, match="shard_size"):
+        AddQueueLimits(max_links_per_batch=10, shard_size=11)
+
+
+def test_ingress_accepts_multi_message_batch_and_creates_fifty_item_shards(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    queue.append_message(batch["id"], message_id=10, links=_magnets(0, 40))
+    queue.append_message(batch["id"], message_id=11, links=_magnets(40, 35))
+
+    submitted = queue.submit(batch["id"])
+
+    assert submitted["state"] == "queued"
+    assert submitted["received_count"] == 75
+    assert [row["item_count"] for row in queue.list_shards(batch["id"])] == [50, 25]
+    assert [row["source_message_id"] for row in queue.list_items(batch["id"])[:41]] == [10] * 40 + [11]
+
+
+def test_overflow_message_is_rejected_atomically(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    queue.append_message(batch["id"], 10, _magnets(0, 490))
+
+    with pytest.raises(ValueError, match="^batch_link_limit$"):
+        queue.append_message(batch["id"], 11, _magnets(600, 20))
+
+    assert queue.get_batch(batch["id"])["received_count"] == 490
+    assert len(queue.list_items(batch["id"])) == 490
+
+
+def test_link_limit_counts_utf8_bytes_not_characters(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(max_link_bytes=64),
+        now=lambda: 100,
+    )
+    batch = queue.open_draft("1", "2")
+    prefix = "https://example.test/"
+    fitting = prefix + ("界" * ((64 - len(prefix.encode("utf-8"))) // 3))
+    queue.append_message(batch["id"], 1, [fitting])
+
+    with pytest.raises(ValueError, match="^link_byte_limit$"):
+        queue.append_message(batch["id"], 2, [fitting + "界"])
+
+    assert queue.get_batch(batch["id"])["received_count"] == 1
+
+
+def test_default_link_limit_accepts_exactly_eight_kib_and_rejects_one_more(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    prefix = "https://example.test/"
+    exact = prefix + "a" * (8192 - len(prefix.encode("utf-8")))
+    queue.append_message(batch["id"], 1, [exact])
+
+    with pytest.raises(ValueError, match="^link_byte_limit$"):
+        queue.append_message(batch["id"], 2, [exact + "a"])
+
+    assert queue.get_batch(batch["id"])["received_count"] == 1
+
+
+def test_draft_raw_byte_limit_rejects_whole_message(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(
+            max_links_per_batch=10,
+            shard_size=5,
+            max_link_bytes=128,
+            max_draft_bytes=100,
+        ),
+        now=lambda: 100,
+    )
+    batch = queue.open_draft("1", "2")
+    queue.append_message(batch["id"], 1, ["https://example.test/" + "a" * 40])
+
+    with pytest.raises(ValueError, match="^draft_byte_limit$"):
+        queue.append_message(
+            batch["id"],
+            2,
+            ["https://example.test/" + "b" * 20, "https://example.test/" + "c" * 20],
+        )
+
+    assert queue.get_batch(batch["id"])["received_count"] == 1
+
+
+def test_default_draft_limit_accepts_exactly_two_mib_and_rejects_next_message(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    prefix = "https://example.test/"
+    links = []
+    for index in range(256):
+        suffix = f"/{index:03d}"
+        links.append(
+            prefix
+            + "a" * (8192 - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8")))
+            + suffix
+        )
+    assert sum(len(link.encode("utf-8")) for link in links) == 2 * 1024 * 1024
+    queue.append_message(batch["id"], 1, links)
+
+    with pytest.raises(ValueError, match="^draft_byte_limit$"):
+        queue.append_message(batch["id"], 2, ["magnet:?xt=" + "urn:btih:" + "f" * 40])
+
+    assert queue.get_batch(batch["id"])["received_count"] == 256
+
+
+def test_open_draft_is_idempotent_and_scoped_to_chat_and_user(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    first = queue.open_draft("chat", "user")
+    assert queue.open_draft("chat", "user")["id"] == first["id"]
+    assert queue.open_draft("chat", "other")["id"] != first["id"]
+    assert queue.open_draft("other", "user")["id"] != first["id"]
+    assert len(queue.list_batches()) == 3
+
+
+def test_submit_rejects_entire_draft_when_global_backlog_is_full(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(
+            max_links_per_batch=500,
+            shard_size=50,
+            max_submitted_items=500,
+        ),
+        now=lambda: 100,
+    )
+    first = queue.open_draft("1", "1")
+    queue.append_message(first["id"], 1, _magnets(0, 490))
+    queue.submit(first["id"])
+    second = queue.open_draft("2", "2")
+    queue.append_message(second["id"], 2, _magnets(600, 20))
+
+    with pytest.raises(ValueError, match="^global_backlog_limit$"):
+        queue.submit(second["id"])
+
+    assert queue.get_batch(second["id"])["state"] == "draft"
+    assert queue.list_shards(second["id"]) == []
+    assert queue.submitted_nonterminal_count() == 490
+
+
+def test_default_global_backlog_accepts_one_thousand_then_rejects_next(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    first = queue.open_draft("1", "1")
+    queue.append_message(first["id"], 1, _magnets(0, 500))
+    queue.submit(first["id"])
+    second = queue.open_draft("2", "2")
+    queue.append_message(second["id"], 2, _magnets(1000, 500))
+    queue.submit(second["id"])
+    overflow = queue.open_draft("3", "3")
+    queue.append_message(overflow["id"], 3, _magnets(2000, 1))
+
+    with pytest.raises(ValueError, match="^global_backlog_limit$"):
+        queue.submit(overflow["id"])
+
+    assert queue.submitted_nonterminal_count() == 1000
+    assert queue.get_batch(overflow["id"])["state"] == "draft"
+
+
+def test_global_backlog_ignores_drafts_cancelled_and_terminal_items(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(
+            max_links_per_batch=10,
+            shard_size=5,
+            max_submitted_items=2,
+        ),
+        now=lambda: 100,
+    )
+    queued = queue.open_draft("1", "1")
+    queue.append_message(queued["id"], 1, _magnets(0, 2))
+    queue.submit(queued["id"])
+    first_item, second_item = queue.list_items(queued["id"])
+    queue.transition_item(first_item["id"], {"received"}, "invalid", "invalid")
+    queue.transition_item(second_item["id"], {"received"}, "cancelled", "cancelled")
+    draft = queue.open_draft("2", "2")
+    queue.append_message(draft["id"], 2, _magnets(20, 2))
+
+    assert queue.submit(draft["id"])["state"] == "queued"
+    assert queue.submitted_nonterminal_count() == 2
+
+
+def test_replayed_telegram_message_is_idempotent_without_duplicate_events(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    links = _magnets(0, 2)
+    first = queue.append_message(batch["id"], 100, links)
+    event_count = len(queue.list_events(batch["id"]))
+
+    replay = queue.append_message(batch["id"], 100, links)
+
+    assert replay["received_count"] == first["received_count"] == 2
+    assert replay["idempotent"] is True
+    assert len(queue.list_items(batch["id"])) == 2
+    assert len(queue.list_events(batch["id"])) == event_count
+
+
+def test_replayed_message_id_with_different_content_fails_closed(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    queue.append_message(batch["id"], 100, _magnets(0, 2))
+
+    with pytest.raises(ValueError, match="^source_message_conflict$"):
+        queue.append_message(batch["id"], 100, _magnets(0, 1))
+    with pytest.raises(ValueError, match="^source_message_conflict$"):
+        queue.append_message(batch["id"], 100, _magnets(10, 2))
+
+    assert queue.get_batch(batch["id"])["received_count"] == 2
+
+
+def test_replayed_update_is_idempotent_across_successive_batches_in_same_chat(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    first = queue.open_draft("chat", "user")
+    links = _magnets(0, 2)
+    queue.append_message(first["id"], 100, links)
+    queue.submit(first["id"])
+    second = queue.open_draft("chat", "user")
+    first_events = len(queue.list_events(first["id"]))
+
+    replay = queue.append_message(second["id"], 100, links)
+
+    assert replay["id"] == first["id"]
+    assert replay["idempotent"] is True
+    assert queue.get_batch(second["id"])["received_count"] == 0
+    assert len(queue.list_events(first["id"])) == first_events
+
+
+def test_reused_message_id_across_batches_with_different_content_fails_closed(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    first = queue.open_draft("chat", "user")
+    queue.append_message(first["id"], 100, _magnets(0, 1))
+    queue.submit(first["id"])
+    second = queue.open_draft("chat", "user")
+
+    with pytest.raises(ValueError, match="^source_message_conflict$"):
+        queue.append_message(second["id"], 100, _magnets(10, 1))
+
+    assert queue.get_batch(second["id"])["received_count"] == 0
+
+
+def test_append_rejects_empty_non_string_unsupported_and_duplicate_inputs_atomically(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    for links, error in (
+        ([], "empty_message"),
+        (["magnet:?xt=" + "urn:btih:" + "0" * 40, 7], "link_type"),
+        (["ftp://example.test/file"], "unsupported_link_scheme"),
+    ):
+        with pytest.raises(ValueError, match=f"^{error}$"):
+            queue.append_message(batch["id"], 1, links)
+    queue.append_message(batch["id"], 2, _magnets(0, 1))
+    with pytest.raises(ValueError, match="^duplicate_input$"):
+        queue.append_message(batch["id"], 3, _magnets(0, 1))
+    assert queue.get_batch(batch["id"])["received_count"] == 1
+
+
+def test_redacted_inputs_never_retain_url_credentials_or_query(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    queue.append_message(
+        batch["id"],
+        1,
+        [
+            "https://alice:secret@example.test/private/path?token=very-secret#frag",
+            "magnet:?xt=" + "urn:btih:" + "a" * 40 + "&tr=https://secret.test/a",
+            "bc://bt/SECRET",
+        ],
+    )
+    redacted = [row["redacted_input"] for row in queue.list_items(batch["id"])]
+    rendered = " ".join(redacted)
+    assert "alice" not in rendered
+    assert "secret" not in rendered.lower()
+    assert "token" not in rendered
+    assert "?" not in rendered
+    assert queue.list_items(batch["id"], include_raw=False)[0]["raw_input"] is None
+
+
+def test_message_event_evidence_is_bounded_and_contains_no_raw_links(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    queue.append_message(batch["id"], 1, _magnets(0, 500))
+
+    evidence = queue.list_events(batch["id"])[0]["safe_evidence_json"]
+
+    assert len(evidence.encode("utf-8")) < 1024
+    assert "magnet:" not in evidence
+
+
+def test_draft_expires_after_thirty_minutes_and_clears_raw(queue_fixture):
+    queue, clock, db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    clock.advance(1800)
+
+    replacement = queue.open_draft("1", "2")
+
+    assert replacement["id"] != batch["id"]
+    assert queue.get_batch(batch["id"])["state"] == "draft_expired"
+    con = readonly_connect(db)
+    try:
+        raw = con.execute(
+            "select raw_input,raw_input_expires_at from bot_add_items where batch_id=?",
+            (batch["id"],),
+        ).fetchone()
+        assert tuple(raw) == (None, None)
+    finally:
+        con.close()
+
+
+def test_append_and_submit_reject_expired_or_submitted_drafts(queue_fixture):
+    queue, clock, db = queue_fixture
+    expired = queue.open_draft("1", "1")
+    queue.append_message(expired["id"], 1, _magnets(0, 1))
+    clock.advance(1800)
+    with pytest.raises(ValueError, match="^draft_expired$"):
+        queue.append_message(expired["id"], 2, _magnets(2, 1))
+    assert queue.get_batch(expired["id"])["state"] == "draft_expired"
+    con = readonly_connect(db)
+    try:
+        assert con.execute(
+            "select raw_input from bot_add_items where batch_id=?", (expired["id"],)
+        ).fetchone()[0] is None
+    finally:
+        con.close()
+    submitted = queue.open_draft("2", "2")
+    queue.append_message(submitted["id"], 3, _magnets(3, 1))
+    queue.submit(submitted["id"])
+    with pytest.raises(ValueError, match="^batch_not_draft$"):
+        queue.append_message(submitted["id"], 4, _magnets(4, 1))
+    assert queue.submit(submitted["id"])["state"] == "queued"
+
+
+def test_submit_persists_expiry_before_reporting_expired_draft(queue_fixture):
+    queue, clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    clock.advance(1800)
+
+    with pytest.raises(ValueError, match="^draft_expired$"):
+        queue.submit(batch["id"])
+
+    assert queue.get_batch(batch["id"])["state"] == "draft_expired"
+    assert queue.list_shards(batch["id"]) == []
+
+
+def test_expiry_wins_over_conflicting_replay_and_is_not_rolled_back(queue_fixture):
+    queue, clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    clock.advance(1800)
+
+    with pytest.raises(ValueError, match="^draft_expired$"):
+        queue.append_message(batch["id"], 1, _magnets(10, 1))
+
+    assert queue.get_batch(batch["id"])["state"] == "draft_expired"
+
+
+def test_cancel_clears_raw_and_preserves_enrolling_or_enrolled_items(queue_fixture):
+    queue, _clock, db = queue_fixture
+    batch = queue.open_draft("1", "2")
+    queue.append_message(batch["id"], 1, _magnets(0, 4))
+    queue.submit(batch["id"])
+    items = queue.list_items(batch["id"])
+    queue.transition_item(items[1]["id"], {"received"}, "enrolling", "start")
+    queue.transition_item(items[2]["id"], {"received"}, "enrolled", "done")
+    queue.transition_item(items[3]["id"], {"received"}, "enrolled_hold", "held")
+
+    cancelled = queue.cancel_batch(batch["id"], "operator")
+
+    assert cancelled["state"] == "cancelled"
+    assert [row["state"] for row in queue.list_items(batch["id"])] == [
+        "cancelled",
+        "enrolling",
+        "enrolled",
+        "enrolled_hold",
+    ]
+    con = readonly_connect(db)
+    try:
+        assert con.execute(
+            "select count(*) from bot_add_items where batch_id=? and raw_input is not null",
+            (batch["id"],),
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_transition_uses_cas_field_allowlist_and_item_batch_for_events(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    first = queue.open_draft("1", "1")
+    second = queue.open_draft("2", "2")
+    queue.append_message(first["id"], 1, _magnets(0, 1))
+    queue.append_message(second["id"], 2, _magnets(2, 1))
+    item = queue.list_items(second["id"])[0]
+
+    changed = queue.transition_item(
+        item["id"],
+        {"received"},
+        "resolving",
+        "accepted",
+        {"attempts": 1, "decision_reason": "safe"},
+    )
+    assert changed["state"] == "resolving"
+    assert changed["raw_input"] is None
+    with pytest.raises(ValueError, match="^state_conflict$"):
+        queue.transition_item(item["id"], {"received"}, "ready", "raced")
+    with pytest.raises(ValueError, match="^invalid_field$"):
+        queue.transition_item(item["id"], {"resolving"}, "ready", "bad", {"state = 'failed' --": 1})
+    event = queue.list_events(second["id"])[-1]
+    assert event["batch_id"] == second["id"]
+    assert event["item_id"] == item["id"]
+    assert not [
+        row
+        for row in queue.list_events(first["id"])
+        if row["event_type"] == "state_transition"
+    ]
+
+
+def test_terminal_transition_clears_raw_expiry_and_retry_secrets(queue_fixture):
+    queue, _clock, db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(
+        item["id"],
+        {"received"},
+        "failed",
+        "permanent",
+        {
+            "metadata_retry_at": 500,
+            "metadata_next_poll_at": 501,
+            "metadata_lease_owner": "worker-secret",
+            "metadata_lease_until": 502,
+            "next_run_at": 503,
+            "qbt_precheck_tag": "opaque-secret",
+        },
+    )
+    con = readonly_connect(db)
+    try:
+        row = con.execute(
+            "select raw_input,raw_input_expires_at,metadata_retry_at,metadata_next_poll_at,"
+            "metadata_lease_owner,metadata_lease_until,next_run_at,qbt_precheck_tag "
+            "from bot_add_items where id=?",
+            (item["id"],),
+        ).fetchone()
+        assert tuple(row) == (None,) * 8
+    finally:
+        con.close()
+
+
+def test_persisted_shard_counts_survive_runtime_limit_changes(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    original = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(max_links_per_batch=10, shard_size=4),
+        now=lambda: 100,
+    )
+    batch = original.open_draft("1", "1")
+    original.append_message(batch["id"], 1, _magnets(0, 6))
+    original.submit(batch["id"])
+    changed_config = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(max_links_per_batch=10, shard_size=2),
+        now=lambda: 101,
+    )
+
+    items = changed_config.list_items(batch["id"])
+    assert [row["shard_index"] for row in items] == [0, 0, 0, 0, 1, 1]
+    changed_config.transition_item(items[4]["id"], {"received"}, "invalid", "invalid")
+
+    assert [row["processed_count"] for row in changed_config.list_shards(batch["id"])] == [0, 1]
+
+
+def test_raw_input_ttl_cleanup_is_explicit_and_audited(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(draft_ttl_sec=5, raw_input_ttl_sec=10),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    clock.advance(10)
+
+    assert queue.expire_raw_inputs() == 1
+    assert queue.expire_raw_inputs() == 0
+    assert queue.list_items(batch["id"], include_raw=True)[0]["raw_input"] is None
+    assert [event["event_type"] for event in queue.list_events(batch["id"])] == [
+        "message_appended",
+        "batch_submitted",
+        "raw_input_expired",
+    ]
+
+
+def test_concurrent_appends_enforce_batch_limit_inside_sqlite_transaction(tmp_path, monkeypatch):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    limits = AddQueueLimits(max_links_per_batch=10, shard_size=5)
+    queue = BotAddQueueRepository(db, limits=limits, now=lambda: 100)
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 6))
+    repos = [BotAddQueueRepository(db, limits=limits, now=lambda: 100) for _ in range(2)]
+    monkeypatch.setattr(queue_module, "write_transaction", _independent_write_transaction)
+
+    def append(index: int):
+        try:
+            repos[index].append_message(batch["id"], 10 + index, _magnets(100 + index * 10, 4))
+            return "accepted"
+        except ValueError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(append, range(2)))
+
+    assert sorted(results) == ["accepted", "batch_link_limit"]
+    assert queue.get_batch(batch["id"])["received_count"] == 10
+
+
+def test_concurrent_submits_enforce_global_backlog_without_partial_shards(tmp_path, monkeypatch):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    limits = AddQueueLimits(
+        max_links_per_batch=10,
+        shard_size=5,
+        max_submitted_items=10,
+    )
+    queues = [BotAddQueueRepository(db, limits=limits, now=lambda: 100) for _ in range(2)]
+    batches = []
+    for index, queue in enumerate(queues):
+        batch = queue.open_draft(str(index), str(index))
+        queue.append_message(batch["id"], index + 1, _magnets(index * 20, 6))
+        batches.append(batch)
+    monkeypatch.setattr(queue_module, "write_transaction", _independent_write_transaction)
+
+    def submit(index: int):
+        try:
+            queues[index].submit(batches[index]["id"])
+            return "accepted"
+        except ValueError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(submit, range(2)))
+
+    assert sorted(results) == ["accepted", "global_backlog_limit"]
+    states = [queues[0].get_batch(batch["id"])["state"] for batch in batches]
+    assert sorted(states) == ["draft", "queued"]
+    assert sorted(len(queues[0].list_shards(batch["id"])) for batch in batches) == [0, 2]
+    assert queues[0].submitted_nonterminal_count() == 6
