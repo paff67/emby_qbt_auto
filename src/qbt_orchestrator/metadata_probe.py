@@ -64,6 +64,7 @@ class MetadataProbeCoordinator:
             "timed_out": [],
             "recovered": [],
             "requeued": [],
+            "duplicates": [],
             "errors": 0,
         }
         if not sync_healthy:
@@ -219,6 +220,19 @@ class MetadataProbeCoordinator:
             stored_hash = str(item.get("qbt_hash") or "").lower()
             if stored_hash and stored_hash != torrent_hash:
                 raise ValueError("qbt_precheck_hash_mismatch")
+            current = self.gateway.torrent_info(torrent_hash)
+            if not str(current.get("state") or "").strip():
+                self._schedule_poll(item_id, token, now, clear_error=False)
+                return
+            current_hash = str(current.get("hash") or torrent_hash).lower()
+            if current_hash != torrent_hash:
+                raise ValueError("qbt_precheck_hash_mismatch")
+            if not self._has_exact_tag(current, tag):
+                self._finish_existing_duplicate(
+                    item_id, token, torrent_hash, result
+                )
+                return
+            snapshot = current
             self.repository.update_metadata_probe(
                 item_id,
                 token[0],
@@ -230,7 +244,10 @@ class MetadataProbeCoordinator:
                 return
             self._require_write(
                 self.gateway.stop(
-                    torrent_hash, guard=self._lease_guard(item_id, token)
+                    torrent_hash,
+                    guard=self._owned_write_guard(
+                        item_id, token, torrent_hash, tag
+                    ),
                 )
             )
             files = self.gateway.torrent_files(torrent_hash)
@@ -247,7 +264,9 @@ class MetadataProbeCoordinator:
                 self.gateway.zero_file_priorities(
                     torrent_hash,
                     files,
-                    guard=self._lease_guard(item_id, token),
+                    guard=self._owned_write_guard(
+                        item_id, token, torrent_hash, tag
+                    ),
                 )
             )
             verified = self.gateway.torrent_files(torrent_hash)
@@ -257,6 +276,11 @@ class MetadataProbeCoordinator:
             current_hash = str(current.get("hash") or torrent_hash).lower()
             if current_hash != torrent_hash:
                 raise ValueError("qbt_precheck_hash_mismatch")
+            if not self._has_exact_tag(current, tag):
+                self._finish_existing_duplicate(
+                    item_id, token, torrent_hash, result
+                )
+                return
             if not self._is_stopped_state(current.get("state")):
                 raise ValueError("qbt_precheck_not_stopped")
             self.repository.transition_item(
@@ -326,16 +350,32 @@ class MetadataProbeCoordinator:
                 torrent_hash = str(snapshot.get("hash") or "").lower()
                 if stored_hash and stored_hash != torrent_hash:
                     raise ValueError("qbt_precheck_hash_mismatch")
+                current = self.gateway.torrent_info(torrent_hash)
+                if not str(current.get("state") or "").strip():
+                    self._record_failure(item_id, token, now, result)
+                    return
+                current_hash = str(current.get("hash") or torrent_hash).lower()
+                if current_hash != torrent_hash:
+                    raise ValueError("qbt_precheck_hash_mismatch")
+                if not self._has_exact_tag(current, tag):
+                    self._finish_existing_duplicate(
+                        item_id, token, torrent_hash, result
+                    )
+                    return
                 self._require_write(
                     self.gateway.stop(
                         torrent_hash,
-                        guard=self._lease_guard(item_id, token),
+                        guard=self._owned_write_guard(
+                            item_id, token, torrent_hash, tag
+                        ),
                     )
                 )
                 self._require_write(
                     self.gateway.remove_registration(
                         torrent_hash,
-                        guard=self._lease_guard(item_id, token),
+                        guard=self._owned_write_guard(
+                            item_id, token, torrent_hash, tag
+                        ),
                     )
                 )
             attempt = int(item.get("metadata_probe_attempt") or 0)
@@ -487,6 +527,62 @@ class MetadataProbeCoordinator:
                 return False
 
         return current
+
+    def _owned_write_guard(
+        self,
+        item_id: int,
+        token: tuple[str, int],
+        torrent_hash: str,
+        tag: str,
+    ) -> Callable[[], bool]:
+        lease_guard = self._lease_guard(item_id, token)
+
+        def current() -> bool:
+            if not lease_guard():
+                return False
+            try:
+                info = self.gateway.torrent_info(torrent_hash)
+                return (
+                    str(info.get("hash") or torrent_hash).lower()
+                    == torrent_hash
+                    and bool(str(info.get("state") or "").strip())
+                    and self._has_exact_tag(info, tag)
+                )
+            except Exception:
+                return False
+
+        return current
+
+    def _finish_existing_duplicate(
+        self,
+        item_id: int,
+        token: tuple[str, int],
+        torrent_hash: str,
+        result: dict[str, Any],
+    ) -> None:
+        self.repository.transition_item(
+            item_id,
+            {"metadata_wait"},
+            "duplicate_local",
+            "existing_torrent_without_precheck_tag",
+            {
+                "qbt_hash": torrent_hash,
+                "decision": "duplicate_local",
+                "decision_reason": "existing_torrent_without_precheck_tag",
+                "last_error": None,
+            },
+            metadata_lease_owner=token[0],
+            metadata_lease_generation=token[1],
+        )
+        result["duplicates"].append(item_id)
+
+    @staticmethod
+    def _has_exact_tag(snapshot: Mapping[str, Any], tag: str) -> bool:
+        return tag in {
+            part.strip()
+            for part in str(snapshot.get("tags") or "").split(",")
+            if part.strip()
+        }
 
     @staticmethod
     def _require_write(applied: bool) -> None:

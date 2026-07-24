@@ -98,6 +98,7 @@ _ALLOWED_TRANSITIONS = {
     "metadata_wait": frozenset(
         {
             "waiting_probe_slot",
+            "duplicate_local",
             "metadata_retry_wait",
             "metadata_unavailable",
             "prechecking",

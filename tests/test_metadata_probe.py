@@ -35,10 +35,11 @@ class RecordingExecutor:
 
 
 class SnapshotQbt:
-    def __init__(self, files=None, *, state="stoppedDL"):
+    def __init__(self, files=None, *, state="stoppedDL", tags=""):
         self.files = list(files or [])
         self.file_reads: list[str] = []
         self.state = state
+        self.tags = tags
         self.info_reads: list[str] = []
 
     def torrent_files(self, torrent_hash):
@@ -47,7 +48,7 @@ class SnapshotQbt:
 
     def torrent_info(self, torrent_hash):
         self.info_reads.append(torrent_hash)
-        return {"hash": torrent_hash, "state": self.state}
+        return {"hash": torrent_hash, "state": self.state, "tags": self.tags}
 
 
 def test_precheck_gateway_uses_existing_executor_and_fixed_safe_payload():
@@ -195,8 +196,10 @@ class FakeProbeGateway:
         self.zeroed: list[str] = []
         self.removed: list[str] = []
         self.find_calls: list[str] = []
-        self.info_state = "stoppedDL"
+        self.info_state: str | None = None
+        self.info_tags: str | None = None
         self.info_reads: list[str] = []
+        self.remove_tag_after_stop = False
         self.fail_add = False
         self.lose_add_response = False
 
@@ -247,6 +250,11 @@ class FakeProbeGateway:
         if guard is not None and not guard():
             return False
         self.stopped.append(torrent_hash)
+        if self.remove_tag_after_stop:
+            for row in self.by_tag.values():
+                if str(row.get("hash") or "").lower() == torrent_hash.lower():
+                    row["tags"] = "hold"
+            self.info_tags = "hold"
         return True
 
     def torrent_files(self, torrent_hash: str):
@@ -254,7 +262,21 @@ class FakeProbeGateway:
 
     def torrent_info(self, torrent_hash: str):
         self.info_reads.append(torrent_hash)
-        return {"hash": torrent_hash, "state": self.info_state}
+        matching = next(
+            (
+                row
+                for row in self.by_tag.values()
+                if str(row.get("hash") or "").lower() == torrent_hash.lower()
+            ),
+            {},
+        )
+        tags = self.info_tags
+        if tags is None:
+            tags = str(matching.get("tags") or "")
+        state = self.info_state
+        if state is None:
+            state = str(matching.get("state") or "")
+        return {"hash": torrent_hash, "state": state, "tags": tags}
 
     def zero_file_priorities(self, torrent_hash: str, files, *, guard=None):
         if guard is not None and not guard():
@@ -407,7 +429,8 @@ def test_ready_probe_is_stopped_zeroed_verified_and_left_for_prechecking(tmp_pat
     assert gateway.stopped == [ready["qbt_hash"]]
     assert gateway.zeroed == [ready["qbt_hash"]]
     assert gateway.files_by_hash[ready["qbt_hash"]][0]["priority"] == 0
-    assert gateway.info_reads == [ready["qbt_hash"]]
+    assert len(gateway.info_reads) >= 3
+    assert set(gateway.info_reads) == {ready["qbt_hash"]}
 
 
 @pytest.mark.parametrize(
@@ -431,6 +454,75 @@ def test_ready_probe_does_not_advance_until_qbt_confirms_it_is_stopped(
     assert result["ready"] == []
     assert stored["state"] == "metadata_wait"
     assert stored["last_error"] == "qbt_precheck_failed"
+
+
+def test_existing_same_hash_without_item_tag_finishes_as_duplicate_without_qbt_writes(
+    tmp_path,
+):
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    qbt = SnapshotQbt(state="downloading", tags="auto")
+    queue, _gateway, _coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    executor = RecordingExecutor()
+    result = MetadataProbeCoordinator(
+        queue,
+        QbtPrecheckGateway(qbt, executor),
+        owner="worker",
+        now=clock,
+    ).tick(snapshots={})
+
+    item = queue.get_item(item_ids[0])
+    batch = queue.get_batch(item["batch_id"])
+    assert result["duplicates"] == [item_ids[0]]
+    assert item["state"] == "duplicate_local"
+    assert item["decision_reason"] == "existing_torrent_without_precheck_tag"
+    assert item["raw_input"] is None
+    assert item["metadata_lease_owner"] is None
+    assert batch["duplicate_count"] == 1
+    assert batch["state"] == "complete"
+    assert executor.posts == []
+
+
+def test_realtime_tag_removal_before_ready_write_never_stops_or_zeroes_foreign_torrent(
+    tmp_path,
+):
+    queue, gateway, coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    gateway.by_tag[item["qbt_precheck_tag"]]["state"] = "stoppedDL"
+    gateway.info_tags = "auto"
+    clock.advance(5)
+
+    result = coordinator.tick()
+
+    assert result["duplicates"] == [item_ids[0]]
+    assert queue.get_item(item_ids[0])["state"] == "duplicate_local"
+    assert gateway.stopped == []
+    assert gateway.zeroed == []
+
+
+def test_each_ready_write_rechecks_tag_and_skips_zero_if_tag_removed_after_stop(
+    tmp_path,
+):
+    queue, gateway, coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    gateway.by_tag[item["qbt_precheck_tag"]]["state"] = "stoppedDL"
+    gateway.remove_tag_after_stop = True
+    clock.advance(5)
+
+    coordinator.tick()
+
+    assert gateway.stopped == [item["qbt_hash"]]
+    assert gateway.zeroed == []
+    assert queue.get_item(item_ids[0])["state"] == "metadata_wait"
 
 
 def test_probe_windows_and_backoffs_end_in_metadata_unavailable(tmp_path):
@@ -472,7 +564,7 @@ def test_probe_windows_and_backoffs_end_in_metadata_unavailable(tmp_path):
     assert item["metadata_lease_owner"] is None
 
 
-def test_timeout_reconciles_expected_hash_when_safe_snapshot_has_no_tag(tmp_path):
+def test_timeout_never_touches_same_hash_without_item_tag_and_marks_duplicate(tmp_path):
     from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
     from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
 
@@ -488,7 +580,28 @@ def test_timeout_reconciles_expected_hash_when_safe_snapshot_has_no_tag(tmp_path
         now=clock,
     )
     coordinator.tick(snapshots={})
+    assert queue.get_item(_item_ids[0])["state"] == "duplicate_local"
+    assert executor.posts == []
 
+
+def test_timeout_can_reconcile_owned_registration_by_hash_when_tagged(tmp_path):
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    queue, _gateway, _coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    item = queue.get_item(item_ids[0])
+    tag = MetadataProbeCoordinator._tag_for(item)
+    qbt = SnapshotQbt(state="metaDL", tags=f"precheck,{tag},hold")
+    executor = RecordingExecutor()
+    coordinator = MetadataProbeCoordinator(
+        queue,
+        QbtPrecheckGateway(qbt, executor),
+        owner="worker",
+        now=clock,
+    )
+    coordinator.tick(snapshots={})
     clock.advance(300)
     coordinator.tick(snapshots={})
 
