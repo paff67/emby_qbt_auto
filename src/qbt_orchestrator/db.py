@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, atexit, json, os, queue, sqlite3, threading, time
+import asyncio, atexit, errno, json, os, queue, sqlite3, stat, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -9,9 +9,60 @@ from .hash_identity import canonical_torrent_hash
 
 _ENFORCE_POSIX_SQLITE_MODE = os.name == "posix"
 _SQLITE_PRIVATE_MODE = 0o600
+_SQLITE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_SQLITE_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_SQLITE_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_SQLITE_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
-def _prepare_private_sqlite(path: str | Path) -> None:
+class SQLiteSecurityError(PermissionError):
+    """Writable SQLite path failed the private-file trust checks."""
+
+
+@dataclass
+class _SQLiteSecurityGuard:
+    path: str
+    name: str
+    parent_fd: int
+    file_fd: int
+    fingerprint: tuple[int, int]
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for fd in (self.file_fd, self.parent_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _security_error(path: str | Path, reason: str) -> SQLiteSecurityError:
+    return SQLiteSecurityError(f"SQLite security check failed for {path}: {reason}")
+
+
+def _open_nofollow(
+    name: str,
+    flags: int,
+    *,
+    dir_fd: int,
+    mode: int | None = None,
+) -> int:
+    if not _SQLITE_NOFOLLOW:
+        try:
+            existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            raise OSError(errno.ELOOP, "symbolic link rejected")
+    if mode is None:
+        return os.open(name, flags | _SQLITE_NOFOLLOW, dir_fd=dir_fd)
+    return os.open(name, flags | _SQLITE_NOFOLLOW, mode, dir_fd=dir_fd)
+
+
+def _prepare_private_sqlite(path: str | Path) -> _SQLiteSecurityGuard | None:
     """Secure a writable SQLite database before SQLite can create sidecars.
 
     An explicit create mode avoids a process-wide umask change, which would be
@@ -19,27 +70,137 @@ def _prepare_private_sqlite(path: str | Path) -> None:
     tightened as well.  Read-only connections deliberately bypass this path.
     """
     if not _ENFORCE_POSIX_SQLITE_MODE:
-        return
-    db_path = os.fspath(path)
+        return None
+    db_path = Path(path)
+    parent_path = os.fspath(db_path.parent)
+    parent_flags = os.O_RDONLY | _SQLITE_DIRECTORY | _SQLITE_CLOEXEC | _SQLITE_NOFOLLOW
+    parent_fd: int | None = None
+    file_fd: int | None = None
     try:
-        fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, _SQLITE_PRIVATE_MODE)
-    except FileExistsError:
-        pass
-    else:
-        os.close(fd)
-    for candidate in (db_path, f"{db_path}-wal", f"{db_path}-shm"):
         try:
-            os.chmod(candidate, _SQLITE_PRIVATE_MODE)
-        except FileNotFoundError:
-            continue
+            parent_fd = os.open(parent_path, parent_flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise _security_error(db_path, "symbolic link parent directory is not allowed") from exc
+            raise _security_error(db_path, "cannot securely open parent directory") from exc
+        parent_stat = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise _security_error(db_path, "parent path is not a directory")
+        if parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise _security_error(
+                db_path,
+                "private parent directory required; group/other writable directories are unsafe",
+            )
+
+        main_flags = os.O_RDWR | os.O_CREAT | _SQLITE_CLOEXEC | _SQLITE_NONBLOCK
+        try:
+            file_fd = _open_nofollow(
+                db_path.name,
+                main_flags,
+                dir_fd=parent_fd,
+                mode=_SQLITE_PRIVATE_MODE,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise _security_error(db_path, "symbolic link database is not allowed") from exc
+            raise _security_error(db_path, "database cannot be securely opened as a regular file") from exc
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise _security_error(db_path, "database must be a regular file")
+        os.fchmod(file_fd, _SQLITE_PRIVATE_MODE)
+
+        sidecar_flags = os.O_RDONLY | _SQLITE_CLOEXEC | _SQLITE_NONBLOCK
+        for suffix in ("-wal", "-shm"):
+            sidecar_fd: int | None = None
+            try:
+                try:
+                    sidecar_fd = _open_nofollow(
+                        f"{db_path.name}{suffix}", sidecar_flags, dir_fd=parent_fd
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise _security_error(
+                            db_path, f"SQLite sidecar {suffix} symbolic link is not allowed"
+                        ) from exc
+                    raise _security_error(
+                        db_path, f"SQLite sidecar {suffix} cannot be securely opened"
+                    ) from exc
+                sidecar_stat = os.fstat(sidecar_fd)
+                if not stat.S_ISREG(sidecar_stat.st_mode):
+                    raise _security_error(
+                        db_path, f"SQLite sidecar {suffix} must be a regular file"
+                    )
+                os.fchmod(sidecar_fd, _SQLITE_PRIVATE_MODE)
+            finally:
+                if sidecar_fd is not None:
+                    os.close(sidecar_fd)
+
+        return _SQLiteSecurityGuard(
+            path=os.fspath(db_path),
+            name=db_path.name,
+            parent_fd=parent_fd,
+            file_fd=file_fd,
+            fingerprint=(int(file_stat.st_dev), int(file_stat.st_ino)),
+        )
+    except Exception:
+        if file_fd is not None:
+            os.close(file_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+
+
+def _verify_private_sqlite(
+    con: sqlite3.Connection, guard: _SQLiteSecurityGuard | None
+) -> None:
+    if guard is None:
+        return
+    row = con.execute("pragma database_list").fetchone()
+    actual_path = str(row[2] if row is not None else "")
+    try:
+        actual_stat = os.stat(actual_path, follow_symlinks=False)
+    except OSError as exc:
+        raise _security_error(guard.path, "database path changed during connect") from exc
+    actual_fingerprint = (int(actual_stat.st_dev), int(actual_stat.st_ino))
+    if not stat.S_ISREG(actual_stat.st_mode) or actual_fingerprint != guard.fingerprint:
+        raise _security_error(guard.path, "database path changed during connect")
+
+    verify_fd: int | None = None
+    try:
+        verify_fd = _open_nofollow(
+            guard.name,
+            os.O_RDONLY | _SQLITE_CLOEXEC | _SQLITE_NONBLOCK,
+            dir_fd=guard.parent_fd,
+        )
+        verify_stat = os.fstat(verify_fd)
+        verify_fingerprint = (int(verify_stat.st_dev), int(verify_stat.st_ino))
+        if not stat.S_ISREG(verify_stat.st_mode) or verify_fingerprint != guard.fingerprint:
+            raise _security_error(guard.path, "database path changed during connect")
+    except OSError as exc:
+        raise _security_error(guard.path, "database path changed during connect") from exc
+    finally:
+        if verify_fd is not None:
+            os.close(verify_fd)
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
-    _prepare_private_sqlite(path)
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    con.execute("pragma foreign_keys=ON")
-    return con
+    guard = _prepare_private_sqlite(path)
+    con: sqlite3.Connection | None = None
+    try:
+        con = sqlite3.connect(path)
+        _verify_private_sqlite(con, guard)
+        con.row_factory = sqlite3.Row
+        con.execute("pragma foreign_keys=ON")
+        return con
+    except Exception:
+        if con is not None:
+            con.close()
+        raise
+    finally:
+        if guard is not None:
+            guard.close()
 
 
 def readonly_connect(path: str | Path) -> sqlite3.Connection:
@@ -541,6 +702,7 @@ def migration_sql() -> list[str]:
         "metadata_lease_owner text,"
         "metadata_lease_generation integer not null default 0 "
         "check(metadata_lease_generation>=0),"
+        "metadata_lease_until integer,"
         "approved_by text,"
         "approved_at integer,"
         "attempts integer not null default 0 check(attempts>=0),"
@@ -552,8 +714,13 @@ def migration_sql() -> list[str]:
         "check(total_size is null or primary_video_size is null or primary_video_size<=total_size),"
         "unique(batch_id,source_message_id,source_index),"
         "unique(batch_id,input_sha256))",
+        "alter table bot_add_items add column metadata_lease_until integer",
         "create index if not exists idx_bot_add_items_claim "
         "on bot_add_items(state,metadata_retry_at,id)",
+        "create index if not exists idx_bot_add_items_lease "
+        "on bot_add_items(state,metadata_lease_until,id)",
+        "create index if not exists idx_bot_add_items_due_poll "
+        "on bot_add_items(state,metadata_next_poll_at,id)",
         "create index if not exists idx_bot_add_items_probe_deadline "
         "on bot_add_items(metadata_probe_deadline,state)",
         "create index if not exists idx_bot_add_items_canonical_identity "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import sqlite3
 import stat
@@ -11,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import qbt_orchestrator.db as db_module
-from qbt_orchestrator.db import migrate, readonly_connect
+from qbt_orchestrator.db import migrate, migration_sql, readonly_connect
 
 
 EXPECTED_TABLES = {
@@ -55,6 +56,7 @@ ITEM_COLUMNS = {
     "metadata_retry_at",
     "metadata_lease_owner",
     "metadata_lease_generation",
+    "metadata_lease_until",
     "approved_by",
     "approved_at",
     "attempts",
@@ -105,33 +107,86 @@ def test_private_sqlite_preparation_uses_explicit_0600_without_umask(
     tmp_path, monkeypatch
 ):
     db = tmp_path / "state.sqlite"
-    opened: list[tuple[str, int, int]] = []
+    opened: list[tuple[str, int, int | None, int | None]] = []
     closed: list[int] = []
-    hardened: list[tuple[str, int]] = []
+    hardened: list[tuple[int, int]] = []
 
     monkeypatch.setattr(db_module, "_ENFORCE_POSIX_SQLITE_MODE", True)
+    monkeypatch.setattr(db_module, "_SQLITE_NOFOLLOW", 0x20000)
 
-    def fake_open(path, flags, mode):
-        opened.append((os.fspath(path), int(flags), int(mode)))
-        return 41
+    def fake_open(path, flags, mode=None, *, dir_fd=None):
+        opened.append(
+            (
+                os.fspath(path),
+                int(flags),
+                None if mode is None else int(mode),
+                None if dir_fd is None else int(dir_fd),
+            )
+        )
+        if dir_fd is None:
+            return 40
+        if os.fspath(path) == db.name:
+            return 41
+        raise FileNotFoundError(path)
+
+    def fake_fstat(fd):
+        if fd == 40:
+            return os.stat_result((stat.S_IFDIR | 0o700, 2, 1, 1, 0, 0, 0, 0, 0, 0))
+        return os.stat_result((stat.S_IFREG | 0o644, 4, 3, 1, 0, 0, 0, 0, 0, 0))
 
     monkeypatch.setattr(db_module.os, "open", fake_open)
+    monkeypatch.setattr(db_module.os, "fstat", fake_fstat)
     monkeypatch.setattr(db_module.os, "close", lambda fd: closed.append(int(fd)))
+    monkeypatch.setattr(db_module.os, "fchmod", lambda fd, mode: hardened.append((fd, mode)))
     monkeypatch.setattr(
         db_module.os,
         "chmod",
-        lambda path, mode: hardened.append((os.fspath(path), int(mode))),
+        lambda *_args, **_kwargs: pytest.fail("path chmod must not be used"),
     )
 
-    db_module._prepare_private_sqlite(db)
+    guard = db_module._prepare_private_sqlite(db)
 
-    assert opened == [(str(db), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)]
-    assert closed == [41]
-    assert hardened == [
-        (str(db), 0o600),
-        (f"{db}-wal", 0o600),
-        (f"{db}-shm", 0o600),
-    ]
+    nofollow = db_module._SQLITE_NOFOLLOW
+    assert opened[0][0] == str(db.parent)
+    assert opened[0][1] & nofollow == nofollow
+    assert opened[1][0] == db.name
+    assert opened[1][2:] == (0o600, 40)
+    assert opened[1][1] & nofollow == nofollow
+    assert hardened == [(41, 0o600)]
+    assert guard.fingerprint == (3, 4)
+    guard.close()
+    assert closed == [41, 40]
+
+
+def test_private_sqlite_preparation_fails_closed_on_nofollow_error(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "state.sqlite"
+    monkeypatch.setattr(db_module, "_ENFORCE_POSIX_SQLITE_MODE", True)
+    monkeypatch.setattr(db_module, "_SQLITE_NOFOLLOW", 0x20000)
+
+    def reject_link(path, _flags, _mode=None, *, dir_fd=None):
+        if dir_fd is None:
+            return 40
+        raise OSError(errno.ELOOP, "link rejected")
+
+    monkeypatch.setattr(db_module.os, "open", reject_link)
+    monkeypatch.setattr(
+        db_module.os,
+        "fstat",
+        lambda _fd: os.stat_result(
+            (stat.S_IFDIR | 0o700, 0, 0, 1, 0, 0, 0, 0, 0, 0)
+        ),
+    )
+    monkeypatch.setattr(db_module.os, "close", lambda _fd: None)
+    monkeypatch.setattr(
+        db_module.os,
+        "chmod",
+        lambda *_args, **_kwargs: pytest.fail("must not chmod a link target"),
+    )
+
+    with pytest.raises(db_module.SQLiteSecurityError, match="symbolic link"):
+        db_module._prepare_private_sqlite(db)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not available")
@@ -177,6 +232,76 @@ con.close()
         "state.sqlite-wal": stat.S_IRUSR | stat.S_IWUSR,
         "state.sqlite-shm": stat.S_IRUSR | stat.S_IWUSR,
     }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inode semantics are required")
+def test_posix_writer_rejects_main_and_sidecar_symlinks_without_chmod_target(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    target = private / "target"
+    target.write_text("not a database", encoding="utf-8")
+    target.chmod(0o640)
+    target_mode = stat.S_IMODE(target.stat().st_mode)
+
+    linked_db = private / "linked.sqlite"
+    linked_db.symlink_to(target)
+    with pytest.raises(db_module.SQLiteSecurityError, match="symbolic link"):
+        db_module._connect(linked_db)
+    assert stat.S_IMODE(target.stat().st_mode) == target_mode
+
+    db = private / "state.sqlite"
+    con = db_module._connect(db)
+    con.close()
+    wal_link = Path(f"{db}-wal")
+    wal_link.symlink_to(target)
+    with pytest.raises(db_module.SQLiteSecurityError, match="sidecar"):
+        db_module._connect(db)
+    assert stat.S_IMODE(target.stat().st_mode) == target_mode
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file types are required")
+def test_posix_writer_rejects_non_regular_main_and_sidecar_files(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    fifo = private / "pipe.sqlite"
+    os.mkfifo(fifo)
+    with pytest.raises(db_module.SQLiteSecurityError, match="regular file"):
+        db_module._connect(fifo)
+
+    db = private / "state.sqlite"
+    con = db_module._connect(db)
+    con.close()
+    shm = Path(f"{db}-shm")
+    shm.mkdir()
+    with pytest.raises(db_module.SQLiteSecurityError, match="sidecar"):
+        db_module._connect(db)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory modes are required")
+def test_posix_writer_requires_a_private_parent_directory(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o770)
+    shared.chmod(0o770)
+    try:
+        with pytest.raises(db_module.SQLiteSecurityError, match="private parent directory"):
+            db_module._connect(shared / "state.sqlite")
+    finally:
+        shared.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inode semantics are required")
+def test_posix_writer_rejects_inode_swap_during_sqlite_connect(tmp_path, monkeypatch):
+    db = tmp_path / "state.sqlite"
+    original_connect = db_module.sqlite3.connect
+    swapped = tmp_path / "original.sqlite"
+
+    def replace_during_connect(path, *args, **kwargs):
+        os.replace(path, swapped)
+        return original_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", replace_during_connect)
+    with pytest.raises(db_module.SQLiteSecurityError, match="changed during connect"):
+        db_module._connect(db)
 
 
 def _table_names(con: sqlite3.Connection) -> set[str]:
@@ -271,6 +396,41 @@ def test_migration_16_is_recorded_once_and_is_idempotent(tmp_path):
             "select count(*) from schema_migrations where version=16"
         ).fetchone()[0] == 1
         assert EXPECTED_TABLES <= _table_names(con)
+    finally:
+        con.close()
+
+
+def test_migration_16_repairs_legacy_item_lease_schema_without_losing_rows(tmp_path):
+    db = tmp_path / "state.sqlite"
+    statements = migration_sql()
+    batch_sql = next(
+        stmt for stmt in statements if stmt.startswith("create table if not exists bot_add_batches(")
+    )
+    item_sql = next(
+        stmt for stmt in statements if stmt.startswith("create table if not exists bot_add_items(")
+    ).replace("metadata_lease_until integer,", "")
+    con = sqlite3.connect(db)
+    con.execute(
+        "create table schema_migrations("
+        "version integer primary key,name text not null,applied_at integer not null)"
+    )
+    con.execute(batch_sql)
+    con.execute(item_sql)
+    batch_id = _insert_batch(con, batch_key="legacy-v16", state="queued")
+    item_id = _insert_item(con, batch_id, source_message_id=1600)
+    con.execute(
+        "insert into schema_migrations(version,name,applied_at) values(16,?,?)",
+        ("telegram_add_queue_v1", 100),
+    )
+    con.commit()
+    con.close()
+
+    migrate(db)
+    con = readonly_connect(db)
+    try:
+        assert "metadata_lease_until" in _columns(con, "bot_add_items")
+        assert con.execute("select id from bot_add_items where id=?", (item_id,)).fetchone()
+        assert con.execute("select max(version) from schema_migrations").fetchone()[0] == 16
     finally:
         con.close()
 
@@ -431,6 +591,8 @@ def test_queue_indexes_cover_claim_identity_and_lookup_paths(tmp_path):
     try:
         item_indexes = _index_columns(con, "bot_add_items")
         assert ("state", "metadata_retry_at", "id") in item_indexes.values()
+        assert ("state", "metadata_lease_until", "id") in item_indexes.values()
+        assert ("state", "metadata_next_poll_at", "id") in item_indexes.values()
         assert ("metadata_probe_deadline", "state") in item_indexes.values()
         assert ("canonical_identity",) in item_indexes.values()
         assert ("qbt_hash",) in item_indexes.values()
