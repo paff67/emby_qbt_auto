@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import concurrent.futures
+import heapq
 import hashlib
 import http.client
 import ipaddress
+import math
 import re
 import socket
+import threading
+import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Protocol
 from urllib.parse import unquote_to_bytes, urljoin, urlsplit, urlunsplit
@@ -19,6 +25,8 @@ _DEFAULT_MAX_BODY = 10 * 1024 * 1024
 _MAX_BENCODE_DEPTH = 64
 _MAX_BENCODE_ELEMENTS = 100_000
 _MAX_INTEGER_DIGITS = 80
+_DNS_WORKERS = 4
+_DNS_PENDING = 8
 _HEX = frozenset("0123456789abcdefABCDEF")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _BTIH_HEX_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
@@ -26,6 +34,10 @@ _BTIH_BASE32_RE = re.compile(r"[A-Z2-7a-z]{32}\Z")
 _BTMH_SHA256_RE = re.compile(r"1220([0-9a-fA-F]{64})\Z")
 _BC_SIZE_RE = re.compile(r"(?:0|[1-9][0-9]{0,19})\Z")
 _NUMERIC_HOST_RE = re.compile(r"(?:0[xX][0-9a-fA-F]+|[0-9.]+)\Z")
+_DNS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_DNS_WORKERS, thread_name_prefix="qbt-dns"
+)
+_DNS_SLOTS = threading.BoundedSemaphore(_DNS_PENDING)
 
 
 class LinkResolutionError(ValueError):
@@ -52,8 +64,8 @@ class HttpResponse:
     """Transport result; ``peer_ip`` proves which validated address was used."""
 
     status: int
-    headers: Mapping[str, str]
-    body: bytes | Iterable[bytes]
+    headers: Mapping[str, str] = field(repr=False)
+    body: bytes | Iterable[bytes] = field(repr=False)
     peer_ip: str | None
 
 
@@ -80,6 +92,15 @@ class _PinnedConnectionMixin:
             (self._target_ip, port), timeout, source_address=source_address
         )
 
+    def close(self):
+        # http.client closes self.sock inside getresponse() as soon as headers
+        # declare a non-persistent response. Preserve it until the bounded body
+        # stream owns and closes the response; otherwise its timeout cannot be
+        # tightened against the absolute deadline.
+        if getattr(self, "_preserve_socket_for_body", False):
+            return
+        super().close()
+
 
 class _PinnedHTTPConnection(_PinnedConnectionMixin, http.client.HTTPConnection):
     pass
@@ -102,16 +123,142 @@ def _safe_response_headers(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
     return {key: ", ".join(values) for key, values in grouped.items()}
 
 
+def _remaining_seconds(deadline: float, clock) -> float:
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError("deadline")
+    return remaining
+
+
+def _quiet_close(value) -> None:
+    close = getattr(value, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+class _DeadlineWatchdog:
+    """One daemon thread aborts sockets at absolute wall-clock deadlines."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._heap: list[tuple[float, int, object]] = []
+        self._live: set[int] = set()
+        self._next_token = 0
+        self._thread: threading.Thread | None = None
+
+    def register(self, delay_sec: float, callback) -> int:
+        with self._condition:
+            self._next_token += 1
+            token = self._next_token
+            self._live.add(token)
+            heapq.heappush(
+                self._heap,
+                (time.monotonic() + max(0.0, delay_sec), token, callback),
+            )
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="qbt-http-deadlines",
+                    daemon=True,
+                )
+                self._thread.start()
+            self._condition.notify()
+            return token
+
+    def cancel(self, token: int | None) -> None:
+        if token is None:
+            return
+        with self._condition:
+            self._live.discard(token)
+            self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            callback = None
+            with self._condition:
+                while callback is None:
+                    while self._heap and self._heap[0][1] not in self._live:
+                        heapq.heappop(self._heap)
+                    if not self._heap:
+                        self._condition.wait()
+                        continue
+                    deadline, token, pending = self._heap[0]
+                    delay = deadline - time.monotonic()
+                    if delay > 0:
+                        self._condition.wait(delay)
+                        continue
+                    heapq.heappop(self._heap)
+                    if token in self._live:
+                        self._live.remove(token)
+                        callback = pending
+            try:
+                callback()
+            except Exception:
+                pass
+
+
+_HTTP_WATCHDOG = _DeadlineWatchdog()
+
+
+def _abort_connection(connection, fired: threading.Event) -> None:
+    fired.set()
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    _quiet_close(sock)
+
+
 class _HttpBodyStream:
-    def __init__(self, response, connection):
+    def __init__(
+        self,
+        response,
+        connection,
+        *,
+        socket_ref=None,
+        deadline: float | None = None,
+        clock=time.monotonic,
+        watchdog_token: int | None = None,
+        deadline_fired: threading.Event | None = None,
+    ):
         self._response = response
         self._connection = connection
+        self._socket_ref = socket_ref
+        self._deadline = deadline
+        self._clock = clock
+        self._watchdog_token = watchdog_token
+        self._deadline_fired = deadline_fired
         self._closed = False
 
     def __iter__(self):
         try:
             while not self._closed:
-                chunk = self._response.read(64 * 1024)
+                if self._deadline_fired is not None and self._deadline_fired.is_set():
+                    raise TimeoutError("deadline")
+                if self._deadline is not None:
+                    remaining = _remaining_seconds(self._deadline, self._clock)
+                    if self._socket_ref is not None:
+                        self._socket_ref.settimeout(remaining)
+                read_once = getattr(self._response, "read1", None)
+                try:
+                    chunk = (
+                        read_once(64 * 1024)
+                        if callable(read_once)
+                        else self._response.read(64 * 1024)
+                    )
+                except Exception:
+                    if (
+                        self._deadline_fired is not None
+                        and self._deadline_fired.is_set()
+                    ):
+                        raise TimeoutError("deadline") from None
+                    raise
                 if not chunk:
                     return
                 yield chunk
@@ -122,6 +269,7 @@ class _HttpBodyStream:
         if self._closed:
             return
         self._closed = True
+        _HTTP_WATCHDOG.cancel(self._watchdog_token)
         try:
             self._response.close()
         finally:
@@ -131,6 +279,9 @@ class _HttpBodyStream:
 class PinnedHttpTransport:
     """Minimal production transport whose TCP connection is pinned to checked DNS."""
 
+    def __init__(self, *, clock=time.monotonic):
+        self._clock = clock
+
     def request(
         self,
         url: str,
@@ -138,12 +289,19 @@ class PinnedHttpTransport:
         timeout_sec: float,
         resolved_addresses: tuple[str, ...],
         server_hostname: str,
+        deadline_monotonic: float | None = None,
     ) -> HttpResponse:
+        deadline = (
+            deadline_monotonic
+            if deadline_monotonic is not None
+            else self._clock() + timeout_sec
+        )
         parts = urlsplit(url)
         port = parts.port or (443 if parts.scheme == "https" else 80)
         path = urlunsplit(("", "", parts.path or "/", parts.query, ""))
         last_error: Exception | None = None
         for target_ip in resolved_addresses:
+            remaining = _remaining_seconds(deadline, self._clock)
             connection_cls = (
                 _PinnedHTTPSConnection
                 if parts.scheme == "https"
@@ -152,11 +310,22 @@ class PinnedHttpTransport:
             connection = connection_cls(
                 server_hostname,
                 port,
-                timeout=timeout_sec,
+                timeout=remaining,
                 target_ip=target_ip,
             )
+            deadline_fired = threading.Event()
+            watchdog_token = _HTTP_WATCHDOG.register(
+                remaining,
+                lambda connection=connection, fired=deadline_fired: _abort_connection(
+                    connection, fired
+                ),
+            )
+            response = None
             try:
                 connection.request("GET", path, headers={"Accept": "application/x-bittorrent"})
+                if deadline_fired.is_set():
+                    _abort_connection(connection, deadline_fired)
+                    raise TimeoutError("deadline")
                 # getresponse() detaches self.sock for HTTP/1.0 and explicit
                 # Connection: close responses. Capture the connected peer while
                 # the pinned socket is still owned by the connection.
@@ -166,21 +335,56 @@ class PinnedHttpTransport:
                     if connection.sock
                     else None
                 )
-                response = connection.getresponse()
+                connected_socket = connection.sock
+                if connected_socket is not None:
+                    connected_socket.settimeout(
+                        _remaining_seconds(deadline, self._clock)
+                    )
+                connection._preserve_socket_for_body = True
+                try:
+                    response = connection.getresponse()
+                finally:
+                    connection._preserve_socket_for_body = False
                 headers = _safe_response_headers(response.getheaders())
+
+                response_socket = getattr(
+                    getattr(getattr(response, "fp", None), "raw", None),
+                    "_sock",
+                    None,
+                )
 
                 return HttpResponse(
                     status=response.status,
                     headers=headers,
-                    body=_HttpBodyStream(response, connection),
+                    body=_HttpBodyStream(
+                        response,
+                        connection,
+                        socket_ref=response_socket or connected_socket,
+                        deadline=deadline,
+                        clock=self._clock,
+                        watchdog_token=watchdog_token,
+                        deadline_fired=deadline_fired,
+                    ),
                     peer_ip=peer_ip,
                 )
             except LinkResolutionError:
-                connection.close()
+                _HTTP_WATCHDOG.cancel(watchdog_token)
+                if response is not None:
+                    _quiet_close(response)
+                _quiet_close(connection)
                 raise
             except Exception as exc:
-                connection.close()
-                last_error = exc
+                _HTTP_WATCHDOG.cancel(watchdog_token)
+                if response is not None:
+                    _quiet_close(response)
+                _quiet_close(connection)
+                last_error = (
+                    TimeoutError("deadline")
+                    if deadline_fired.is_set()
+                    or self._clock() >= deadline
+                    or isinstance(exc, (TimeoutError, socket.timeout))
+                    else exc
+                )
         if last_error is not None:
             raise last_error
         raise OSError("no address")
@@ -302,7 +506,14 @@ def _strict_unquote_name(value: str) -> str:
         decoded = unquote_to_bytes(value).decode("utf-8", "strict")
     except UnicodeError:
         _fail("invalid_bc_link")
-    if not decoded or _CONTROL_RE.search(decoded) or "/" in decoded:
+    decoded = unicodedata.normalize("NFKC", decoded)
+    if (
+        not decoded
+        or _CONTROL_RE.search(decoded)
+        or "/" in decoded
+        or "\\" in decoded
+        or decoded in {".", ".."}
+    ):
         _fail("invalid_bc_link")
     return decoded
 
@@ -383,7 +594,7 @@ def _parse_http_url(value: str) -> tuple[str, str, int, str]:
         redacted_netloc = "[" + hostname + "]"
     if parts.port is not None:
         redacted_netloc += ":" + str(parts.port)
-    redacted = urlunsplit((parts.scheme, redacted_netloc, parts.path or "/", "", ""))
+    redacted = urlunsplit((parts.scheme, redacted_netloc, "/…", "", ""))
     return parts.scheme, hostname, port, redacted
 
 
@@ -550,14 +761,14 @@ def _metainfo_identities(data: bytes) -> tuple[str | None, str | None]:
 
 
 def _is_restricted(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return bool(
-        address.is_loopback
-        or address.is_private
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_unspecified
-        or address.is_reserved
-    )
+    if address.is_multicast or address.is_unspecified:
+        return True
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.is_site_local:
+            return True
+        if address.ipv4_mapped is not None and not address.ipv4_mapped.is_global:
+            return True
+    return not address.is_global
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
@@ -570,11 +781,25 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
     return values[0]
 
 
-def _read_body(body: bytes | Iterable[bytes], max_bytes: int) -> bytes:
+def _read_body(
+    body: bytes | Iterable[bytes],
+    max_bytes: int,
+    *,
+    deadline: float,
+    clock,
+) -> bytes:
     chunks = [body] if isinstance(body, bytes) else body
     output = bytearray()
     try:
-        for chunk in chunks:
+        iterator = iter(chunks)
+        while True:
+            _remaining_seconds(deadline, clock)
+            try:
+                chunk = next(iterator)
+            except StopIteration:
+                _remaining_seconds(deadline, clock)
+                break
+            _remaining_seconds(deadline, clock)
             if not isinstance(chunk, (bytes, bytearray, memoryview)):
                 _fail("http_transport_error")
             if len(output) + len(chunk) > max_bytes:
@@ -590,12 +815,7 @@ def _read_body(body: bytes | Iterable[bytes], max_bytes: int) -> bytes:
 
 
 def _close_body(body: object) -> None:
-    close = getattr(body, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            pass
+    _quiet_close(body)
 
 
 class HttpMetainfoResolver:
@@ -607,39 +827,89 @@ class HttpMetainfoResolver:
         max_bytes: int = _DEFAULT_MAX_BODY,
         max_redirects: int = 5,
         allowed_private_hosts: Iterable[str] | None = None,
+        max_resolved_addresses: int = 8,
+        clock=time.monotonic,
     ):
-        if timeout_sec <= 0 or max_bytes <= 0 or max_redirects < 0:
+        if (
+            not isinstance(timeout_sec, (int, float))
+            or isinstance(timeout_sec, bool)
+            or not math.isfinite(timeout_sec)
+            or timeout_sec <= 0
+            or not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or not 0 < max_bytes <= _DEFAULT_MAX_BODY
+            or not isinstance(max_redirects, int)
+            or isinstance(max_redirects, bool)
+            or max_redirects < 0
+            or not isinstance(max_resolved_addresses, int)
+            or isinstance(max_resolved_addresses, bool)
+            or not 1 <= max_resolved_addresses <= 32
+        ):
             raise ValueError("invalid_http_resolver_limits")
-        self.transport = transport or PinnedHttpTransport()
+        self.clock = clock
+        self.transport = transport or PinnedHttpTransport(clock=clock)
         self.timeout_sec = timeout_sec
         self.max_bytes = max_bytes
         self.max_redirects = max_redirects
+        self.max_resolved_addresses = max_resolved_addresses
         self.allowed_private_hosts = frozenset(
             _normalize_hostname(str(host)) for host in (allowed_private_hosts or ())
         )
 
-    def _addresses(self, hostname: str, port: int) -> tuple[str, ...]:
+    def _addresses(
+        self, hostname: str, port: int, *, deadline: float
+    ) -> tuple[str, ...]:
         try:
-            records = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+            remaining = _remaining_seconds(deadline, self.clock)
+        except TimeoutError:
+            _fail("resolution_timeout")
+        if not _DNS_SLOTS.acquire(timeout=remaining):
+            _fail("resolution_timeout")
+        try:
+            future = _DNS_EXECUTOR.submit(
+                socket.getaddrinfo,
+                hostname,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except Exception:
+            _DNS_SLOTS.release()
+            _fail("dns_resolution_failed")
+        future.add_done_callback(lambda _future: _DNS_SLOTS.release())
+        try:
+            remaining = _remaining_seconds(deadline, self.clock)
+            records = future.result(timeout=remaining)
+        except (TimeoutError, concurrent.futures.TimeoutError):
+            future.cancel()
+            _fail("resolution_timeout")
         except Exception:
             _fail("dns_resolution_failed")
         addresses: list[str] = []
         allow_private = hostname in self.allowed_private_hosts
         for record in records:
             try:
+                _remaining_seconds(deadline, self.clock)
+            except TimeoutError:
+                _fail("resolution_timeout")
+            try:
                 parsed = ipaddress.ip_address(record[4][0])
             except (ValueError, IndexError, TypeError):
                 _fail("dns_resolution_failed")
             normalized = parsed.compressed.lower()
+            if parsed.is_multicast or parsed.is_unspecified:
+                _fail("restricted_address")
             if _is_restricted(parsed) and not allow_private:
                 _fail("restricted_address")
             if normalized not in addresses:
                 addresses.append(normalized)
+                if len(addresses) > self.max_resolved_addresses:
+                    _fail("too_many_addresses")
         if not addresses:
             _fail("dns_resolution_failed")
         return tuple(addresses)
 
     def resolve(self, url: str) -> ResolvedDownloadLink:
+        deadline = self.clock() + self.timeout_sec
         unresolved = parse_download_link(url)
         if unresolved.kind not in {"http_url", "https_url"}:
             _fail("unsupported_link_scheme")
@@ -648,14 +918,17 @@ class HttpMetainfoResolver:
         redirects = 0
         while True:
             scheme, hostname, port, _redacted = _parse_http_url(current)
-            addresses = self._addresses(hostname, port)
+            addresses = self._addresses(hostname, port, deadline=deadline)
             try:
-                response = self.transport.request(
-                    current,
-                    timeout_sec=self.timeout_sec,
-                    resolved_addresses=addresses,
-                    server_hostname=hostname,
-                )
+                remaining = _remaining_seconds(deadline, self.clock)
+                request_kwargs = {
+                    "timeout_sec": remaining,
+                    "resolved_addresses": addresses,
+                    "server_hostname": hostname,
+                }
+                if isinstance(self.transport, PinnedHttpTransport):
+                    request_kwargs["deadline_monotonic"] = deadline
+                response = self.transport.request(current, **request_kwargs)
             except LinkResolutionError:
                 raise
             except (TimeoutError, socket.timeout):
@@ -663,6 +936,10 @@ class HttpMetainfoResolver:
             except Exception:
                 _fail("http_transport_error")
             try:
+                try:
+                    _remaining_seconds(deadline, self.clock)
+                except TimeoutError:
+                    _fail("http_timeout")
                 try:
                     peer = ipaddress.ip_address(response.peer_ip).compressed.lower() if response.peer_ip else None
                 except ValueError:
@@ -695,7 +972,16 @@ class HttpMetainfoResolver:
                         _fail("invalid_http_headers")
                     if int(content_length) > self.max_bytes:
                         _fail("response_too_large")
-                body = _read_body(response.body, self.max_bytes)
+                body = _read_body(
+                    response.body,
+                    self.max_bytes,
+                    deadline=deadline,
+                    clock=self.clock,
+                )
+                try:
+                    _remaining_seconds(deadline, self.clock)
+                except TimeoutError:
+                    _fail("http_timeout")
                 v1, v2 = _metainfo_identities(body)
                 return ResolvedDownloadLink(
                     kind=unresolved.kind,

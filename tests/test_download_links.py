@@ -5,6 +5,7 @@ import hashlib
 import http.server
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 
@@ -202,6 +203,15 @@ def test_bc_link_requires_canonical_base64_padding_bits():
 
 
 @pytest.mark.parametrize(
+    "name",
+    ["..", "%2e%2e", "safe%5C..", "%EF%BC%8Fetc"],
+)
+def test_bc_link_rejects_normalized_path_like_names(name):
+    with pytest.raises(LinkResolutionError, match="^invalid_bc_link$"):
+        parse_download_link(_bc_link(name=name))
+
+
+@pytest.mark.parametrize(
     "value",
     [
         "bc://bt/not-base64!",
@@ -227,6 +237,32 @@ def test_http_parse_rejects_credentials_fragment_and_unsupported_scheme():
             parse_download_link(value)
 
 
+def test_http_redaction_drops_raw_and_percent_encoded_path_tokens():
+    parsed = parse_download_link(
+        "https://example.invalid/private/%74oken-abc/file.torrent?key=secret"
+    )
+    assert parsed.redacted == "https://example.invalid/…"
+    shown = repr(parsed)
+    assert "private" not in shown
+    assert "%74oken" not in shown
+    assert "secret" not in shown
+
+    ipv6 = parse_download_link("http://[2001:4860:4860::8888]:8080/path-token")
+    assert ipv6.redacted == "http://[2001:4860:4860::8888]:8080/…"
+
+
+def test_http_response_repr_hides_headers_and_body():
+    response = HttpResponse(
+        status=200,
+        headers={"Authorization": "Bearer private-token"},
+        body=b"private-body",
+        peer_ip="93.184.216.34",
+    )
+    shown = repr(response)
+    assert "private-token" not in shown
+    assert "private-body" not in shown
+
+
 def test_response_header_adapter_rejects_ambiguous_security_headers():
     with pytest.raises(LinkResolutionError, match="^invalid_http_headers$"):
         _safe_response_headers([("Content-Length", "10"), ("content-length", "11")])
@@ -239,6 +275,7 @@ def test_response_header_adapter_rejects_ambiguous_security_headers():
 
 def test_pinned_transport_does_not_retry_ambiguous_received_response(monkeypatch):
     calls = []
+    response_closed = []
 
     class Sock:
         def __init__(self, address):
@@ -247,6 +284,9 @@ def test_pinned_transport_does_not_retry_ambiguous_received_response(monkeypatch
         def getpeername(self):
             return (self.address, 80)
 
+        def settimeout(self, _timeout):
+            pass
+
     class Response:
         status = 200
 
@@ -254,7 +294,7 @@ def test_pinned_transport_does_not_retry_ambiguous_received_response(monkeypatch
             return [("Content-Length", "1"), ("content-length", "2")]
 
         def close(self):
-            pass
+            response_closed.append(True)
 
     class Connection:
         def __init__(self, _host, _port, *, timeout, target_ip):
@@ -279,6 +319,7 @@ def test_pinned_transport_does_not_retry_ambiguous_received_response(monkeypatch
             server_hostname="example.invalid",
         )
     assert calls == ["93.184.216.34"]
+    assert response_closed == [True]
 
 
 def test_http_result_hashes_exact_info_bytes(public_dns):
@@ -290,13 +331,16 @@ def test_http_result_hashes_exact_info_bytes(public_dns):
 
     assert result.kind == "https_url"
     assert result.original == url
-    assert result.redacted == "https://example.invalid/file.torrent"
+    assert result.redacted == "https://example.invalid/…"
     assert result.input_sha256 == hashlib.sha256(url.encode()).hexdigest()
     assert result.infohash_v1 == hashlib.sha1(info).hexdigest()
     assert result.metainfo == metainfo
-    assert transport.calls == [
-        (url, 15, ("93.184.216.34",), "example.invalid")
-    ]
+    assert len(transport.calls) == 1
+    called_url, remaining, addresses, hostname = transport.calls[0]
+    assert called_url == url
+    assert 0 < remaining <= 15
+    assert addresses == ("93.184.216.34",)
+    assert hostname == "example.invalid"
 
 
 @pytest.mark.parametrize(
@@ -315,6 +359,107 @@ def test_pinned_transport_preserves_peer_for_connection_close_responses(
             allowed_private_hosts={"127.0.0.1"}
         ).resolve(f"http://127.0.0.1:{port}/a.torrent")
     assert result.infohash_v1 == hashlib.sha1(info).hexdigest()
+
+
+def test_real_pinned_transport_enforces_total_deadline_on_drip_body():
+    body = _torrent(_v1_info())
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for value in body:
+                    self.wfile.write(bytes([value]))
+                    self.wfile.flush()
+                    time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def log_message(self, _format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    elapsed = None
+    try:
+        with pytest.raises(LinkResolutionError, match="^http_timeout$"):
+            HttpMetainfoResolver(
+                allowed_private_hosts={"127.0.0.1"}, timeout_sec=0.06
+            ).resolve(f"http://127.0.0.1:{server.server_address[1]}/drip")
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert elapsed is not None and elapsed < 0.2
+
+
+def test_real_pinned_transport_enforces_total_deadline_on_drip_headers():
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            response = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"
+            try:
+                for value in response:
+                    self.connection.sendall(bytes([value]))
+                    time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            self.close_connection = True
+
+        def log_message(self, _format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    elapsed = None
+    try:
+        with pytest.raises(LinkResolutionError, match="^http_timeout$"):
+            HttpMetainfoResolver(
+                allowed_private_hosts={"127.0.0.1"}, timeout_sec=0.06
+            ).resolve(f"http://127.0.0.1:{server.server_address[1]}/headers")
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert elapsed is not None and elapsed < 0.2
+
+
+def test_real_pinned_transport_reports_timeout_on_stalled_body():
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "10")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            time.sleep(0.2)
+
+        def log_message(self, _format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(LinkResolutionError, match="^http_timeout$"):
+            HttpMetainfoResolver(
+                allowed_private_hosts={"127.0.0.1"}, timeout_sec=0.05
+            ).resolve(f"http://127.0.0.1:{server.server_address[1]}/stall")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_http_resolver_supports_v2_and_hybrid_exact_hashes(public_dns):
@@ -451,6 +596,31 @@ def test_http_resolver_rejects_private_initial_and_redirect(monkeypatch):
         resolver.resolve("https://metadata.invalid/a.torrent")
 
 
+@pytest.mark.parametrize(
+    "address",
+    [
+        "100.64.0.1",
+        "fec0::1",
+        "::ffff:127.0.0.1",
+        "192.0.2.1",
+        "224.0.0.1",
+        "ff02::1",
+    ],
+)
+def test_http_resolver_rejects_every_non_global_address(monkeypatch, address):
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+
+    def resolve(host, port, *, type=0):
+        sockaddr = (address, port, 0, 0) if family == socket.AF_INET6 else (address, port)
+        return [(family, socket.SOCK_STREAM, 6, "", sockaddr)]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    with pytest.raises(LinkResolutionError, match="^restricted_address$"):
+        HttpMetainfoResolver(transport=FakeTransport([])).resolve(
+            "https://not-allowlisted.invalid/a"
+        )
+
+
 def test_http_resolver_rechecks_private_redirect(monkeypatch):
     def mixed(host, port, *, type=0):
         address = "93.184.216.34" if host == "safe.invalid" else "127.0.0.1"
@@ -491,6 +661,36 @@ def test_any_private_dns_answer_is_rejected(monkeypatch):
         HttpMetainfoResolver(transport=FakeTransport([])).resolve(
             "https://mixed.invalid/a"
         )
+
+
+def test_any_cgnat_answer_in_mixed_dns_is_rejected(monkeypatch):
+    def mixed(host, port, *, type=0):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", port)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", mixed)
+    with pytest.raises(LinkResolutionError, match="^restricted_address$"):
+        HttpMetainfoResolver(transport=FakeTransport([])).resolve(
+            "https://mixed.invalid/a"
+        )
+
+
+def test_global_ipv4_mapped_ipv6_is_unwrapped_and_allowed(monkeypatch):
+    address = "::ffff:8.8.8.8"
+
+    def mapped(host, port, *, type=0):
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (address, port, 0, 0))
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", mapped)
+    info = _v1_info()
+    result = HttpMetainfoResolver(
+        transport=FakeTransport([_response(200, _torrent(info), peer_ip=address)])
+    ).resolve("https://mapped.invalid/a")
+    assert result.infohash_v1 == hashlib.sha1(info).hexdigest()
 
 
 @pytest.mark.parametrize("peer", [None, "93.184.216.35", "127.0.0.1"])
@@ -663,3 +863,116 @@ def test_transport_timeout_and_dns_failure_have_safe_reason_only(monkeypatch, pu
     with pytest.raises(LinkResolutionError, match="^dns_resolution_failed$") as dns:
         HttpMetainfoResolver(transport=FakeTransport([])).resolve(secret)
     assert "secret" not in str(dns.value)
+
+
+def test_resolve_deadline_bounds_drip_body_and_all_redirects(public_dns):
+    class DripTransport:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, url, *, timeout_sec, resolved_addresses, server_hostname):
+            self.calls += 1
+            if url.endswith("/redirect"):
+                time.sleep(0.03)
+                return _response(302, headers={"Location": "/redirect-2"})
+            if url.endswith("/redirect-2"):
+                time.sleep(0.03)
+                return _response(302, headers={"Location": "/done"})
+
+            def drip():
+                for _ in range(4):
+                    time.sleep(0.025)
+                    yield b"d"
+
+            return _response(200, drip())
+
+    drip = DripTransport()
+    started = time.monotonic()
+    with pytest.raises(LinkResolutionError, match="^http_timeout$"):
+        HttpMetainfoResolver(transport=drip, timeout_sec=0.06).resolve(
+            "https://example.invalid/body"
+        )
+    assert time.monotonic() - started < 0.2
+
+    redirects = DripTransport()
+    started = time.monotonic()
+    with pytest.raises(LinkResolutionError, match="^http_timeout$"):
+        HttpMetainfoResolver(transport=redirects, timeout_sec=0.05).resolve(
+            "https://example.invalid/redirect"
+        )
+    assert redirects.calls == 2
+    assert time.monotonic() - started < 0.2
+
+
+def test_dns_resolution_is_deadline_bounded(monkeypatch):
+    def stuck(*args, **kwargs):
+        time.sleep(0.2)
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", stuck)
+    started = time.monotonic()
+    with pytest.raises(LinkResolutionError, match="^resolution_timeout$"):
+        HttpMetainfoResolver(transport=FakeTransport([]), timeout_sec=0.04).resolve(
+            "https://slow-dns.invalid/a"
+        )
+    assert time.monotonic() - started < 0.15
+
+
+def test_pinned_transport_shares_deadline_across_candidate_addresses(monkeypatch):
+    calls = []
+
+    class Clock:
+        now = 100.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+
+    class Connection:
+        sock = None
+
+        def __init__(self, _host, _port, *, timeout, target_ip):
+            calls.append((target_ip, timeout))
+
+        def request(self, *args, **kwargs):
+            clock.now += 0.03
+            raise OSError("connect failed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(download_links, "_PinnedHTTPConnection", Connection)
+    with pytest.raises(TimeoutError):
+        download_links.PinnedHttpTransport(clock=clock).request(
+            "http://example.invalid/a",
+            timeout_sec=0.05,
+            resolved_addresses=("93.184.216.1", "93.184.216.2", "93.184.216.3"),
+            server_hostname="example.invalid",
+        )
+    assert len(calls) == 2
+    assert calls[1][1] < calls[0][1]
+
+
+def test_http_resolver_bounds_address_count_and_max_body_configuration(monkeypatch):
+    def many(host, port, *, type=0):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"8.8.8.{index}", port))
+            for index in range(1, 10)
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", many)
+    with pytest.raises(LinkResolutionError, match="^too_many_addresses$"):
+        HttpMetainfoResolver(transport=FakeTransport([])).resolve(
+            "https://many.invalid/a"
+        )
+    with pytest.raises(ValueError, match="^invalid_http_resolver_limits$"):
+        HttpMetainfoResolver(max_bytes=10 * 1024 * 1024 + 1)
+    for kwargs in (
+        {"max_resolved_addresses": 0},
+        {"max_resolved_addresses": 33},
+        {"timeout_sec": float("inf")},
+        {"timeout_sec": float("nan")},
+    ):
+        with pytest.raises(ValueError, match="^invalid_http_resolver_limits$"):
+            HttpMetainfoResolver(**kwargs)
