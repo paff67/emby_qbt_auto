@@ -1335,6 +1335,47 @@ def test_cancel_clears_raw_cancels_enrolling_and_preserves_only_enrolled_items(q
         con.close()
 
 
+def test_cancelled_batch_allows_only_fenced_enrolled_hold_release(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 2))
+    queue.submit(batch["id"])
+    pending, held = queue.list_items(batch["id"])
+    held_result = _complete_enrollment(queue, held["id"], "enrolled_hold")
+
+    queue.cancel_batch(batch["id"], "operator")
+
+    assert queue.get_batch(batch["id"])["state"] == "cancelled"
+    assert queue.get_item(pending["id"])["state"] == "cancelled"
+    assert queue.get_item(held["id"])["state"] == "enrolled_hold"
+    assert queue.submitted_nonterminal_count() == 0
+    with pytest.raises(ValueError, match="^approval_generation_conflict$"):
+        queue.transition_item(
+            held["id"],
+            {"enrolled_hold"},
+            "enrolled",
+            "wrong_confirmation",
+            approval_generation=held_result["approval_generation"] + 1,
+        )
+    with pytest.raises(ValueError, match="^illegal_transition$"):
+        queue.transition_item(
+            pending["id"], {"cancelled"}, "resolving", "invalid_reopen"
+        )
+
+    released = queue.transition_item(
+        held["id"],
+        {"enrolled_hold"},
+        "enrolled",
+        "operator_confirmation",
+        approval_generation=held_result["approval_generation"],
+    )
+
+    assert released["state"] == "enrolled"
+    assert queue.get_batch(batch["id"])["state"] == "cancelled"
+    assert queue.get_item(pending["id"])["state"] == "cancelled"
+    assert queue.submitted_nonterminal_count() == 0
+
+
 def test_cancel_rewrites_every_non_enrolled_outcome_to_cancelled(queue_fixture):
     queue, _clock, _db = queue_fixture
     batch = queue.open_draft("1", "2")

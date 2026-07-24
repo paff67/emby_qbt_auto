@@ -759,13 +759,19 @@ class BotAddQueueRepository:
                 and target_state in _MANUAL_RETRY_TARGET_STATES
             )
             held_release = old_state == "enrolled_hold" and target_state == "enrolled"
+            cancelled_held_release = batch_state == "cancelled" and held_release
             if batch_state == "draft":
                 raise ValueError("batch_not_submitted")
-            if batch_state in {"cancelled", "draft_expired"}:
+            if batch_state == "draft_expired" or (
+                batch_state == "cancelled" and not cancelled_held_release
+            ):
                 raise ValueError("batch_not_active")
             if batch_state == "complete" and not (manual_retry or held_release):
                 raise ValueError("batch_not_active")
-            if batch_state not in _SUBMITTED_BATCH_STATES | {"complete"}:
+            if (
+                batch_state not in _SUBMITTED_BATCH_STATES | {"complete"}
+                and not cancelled_held_release
+            ):
                 raise ValueError("batch_not_active")
 
             row = self._expire_item_raw_in_transaction(con, row, now)
