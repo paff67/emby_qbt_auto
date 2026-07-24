@@ -54,6 +54,50 @@ _SUBMITTED_BATCH_STATES = frozenset(
 _IDEMPOTENT_SUBMIT_STATES = _SUBMITTED_BATCH_STATES | {"complete"}
 _CANCELLABLE_ITEM_STATES = _ITEM_STATES - {"enrolled", "enrolled_hold", "cancelled"}
 _MANUAL_RETRY_TARGET_STATES = frozenset({"waiting_probe_slot", "metadata_retry_wait"})
+_METADATA_LEASE_STATES = frozenset(
+    {
+        "resolving",
+        "waiting_probe_slot",
+        "metadata_wait",
+        "metadata_retry_wait",
+        "prechecking",
+    }
+)
+_ALLOWED_TRANSITIONS = {
+    "received": frozenset(
+        {"invalid", "resolving", "duplicate_local", "waiting_probe_slot", "cancelled"}
+    ),
+    "resolving": frozenset(
+        {
+            "invalid",
+            "duplicate_local",
+            "waiting_probe_slot",
+            "metadata_wait",
+            "metadata_retry_wait",
+            "metadata_unavailable",
+            "prechecking",
+            "failed",
+            "cancelled",
+        }
+    ),
+    "waiting_probe_slot": frozenset(
+        {"metadata_wait", "metadata_retry_wait", "metadata_unavailable", "prechecking", "failed", "cancelled"}
+    ),
+    "metadata_wait": frozenset(
+        {"metadata_retry_wait", "metadata_unavailable", "prechecking", "failed", "cancelled"}
+    ),
+    "metadata_retry_wait": frozenset(
+        {"waiting_probe_slot", "metadata_wait", "metadata_unavailable", "failed", "cancelled"}
+    ),
+    "metadata_unavailable": _MANUAL_RETRY_TARGET_STATES,
+    "prechecking": frozenset(
+        {"duplicate_local", "duplicate_remote", "needs_confirmation", "ready", "failed", "cancelled"}
+    ),
+    "needs_confirmation": frozenset({"duplicate_remote", "ready", "failed", "cancelled"}),
+    "ready": frozenset({"enrolling", "cancelled"}),
+    "enrolling": frozenset({"enrolled", "enrolled_hold", "failed", "cancelled"}),
+    "enrolled_hold": frozenset({"enrolled"}),
+}
 _FIELD_ALLOWLIST = frozenset(
     {
         "canonical_identity",
@@ -68,15 +112,11 @@ _FIELD_ALLOWLIST = frozenset(
         "qbt_hash",
         "qbt_precheck_tag",
         "remote_match_json",
-        "approval_generation",
         "metadata_probe_attempt",
         "metadata_probe_started_at",
         "metadata_probe_deadline",
         "metadata_next_poll_at",
         "metadata_retry_at",
-        "metadata_lease_owner",
-        "metadata_lease_generation",
-        "metadata_lease_until",
         "approved_by",
         "approved_at",
         "attempts",
@@ -157,7 +197,9 @@ class BotAddQueueRepository:
                 (chat, user),
             ).fetchone()
             if row is not None:
-                return self._row(row)
+                row = self._expire_draft_row_in_transaction(con, row, now)
+                if str(row["state"]) == "draft":
+                    return self._row(row)
             cursor = con.execute(
                 "insert into bot_add_batches("
                 "batch_key,chat_id,user_id,state,created_at,updated_at"
@@ -187,6 +229,7 @@ class BotAddQueueRepository:
             ).fetchone()
             if batch is None:
                 raise ValueError("batch_not_found")
+            batch = self._expire_draft_row_in_transaction(con, batch, now)
             state = str(batch["state"])
             expected_signature = [
                 (index, str(link["input_sha256"]))
@@ -336,6 +379,7 @@ class BotAddQueueRepository:
             ).fetchone()
             if row is None:
                 raise ValueError("batch_not_found")
+            row = self._expire_draft_row_in_transaction(con, row, now)
             state = str(row["state"])
             if state in _IDEMPOTENT_SUBMIT_STATES:
                 result = self._row(row)
@@ -408,6 +452,7 @@ class BotAddQueueRepository:
             ).fetchone()
             if batch is None:
                 raise ValueError("batch_not_found")
+            batch = self._expire_draft_row_in_transaction(con, batch, now)
             state = str(batch["state"])
             if state == "cancelled":
                 result = self._row(batch)
@@ -433,9 +478,11 @@ class BotAddQueueRepository:
                         "update bot_add_items set state='cancelled',raw_input=null,"
                         "raw_input_expires_at=null,metadata_probe_deadline=null,"
                         "metadata_next_poll_at=null,metadata_retry_at=null,"
-                        "metadata_lease_owner=null,metadata_lease_until=null,next_run_at=null,"
+                        "metadata_lease_owner=null,metadata_lease_until=null,"
+                        "metadata_lease_generation=metadata_lease_generation+1,"
+                        "approval_generation=approval_generation+?,next_run_at=null,"
                         "qbt_precheck_tag=null,updated_at=? where id=? and state=?",
-                        (now, item_id, old_state),
+                        (1 if old_state == "enrolling" else 0, now, item_id, old_state),
                     )
                     changed += 1
                     self._event(
@@ -484,6 +531,172 @@ class BotAddQueueRepository:
         self._raise_result_error(result)
         return result
 
+    def claim_metadata_lease(
+        self, item_id: int, owner: str, lease_until: int
+    ) -> dict[str, Any]:
+        item_key = self._positive_id(item_id, "item_id")
+        lease_owner = self._identity(owner, "owner")
+        now = self._timestamp()
+        until = self._future_timestamp(lease_until, now, "lease_until")
+
+        def txn(con: sqlite3.Connection) -> dict[str, Any]:
+            self._begin_immediate(con)
+            row = self._item_in_transaction(con, item_key)
+            row = self._expire_item_raw_in_transaction(con, row, now)
+            if str(row["state"]) not in _METADATA_LEASE_STATES:
+                raise ValueError("metadata_lease_state")
+            batch_state = self._batch_state_in_transaction(con, int(row["batch_id"]))
+            if batch_state not in _SUBMITTED_BATCH_STATES:
+                raise ValueError("batch_not_submitted")
+            current_owner = row["metadata_lease_owner"]
+            current_until = row["metadata_lease_until"]
+            if (
+                current_owner is not None
+                and current_until is not None
+                and int(current_until) > now
+            ):
+                raise ValueError("metadata_lease_active")
+            current_generation = int(row["metadata_lease_generation"] or 0)
+            next_generation = current_generation + 1
+            cursor = con.execute(
+                "update bot_add_items set metadata_lease_owner=?,metadata_lease_generation=?,"
+                "metadata_lease_until=?,updated_at=? where id=? and state=? "
+                "and metadata_lease_generation=?",
+                (
+                    lease_owner,
+                    next_generation,
+                    until,
+                    now,
+                    item_key,
+                    str(row["state"]),
+                    current_generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("metadata_lease_conflict")
+            self._event(
+                con,
+                batch_id=int(row["batch_id"]),
+                item_id=item_key,
+                event_type="metadata_lease_claimed",
+                from_state=str(row["state"]),
+                to_state=str(row["state"]),
+                reason="metadata_lease_claimed",
+                now=now,
+                evidence={"generation": next_generation},
+            )
+            return self._safe_item_in_transaction(con, item_key)
+
+        return dict(write_transaction(self.state_db, txn))
+
+    def renew_metadata_lease(
+        self,
+        item_id: int,
+        owner: str,
+        generation: int,
+        lease_until: int,
+    ) -> dict[str, Any]:
+        item_key = self._positive_id(item_id, "item_id")
+        lease_owner = self._identity(owner, "owner")
+        token_generation = self._positive_id(generation, "metadata_lease_generation")
+        now = self._timestamp()
+        until = self._future_timestamp(lease_until, now, "lease_until")
+
+        def txn(con: sqlite3.Connection) -> dict[str, Any]:
+            self._begin_immediate(con)
+            row = self._item_in_transaction(con, item_key)
+            row = self._expire_item_raw_in_transaction(con, row, now)
+            cursor = con.execute(
+                "update bot_add_items set metadata_lease_until=?,updated_at=? "
+                "where id=? and metadata_lease_owner=? and metadata_lease_generation=? "
+                "and metadata_lease_until>?",
+                (until, now, item_key, lease_owner, token_generation, now),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("metadata_lease_conflict")
+            self._event(
+                con,
+                batch_id=int(row["batch_id"]),
+                item_id=item_key,
+                event_type="metadata_lease_renewed",
+                from_state=str(row["state"]),
+                to_state=str(row["state"]),
+                reason="metadata_lease_renewed",
+                now=now,
+                evidence={"generation": token_generation},
+            )
+            return self._safe_item_in_transaction(con, item_key)
+
+        return dict(write_transaction(self.state_db, txn))
+
+    def release_metadata_lease(
+        self, item_id: int, owner: str, generation: int
+    ) -> dict[str, Any]:
+        return self._finish_metadata_lease(
+            item_id,
+            owner,
+            generation,
+            fence=False,
+        )
+
+    def fence_metadata_lease(
+        self, item_id: int, owner: str, generation: int
+    ) -> dict[str, Any]:
+        return self._finish_metadata_lease(
+            item_id,
+            owner,
+            generation,
+            fence=True,
+        )
+
+    def _finish_metadata_lease(
+        self,
+        item_id: int,
+        owner: str,
+        generation: int,
+        *,
+        fence: bool,
+    ) -> dict[str, Any]:
+        item_key = self._positive_id(item_id, "item_id")
+        lease_owner = self._identity(owner, "owner")
+        token_generation = self._positive_id(generation, "metadata_lease_generation")
+        now = self._timestamp()
+
+        def txn(con: sqlite3.Connection) -> dict[str, Any]:
+            self._begin_immediate(con)
+            row = self._item_in_transaction(con, item_key)
+            row = self._expire_item_raw_in_transaction(con, row, now)
+            next_generation = token_generation + 1 if fence else token_generation
+            cursor = con.execute(
+                "update bot_add_items set metadata_lease_owner=null,"
+                "metadata_lease_generation=?,metadata_lease_until=null,updated_at=? "
+                "where id=? and metadata_lease_owner=? and metadata_lease_generation=?",
+                (
+                    next_generation,
+                    now,
+                    item_key,
+                    lease_owner,
+                    token_generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("metadata_lease_conflict")
+            event_type = "metadata_lease_fenced" if fence else "metadata_lease_released"
+            self._event(
+                con,
+                batch_id=int(row["batch_id"]),
+                item_id=item_key,
+                event_type=event_type,
+                from_state=str(row["state"]),
+                to_state=str(row["state"]),
+                reason=event_type,
+                now=now,
+                evidence={"generation": next_generation},
+            )
+            return self._safe_item_in_transaction(con, item_key)
+
+        return dict(write_transaction(self.state_db, txn))
+
     def transition_item(
         self,
         item_id: int,
@@ -491,6 +704,10 @@ class BotAddQueueRepository:
         new_state: str,
         reason: str,
         fields: Mapping[str, Any] | None = None,
+        *,
+        metadata_lease_owner: str | None = None,
+        metadata_lease_generation: int | None = None,
+        approval_generation: int | None = None,
     ) -> dict[str, Any]:
         item_key = self._positive_id(item_id, "item_id")
         if not isinstance(expected, (set, frozenset)) or not expected:
@@ -505,24 +722,82 @@ class BotAddQueueRepository:
         proposed_fields = dict(fields or {})
         if not set(proposed_fields) <= _FIELD_ALLOWLIST:
             raise ValueError("invalid_field")
+        if (metadata_lease_owner is None) != (metadata_lease_generation is None):
+            raise ValueError("metadata_lease_token")
+        expected_lease_owner = (
+            None
+            if metadata_lease_owner is None
+            else self._identity(metadata_lease_owner, "metadata_lease_owner")
+        )
+        expected_lease_generation = (
+            None
+            if metadata_lease_generation is None
+            else self._positive_id(
+                metadata_lease_generation, "metadata_lease_generation"
+            )
+        )
+        expected_approval_generation = (
+            None
+            if approval_generation is None
+            else self._positive_id(approval_generation, "approval_generation")
+        )
         now = self._timestamp()
 
         def txn(con: sqlite3.Connection) -> dict[str, Any]:
             self._begin_immediate(con)
-            row = con.execute(
-                "select * from bot_add_items where id=?", (item_key,)
-            ).fetchone()
-            if row is None:
-                raise ValueError("item_not_found")
+            row = self._item_in_transaction(con, item_key)
             old_state = str(row["state"])
             if old_state not in expected_states:
                 raise ValueError("state_conflict")
             batch_id = int(row["batch_id"])
+            if target_state not in _ALLOWED_TRANSITIONS.get(old_state, frozenset()):
+                raise ValueError("illegal_transition")
+            batch_state = self._batch_state_in_transaction(con, batch_id)
 
             manual_retry = (
                 old_state == "metadata_unavailable"
                 and target_state in _MANUAL_RETRY_TARGET_STATES
             )
+            held_release = old_state == "enrolled_hold" and target_state == "enrolled"
+            if batch_state == "draft":
+                raise ValueError("batch_not_submitted")
+            if batch_state in {"cancelled", "draft_expired"}:
+                raise ValueError("batch_not_active")
+            if batch_state == "complete" and not (manual_retry or held_release):
+                raise ValueError("batch_not_active")
+            if batch_state not in _SUBMITTED_BATCH_STATES | {"complete"}:
+                raise ValueError("batch_not_active")
+
+            row = self._expire_item_raw_in_transaction(con, row, now)
+            active_lease = (
+                row["metadata_lease_owner"] is not None
+                and row["metadata_lease_until"] is not None
+                and int(row["metadata_lease_until"]) > now
+            )
+            if active_lease and expected_lease_owner is None:
+                raise ValueError("metadata_lease_token_required")
+            if expected_lease_owner is not None and (
+                str(row["metadata_lease_owner"] or "") != expected_lease_owner
+                or int(row["metadata_lease_generation"] or 0)
+                != expected_lease_generation
+                or row["metadata_lease_until"] is None
+                or int(row["metadata_lease_until"]) <= now
+            ):
+                raise ValueError("metadata_lease_conflict")
+
+            approval_required = (
+                (old_state == "enrolling" and target_state in {"enrolled", "enrolled_hold", "failed"})
+                or held_release
+            )
+            if approval_required and expected_approval_generation is None:
+                raise ValueError("approval_token_required")
+            if approval_required and int(row["approval_generation"] or 0) != int(
+                expected_approval_generation
+            ):
+                raise ValueError("approval_generation_conflict")
+            if not approval_required and expected_approval_generation is not None:
+                raise ValueError("approval_token_unexpected")
+
             if manual_retry:
                 raw_input = row["raw_input"]
                 raw_expires_at = row["raw_input_expires_at"]
@@ -531,32 +806,7 @@ class BotAddQueueRepository:
                     or raw_expires_at is None
                     or int(raw_expires_at) <= now
                 ):
-                    if raw_input is not None or raw_expires_at is not None:
-                        con.execute(
-                            "update bot_add_items set raw_input=null,raw_input_expires_at=null,"
-                            "updated_at=? where id=? and state=?",
-                            (now, item_key, old_state),
-                        )
-                        self._event(
-                            con,
-                            batch_id=batch_id,
-                            item_id=item_key,
-                            event_type="raw_input_expired",
-                            from_state=old_state,
-                            to_state=old_state,
-                            reason="raw_input_ttl_elapsed",
-                            now=now,
-                        )
                     return {"__error__": "raw_input_expired"}
-
-                batch = con.execute(
-                    "select state from bot_add_batches where id=?", (batch_id,)
-                ).fetchone()
-                if batch is None:  # pragma: no cover - protected by the FK
-                    raise ValueError("batch_not_found")
-                batch_state = str(batch["state"])
-                if batch_state not in _SUBMITTED_BATCH_STATES | {"complete"}:
-                    raise ValueError("batch_not_reopenable")
                 if (
                     self._submitted_nonterminal_in_transaction(con) + 1
                     > self.limits.max_submitted_items
@@ -570,6 +820,14 @@ class BotAddQueueRepository:
                     )
 
             assignments: dict[str, Any] = dict(proposed_fields)
+            if target_state == "enrolling":
+                assignments["approval_generation"] = int(
+                    row["approval_generation"] or 0
+                ) + 1
+            elif old_state == "enrolling" and target_state == "cancelled":
+                assignments["approval_generation"] = int(
+                    row["approval_generation"] or 0
+                ) + 1
             if target_state in _AUTOMATIC_TERMINAL_ITEM_STATES:
                 for field in _AUTOMATIC_TERMINAL_CLEAR_FIELDS:
                     assignments[field] = None
@@ -581,14 +839,33 @@ class BotAddQueueRepository:
                     if raw_expires_at is None or int(raw_expires_at) <= now:
                         for field in _RAW_INPUT_FIELDS:
                             assignments[field] = None
+            if (
+                row["metadata_lease_owner"] is not None
+                and target_state not in _METADATA_LEASE_STATES
+            ):
+                assignments["metadata_lease_owner"] = None
+                assignments["metadata_lease_until"] = None
+                assignments["metadata_lease_generation"] = int(
+                    row["metadata_lease_generation"] or 0
+                ) + 1
             assignments["state"] = target_state
             assignments["updated_at"] = now
             ordered = sorted(assignments)
             sql = ",".join(f"{field}=?" for field in ordered)
             params = [assignments[field] for field in ordered]
+            where = "id=? and state=?"
+            where_params: list[Any] = [item_key, old_state]
+            if expected_lease_owner is not None:
+                where += " and metadata_lease_owner=? and metadata_lease_generation=?"
+                where_params.extend(
+                    [expected_lease_owner, expected_lease_generation]
+                )
+            if approval_required:
+                where += " and approval_generation=?"
+                where_params.append(expected_approval_generation)
             cursor = con.execute(
-                f"update bot_add_items set {sql} where id=? and state=?",
-                (*params, item_key, old_state),
+                f"update bot_add_items set {sql} where {where}",
+                (*params, *where_params),
             )
             if cursor.rowcount != 1:
                 raise ValueError("state_conflict")
@@ -614,24 +891,26 @@ class BotAddQueueRepository:
         self._raise_result_error(result)
         return result
 
-    def expire_drafts(self) -> int:
+    def expire_drafts(self, *, limit: int = 10) -> int:
+        maintenance_limit = self._maintenance_limit(limit)
         now = self._timestamp()
 
         def txn(con: sqlite3.Connection) -> int:
             self._begin_immediate(con)
-            return self._expire_drafts_in_transaction(con, now)
+            return self._expire_drafts_in_transaction(con, now, maintenance_limit)
 
         return int(write_transaction(self.state_db, txn))
 
-    def expire_raw_inputs(self) -> int:
+    def expire_raw_inputs(self, *, limit: int = 100) -> dict[str, Any]:
+        maintenance_limit = self._maintenance_limit(limit)
         now = self._timestamp()
 
-        def txn(con: sqlite3.Connection) -> int:
+        def txn(con: sqlite3.Connection) -> dict[str, Any]:
             self._begin_immediate(con)
-            self._expire_drafts_in_transaction(con, now)
-            return self._expire_raw_inputs_in_transaction(con, now)
+            self._expire_drafts_in_transaction(con, now, min(10, maintenance_limit))
+            return self._expire_raw_inputs_in_transaction(con, now, maintenance_limit)
 
-        return int(write_transaction(self.state_db, txn))
+        return dict(write_transaction(self.state_db, txn))
 
     def get_batch(self, batch_id: int) -> dict[str, Any]:
         key = self._positive_id(batch_id, "batch_id")
@@ -805,47 +1084,69 @@ class BotAddQueueRepository:
             return f"{kind.split('_', 1)[0]}:[redacted]"
 
     def _expire_due_in_transaction(self, con: sqlite3.Connection, now: int) -> None:
-        self._expire_drafts_in_transaction(con, now)
-        self._expire_raw_inputs_in_transaction(con, now)
+        self._expire_drafts_in_transaction(con, now, 10)
+        self._expire_raw_inputs_in_transaction(con, now, 100)
 
-    def _expire_drafts_in_transaction(self, con: sqlite3.Connection, now: int) -> int:
+    def _expire_drafts_in_transaction(
+        self, con: sqlite3.Connection, now: int, limit: int
+    ) -> int:
         rows = list(
             con.execute(
-                "select id from bot_add_batches where state='draft' and updated_at<=? order by id",
-                (now - self.limits.draft_ttl_sec,),
+                "select * from bot_add_batches where state='draft' and updated_at<=? "
+                "order by updated_at,id limit ?",
+                (now - self.limits.draft_ttl_sec, limit),
             )
         )
         for row in rows:
-            batch_id = int(row["id"])
-            con.execute(
-                "update bot_add_batches set state='draft_expired',completed_at=?,updated_at=? "
-                "where id=? and state='draft'",
-                (now, now, batch_id),
-            )
-            con.execute(
-                "update bot_add_items set raw_input=null,raw_input_expires_at=null,updated_at=? "
-                "where batch_id=? and raw_input is not null",
-                (now, batch_id),
-            )
-            self._event(
-                con,
-                batch_id=batch_id,
-                item_id=None,
-                event_type="draft_expired",
-                from_state="draft",
-                to_state="draft_expired",
-                reason="draft_ttl_elapsed",
-                now=now,
-            )
+            self._expire_draft_row_in_transaction(con, row, now)
         return len(rows)
 
-    def _expire_raw_inputs_in_transaction(self, con: sqlite3.Connection, now: int) -> int:
+    def _expire_draft_row_in_transaction(
+        self, con: sqlite3.Connection, row: sqlite3.Row, now: int
+    ) -> sqlite3.Row:
+        if (
+            str(row["state"]) != "draft"
+            or int(row["updated_at"]) > now - self.limits.draft_ttl_sec
+        ):
+            return row
+        batch_id = int(row["id"])
+        con.execute(
+            "update bot_add_batches set state='draft_expired',completed_at=?,updated_at=? "
+            "where id=? and state='draft'",
+            (now, now, batch_id),
+        )
+        con.execute(
+            "update bot_add_items set raw_input=null,raw_input_expires_at=null,updated_at=? "
+            "where batch_id=? and raw_input is not null",
+            (now, batch_id),
+        )
+        self._event(
+            con,
+            batch_id=batch_id,
+            item_id=None,
+            event_type="draft_expired",
+            from_state="draft",
+            to_state="draft_expired",
+            reason="draft_ttl_elapsed",
+            now=now,
+        )
+        refreshed = con.execute(
+            "select * from bot_add_batches where id=?", (batch_id,)
+        ).fetchone()
+        if refreshed is None:  # pragma: no cover - protected by the transaction
+            raise ValueError("batch_not_found")
+        return refreshed
+
+    def _expire_raw_inputs_in_transaction(
+        self, con: sqlite3.Connection, now: int, limit: int
+    ) -> dict[str, Any]:
         rows = list(
             con.execute(
                 "select i.id,i.batch_id,b.state as batch_state "
                 "from bot_add_items i join bot_add_batches b on b.id=i.batch_id "
-                "where i.raw_input is not null and i.raw_input_expires_at<=? order by i.id",
-                (now,),
+                "where i.raw_input is not null and i.raw_input_expires_at<=? "
+                "order by i.raw_input_expires_at,i.id limit ?",
+                (now, limit),
             )
         )
         draft_batches = {int(row["batch_id"]) for row in rows if row["batch_state"] == "draft"}
@@ -889,7 +1190,15 @@ class BotAddQueueRepository:
                 reason="raw_input_ttl_elapsed",
                 now=now,
             )
-        return len(rows)
+        has_more = (
+            con.execute(
+                "select 1 from bot_add_items where raw_input is not null "
+                "and raw_input_expires_at<=? limit 1",
+                (now,),
+            ).fetchone()
+            is not None
+        )
+        return {"expired_count": len(rows), "has_more": has_more}
 
     def _refresh_batch_counters(
         self, con: sqlite3.Connection, batch_id: int, now: int
@@ -923,7 +1232,7 @@ class BotAddQueueRepository:
         self, con: sqlite3.Connection, batch_id: int, now: int
     ) -> None:
         batch = con.execute(
-            "select state from bot_add_batches where id=?", (batch_id,)
+            "select state,completed_at from bot_add_batches where id=?", (batch_id,)
         ).fetchone()
         if batch is None or str(batch["state"]) not in _SUBMITTED_BATCH_STATES:
             return
@@ -934,7 +1243,7 @@ class BotAddQueueRepository:
         )
         shards = list(
             con.execute(
-                "select shard_index,item_count from bot_add_shards "
+                "select shard_index,item_count,state,completed_at from bot_add_shards "
                 "where batch_id=? order by shard_index,id",
                 (batch_id,),
             )
@@ -949,7 +1258,12 @@ class BotAddQueueRepository:
             processed = sum(state in _AUTOMATIC_TERMINAL_ITEM_STATES for state in states)
             if processed == len(states):
                 shard_state = "complete"
-                completed_at = now
+                completed_at = (
+                    int(shard["completed_at"])
+                    if str(shard["state"]) == "complete"
+                    and shard["completed_at"] is not None
+                    else now
+                )
             elif any(state != "received" for state in states):
                 shard_state = "processing"
                 completed_at = None
@@ -976,7 +1290,11 @@ class BotAddQueueRepository:
         )
         if nonterminal == 0:
             state = "complete"
-            completed_at = now
+            completed_at = (
+                int(batch["completed_at"])
+                if str(batch["state"]) == "complete" and batch["completed_at"] is not None
+                else now
+            )
         elif any(str(row["state"]) == "needs_confirmation" for row in items):
             state = "awaiting_confirmation"
             completed_at = None
@@ -1013,6 +1331,58 @@ class BotAddQueueRepository:
         if row is None:  # pragma: no cover - protected by FK/transaction invariants
             raise ValueError("batch_not_found")
         return dict(row)
+
+    @staticmethod
+    def _batch_state_in_transaction(con: sqlite3.Connection, batch_id: int) -> str:
+        row = con.execute(
+            "select state from bot_add_batches where id=?", (batch_id,)
+        ).fetchone()
+        if row is None:  # pragma: no cover - protected by FK
+            raise ValueError("batch_not_found")
+        return str(row["state"])
+
+    @staticmethod
+    def _item_in_transaction(con: sqlite3.Connection, item_id: int) -> sqlite3.Row:
+        row = con.execute("select * from bot_add_items where id=?", (item_id,)).fetchone()
+        if row is None:
+            raise ValueError("item_not_found")
+        return row
+
+    def _safe_item_in_transaction(
+        self, con: sqlite3.Connection, item_id: int
+    ) -> dict[str, Any]:
+        return self._item_for_output(
+            self._item_in_transaction(con, item_id), include_raw=False
+        )
+
+    def _expire_item_raw_in_transaction(
+        self, con: sqlite3.Connection, row: sqlite3.Row, now: int
+    ) -> sqlite3.Row:
+        expires_at = row["raw_input_expires_at"]
+        if (
+            row["raw_input"] is None
+            or expires_at is None
+            or int(expires_at) > now
+        ):
+            return row
+        item_id = int(row["id"])
+        batch_id = int(row["batch_id"])
+        con.execute(
+            "update bot_add_items set raw_input=null,raw_input_expires_at=null,updated_at=? "
+            "where id=? and raw_input is not null and raw_input_expires_at<=?",
+            (now, item_id, now),
+        )
+        self._event(
+            con,
+            batch_id=batch_id,
+            item_id=item_id,
+            event_type="raw_input_expired",
+            from_state=str(row["state"]),
+            to_state=str(row["state"]),
+            reason="raw_input_ttl_elapsed",
+            now=now,
+        )
+        return self._item_in_transaction(con, item_id)
 
     @staticmethod
     def _event(
@@ -1063,6 +1433,18 @@ class BotAddQueueRepository:
         if isinstance(value, bool):
             raise ValueError("now")
         return int(value)
+
+    @staticmethod
+    def _future_timestamp(value: int, now: int, field: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= now:
+            raise ValueError(field)
+        return value
+
+    @staticmethod
+    def _maintenance_limit(value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1000:
+            raise ValueError("limit")
+        return value
 
     @staticmethod
     def _raise_result_error(result: dict[str, Any]) -> None:

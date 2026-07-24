@@ -688,6 +688,8 @@ def test_queue_indexes_cover_claim_identity_and_lookup_paths(tmp_path):
         assert ("metadata_probe_deadline", "state") in item_indexes.values()
         assert ("canonical_identity",) in item_indexes.values()
         assert ("qbt_hash",) in item_indexes.values()
+        assert ("source_message_id", "batch_id", "source_index") in item_indexes.values()
+        assert ("raw_input_expires_at", "id") in item_indexes.values()
         batch_indexes = _index_columns(con, "bot_add_batches")
         assert ("chat_id", "user_id") in batch_indexes.values()
         open_draft = next(
@@ -699,6 +701,36 @@ def test_queue_indexes_cover_claim_identity_and_lookup_paths(tmp_path):
         assert int(open_draft[4]) == 1
         shard_indexes = _index_columns(con, "bot_add_shards")
         assert ("batch_id", "shard_index") in shard_indexes.values()
+    finally:
+        con.close()
+
+
+def test_queue_query_plans_use_ingress_and_raw_expiry_indexes(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    con = readonly_connect(db)
+    try:
+        ingress_plan = " ".join(
+            str(row[3])
+            for row in con.execute(
+                "explain query plan select i.batch_id,i.source_index,i.input_sha256 "
+                "from bot_add_items i join bot_add_batches b on b.id=i.batch_id "
+                "where b.chat_id=? and i.source_message_id=? "
+                "order by i.batch_id,i.source_index",
+                ("chat", 1),
+            )
+        )
+        raw_plan = " ".join(
+            str(row[3])
+            for row in con.execute(
+                "explain query plan select id,batch_id from bot_add_items "
+                "where raw_input is not null and raw_input_expires_at<=? "
+                "order by raw_input_expires_at,id limit ?",
+                (100, 10),
+            )
+        )
+        assert "idx_bot_add_items_source_message" in ingress_plan
+        assert "idx_bot_add_items_raw_expiry" in raw_plan
     finally:
         con.close()
 
@@ -802,6 +834,24 @@ def _independent_write_transaction(path, callback):
         raise
     finally:
         con.close()
+
+
+def _advance_item_to_ready(queue, item_id: int) -> dict:
+    queue.transition_item(item_id, {"received"}, "resolving", "resolve")
+    queue.transition_item(item_id, {"resolving"}, "prechecking", "metadata_ready")
+    return queue.transition_item(item_id, {"prechecking"}, "ready", "validated")
+
+
+def _complete_enrollment(queue, item_id: int, target: str = "enrolled") -> dict:
+    _advance_item_to_ready(queue, item_id)
+    enrolling = queue.transition_item(item_id, {"ready"}, "enrolling", "enroll_start")
+    return queue.transition_item(
+        item_id,
+        {"enrolling"},
+        target,
+        "enroll_finish",
+        approval_generation=enrolling["approval_generation"],
+    )
 
 
 def test_queue_limits_validate_positive_integer_relationships():
@@ -1153,6 +1203,20 @@ def test_draft_expires_after_thirty_minutes_and_clears_raw(queue_fixture):
         con.close()
 
 
+def test_accessed_draft_expires_even_beyond_bounded_maintenance_window(queue_fixture):
+    queue, clock, _db = queue_fixture
+    drafts = [queue.open_draft(str(index), str(index)) for index in range(11)]
+    queue.append_message(drafts[-1]["id"], 1, _magnets(0, 1))
+    clock.advance(1800)
+
+    with pytest.raises(ValueError, match="^draft_expired$"):
+        queue.append_message(drafts[-1]["id"], 2, _magnets(2, 1))
+    replacement = queue.open_draft("10", "10")
+
+    assert queue.get_batch(drafts[-1]["id"])["state"] == "draft_expired"
+    assert replacement["id"] != drafts[-1]["id"]
+
+
 def test_append_and_submit_reject_expired_or_submitted_drafts(queue_fixture):
     queue, clock, db = queue_fixture
     expired = queue.open_draft("1", "1")
@@ -1233,9 +1297,12 @@ def test_cancel_clears_raw_cancels_enrolling_and_preserves_only_enrolled_items(q
     queue.append_message(batch["id"], 1, _magnets(0, 4))
     queue.submit(batch["id"])
     items = queue.list_items(batch["id"])
-    queue.transition_item(items[1]["id"], {"received"}, "enrolling", "start")
-    queue.transition_item(items[2]["id"], {"received"}, "enrolled", "done")
-    queue.transition_item(items[3]["id"], {"received"}, "enrolled_hold", "held")
+    _advance_item_to_ready(queue, items[1]["id"])
+    enrolling = queue.transition_item(
+        items[1]["id"], {"ready"}, "enrolling", "start"
+    )
+    _complete_enrollment(queue, items[2]["id"], "enrolled")
+    _complete_enrollment(queue, items[3]["id"], "enrolled_hold")
 
     cancelled = queue.cancel_batch(batch["id"], "operator")
 
@@ -1247,7 +1314,16 @@ def test_cancel_clears_raw_cancels_enrolling_and_preserves_only_enrolled_items(q
         "enrolled_hold",
     ]
     with pytest.raises(ValueError, match="^state_conflict$"):
-        queue.transition_item(items[1]["id"], {"enrolling"}, "enrolled", "late_result")
+        queue.transition_item(
+            items[1]["id"],
+            {"enrolling"},
+            "enrolled",
+            "late_result",
+            approval_generation=enrolling["approval_generation"],
+        )
+    assert queue.get_item(items[1]["id"])["approval_generation"] == (
+        enrolling["approval_generation"] + 1
+    )
     assert queue.submitted_nonterminal_count() == 0
     con = readonly_connect(db)
     try:
@@ -1265,11 +1341,12 @@ def test_cancel_rewrites_every_non_enrolled_outcome_to_cancelled(queue_fixture):
     queue.append_message(batch["id"], 1, _magnets(0, 6))
     queue.submit(batch["id"])
     items = queue.list_items(batch["id"])
-    for item, state in zip(
-        items,
-        ("invalid", "duplicate_local", "metadata_unavailable", "failed", "enrolled"),
-    ):
-        queue.transition_item(item["id"], {"received"}, state, "outcome")
+    queue.transition_item(items[0]["id"], {"received"}, "invalid", "outcome")
+    queue.transition_item(items[1]["id"], {"received"}, "duplicate_local", "outcome")
+    for item, state in ((items[2], "metadata_unavailable"), (items[3], "failed")):
+        queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+        queue.transition_item(item["id"], {"resolving"}, state, "outcome")
+    _complete_enrollment(queue, items[4]["id"], "enrolled")
 
     queue.cancel_batch(batch["id"], "operator")
 
@@ -1289,6 +1366,7 @@ def test_transition_uses_cas_field_allowlist_and_item_batch_for_events(queue_fix
     second = queue.open_draft("2", "2")
     queue.append_message(first["id"], 1, _magnets(0, 1))
     queue.append_message(second["id"], 2, _magnets(2, 1))
+    queue.submit(second["id"])
     item = queue.list_items(second["id"])[0]
 
     changed = queue.transition_item(
@@ -1304,6 +1382,16 @@ def test_transition_uses_cas_field_allowlist_and_item_batch_for_events(queue_fix
         queue.transition_item(item["id"], {"received"}, "ready", "raced")
     with pytest.raises(ValueError, match="^invalid_field$"):
         queue.transition_item(item["id"], {"resolving"}, "ready", "bad", {"state = 'failed' --": 1})
+    for protected in (
+        "metadata_lease_owner",
+        "metadata_lease_generation",
+        "metadata_lease_until",
+        "approval_generation",
+    ):
+        with pytest.raises(ValueError, match="^invalid_field$"):
+            queue.transition_item(
+                item["id"], {"resolving"}, "prechecking", "bad", {protected: 1}
+            )
     event = queue.list_events(second["id"])[-1]
     assert event["batch_id"] == second["id"]
     assert event["item_id"] == item["id"]
@@ -1314,24 +1402,219 @@ def test_transition_uses_cas_field_allowlist_and_item_batch_for_events(queue_fix
     ]
 
 
+def test_draft_terminal_and_same_state_transitions_are_rejected(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    draft = queue.open_draft("1", "1")
+    queue.append_message(draft["id"], 1, _magnets(0, 1))
+    draft_item = queue.list_items(draft["id"])[0]
+    with pytest.raises(ValueError, match="^batch_not_submitted$"):
+        queue.transition_item(draft_item["id"], {"received"}, "resolving", "early")
+
+    queue.submit(draft["id"])
+    with pytest.raises(ValueError, match="^illegal_transition$"):
+        queue.transition_item(draft_item["id"], {"received"}, "received", "same")
+    queue.transition_item(draft_item["id"], {"received"}, "invalid", "invalid")
+    with pytest.raises(ValueError, match="^illegal_transition$"):
+        queue.transition_item(draft_item["id"], {"invalid"}, "resolving", "reopen")
+
+    cancelled = queue.open_draft("2", "2")
+    queue.append_message(cancelled["id"], 2, _magnets(10, 1))
+    cancelled_item = queue.list_items(cancelled["id"])[0]
+    queue.cancel_batch(cancelled["id"], "operator")
+    with pytest.raises(ValueError, match="^illegal_transition$"):
+        queue.transition_item(
+            cancelled_item["id"], {"cancelled"}, "resolving", "reopen"
+        )
+
+
+def test_metadata_lease_generation_fences_old_workers(queue_fixture):
+    queue, clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+
+    first = queue.claim_metadata_lease(item["id"], "worker-a", clock.value + 60)
+    assert first["metadata_lease_generation"] == 1
+    renewed = queue.renew_metadata_lease(
+        item["id"], "worker-a", first["metadata_lease_generation"], clock.value + 120
+    )
+    assert renewed["metadata_lease_until"] == clock.value + 120
+    with pytest.raises(ValueError, match="^metadata_lease_conflict$"):
+        queue.renew_metadata_lease(
+            item["id"], "worker-a", first["metadata_lease_generation"] + 1, clock.value + 180
+        )
+
+    fenced = queue.fence_metadata_lease(
+        item["id"], "worker-a", first["metadata_lease_generation"]
+    )
+    assert fenced["metadata_lease_generation"] == 2
+    second = queue.claim_metadata_lease(item["id"], "worker-b", clock.value + 60)
+    assert second["metadata_lease_generation"] == 3
+
+    with pytest.raises(ValueError, match="^metadata_lease_conflict$"):
+        queue.transition_item(
+            item["id"],
+            {"resolving"},
+            "prechecking",
+            "stale_worker",
+            metadata_lease_owner="worker-a",
+            metadata_lease_generation=first["metadata_lease_generation"],
+        )
+    changed = queue.transition_item(
+        item["id"],
+        {"resolving"},
+        "prechecking",
+        "current_worker",
+        metadata_lease_owner="worker-b",
+        metadata_lease_generation=second["metadata_lease_generation"],
+    )
+    assert changed["state"] == "prechecking"
+
+
+def test_active_metadata_lease_requires_explicit_token(queue_fixture):
+    queue, clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    lease = queue.claim_metadata_lease(item["id"], "worker", clock.value + 60)
+
+    with pytest.raises(ValueError, match="^metadata_lease_token_required$"):
+        queue.transition_item(item["id"], {"resolving"}, "prechecking", "missing")
+    queue.release_metadata_lease(
+        item["id"], "worker", lease["metadata_lease_generation"]
+    )
+    assert queue.transition_item(
+        item["id"], {"resolving"}, "prechecking", "released"
+    )["state"] == "prechecking"
+
+
+def test_concurrent_metadata_claims_have_one_generation_winner(tmp_path, monkeypatch):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    setup = BotAddQueueRepository(db, now=lambda: 100)
+    batch = setup.open_draft("1", "1")
+    setup.append_message(batch["id"], 1, _magnets(0, 1))
+    setup.submit(batch["id"])
+    item = setup.list_items(batch["id"])[0]
+    setup.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    repos = [BotAddQueueRepository(db, now=lambda: 100) for _ in range(2)]
+    monkeypatch.setattr(queue_module, "write_transaction", _independent_write_transaction)
+
+    def claim(index: int):
+        try:
+            result = repos[index].claim_metadata_lease(
+                item["id"], f"worker-{index}", 200
+            )
+            return ("accepted", result["metadata_lease_generation"])
+        except ValueError as exc:
+            return (str(exc), None)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, range(2)))
+
+    assert sorted(result[0] for result in results) == [
+        "accepted",
+        "metadata_lease_active",
+    ]
+    assert [result[1] for result in results if result[0] == "accepted"] == [1]
+    stored = setup.get_item(item["id"])
+    assert stored["metadata_lease_generation"] == 1
+    assert stored["metadata_lease_owner"] in {"worker-0", "worker-1"}
+
+
+def test_enrollment_generation_is_required_and_completed_at_is_stable(queue_fixture):
+    queue, clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    _advance_item_to_ready(queue, item["id"])
+
+    enrolling = queue.transition_item(
+        item["id"], {"ready"}, "enrolling", "enroll_start"
+    )
+    generation = enrolling["approval_generation"]
+    assert generation == 1
+    with pytest.raises(ValueError, match="^approval_token_required$"):
+        queue.transition_item(item["id"], {"enrolling"}, "enrolled_hold", "missing")
+    with pytest.raises(ValueError, match="^approval_generation_conflict$"):
+        queue.transition_item(
+            item["id"],
+            {"enrolling"},
+            "enrolled_hold",
+            "stale",
+            approval_generation=generation + 1,
+        )
+    queue.transition_item(
+        item["id"],
+        {"enrolling"},
+        "enrolled_hold",
+        "held",
+        approval_generation=generation,
+    )
+    first_completed_at = queue.get_batch(batch["id"])["completed_at"]
+    clock.advance(100)
+
+    queue.transition_item(
+        item["id"],
+        {"enrolled_hold"},
+        "enrolled",
+        "allow_scheduling",
+        approval_generation=generation,
+    )
+
+    assert queue.get_batch(batch["id"])["completed_at"] == first_completed_at
+
+
+def test_completed_shard_timestamp_is_not_rewritten_by_later_item_progress(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(max_links_per_batch=10, shard_size=1),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 2))
+    queue.submit(batch["id"])
+    items = queue.list_items(batch["id"])
+    queue.transition_item(items[0]["id"], {"received"}, "invalid", "invalid")
+    first_completed_at = queue.list_shards(batch["id"])[0]["completed_at"]
+    clock.advance(100)
+
+    queue.transition_item(items[1]["id"], {"received"}, "invalid", "invalid")
+
+    shards = queue.list_shards(batch["id"])
+    assert shards[0]["completed_at"] == first_completed_at
+    assert shards[1]["completed_at"] == clock.value
+
+
 def test_terminal_transition_clears_raw_expiry_and_retry_secrets(queue_fixture):
     queue, _clock, db = queue_fixture
     batch = queue.open_draft("1", "1")
     queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
     item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    lease = queue.claim_metadata_lease(item["id"], "worker-secret", 1_800_000_100)
     queue.transition_item(
         item["id"],
-        {"received"},
+        {"resolving"},
         "failed",
         "permanent",
         {
             "metadata_retry_at": 500,
             "metadata_next_poll_at": 501,
-            "metadata_lease_owner": "worker-secret",
-            "metadata_lease_until": 502,
             "next_run_at": 503,
             "qbt_precheck_tag": "opaque-secret",
         },
+        metadata_lease_owner="worker-secret",
+        metadata_lease_generation=lease["metadata_lease_generation"],
     )
     con = readonly_connect(db)
     try:
@@ -1353,9 +1636,10 @@ def test_metadata_unavailable_retains_raw_and_manual_retry_reopens_complete_batc
     queue.submit(batch["id"])
     item = queue.list_items(batch["id"], include_raw=True)[0]
     raw = item["raw_input"]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
 
     unavailable = queue.transition_item(
-        item["id"], {"received"}, "metadata_unavailable", "probe_exhausted"
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
     )
 
     assert unavailable["raw_input"] is None  # safe return view
@@ -1397,8 +1681,9 @@ def test_expired_metadata_unavailable_raw_is_cleared_and_cannot_retry(tmp_path):
     queue.append_message(batch["id"], 1, _magnets(0, 1))
     queue.submit(batch["id"])
     item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
     queue.transition_item(
-        item["id"], {"received"}, "metadata_unavailable", "probe_exhausted"
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
     )
     clock.advance(10)
 
@@ -1437,8 +1722,9 @@ def test_manual_retry_reopen_respects_global_backlog_atomically(tmp_path):
     queue.append_message(retry_batch["id"], 1, _magnets(0, 1))
     queue.submit(retry_batch["id"])
     retry_item = queue.list_items(retry_batch["id"])[0]
+    queue.transition_item(retry_item["id"], {"received"}, "resolving", "resolve")
     queue.transition_item(
-        retry_item["id"], {"received"}, "metadata_unavailable", "probe_exhausted"
+        retry_item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
     )
     blocking_batch = queue.open_draft("2", "2")
     queue.append_message(blocking_batch["id"], 2, _magnets(10, 1))
@@ -1510,14 +1796,58 @@ def test_raw_input_ttl_cleanup_is_explicit_and_audited(tmp_path):
     queue.submit(batch["id"])
     clock.advance(10)
 
-    assert queue.expire_raw_inputs() == 1
-    assert queue.expire_raw_inputs() == 0
+    assert queue.expire_raw_inputs() == {"expired_count": 1, "has_more": False}
+    assert queue.expire_raw_inputs() == {"expired_count": 0, "has_more": False}
     assert queue.list_items(batch["id"], include_raw=True)[0]["raw_input"] is None
     assert [event["event_type"] for event in queue.list_events(batch["id"])] == [
         "message_appended",
         "batch_submitted",
         "raw_input_expired",
     ]
+
+
+def test_raw_input_maintenance_is_bounded_and_reports_more_work(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(raw_input_ttl_sec=10),
+        now=clock,
+    )
+    batches = []
+    for index in range(5):
+        batch = queue.open_draft(str(index), str(index))
+        queue.append_message(batch["id"], index + 1, _magnets(index, 1))
+        queue.submit(batch["id"])
+        batches.append(batch)
+    clock.advance(10)
+
+    assert queue.expire_raw_inputs(limit=2) == {"expired_count": 2, "has_more": True}
+    assert queue.expire_raw_inputs(limit=2) == {"expired_count": 2, "has_more": True}
+    assert queue.expire_raw_inputs(limit=2) == {"expired_count": 1, "has_more": False}
+    assert queue.expire_raw_inputs(limit=2) == {"expired_count": 0, "has_more": False}
+
+
+def test_transition_immediately_clears_its_expired_raw_input(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(raw_input_ttl_sec=10),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    clock.advance(10)
+
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+
+    assert queue.get_item(item["id"], include_raw=True)["raw_input"] is None
+    assert queue.list_events(batch["id"])[-2]["event_type"] == "raw_input_expired"
 
 
 def test_concurrent_appends_enforce_batch_limit_inside_sqlite_transaction(tmp_path, monkeypatch):

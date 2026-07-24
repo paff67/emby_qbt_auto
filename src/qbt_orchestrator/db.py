@@ -744,6 +744,10 @@ def migration_sql() -> list[str]:
         "create index if not exists idx_bot_add_items_canonical_identity "
         "on bot_add_items(canonical_identity)",
         "create index if not exists idx_bot_add_items_qbt_hash on bot_add_items(qbt_hash)",
+        "create index if not exists idx_bot_add_items_source_message "
+        "on bot_add_items(source_message_id,batch_id,source_index)",
+        "create index if not exists idx_bot_add_items_raw_expiry "
+        "on bot_add_items(raw_input_expires_at,id) where raw_input is not null",
         "create table if not exists bot_add_events("
         "id integer primary key autoincrement,"
         "batch_id integer references bot_add_batches(id),"
