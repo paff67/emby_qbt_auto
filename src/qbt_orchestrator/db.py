@@ -10,6 +10,7 @@ from .hash_identity import canonical_torrent_hash
 def _connect(path: str | Path) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
+    con.execute("pragma foreign_keys=ON")
     return con
 
 
@@ -439,6 +440,162 @@ def migration_sql() -> list[str]:
         "create table if not exists bot_commands(id integer primary key autoincrement, command_id text unique, chat_id text, user_id text, command text, payload_json text, state text default 'queued', created_at integer, updated_at integer)",
         "create table if not exists bot_approvals(id integer primary key autoincrement, approval_id text unique, command_id text, action text, payload_json text, state text default 'pending', expires_at integer, approved_by text, approved_at integer, created_at integer)",
         "create table if not exists bot_notifications(id integer primary key autoincrement, dedupe_key text unique, chat_id text not null, level text default 'info', topic text, message text not null, payload_json text, state text default 'queued', attempts integer default 0, next_run_at integer, last_error text, created_at integer, updated_at integer, sent_at integer)",
+        "create table if not exists bot_add_batches("
+        "id integer primary key autoincrement,"
+        "batch_key text not null unique,"
+        "chat_id text not null,"
+        "user_id text not null,"
+        "state text not null check(state in "
+        "('draft','queued','processing','awaiting_confirmation','complete','cancelled','draft_expired')),"
+        "panel_message_id integer,"
+        "received_count integer not null default 0 check(received_count>=0),"
+        "valid_count integer not null default 0 check(valid_count>=0),"
+        "enrolled_count integer not null default 0 check(enrolled_count>=0),"
+        "duplicate_count integer not null default 0 check(duplicate_count>=0),"
+        "confirmation_count integer not null default 0 check(confirmation_count>=0),"
+        "failed_count integer not null default 0 check(failed_count>=0),"
+        "initial_summary_sent_at integer,"
+        "created_at integer not null,"
+        "submitted_at integer,"
+        "completed_at integer,"
+        "updated_at integer not null)",
+        "create unique index if not exists idx_bot_add_open_draft "
+        "on bot_add_batches(chat_id,user_id) where state='draft'",
+        "create index if not exists idx_bot_add_batches_state_updated "
+        "on bot_add_batches(state,updated_at,id)",
+        "create table if not exists bot_add_shards("
+        "id integer primary key autoincrement,"
+        "batch_id integer not null references bot_add_batches(id),"
+        "shard_index integer not null check(shard_index>=0),"
+        "state text not null check(state in ('queued','processing','complete','cancelled')),"
+        "item_count integer not null default 0 check(item_count>=0),"
+        "processed_count integer not null default 0 "
+        "check(processed_count>=0 and processed_count<=item_count),"
+        "created_at integer not null,"
+        "completed_at integer,"
+        "updated_at integer not null,"
+        "unique(batch_id,shard_index))",
+        "create index if not exists idx_bot_add_shards_state "
+        "on bot_add_shards(state,updated_at,id)",
+        "create table if not exists bot_add_items("
+        "id integer primary key autoincrement,"
+        "batch_id integer not null references bot_add_batches(id),"
+        "source_message_id integer not null,"
+        "source_index integer not null check(source_index>=0),"
+        "input_kind text not null check(input_kind in ('magnet','http_url','https_url','bc_link')),"
+        "raw_input text,"
+        "raw_input_expires_at integer,"
+        "redacted_input text not null,"
+        "input_sha256 text not null,"
+        "canonical_identity text,"
+        "infohash_v1 text,"
+        "infohash_v2 text,"
+        "display_name text,"
+        "normalized_media_id text,"
+        "total_size integer check(total_size is null or total_size>=0),"
+        "primary_video_size integer check(primary_video_size is null or primary_video_size>=0),"
+        "state text not null default 'received' check(state in "
+        "('received','invalid','resolving','duplicate_local','waiting_probe_slot',"
+        "'metadata_wait','metadata_retry_wait','metadata_unavailable','prechecking',"
+        "'duplicate_remote','needs_confirmation','ready','enrolling','enrolled',"
+        "'enrolled_hold','failed','cancelled')),"
+        "decision text,"
+        "decision_reason text,"
+        "qbt_hash text,"
+        "qbt_precheck_tag text,"
+        "remote_match_json text,"
+        "approval_generation integer not null default 0 check(approval_generation>=0),"
+        "metadata_probe_attempt integer not null default 0 check(metadata_probe_attempt>=0),"
+        "metadata_probe_started_at integer,"
+        "metadata_probe_deadline integer,"
+        "metadata_next_poll_at integer,"
+        "metadata_retry_at integer,"
+        "metadata_lease_owner text,"
+        "metadata_lease_generation integer not null default 0 "
+        "check(metadata_lease_generation>=0),"
+        "approved_by text,"
+        "approved_at integer,"
+        "attempts integer not null default 0 check(attempts>=0),"
+        "next_run_at integer,"
+        "last_error text,"
+        "created_at integer not null,"
+        "updated_at integer not null,"
+        "check(raw_input is null or raw_input_expires_at is not null),"
+        "check(total_size is null or primary_video_size is null or primary_video_size<=total_size),"
+        "unique(batch_id,source_message_id,source_index),"
+        "unique(batch_id,input_sha256))",
+        "create index if not exists idx_bot_add_items_claim "
+        "on bot_add_items(state,metadata_retry_at,id)",
+        "create index if not exists idx_bot_add_items_probe_deadline "
+        "on bot_add_items(metadata_probe_deadline,state)",
+        "create index if not exists idx_bot_add_items_canonical_identity "
+        "on bot_add_items(canonical_identity)",
+        "create index if not exists idx_bot_add_items_qbt_hash on bot_add_items(qbt_hash)",
+        "create table if not exists bot_add_events("
+        "id integer primary key autoincrement,"
+        "batch_id integer references bot_add_batches(id),"
+        "item_id integer references bot_add_items(id),"
+        "event_type text not null,"
+        "from_state text,"
+        "to_state text,"
+        "actor_chat_id text,"
+        "actor_user_id text,"
+        "actor_role text,"
+        "reason_code text not null,"
+        "safe_evidence_json text not null default '{}',"
+        "created_at integer not null,"
+        "check(batch_id is not null or item_id is not null))",
+        "create index if not exists idx_bot_add_events_batch_time "
+        "on bot_add_events(batch_id,created_at,id)",
+        "create index if not exists idx_bot_add_events_item_time "
+        "on bot_add_events(item_id,created_at,id)",
+        "create trigger if not exists trg_bot_add_events_append_only_update "
+        "before update on bot_add_events begin "
+        "select raise(abort,'bot_add_events_append_only'); end",
+        "create trigger if not exists trg_bot_add_events_append_only_delete "
+        "before delete on bot_add_events begin "
+        "select raise(abort,'bot_add_events_append_only'); end",
+        "create table if not exists remote_media_index("
+        "video_path text primary key,"
+        "normalized_id text,"
+        "size integer check(size is null or size>=0),"
+        "raw_basename text,"
+        "status text,"
+        "source text,"
+        "updated_at integer not null)",
+        "create index if not exists idx_remote_media_normalized_id "
+        "on remote_media_index(normalized_id)",
+        "create table if not exists bot_warning_inbox("
+        "id integer primary key autoincrement,"
+        "warning_key text not null unique,"
+        "severity text not null check(severity in ('info','warning','error','critical')),"
+        "topic text not null,"
+        "safe_message text not null,"
+        "related_hash text,"
+        "related_job_id integer references torrent_jobs(id),"
+        "related_batch_id integer references bot_add_batches(id),"
+        "related_item_id integer references bot_add_items(id),"
+        "occurrence_count integer not null default 1 check(occurrence_count>=1),"
+        "first_occurred_at integer not null,"
+        "last_occurred_at integer not null,"
+        "updated_at integer not null,"
+        "resolved integer not null default 0 check(resolved in (0,1)),"
+        "resolved_at integer,"
+        "resolved_by text)",
+        "create index if not exists idx_bot_warning_open_severity "
+        "on bot_warning_inbox(resolved,severity,last_occurred_at,id)",
+        "create index if not exists idx_bot_warning_topic_time "
+        "on bot_warning_inbox(topic,last_occurred_at,id)",
+        "create index if not exists idx_bot_warning_related_hash "
+        "on bot_warning_inbox(related_hash,last_occurred_at,id)",
+        "create table if not exists bot_warning_reads("
+        "warning_id integer not null references bot_warning_inbox(id) on delete cascade,"
+        "chat_id text not null,"
+        "user_id text not null,"
+        "read_at integer not null,"
+        "primary key(warning_id,chat_id,user_id))",
+        "create index if not exists idx_bot_warning_reads_actor "
+        "on bot_warning_reads(chat_id,user_id,warning_id)",
         "create table if not exists capacity_reclaims(id integer primary key autoincrement, reclaim_key text not null unique, hash text not null, name text not null, magnet_uri text not null, host_path text not null, content_path text not null, allocated_bytes integer not null default 0, completed_bytes integer not null default 0, progress real not null default 0, dead_since integer, state text not null, recheck_state text not null default 'pending', recheck_error text, notification_ids_json text not null default '[]', created_at integer not null, reclaimed_at integer, updated_at integer not null)",
         "create index if not exists idx_capacity_reclaims_hash_time on capacity_reclaims(hash,reclaimed_at desc)",
         "create index if not exists idx_capacity_reclaims_state on capacity_reclaims(state,updated_at)",
@@ -586,6 +743,7 @@ def migration_sql() -> list[str]:
         "where state in ('deleting','quarantined')) "
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "insert or ignore into schema_migrations(version,name,applied_at) values(15,'shared_capacity_assessment_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(16,'telegram_add_queue_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(3,'resource_ledger_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(4,'capacity_state_v1',strftime('%s','now'))",
