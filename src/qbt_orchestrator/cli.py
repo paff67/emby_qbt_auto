@@ -390,7 +390,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         _truthy(os.environ.get("QBT_ORCH_METADATA_PROBE_ENABLED")) is True
     )
     metadata_probe_coordinator = None
-    if metadata_probe_enabled:
+    if metadata_probe_enabled and not dry_run:
         metadata_probe_coordinator = MetadataProbeCoordinator(
             BotAddQueueRepository(state_db),
             QbtPrecheckGateway(qbt, executor),

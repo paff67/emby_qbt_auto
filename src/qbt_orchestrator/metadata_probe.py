@@ -237,6 +237,12 @@ class MetadataProbeCoordinator:
             verified = self.gateway.torrent_files(torrent_hash)
             if not self.gateway.all_priorities_zero(verified):
                 raise ValueError("qbt_precheck_priority_verify_failed")
+            current = self.gateway.torrent_info(torrent_hash)
+            current_hash = str(current.get("hash") or torrent_hash).lower()
+            if current_hash != torrent_hash:
+                raise ValueError("qbt_precheck_hash_mismatch")
+            if not self._is_stopped_state(current.get("state")):
+                raise ValueError("qbt_precheck_not_stopped")
             self.repository.transition_item(
                 item_id,
                 {"metadata_wait"},
@@ -484,6 +490,23 @@ class MetadataProbeCoordinator:
             "order by b.updated_at,b.id,i.id",
             (now, now),
         )
+        active_batches = {
+            int(row["batch_id"])
+            for row in self._query(
+                "select distinct i.batch_id from bot_add_items i "
+                "join bot_add_batches b on b.id=i.batch_id "
+                "where i.state='metadata_wait' and b.state in "
+                "('queued','processing','awaiting_confirmation')",
+                (),
+            )
+        }
+        eligible_batches = {int(row["batch_id"]) for row in rows}
+        if len(active_batches | eligible_batches) >= 3:
+            rows = [
+                row
+                for row in rows
+                if int(row["batch_id"]) not in active_batches
+            ]
         by_batch: dict[int, list[dict[str, Any]]] = {}
         order: list[int] = []
         for row in rows:
@@ -514,3 +537,14 @@ class MetadataProbeCoordinator:
     def _tag_for(item: Mapping[str, Any]) -> str:
         material = f"{int(item['id'])}:{str(item.get('input_sha256') or '')}"
         return "add-item-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _is_stopped_state(value: Any) -> bool:
+        return str(value or "").strip().lower() in {
+            "stopped",
+            "stoppeddl",
+            "stoppedup",
+            "paused",
+            "pauseddl",
+            "pausedup",
+        }

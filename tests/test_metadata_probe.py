@@ -35,13 +35,19 @@ class RecordingExecutor:
 
 
 class SnapshotQbt:
-    def __init__(self, files=None):
+    def __init__(self, files=None, *, state="stoppedDL"):
         self.files = list(files or [])
         self.file_reads: list[str] = []
+        self.state = state
+        self.info_reads: list[str] = []
 
     def torrent_files(self, torrent_hash):
         self.file_reads.append(torrent_hash)
         return [dict(row) for row in self.files]
+
+    def torrent_info(self, torrent_hash):
+        self.info_reads.append(torrent_hash)
+        return {"hash": torrent_hash, "state": self.state}
 
 
 def test_precheck_gateway_uses_existing_executor_and_fixed_safe_payload():
@@ -104,6 +110,15 @@ def test_precheck_gateway_reconciles_an_exact_opaque_tag_and_rejects_ambiguity()
     )
     with pytest.raises(ValueError, match="^qbt_precheck_tag_ambiguous$"):
         gateway.find_by_tag(tag)
+
+
+def test_precheck_gateway_reads_current_torrent_state_through_existing_client():
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    qbt = SnapshotQbt(state="pausedDL")
+    gateway = QbtPrecheckGateway(qbt, RecordingExecutor())
+    assert gateway.torrent_info("a" * 40)["state"] == "pausedDL"
+    assert qbt.info_reads == ["a" * 40]
 
 
 def test_precheck_gateway_validation_never_calls_executor_for_unsafe_inputs():
@@ -179,6 +194,8 @@ class FakeProbeGateway:
         self.zeroed: list[str] = []
         self.removed: list[str] = []
         self.find_calls: list[str] = []
+        self.info_state = "stoppedDL"
+        self.info_reads: list[str] = []
         self.fail_add = False
         self.lose_add_response = False
 
@@ -222,6 +239,10 @@ class FakeProbeGateway:
 
     def torrent_files(self, torrent_hash: str):
         return [dict(row) for row in self.files_by_hash.get(torrent_hash, [])]
+
+    def torrent_info(self, torrent_hash: str):
+        self.info_reads.append(torrent_hash)
+        return {"hash": torrent_hash, "state": self.info_state}
 
     def zero_file_priorities(self, torrent_hash: str, files, *, guard=None):
         if guard is not None and not guard():
@@ -302,6 +323,43 @@ def test_single_batch_can_fill_all_three_probe_slots(tmp_path):
     ) == 3
 
 
+def test_three_batches_reserve_new_slots_for_batches_without_an_active_probe(tmp_path):
+    from qbt_orchestrator.metadata_probe import (
+        MetadataProbeConfig,
+        MetadataProbeCoordinator,
+    )
+
+    queue, gateway, _coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[2, 1, 1]
+    )
+    one_slot = MetadataProbeCoordinator(
+        queue,
+        gateway,
+        owner="worker-a",
+        now=clock,
+        config=MetadataProbeConfig(slots=1),
+    )
+    first = one_slot.tick()
+    active = queue.get_item(first["started"][0])
+    assert active["batch_id"] == queue.get_item(item_ids[0])["batch_id"]
+
+    three_slots = MetadataProbeCoordinator(
+        queue,
+        gateway,
+        owner="worker-a",
+        now=clock,
+        config=MetadataProbeConfig(slots=3),
+    )
+    filled = three_slots.tick()
+    filled_batches = {
+        queue.get_item(item_id)["batch_id"] for item_id in filled["started"]
+    }
+    all_batches = {queue.get_item(item_id)["batch_id"] for item_id in item_ids}
+
+    assert len(filled["started"]) == 2
+    assert filled_batches == all_batches - {active["batch_id"]}
+
+
 def test_polling_is_due_only_and_tick_never_sleeps(tmp_path, monkeypatch):
     _queue, gateway, coordinator, clock, _item_ids, _db = _probe_fixture(
         tmp_path, batches=[1]
@@ -337,6 +395,30 @@ def test_ready_probe_is_stopped_zeroed_verified_and_left_for_prechecking(tmp_pat
     assert gateway.stopped == [ready["qbt_hash"]]
     assert gateway.zeroed == [ready["qbt_hash"]]
     assert gateway.files_by_hash[ready["qbt_hash"]][0]["priority"] == 0
+    assert gateway.info_reads == [ready["qbt_hash"]]
+
+
+@pytest.mark.parametrize(
+    "state", ["downloading", "uploading", "checkingDL", "forcedDL"]
+)
+def test_ready_probe_does_not_advance_until_qbt_confirms_it_is_stopped(
+    tmp_path, state
+):
+    queue, gateway, coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    gateway.by_tag[item["qbt_precheck_tag"]]["state"] = "stoppedDL"
+    gateway.info_state = state
+    clock.advance(5)
+
+    result = coordinator.tick()
+
+    stored = queue.get_item(item_ids[0])
+    assert result["ready"] == []
+    assert stored["state"] == "metadata_wait"
+    assert stored["last_error"] == "qbt_precheck_failed"
 
 
 def test_probe_windows_and_backoffs_end_in_metadata_unavailable(tmp_path):
@@ -587,7 +669,7 @@ def test_daemon_runtime_only_schedules_optional_metadata_probe_and_passes_sync_s
     assert disabled.metadata_probe_tick() == {"status": "disabled"}
 
 
-def test_cli_metadata_probe_feature_flag_defaults_off_and_enables_one_coordinator(
+def test_cli_metadata_probe_flag_defaults_off_skips_global_dry_run_and_enables_live(
     tmp_path, monkeypatch
 ):
     import argparse
@@ -621,6 +703,29 @@ def test_cli_metadata_probe_feature_flag_defaults_off_and_enables_one_coordinato
     assert disabled.metadata_probe_coordinator is None
 
     monkeypatch.setenv("QBT_ORCH_METADATA_PROBE_ENABLED", "1")
+    dry_enabled, _ = cli._build_runtime(ns, tmp_path / "state.sqlite")
+    assert dry_enabled.metadata_probe_coordinator is None
+    assert dry_enabled.metadata_probe_tick() == {"status": "disabled"}
+
+    from qbt_orchestrator.bot_add_queue import BotAddQueueRepository
+
+    queue = BotAddQueueRepository(tmp_path / "state.sqlite")
+    batch = queue.open_draft("chat", "user")
+    queue.append_message(
+        batch["id"], 1, ["magnet:?" + "xt=urn:btih:" + "a" * 40]
+    )
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolved")
+    queue.transition_item(
+        item["id"], {"resolving"}, "waiting_probe_slot", "probe_required"
+    )
+    dry_enabled.metadata_probe_tick()
+    assert queue.get_item(item["id"])["state"] == "waiting_probe_slot"
+
+    ns.dry_run = False
+    monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
     enabled, _ = cli._build_runtime(ns, tmp_path / "state.sqlite")
     assert enabled.metadata_probe_coordinator is not None
     assert [task.name for task in enabled.loop_tasks].count("metadata_probe") == 1
+    enabled.executor.close(timeout=1)

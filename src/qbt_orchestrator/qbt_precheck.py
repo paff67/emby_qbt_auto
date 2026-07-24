@@ -80,6 +80,10 @@ class QbtPrecheckGateway:
         safe_hash = self._hash(torrent_hash)
         return [dict(row) for row in self.qbt.torrent_files(safe_hash)]
 
+    def torrent_info(self, torrent_hash: str) -> dict[str, Any]:
+        safe_hash = self._hash(torrent_hash)
+        return dict(self.qbt.torrent_info(safe_hash))
+
     def zero_file_priorities(
         self,
         torrent_hash: str,
