@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "bot_add_items",
     "bot_add_events",
     "remote_media_index",
+    "remote_media_index_refresh_state",
     "bot_warning_inbox",
     "bot_warning_reads",
 }
@@ -522,7 +523,7 @@ def test_migration_16_repairs_legacy_item_lease_schema_without_losing_rows(tmp_p
     try:
         assert "metadata_lease_until" in _columns(con, "bot_add_items")
         assert con.execute("select id from bot_add_items where id=?", (item_id,)).fetchone()
-        assert con.execute("select max(version) from schema_migrations").fetchone()[0] == 16
+        assert con.execute("select max(version) from schema_migrations").fetchone()[0] == 17
     finally:
         con.close()
 
@@ -547,6 +548,31 @@ def test_migration_16_upgrades_a_database_marked_at_version_15(tmp_path):
         assert EXPECTED_TABLES <= _table_names(con)
         assert con.execute(
             "select count(*) from schema_migrations where version=16"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_migration_17_adds_durable_remote_index_refresh_metadata_idempotently(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    migrate(db)
+    con = readonly_connect(db)
+    try:
+        assert {
+            "source",
+            "requested_generation",
+            "applied_generation",
+            "refreshed_at",
+            "row_count",
+            "last_attempt_at",
+            "last_result",
+        } <= _columns(con, "remote_media_index_refresh_state")
+        assert con.execute(
+            "select name from schema_migrations where version=17"
+        ).fetchone()[0] == "remote_media_index_refresh_v1"
+        assert con.execute(
+            "select count(*) from schema_migrations where version=17"
         ).fetchone()[0] == 1
     finally:
         con.close()

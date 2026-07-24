@@ -782,6 +782,14 @@ def migration_sql() -> list[str]:
         "updated_at integer not null)",
         "create index if not exists idx_remote_media_normalized_id "
         "on remote_media_index(normalized_id)",
+        "create table if not exists remote_media_index_refresh_state("
+        "source text primary key,"
+        "requested_generation integer not null default 0 check(requested_generation>=0),"
+        "applied_generation integer not null default 0 check(applied_generation>=0),"
+        "refreshed_at integer,"
+        "row_count integer not null default 0 check(row_count>=0),"
+        "last_attempt_at integer,"
+        "last_result text not null default 'never')",
         "create table if not exists bot_warning_inbox("
         "id integer primary key autoincrement,"
         "warning_key text not null unique,"
@@ -961,6 +969,7 @@ def migration_sql() -> list[str]:
         "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
         "insert or ignore into schema_migrations(version,name,applied_at) values(15,'shared_capacity_assessment_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(16,'telegram_add_queue_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(17,'remote_media_index_refresh_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(3,'resource_ledger_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(4,'capacity_state_v1',strftime('%s','now'))",
