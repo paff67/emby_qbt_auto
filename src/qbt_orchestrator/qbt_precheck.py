@@ -141,10 +141,25 @@ class QbtPrecheckGateway:
         *,
         guard: Callable[[], bool] | None = None,
     ) -> bool:
+        indices = [row.get("index") for row in files]
+        return self.set_file_priorities(
+            torrent_hash, indices, 0, guard=guard
+        )
+
+    def set_file_priorities(
+        self,
+        torrent_hash: str,
+        indices: Sequence[Any],
+        priority: int,
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
         safe_hash = self._hash(torrent_hash)
-        indices: set[int] = set()
-        for row in files:
-            raw_index = row.get("index")
+        if type(priority) is not int or priority not in {0, 1, 6, 7}:
+            raise ValueError("file_priority")
+        raw_indices = list(indices)
+        parsed_indices: set[int] = set()
+        for raw_index in raw_indices:
             if isinstance(raw_index, bool):
                 raise ValueError("file_index")
             try:
@@ -153,16 +168,16 @@ class QbtPrecheckGateway:
                 raise ValueError("file_index") from exc
             if index < 0:
                 raise ValueError("file_index")
-            indices.add(index)
-        if not indices:
+            parsed_indices.add(index)
+        if not parsed_indices:
             raise ValueError("file_index")
         return bool(
             self._post(
                 "/api/v2/torrents/filePrio",
                 {
                     "hash": safe_hash,
-                    "id": "|".join(str(index) for index in sorted(indices)),
-                    "priority": "0",
+                    "id": "|".join(str(index) for index in sorted(parsed_indices)),
+                    "priority": str(priority),
                 },
                 guard,
             )
@@ -179,6 +194,80 @@ class QbtPrecheckGateway:
             self._post(
                 "/api/v2/torrents/delete",
                 {"hashes": safe_hash, "deleteFiles": "false"},
+                guard,
+            )
+        )
+
+    def set_category(
+        self,
+        torrent_hash: str,
+        category: str,
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        safe_hash = self._hash(torrent_hash)
+        value = str(category or "").strip()
+        if value not in {"auto", "precheck"}:
+            raise ValueError("qbt_category")
+        return bool(
+            self._post(
+                "/api/v2/torrents/setCategory",
+                {"hashes": safe_hash, "category": value},
+                guard,
+            )
+        )
+
+    def add_tags(
+        self,
+        torrent_hash: str,
+        tags: str,
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        return self._write_tags("addTags", torrent_hash, tags, guard)
+
+    def remove_tags(
+        self,
+        torrent_hash: str,
+        tags: str,
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        return self._write_tags("removeTags", torrent_hash, tags, guard)
+
+    def set_force_start(
+        self,
+        torrent_hash: str,
+        value: bool,
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        safe_hash = self._hash(torrent_hash)
+        if type(value) is not bool:
+            raise ValueError("force_start")
+        return bool(
+            self._post(
+                "/api/v2/torrents/setForceStart",
+                {"hashes": safe_hash, "value": str(value).lower()},
+                guard,
+            )
+        )
+
+    def _write_tags(
+        self,
+        action: str,
+        torrent_hash: str,
+        tags: str,
+        guard: Callable[[], bool] | None,
+    ) -> bool:
+        safe_hash = self._hash(torrent_hash)
+        parts = [part.strip() for part in str(tags or "").split(",") if part.strip()]
+        if not parts or any("," in part or len(part) > 128 for part in parts):
+            raise ValueError("qbt_tags")
+        return bool(
+            self._post(
+                f"/api/v2/torrents/{action}",
+                {"hashes": safe_hash, "tags": ",".join(dict.fromkeys(parts))},
                 guard,
             )
         )

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import sqlite3
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Protocol
@@ -608,6 +609,8 @@ class DuplicateMatcher:
         state_db: str | Path,
         *,
         normalizer: FilenameNormalizer | FilenameNormalizerAdapter | None = None,
+        backfill_db: str | Path | None = None,
+        now=None,
         size_tolerance_ratio: float = 0.15,
         min_normalizer_confidence: float = 0.8,
     ):
@@ -635,7 +638,9 @@ class DuplicateMatcher:
         self._tolerance_decimal = Decimal(str(tolerance))
         self.min_normalizer_confidence = confidence_threshold
         self.remote_index = RemoteMediaIndex(
-            self.state_db, backfill_db=None, now=lambda: int(time.time())
+            self.state_db,
+            backfill_db=backfill_db,
+            now=now or (lambda: int(time.time())),
         )
 
     def decide(
@@ -822,3 +827,460 @@ class DuplicateMatcher:
             if len(result) >= _MAX_EVIDENCE:
                 break
         return tuple(result)
+
+
+class CheckedAddService:
+    """Validate prechecked bot items and enroll them without starting qBT.
+
+    This deliberately stays a thin coordinator over the existing queue,
+    duplicate matcher and qBT executor.  SQLite generations are the durable
+    fence; the opaque qBT tag proves that a temporary registration belongs to
+    the item before any external mutation.
+    """
+
+    _STOPPED_STATES = frozenset({"stoppeddl", "stoppedup", "pauseddl", "pausedup"})
+
+    def __init__(
+        self,
+        repository,
+        gateway,
+        matcher: DuplicateMatcher,
+        *,
+        notifications=None,
+        owner: str = "checked-add",
+        now=None,
+        lease_sec: int = 30,
+    ) -> None:
+        if isinstance(lease_sec, bool) or not isinstance(lease_sec, int) or lease_sec <= 0:
+            raise ValueError("lease_sec")
+        self.repository = repository
+        self.gateway = gateway
+        self.matcher = matcher
+        self.notifications = notifications
+        self.owner = str(owner or "checked-add")
+        self.now = now or (lambda: int(time.time()))
+        self.lease_sec = lease_sec
+
+    def tick(self, sync_healthy: bool = True, max_items: int = 20) -> dict[str, Any]:
+        if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
+            raise ValueError("max_items")
+        result: dict[str, Any] = {
+            "suspended": not bool(sync_healthy),
+            "checked": [],
+            "enrolled": [],
+            "duplicates": [],
+            "confirmations": [],
+            "recovered": [],
+            "errors": 0,
+        }
+        if not sync_healthy:
+            return result
+
+        for item in self._items_in_states({"enrolling"}, max_items):
+            try:
+                finished = self._finish_enrollment(dict(item))
+                result["recovered"].append(int(item["id"]))
+                result["enrolled"].append(int(finished["id"]))
+            except (ValueError, RuntimeError):
+                result["errors"] += 1
+
+        remaining = max(0, max_items - len(result["recovered"]))
+        prechecking = self._items_in_states({"prechecking"}, remaining)
+        if prechecking and self.matcher.remote_index.backfill_db is not None:
+            self.matcher.remote_index.refresh()
+        for item in prechecking:
+            item_id = int(item["id"])
+            try:
+                outcome = self._validate_one(item_id)
+                result["checked"].append(item_id)
+                if outcome["state"] == "enrolled":
+                    result["enrolled"].append(item_id)
+                elif outcome["state"] in {"duplicate_local", "duplicate_remote"}:
+                    result["duplicates"].append(item_id)
+                elif outcome["state"] == "needs_confirmation":
+                    result["confirmations"].append(item_id)
+            except (ValueError, RuntimeError, sqlite3.Error):
+                result["errors"] += 1
+        return result
+
+    def approve_hold(
+        self, item_id: int, actor: str, approval_generation: int
+    ) -> dict[str, Any]:
+        current = self.repository.get_item(item_id)
+        if current["state"] == "enrolled_hold":
+            if int(approval_generation) != int(current["approval_generation"]) - 1:
+                raise ValueError("approval_generation_conflict")
+            return current
+        if current["state"] == "enrolling" and current.get("approved_by") == str(actor):
+            if int(approval_generation) != int(current["approval_generation"]) - 1:
+                raise ValueError("approval_generation_conflict")
+            return self._finish_enrollment(current)
+        self._approval_token(current, approval_generation, "needs_confirmation")
+        if self._owned_snapshot(current) is None:
+            raise ValueError("qbt_precheck_ownership")
+        enrolling = self.repository.transition_item(
+            item_id,
+            {"needs_confirmation"},
+            "enrolling",
+            "duplicate_override_approved",
+            {"approved_by": str(actor), "approved_at": int(self.now())},
+            approval_generation=approval_generation,
+        )
+        return self._finish_enrollment(enrolling)
+
+    def cancel(
+        self, item_id: int, actor: str, approval_generation: int
+    ) -> dict[str, Any]:
+        del actor  # Actor is recorded by the Telegram callback event layer.
+        current = self.repository.get_item(item_id)
+        if current["state"] == "cancelled":
+            if int(approval_generation) != int(current["approval_generation"]) - 1:
+                raise ValueError("approval_generation_conflict")
+            return current
+        self._approval_token(current, approval_generation, "needs_confirmation")
+        snapshot = self._owned_snapshot(current, missing_ok=True)
+        if snapshot is not None:
+            if not self.gateway.remove_registration(
+                str(current["qbt_hash"]),
+                guard=lambda: self._approval_owned_guard(
+                    item_id, approval_generation, "needs_confirmation"
+                ),
+            ):
+                raise ValueError("qbt_write_fenced")
+        return self.repository.transition_item(
+            item_id,
+            {"needs_confirmation"},
+            "cancelled",
+            "cancelled_by_operator",
+            approval_generation=approval_generation,
+        )
+
+    def allow_scheduling(
+        self, item_id: int, actor: str, approval_generation: int
+    ) -> dict[str, Any]:
+        del actor
+        current = self.repository.get_item(item_id)
+        if current["state"] == "enrolled":
+            if not current.get("approved_by"):
+                raise ValueError("state_conflict")
+            if int(approval_generation) != int(current["approval_generation"]):
+                raise ValueError("approval_generation_conflict")
+            return current
+        self._approval_token(current, approval_generation, "enrolled_hold")
+        snapshot = self._managed_snapshot(current)
+        tags = self._tags(snapshot)
+        if "hold" in tags:
+            if not self.gateway.remove_tags(
+                str(current["qbt_hash"]),
+                "hold",
+                guard=lambda: self._managed_guard(
+                    item_id, approval_generation, require_hold=True
+                ),
+            ):
+                raise ValueError("qbt_write_fenced")
+        return self.repository.transition_item(
+            item_id,
+            {"enrolled_hold"},
+            "enrolled",
+            "scheduling_allowed",
+            approval_generation=approval_generation,
+        )
+
+    def _validate_one(self, item_id: int) -> dict[str, Any]:
+        now = int(self.now())
+        lease = self._claim_or_renew(item_id, now)
+        generation = int(lease["metadata_lease_generation"])
+        token = (self.owner, generation)
+        current = self.repository.get_item(item_id)
+        snapshot = self._owned_snapshot(current, missing_ok=True)
+
+        # Recovery after qBT accepted duplicate cleanup but SQLite did not.
+        if snapshot is None and current.get("decision") in {
+            "duplicate_local",
+            "duplicate_remote",
+        }:
+            return self.repository.transition_item(
+                item_id,
+                {"prechecking"},
+                str(current["decision"]),
+                str(current.get("decision_reason") or "duplicate_cleanup_recovered"),
+                metadata_lease_owner=token[0],
+                metadata_lease_generation=token[1],
+            )
+        if snapshot is None:
+            self.repository.release_metadata_lease(item_id, *token)
+            raise ValueError("qbt_precheck_ownership")
+
+        files = self.gateway.torrent_files(str(current["qbt_hash"]))
+        primary = select_primary_video(files)
+        if primary is None:
+            self.repository.update_metadata_probe(
+                item_id,
+                token[0],
+                token[1],
+                {"last_error": "primary_video_not_found"},
+            )
+            self.repository.release_metadata_lease(item_id, *token)
+            raise ValueError("primary_video_not_found")
+        total_size = sum(
+            row["size"]
+            for row in files
+            if type(row.get("size")) is int and row["size"] > 0
+        )
+        decision = self.matcher.decide(
+            primary.name,
+            primary.size,
+            canonical_identity=current.get("canonical_identity"),
+        )
+        evidence = {
+            "matches": [asdict(match) for match in decision.matches],
+            "evidence": list(decision.evidence),
+            "warnings": list(decision.warnings),
+        }
+        self.repository.update_metadata_probe(
+            item_id,
+            token[0],
+            token[1],
+            {
+                "display_name": primary.name,
+                "normalized_media_id": decision.normalized_id,
+                "total_size": total_size,
+                "primary_video_size": primary.size,
+                "decision": decision.decision,
+                "decision_reason": decision.reason,
+                "remote_match_json": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                "last_error": None,
+            },
+        )
+
+        if decision.decision in {"duplicate_local", "duplicate_remote"}:
+            if not self.gateway.remove_registration(
+                str(current["qbt_hash"]),
+                guard=lambda: self._lease_owned_guard(item_id, token),
+            ):
+                raise ValueError("qbt_write_fenced")
+            return self.repository.transition_item(
+                item_id,
+                {"prechecking"},
+                decision.decision,
+                decision.reason,
+                metadata_lease_owner=token[0],
+                metadata_lease_generation=token[1],
+            )
+        if decision.decision == "needs_confirmation":
+            pending = self.repository.transition_item(
+                item_id,
+                {"prechecking"},
+                "needs_confirmation",
+                decision.reason,
+                metadata_lease_owner=token[0],
+                metadata_lease_generation=token[1],
+            )
+            self._notify_confirmation(pending)
+            return pending
+        ready = self.repository.transition_item(
+            item_id,
+            {"prechecking"},
+            "ready",
+            decision.reason,
+            metadata_lease_owner=token[0],
+            metadata_lease_generation=token[1],
+        )
+        enrolling = self.repository.transition_item(
+            item_id, {"ready"}, "enrolling", "automatic_enrollment"
+        )
+        return self._finish_enrollment(enrolling)
+
+    def _finish_enrollment(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        item_id = int(item["id"])
+        current = self.repository.get_item(item_id)
+        if current["state"] in {"enrolled", "enrolled_hold"}:
+            return current
+        if current["state"] != "enrolling":
+            raise ValueError("state_conflict")
+        now = int(self.now())
+        lease = self._claim_or_renew(item_id, now)
+        token = (self.owner, int(lease["metadata_lease_generation"]))
+        current = self.repository.get_item(item_id)
+        opaque_tag = str(current.get("qbt_precheck_tag") or "")
+        self._owned_snapshot(current)
+        held = bool(current.get("approved_by")) or current.get("decision") == "needs_confirmation"
+        added_tags = "checked,maybe-duplicate" if held else "checked"
+        removed_tags = "precheck,metadata-probe" if held else "precheck,metadata-probe,hold"
+        guard = lambda: self._lease_owned_guard(item_id, token)
+        primary = select_primary_video(
+            self.gateway.torrent_files(str(current["qbt_hash"]))
+        )
+        if primary is None:
+            raise ValueError("primary_video_not_found")
+        actions = (
+            (
+                self.gateway.set_file_priorities,
+                (str(current["qbt_hash"]), [primary.index], 1),
+            ),
+            (self.gateway.set_category, (str(current["qbt_hash"]), "auto")),
+            (self.gateway.add_tags, (str(current["qbt_hash"]), added_tags)),
+            (self.gateway.remove_tags, (str(current["qbt_hash"]), removed_tags)),
+            (self.gateway.set_force_start, (str(current["qbt_hash"]), False)),
+            (self.gateway.stop, (str(current["qbt_hash"]),)),
+        )
+        for action, args in actions:
+            if not action(*args, guard=guard):
+                raise ValueError("qbt_write_fenced")
+        approval_generation = int(current["approval_generation"])
+        finished = self.repository.transition_item(
+            item_id,
+            {"enrolling"},
+            "enrolled_hold" if held else "enrolled",
+            "approved_enrollment" if held else "automatic_enrollment_complete",
+            metadata_lease_owner=token[0],
+            metadata_lease_generation=token[1],
+            approval_generation=approval_generation,
+        )
+        # The terminal database state is authoritative.  Leaving an opaque tag
+        # is harmless, so removal is intentionally best effort after commit.
+        try:
+            self.gateway.remove_tags(
+                str(current["qbt_hash"]),
+                opaque_tag,
+                guard=lambda: self.repository.get_item(item_id)["state"]
+                == finished["state"],
+            )
+        except Exception:
+            pass
+        return finished
+
+    def _notify_confirmation(self, item: Mapping[str, Any]) -> None:
+        if self.notifications is None:
+            return
+        batch = self.repository.get_batch(int(item["batch_id"]))
+        generation = int(item["approval_generation"])
+        self.notifications.enqueue_with_status(
+            batch["chat_id"],
+            "download_confirmation",
+            "检查完成，需要你确认；当前任务保持暂停。",
+            level="warning",
+            payload={
+                "item_id": int(item["id"]),
+                "approval_generation": generation,
+                "normalized_media_id": item.get("normalized_media_id"),
+                "primary_video_size": item.get("primary_video_size"),
+            },
+            dedupe_key=f"checked-add-confirm:{int(item['id'])}:{generation}",
+        )
+
+    def _items_in_states(self, states: set[str], limit: int) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        values = sorted(states)
+        placeholders = ",".join("?" for _ in values)
+        con = readonly_connect(self.repository.state_db)
+        try:
+            return [
+                dict(row)
+                for row in con.execute(
+                    f"select * from bot_add_items where state in ({placeholders}) "
+                    "order by updated_at,id limit ?",
+                    (*values, int(limit)),
+                )
+            ]
+        finally:
+            con.close()
+
+    def _claim_or_renew(self, item_id: int, now: int) -> dict[str, Any]:
+        current = self.repository.get_item(item_id)
+        if (
+            str(current.get("metadata_lease_owner") or "") == self.owner
+            and int(current.get("metadata_lease_until") or 0) > now
+            and int(current.get("metadata_lease_generation") or 0) > 0
+        ):
+            return self.repository.renew_metadata_lease(
+                item_id,
+                self.owner,
+                int(current["metadata_lease_generation"]),
+                now + self.lease_sec,
+            )
+        return self.repository.claim_metadata_lease(
+            item_id, self.owner, now + self.lease_sec
+        )
+
+    def _owned_snapshot(
+        self, item: Mapping[str, Any], *, missing_ok: bool = False
+    ) -> dict[str, Any] | None:
+        torrent_hash = str(item.get("qbt_hash") or "").lower()
+        tag = str(item.get("qbt_precheck_tag") or "")
+        snapshot = self.gateway.torrent_info(torrent_hash)
+        if not str(snapshot.get("state") or "").strip():
+            if missing_ok:
+                return None
+            raise ValueError("qbt_precheck_missing")
+        if str(snapshot.get("hash") or "").lower() != torrent_hash:
+            raise ValueError("qbt_precheck_hash_mismatch")
+        if not tag or tag not in self._tags(snapshot):
+            raise ValueError("qbt_precheck_tag_mismatch")
+        if str(snapshot.get("state") or "").strip().lower() not in self._STOPPED_STATES:
+            raise ValueError("qbt_precheck_not_stopped")
+        return dict(snapshot)
+
+    def _managed_snapshot(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        torrent_hash = str(item.get("qbt_hash") or "").lower()
+        snapshot = self.gateway.torrent_info(torrent_hash)
+        if str(snapshot.get("hash") or "").lower() != torrent_hash:
+            raise ValueError("qbt_enrolled_hash_mismatch")
+        if str(snapshot.get("category") or "") != "auto" or "checked" not in self._tags(snapshot):
+            raise ValueError("qbt_enrolled_ownership")
+        return dict(snapshot)
+
+    def _lease_owned_guard(self, item_id: int, token: tuple[str, int]) -> bool:
+        try:
+            current = self.repository.get_item(item_id)
+            if (
+                current.get("state") not in {"prechecking", "enrolling"}
+                or str(current.get("metadata_lease_owner") or "") != token[0]
+                or int(current.get("metadata_lease_generation") or 0) != token[1]
+                or int(current.get("metadata_lease_until") or 0) <= int(self.now())
+            ):
+                return False
+            return self._owned_snapshot(current) is not None
+        except Exception:
+            return False
+
+    def _approval_owned_guard(self, item_id: int, generation: int, state: str) -> bool:
+        try:
+            current = self.repository.get_item(item_id)
+            return (
+                current["state"] == state
+                and int(current["approval_generation"]) == int(generation)
+                and self._owned_snapshot(current) is not None
+            )
+        except Exception:
+            return False
+
+    def _managed_guard(self, item_id: int, generation: int, *, require_hold: bool) -> bool:
+        try:
+            current = self.repository.get_item(item_id)
+            snapshot = self._managed_snapshot(current)
+            return (
+                current["state"] == "enrolled_hold"
+                and int(current["approval_generation"]) == int(generation)
+                and (not require_hold or "hold" in self._tags(snapshot))
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _approval_token(
+        item: Mapping[str, Any], generation: int, expected_state: str
+    ) -> None:
+        if item.get("state") != expected_state:
+            raise ValueError("state_conflict")
+        if int(item.get("approval_generation") or 0) != int(generation):
+            raise ValueError("approval_generation_conflict")
+
+    @staticmethod
+    def _tags(snapshot: Mapping[str, Any]) -> set[str]:
+        return {
+            part.strip()
+            for part in str(snapshot.get("tags") or "").split(",")
+            if part.strip()
+        }

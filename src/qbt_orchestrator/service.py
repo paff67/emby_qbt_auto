@@ -299,6 +299,7 @@ class DaemonRuntime:
         junk_janitor=None,
         observe_promotion_service: ObservePromotionService | None = None,
         metadata_probe_coordinator=None,
+        checked_add_service=None,
         junk_file_refresh_limit: int = 3,
         carousel_service=None,
         carousel_enabled: bool = True,
@@ -447,6 +448,7 @@ class DaemonRuntime:
         self.junk_janitor = junk_janitor
         self.observe_promotion_service = observe_promotion_service
         self.metadata_probe_coordinator = metadata_probe_coordinator
+        self.checked_add_service = checked_add_service
         self.path_reconciler = path_reconciler
         self.preemption_service = preemption_service
         self.soak_dry_run = soak_dry_run or dry_run
@@ -591,6 +593,15 @@ class DaemonRuntime:
                     max_runtime_sec=2,
                 )
             )
+        if self.checked_add_service is not None:
+            tasks.append(
+                LoopTask(
+                    "checked_add",
+                    5,
+                    self.checked_add_tick,
+                    max_runtime_sec=2,
+                )
+            )
         return tasks
 
     def metadata_probe_tick(self) -> dict:
@@ -601,6 +612,12 @@ class DaemonRuntime:
             sync_healthy=sync_healthy,
             snapshots=snapshots,
         )
+
+    def checked_add_tick(self) -> dict:
+        if self.checked_add_service is None:
+            return {"status": "disabled"}
+        _snapshots, sync_healthy, _sampled = self._capture_safety_snapshot()
+        return self.checked_add_service.tick(sync_healthy=sync_healthy)
 
     def maintenance_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
@@ -1391,6 +1408,7 @@ class DaemonRuntime:
                 "background_event_workers": bool(self.background_event_workers),
                 "background_periodic_workers": bool(self.background_periodic_workers),
                 "metadata_probe": self.metadata_probe_coordinator is not None,
+                "checked_add": self.checked_add_service is not None,
                 "scheduler_alerts": bool(self.scheduler_alert_service.config.enabled)
                 if hasattr(self.scheduler_alert_service, "config")
                 else False,

@@ -8,6 +8,7 @@ from .carousel import CarouselService
 from .bot_add_queue import BotAddQueueRepository
 from .capacity_reclaim import DeadPartialReclaimer
 from .capacity_assessment import CapacityAssessmentBuilder, CapacityAssessmentStore
+from .checked_add import CheckedAddService, DuplicateMatcher
 from .db import migrate, readonly_connect, readonly_counts, recover_jobs
 from .executor import Executor
 from .integrations.qbt import QbtDockerClient, QbtHttpClient
@@ -394,6 +395,25 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         metadata_probe_coordinator = MetadataProbeCoordinator(
             BotAddQueueRepository(state_db),
             QbtPrecheckGateway(qbt, executor),
+        )
+    checked_add_enabled = (
+        _truthy(os.environ.get("QBT_ORCH_CHECKED_ADD_ENABLED")) is True
+    )
+    checked_add_service = None
+    if checked_add_enabled and not dry_run:
+        checked_queue = BotAddQueueRepository(state_db)
+        checked_add_service = CheckedAddService(
+            checked_queue,
+            QbtPrecheckGateway(qbt, executor),
+            DuplicateMatcher(
+                state_db,
+                normalizer=_build_normalizer_from_env(os.environ),
+                backfill_db=os.environ.get(
+                    "QBT_ORCH_TELEGRAM_BACKFILL_DB",
+                    "/opt/qbt/gdrive-backfill/state/backfill.sqlite",
+                ),
+            ),
+            notifications=BotNotificationRepository(state_db),
         )
     capacity_assessment_builder = CapacityAssessmentBuilder(
         viability_stale_sec=viability_stale_sec
@@ -792,6 +812,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         junk_janitor=junk_janitor,
         observe_promotion_service=observe_promotion_service,
         metadata_probe_coordinator=metadata_probe_coordinator,
+        checked_add_service=checked_add_service,
         junk_file_refresh_limit=int(os.environ.get("QBT_ORCH_JUNK_FILE_REFRESH_LIMIT", "3")),
         carousel_service=carousel_service,
         carousel_enabled=carousel_enabled,

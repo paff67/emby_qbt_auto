@@ -73,6 +73,7 @@ _METADATA_LEASE_STATES = frozenset(
         "metadata_wait",
         "metadata_retry_wait",
         "prechecking",
+        "enrolling",
     }
 )
 _ALLOWED_TRANSITIONS = {
@@ -121,7 +122,9 @@ _ALLOWED_TRANSITIONS = {
             "cancelled",
         }
     ),
-    "needs_confirmation": frozenset({"duplicate_remote", "ready", "failed", "cancelled"}),
+    "needs_confirmation": frozenset(
+        {"duplicate_remote", "ready", "enrolling", "failed", "cancelled"}
+    ),
     "ready": frozenset({"enrolling", "cancelled"}),
     "enrolling": frozenset({"enrolled", "enrolled_hold", "failed", "cancelled"}),
     "enrolled_hold": frozenset({"enrolled"}),
@@ -175,6 +178,13 @@ _METADATA_PROGRESS_FIELDS = frozenset(
         "metadata_retry_at",
         "next_run_at",
         "last_error",
+        "display_name",
+        "normalized_media_id",
+        "total_size",
+        "primary_video_size",
+        "decision",
+        "decision_reason",
+        "remote_match_json",
     }
 )
 _SAFE_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -606,23 +616,24 @@ class BotAddQueueRepository:
                 )
             ):
                 raise ValueError("metadata_retry_not_due")
-            required_raw_until = max(
-                until,
-                int(row["metadata_probe_deadline"] or 0),
-            )
-            raw_expires_at = row["raw_input_expires_at"]
-            if (
-                row["raw_input"] is None
-                or raw_expires_at is None
-                or int(raw_expires_at) < required_raw_until
-            ):
-                self._terminalize_metadata_operation_without_raw(
-                    con,
-                    row,
-                    now=now,
-                    required_raw_until=required_raw_until,
+            if str(row["state"]) not in {"prechecking", "enrolling"}:
+                required_raw_until = max(
+                    until,
+                    int(row["metadata_probe_deadline"] or 0),
                 )
-                return {"__error__": "raw_input_unavailable"}
+                raw_expires_at = row["raw_input_expires_at"]
+                if (
+                    row["raw_input"] is None
+                    or raw_expires_at is None
+                    or int(raw_expires_at) < required_raw_until
+                ):
+                    self._terminalize_metadata_operation_without_raw(
+                        con,
+                        row,
+                        now=now,
+                        required_raw_until=required_raw_until,
+                    )
+                    return {"__error__": "raw_input_unavailable"}
             current_generation = int(row["metadata_lease_generation"] or 0)
             next_generation = current_generation + 1
             cursor = con.execute(
@@ -682,23 +693,24 @@ class BotAddQueueRepository:
                 or int(row["metadata_lease_until"]) <= now
             ):
                 raise ValueError("metadata_lease_conflict")
-            required_raw_until = max(
-                until,
-                int(row["metadata_probe_deadline"] or 0),
-            )
-            raw_expires_at = row["raw_input_expires_at"]
-            if (
-                row["raw_input"] is None
-                or raw_expires_at is None
-                or int(raw_expires_at) < required_raw_until
-            ):
-                self._terminalize_metadata_operation_without_raw(
-                    con,
-                    row,
-                    now=now,
-                    required_raw_until=required_raw_until,
+            if str(row["state"]) not in {"prechecking", "enrolling"}:
+                required_raw_until = max(
+                    until,
+                    int(row["metadata_probe_deadline"] or 0),
                 )
-                return {"__error__": "raw_input_unavailable"}
+                raw_expires_at = row["raw_input_expires_at"]
+                if (
+                    row["raw_input"] is None
+                    or raw_expires_at is None
+                    or int(raw_expires_at) < required_raw_until
+                ):
+                    self._terminalize_metadata_operation_without_raw(
+                        con,
+                        row,
+                        now=now,
+                        required_raw_until=required_raw_until,
+                    )
+                    return {"__error__": "raw_input_unavailable"}
             cursor = con.execute(
                 "update bot_add_items set metadata_lease_until=?,updated_at=? "
                 "where id=? and metadata_lease_owner=? and metadata_lease_generation=? "
@@ -965,6 +977,7 @@ class BotAddQueueRepository:
 
             approval_required = (
                 (old_state == "enrolling" and target_state in {"enrolled", "enrolled_hold", "failed"})
+                or (old_state == "needs_confirmation" and target_state in {"enrolling", "cancelled"})
                 or held_release
                 or metadata_callback
             )
@@ -1009,11 +1022,15 @@ class BotAddQueueRepository:
                     )
 
             assignments: dict[str, Any] = dict(proposed_fields)
-            if target_state in {"enrolling", "metadata_unavailable"}:
+            if target_state in {"enrolling", "metadata_unavailable", "needs_confirmation"}:
                 assignments["approval_generation"] = int(
                     row["approval_generation"] or 0
                 ) + 1
             elif old_state == "enrolling" and target_state == "cancelled":
+                assignments["approval_generation"] = int(
+                    row["approval_generation"] or 0
+                ) + 1
+            elif old_state == "needs_confirmation" and target_state == "cancelled":
                 assignments["approval_generation"] = int(
                     row["approval_generation"] or 0
                 ) + 1
