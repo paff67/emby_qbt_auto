@@ -17,6 +17,7 @@ class MetadataProbeConfig:
     backoffs_sec: tuple[int, int] = (1800, 21600)
     payload_limit_bps: int = 1024
     lease_sec: int = 30
+    visibility_grace_sec: int = 30
 
     def __post_init__(self) -> None:
         for field in fields(self):
@@ -62,6 +63,7 @@ class MetadataProbeCoordinator:
             "ready": [],
             "timed_out": [],
             "recovered": [],
+            "requeued": [],
             "errors": 0,
         }
         if not sync_healthy:
@@ -130,6 +132,7 @@ class MetadataProbeCoordinator:
                 self._safe_release(item_id, token)
             return
         tag = str(raw.get("qbt_precheck_tag") or self._tag_for(raw))
+        expected_hash = self.gateway.expected_hash(str(raw.get("raw_input") or ""))
         try:
             current = self.repository.transition_item(
                 item_id,
@@ -144,6 +147,7 @@ class MetadataProbeCoordinator:
                     "metadata_retry_at": None,
                     "next_run_at": None,
                     "qbt_precheck_tag": tag,
+                    "qbt_hash": expected_hash,
                     "last_error": None,
                 },
                 metadata_lease_owner=self.owner,
@@ -158,6 +162,7 @@ class MetadataProbeCoordinator:
             token,
             now,
             result,
+            allow_add=True,
         )
 
     def _poll_item(
@@ -169,7 +174,7 @@ class MetadataProbeCoordinator:
     ) -> None:
         try:
             item = self.repository.get_item(item_id, include_raw=True)
-            self._drive_item(item, token, now, result)
+            self._drive_item(item, token, now, result, allow_add=False)
         except Exception:
             self._record_failure(item_id, token, now, result)
 
@@ -179,12 +184,17 @@ class MetadataProbeCoordinator:
         token: tuple[str, int],
         now: int,
         result: dict[str, Any],
+        *,
+        allow_add: bool,
     ) -> None:
         item_id = int(item["id"])
         tag = str(item.get("qbt_precheck_tag") or "")
         try:
             snapshot = self.gateway.find_by_tag(tag)
-            if snapshot is None:
+            expected_hash = str(item.get("qbt_hash") or "").lower()
+            if snapshot is None and expected_hash:
+                snapshot = self.gateway.find_by_hash(expected_hash)
+            if snapshot is None and allow_add:
                 raw = str(item.get("raw_input") or "")
                 if str(item.get("input_kind")) != "magnet" or not raw:
                     raise ValueError("unsupported_precheck_input")
@@ -196,8 +206,14 @@ class MetadataProbeCoordinator:
                     )
                 )
                 snapshot = self.gateway.find_by_tag(tag)
+                if snapshot is None:
+                    snapshot = self.gateway.find_by_hash(expected_hash)
             if snapshot is None:
-                self._schedule_poll(item_id, token, now)
+                started_at = int(item.get("metadata_probe_started_at") or now)
+                if now - started_at >= self.config.visibility_grace_sec:
+                    self._requeue_missing(item, token, result)
+                    return
+                self._schedule_poll(item_id, token, now, clear_error=False)
                 return
             torrent_hash = str(snapshot.get("hash") or "").lower()
             stored_hash = str(item.get("qbt_hash") or "").lower()
@@ -263,6 +279,35 @@ class MetadataProbeCoordinator:
         except Exception:
             self._record_failure(item_id, token, now, result)
 
+    def _requeue_missing(
+        self,
+        item: Mapping[str, Any],
+        token: tuple[str, int],
+        result: dict[str, Any],
+    ) -> None:
+        item_id = int(item["id"])
+        attempt = max(0, int(item.get("metadata_probe_attempt") or 0) - 1)
+        self.repository.transition_item(
+            item_id,
+            {"metadata_wait"},
+            "waiting_probe_slot",
+            "qbt_add_not_visible",
+            {
+                "qbt_hash": None,
+                "metadata_probe_attempt": attempt,
+                "metadata_probe_started_at": None,
+                "metadata_probe_deadline": None,
+                "metadata_next_poll_at": None,
+                "metadata_retry_at": None,
+                "next_run_at": None,
+                "last_error": "qbt_add_not_visible",
+            },
+            metadata_lease_owner=token[0],
+            metadata_lease_generation=token[1],
+        )
+        self.repository.release_metadata_lease(item_id, token[0], token[1])
+        result["requeued"].append(item_id)
+
     def _timeout_item(
         self,
         item_id: int,
@@ -275,6 +320,8 @@ class MetadataProbeCoordinator:
             tag = str(item.get("qbt_precheck_tag") or "")
             snapshot = self.gateway.find_by_tag(tag)
             stored_hash = str(item.get("qbt_hash") or "").lower()
+            if snapshot is None and stored_hash:
+                snapshot = self.gateway.find_by_hash(stored_hash)
             if snapshot is not None:
                 torrent_hash = str(snapshot.get("hash") or "").lower()
                 if stored_hash and stored_hash != torrent_hash:
@@ -339,16 +386,23 @@ class MetadataProbeCoordinator:
             self._record_failure(item_id, token, now, result)
 
     def _schedule_poll(
-        self, item_id: int, token: tuple[str, int], now: int
+        self,
+        item_id: int,
+        token: tuple[str, int],
+        now: int,
+        *,
+        clear_error: bool = True,
     ) -> None:
+        fields: dict[str, Any] = {
+            "metadata_next_poll_at": now + self.config.poll_interval_sec,
+        }
+        if clear_error:
+            fields["last_error"] = None
         self.repository.update_metadata_probe(
             item_id,
             token[0],
             token[1],
-            {
-                "metadata_next_poll_at": now + self.config.poll_interval_sec,
-                "last_error": None,
-            },
+            fields,
         )
 
     def _record_failure(

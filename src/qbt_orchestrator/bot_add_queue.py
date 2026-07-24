@@ -96,7 +96,14 @@ _ALLOWED_TRANSITIONS = {
         {"metadata_wait", "metadata_retry_wait", "metadata_unavailable", "prechecking", "failed", "cancelled"}
     ),
     "metadata_wait": frozenset(
-        {"metadata_retry_wait", "metadata_unavailable", "prechecking", "failed", "cancelled"}
+        {
+            "waiting_probe_slot",
+            "metadata_retry_wait",
+            "metadata_unavailable",
+            "prechecking",
+            "failed",
+            "cancelled",
+        }
     ),
     "metadata_retry_wait": frozenset(
         {"waiting_probe_slot", "metadata_wait", "metadata_unavailable", "failed", "cancelled"}

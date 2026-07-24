@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import re
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import parse_qs, urlsplit
 
 from .hash_identity import canonical_torrent_hash
 
@@ -62,6 +64,54 @@ class QbtPrecheckGateway:
         torrent_hash = self._hash(matches[0].get("hash"))
         matches[0]["hash"] = torrent_hash
         return matches[0]
+
+    def find_by_hash(self, torrent_hash: str) -> dict[str, Any] | None:
+        safe_hash = self._hash(torrent_hash)
+        snapshot = next(
+            (
+                dict(row)
+                for key, row in self._snapshots.items()
+                if self._hash(row.get("hash") or key) == safe_hash
+            ),
+            None,
+        )
+        if snapshot is not None:
+            snapshot["hash"] = safe_hash
+            return snapshot
+        current = self.torrent_info(safe_hash)
+        if not str(current.get("state") or "").strip():
+            return None
+        current_hash = self._hash(current.get("hash") or safe_hash)
+        if current_hash != safe_hash:
+            raise ValueError("qbt_precheck_hash_mismatch")
+        current["hash"] = current_hash
+        return current
+
+    @classmethod
+    def expected_hash(cls, magnet: str) -> str:
+        raw = str(magnet or "").strip()
+        if not raw.lower().startswith("magnet:?"):
+            raise ValueError("magnet_uri")
+        exact_topics = parse_qs(urlsplit(raw).query).get("xt", [])
+        for topic in exact_topics:
+            lowered = str(topic).strip().lower()
+            if lowered.startswith("urn:btih:"):
+                value = lowered.rsplit(":", 1)[-1]
+                if len(value) == 40 and all(c in "0123456789abcdef" for c in value):
+                    return cls._hash(value)
+                if len(value) == 32:
+                    try:
+                        decoded = base64.b32decode(value.upper()).hex()
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError("magnet_infohash") from exc
+                    return cls._hash(decoded)
+            if lowered.startswith("urn:btmh:"):
+                value = lowered.rsplit(":", 1)[-1]
+                if value.startswith("1220"):
+                    value = value[4:]
+                if len(value) == 64 and all(c in "0123456789abcdef" for c in value):
+                    return cls._hash(value)
+        raise ValueError("magnet_infohash")
 
     def stop(
         self,

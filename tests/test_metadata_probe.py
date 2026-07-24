@@ -181,6 +181,7 @@ def test_metadata_probe_config_keeps_only_fixed_personal_instance_controls():
     assert config.backoffs_sec == (1800, 21600)
     assert config.payload_limit_bps == 1024
     assert config.lease_sec == 30
+    assert config.visibility_grace_sec == 30
     with pytest.raises(ValueError, match="slots"):
         MetadataProbeConfig(slots=0)
 
@@ -201,6 +202,11 @@ class FakeProbeGateway:
 
     def set_snapshots(self, _snapshots):
         return None
+
+    @staticmethod
+    def expected_hash(magnet: str):
+        query = parse_qs(urlsplit(magnet).query)
+        return query["xt"][0].split(":")[-1].lower()
 
     def add_magnet(self, magnet: str, tag: str, *, guard=None):
         if guard is not None and not guard():
@@ -226,6 +232,12 @@ class FakeProbeGateway:
         self.find_calls.append(tag)
         row = self.by_tag.get(tag)
         return None if row is None else dict(row)
+
+    def find_by_hash(self, torrent_hash: str):
+        for row in self.by_tag.values():
+            if str(row.get("hash") or "").lower() == torrent_hash.lower():
+                return dict(row)
+        return None
 
     @staticmethod
     def metadata_ready(snapshot):
@@ -460,6 +472,32 @@ def test_probe_windows_and_backoffs_end_in_metadata_unavailable(tmp_path):
     assert item["metadata_lease_owner"] is None
 
 
+def test_timeout_reconciles_expected_hash_when_safe_snapshot_has_no_tag(tmp_path):
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    qbt = SnapshotQbt(state="metaDL")
+    queue, _gateway, _coordinator, clock, _item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    executor = RecordingExecutor()
+    coordinator = MetadataProbeCoordinator(
+        queue,
+        QbtPrecheckGateway(qbt, executor),
+        owner="worker",
+        now=clock,
+    )
+    coordinator.tick(snapshots={})
+
+    clock.advance(300)
+    coordinator.tick(snapshots={})
+
+    assert (
+        "/api/v2/torrents/delete",
+        {"hashes": "0" * 39 + "1", "deleteFiles": "false"},
+    ) in executor.posts
+
+
 def test_active_lease_blocks_second_worker_and_expired_lease_recovers_by_tag(tmp_path):
     from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
 
@@ -534,6 +572,90 @@ def test_lost_add_response_is_reconciled_by_tag_without_duplicate_add(tmp_path):
     assert len(gateway.added) == 1
     assert queue.get_item(item_ids[0])["qbt_hash"] is not None
     assert queue.get_item(item_ids[0])["last_error"] is None
+
+
+def test_real_gateway_does_not_repeat_add_while_safe_snapshots_stay_empty(tmp_path):
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    class NotVisibleQbt(SnapshotQbt):
+        def torrent_info(self, torrent_hash):
+            self.info_reads.append(torrent_hash)
+            return {"hash": torrent_hash}
+
+    queue, _gateway, _coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    executor = RecordingExecutor()
+    gateway = QbtPrecheckGateway(NotVisibleQbt(), executor)
+    coordinator = MetadataProbeCoordinator(
+        queue, gateway, owner="worker", now=clock
+    )
+
+    coordinator.tick(snapshots={})
+    clock.advance(5)
+    coordinator.tick(snapshots={})
+
+    add_posts = [
+        post for post in executor.posts if post[0] == "/api/v2/torrents/add"
+    ]
+    assert len(add_posts) == 1
+    stored = queue.get_item(item_ids[0])
+    assert stored["state"] == "metadata_wait"
+    assert stored["qbt_hash"] == "0" * 39 + "1"
+
+
+def test_marker_before_add_waits_for_grace_then_requeues_without_consuming_attempt(
+    tmp_path,
+):
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    class NotVisibleQbt(SnapshotQbt):
+        def torrent_info(self, torrent_hash):
+            return {"hash": torrent_hash}
+
+    queue, _gateway, _coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    item_id = item_ids[0]
+    lease = queue.claim_metadata_lease(item_id, "crashed", clock.value + 30)
+    queue.transition_item(
+        item_id,
+        {"waiting_probe_slot"},
+        "metadata_wait",
+        "metadata_probe_started",
+        {
+            "metadata_probe_attempt": 1,
+            "metadata_probe_started_at": clock.value,
+            "metadata_probe_deadline": clock.value + 300,
+            "metadata_next_poll_at": clock.value + 5,
+            "qbt_precheck_tag": "add-item-" + "c" * 32,
+            "qbt_hash": "0" * 39 + "1",
+        },
+        metadata_lease_owner="crashed",
+        metadata_lease_generation=lease["metadata_lease_generation"],
+    )
+    executor = RecordingExecutor()
+    coordinator = MetadataProbeCoordinator(
+        queue,
+        QbtPrecheckGateway(NotVisibleQbt(), executor),
+        owner="restarted",
+        now=clock,
+    )
+
+    clock.advance(5)
+    coordinator.tick(snapshots={})
+    assert executor.posts == []
+
+    clock.advance(26)
+    result = coordinator.tick(snapshots={})
+    add_posts = [
+        post for post in executor.posts if post[0] == "/api/v2/torrents/add"
+    ]
+    assert result["requeued"] == [item_id]
+    assert len(add_posts) == 1
+    assert queue.get_item(item_id)["metadata_probe_attempt"] == 1
 
 
 def test_draft_and_not_due_retry_items_do_not_take_probe_slots(tmp_path):
