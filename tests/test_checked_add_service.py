@@ -227,6 +227,21 @@ def test_priority_write_failure_leaves_enrolling_held_and_retry_recovers(tmp_pat
     assert gateway.files[0]["priority"] == 1
 
 
+def test_batch_cancel_rejects_active_enrollment_without_mutating_lease_or_marker(tmp_path):
+    queue, gateway, service, item_id = _fixture(tmp_path)
+    gateway.fail_next_priority_write = True
+    assert service.tick()["errors"] == 1
+    before = queue.get_item(item_id)
+
+    with pytest.raises(ValueError, match="^batch_requires_guarded_cancel$"):
+        queue.cancel_batch(before["batch_id"], "123")
+
+    after = queue.get_item(item_id)
+    assert after == before
+    assert service.tick()["enrolled"] == [item_id]
+    assert gateway.removed is False
+
+
 def test_unique_finalization_failure_leaves_enrolled_held_then_tick_reconciles(tmp_path):
     queue, gateway, service, item_id = _fixture(tmp_path)
     gateway.fail_remove_tag = "hold"
@@ -275,6 +290,45 @@ def test_cancel_needs_confirmation_removes_only_registration_and_replay_is_idemp
     assert first["state"] == second["state"] == "cancelled"
     assert gateway.posts[-1] == ("delete", {"hashes": "a" * 40, "deleteFiles": "false"})
     assert sum(name == "delete" for name, _ in gateway.posts) == 1
+
+
+def test_batch_cancel_rejects_owned_confirmation_but_individual_cancel_cleans_qbt(tmp_path):
+    queue, gateway, service, item_id = _fixture(
+        tmp_path, size=2_000 * 1024**2, remote_size=1_000 * 1024**2
+    )
+    service.tick()
+    pending = queue.get_item(item_id)
+
+    with pytest.raises(ValueError, match="^batch_requires_guarded_cancel$"):
+        queue.cancel_batch(pending["batch_id"], "123")
+    assert queue.get_item(item_id)["state"] == "needs_confirmation"
+
+    cancelled = service.cancel(
+        item_id, "123", pending["approval_generation"]
+    )
+    assert cancelled["state"] == "cancelled"
+    assert gateway.posts[-1] == (
+        "delete",
+        {"hashes": "a" * 40, "deleteFiles": "false"},
+    )
+
+
+def test_batch_cancel_still_accepts_queued_items_without_qbt_registration(tmp_path):
+    from qbt_orchestrator.bot_add_queue import BotAddQueueRepository
+
+    db = tmp_path / "queued.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(db)
+    batch = queue.open_draft("123", "123")
+    queue.append_message(
+        batch["id"], 1, ["magnet:?" + "xt=urn:btih:" + "c" * 40]
+    )
+    queue.submit(batch["id"])
+
+    cancelled = queue.cancel_batch(batch["id"], "123")
+
+    assert cancelled["state"] == "cancelled"
+    assert queue.list_items(batch["id"])[0]["state"] == "cancelled"
 
 
 def test_allow_scheduling_only_removes_hold_and_is_idempotent(tmp_path):

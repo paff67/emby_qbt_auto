@@ -496,12 +496,26 @@ class BotAddQueueRepository:
 
         def txn(con: sqlite3.Connection) -> dict[str, Any]:
             self._begin_immediate(con)
-            self._expire_due_in_transaction(con, now)
             batch = con.execute(
                 "select * from bot_add_batches where id=?", (batch_key,)
             ).fetchone()
             if batch is None:
                 raise ValueError("batch_not_found")
+            terminal_states = sorted(_AUTOMATIC_TERMINAL_ITEM_STATES)
+            placeholders = ",".join("?" for _ in terminal_states)
+            guarded = con.execute(
+                f"select 1 from bot_add_items where batch_id=? "
+                f"and state not in ({placeholders}) "
+                "and (qbt_precheck_tag is not null or qbt_hash is not null) limit 1",
+                (batch_key, *terminal_states),
+            ).fetchone()
+            if guarded is not None:
+                raise ValueError("batch_requires_guarded_cancel")
+            self._expire_due_in_transaction(con, now)
+            batch = con.execute(
+                "select * from bot_add_batches where id=?", (batch_key,)
+            ).fetchone()
+            assert batch is not None
             batch = self._expire_draft_row_in_transaction(con, batch, now)
             state = str(batch["state"])
             if state == "cancelled":
