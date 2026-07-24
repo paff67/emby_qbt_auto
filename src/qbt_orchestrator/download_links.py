@@ -157,8 +157,16 @@ class PinnedHttpTransport:
             )
             try:
                 connection.request("GET", path, headers={"Accept": "application/x-bittorrent"})
+                # getresponse() detaches self.sock for HTTP/1.0 and explicit
+                # Connection: close responses. Capture the connected peer while
+                # the pinned socket is still owned by the connection.
+                peer_ip = (
+                    ipaddress.ip_address(connection.sock.getpeername()[0])
+                    .compressed.lower()
+                    if connection.sock
+                    else None
+                )
                 response = connection.getresponse()
-                peer_ip = str(connection.sock.getpeername()[0]) if connection.sock else None
                 headers = _safe_response_headers(response.getheaders())
 
                 return HttpResponse(
@@ -511,55 +519,6 @@ class _BencodeParser:
             result[key] = value
 
 
-def _valid_v1_layout(info: dict[bytes, object]) -> bool:
-    pieces = info.get(b"pieces")
-    if not isinstance(pieces, bytes) or len(pieces) % 20:
-        return False
-    piece_length = info.get(b"piece length")
-    if type(piece_length) is not int or int(piece_length) <= 0:
-        return False
-    total_length: int
-    if type(info.get(b"length")) is int and int(info[b"length"]) >= 0:
-        total_length = int(info[b"length"])
-    else:
-        files = info.get(b"files")
-        if not isinstance(files, list) or not files:
-            return False
-        total_length = 0
-        for item in files:
-            if not isinstance(item, dict):
-                return False
-            if type(item.get(b"length")) is not int or int(item[b"length"]) < 0:
-                return False
-            path = item.get(b"path")
-            if not isinstance(path, list) or not path or not all(isinstance(part, bytes) and part for part in path):
-                return False
-            total_length += int(item[b"length"])
-    expected_piece_count = (
-        (total_length + int(piece_length) - 1) // int(piece_length)
-        if total_length
-        else 0
-    )
-    return len(pieces) == expected_piece_count * 20
-
-
-def _valid_file_tree(tree: object) -> bool:
-    if not isinstance(tree, dict) or not tree:
-        return False
-    leaf = tree.get(b"")
-    if leaf is not None:
-        if len(tree) != 1 or not isinstance(leaf, dict):
-            return False
-        length = leaf.get(b"length")
-        if type(length) is not int or int(length) < 0:
-            return False
-        pieces_root = leaf.get(b"pieces root")
-        if int(length) == 0:
-            return pieces_root is None
-        return isinstance(pieces_root, bytes) and len(pieces_root) == 32
-    return all(isinstance(name, bytes) and name and _valid_file_tree(child) for name, child in tree.items())
-
-
 def _metainfo_identities(data: bytes) -> tuple[str | None, str | None]:
     parser = _BencodeParser(data)
     top = parser.parse()
@@ -570,26 +529,18 @@ def _metainfo_identities(data: bytes) -> tuple[str | None, str | None]:
         _fail("metainfo_info_not_dictionary")
     start, end = parser.info_span
     raw_info = data[start:end]
-    if not isinstance(info.get(b"name"), bytes) or not info[b"name"]:
-        _fail("invalid_metainfo")
-    if type(info.get(b"piece length")) is not int or int(info[b"piece length"]) <= 0:
-        _fail("invalid_metainfo")
 
-    meta_version = info.get(b"meta version")
-    has_v2_fields = b"file tree" in info or meta_version is not None
-    piece_length = int(info[b"piece length"])
-    valid_v2_piece_length = piece_length >= 16 * 1024 and not (
-        piece_length & (piece_length - 1)
+    # This resolver owns canonical parsing, resource bounds, and identity
+    # hashing. It deliberately does not duplicate libtorrent's complete
+    # BEP3/BEP47/BEP52 semantic validator: canonical candidates proceed to the
+    # stopped qBT precheck, which is the authoritative acceptance boundary.
+    is_v2 = type(info.get(b"meta version")) is int and info[b"meta version"] == 2
+    is_v1 = (
+        isinstance(info.get(b"name"), bytes)
+        and type(info.get(b"piece length")) is int
+        and isinstance(info.get(b"pieces"), bytes)
+        and (b"length" in info or b"files" in info)
     )
-    is_v2 = (
-        type(meta_version) is int
-        and meta_version == 2
-        and valid_v2_piece_length
-        and _valid_file_tree(info.get(b"file tree"))
-    )
-    if has_v2_fields and not is_v2:
-        _fail("invalid_metainfo")
-    is_v1 = _valid_v1_layout(info)
     if not is_v1 and not is_v2:
         _fail("invalid_metainfo")
     return (

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.server
 import socket
+import threading
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -75,6 +78,34 @@ def _response(status, body=b"", *, headers=None, peer_ip="93.184.216.34"):
         body=body,
         peer_ip=peer_ip,
     )
+
+
+@contextmanager
+def _local_metainfo_server(body: bytes, *, protocol: str, connection_close: bool):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = protocol
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-bittorrent")
+            self.send_header("Content-Length", str(len(body)))
+            if connection_close:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.fixture
@@ -268,6 +299,24 @@ def test_http_result_hashes_exact_info_bytes(public_dns):
     ]
 
 
+@pytest.mark.parametrize(
+    ("protocol", "connection_close"),
+    [("HTTP/1.0", False), ("HTTP/1.1", True)],
+)
+def test_pinned_transport_preserves_peer_for_connection_close_responses(
+    protocol, connection_close
+):
+    info = _v1_info()
+    metainfo = _torrent(info)
+    with _local_metainfo_server(
+        metainfo, protocol=protocol, connection_close=connection_close
+    ) as port:
+        result = HttpMetainfoResolver(
+            allowed_private_hosts={"127.0.0.1"}
+        ).resolve(f"http://127.0.0.1:{port}/a.torrent")
+    assert result.infohash_v1 == hashlib.sha1(info).hexdigest()
+
+
 def test_http_resolver_supports_v2_and_hybrid_exact_hashes(public_dns):
     v2_info = (
         b"d9:file tree" + _v2_tree()
@@ -296,21 +345,84 @@ def test_http_resolver_supports_v2_and_hybrid_exact_hashes(public_dns):
         b"d9:file tree" + _v2_tree() + b"12:meta versioni2e4:name1:a12:piece lengthi10000ee",
     ],
 )
-def test_v2_metainfo_requires_valid_file_roots_and_piece_length(public_dns, info):
-    with pytest.raises(LinkResolutionError, match="^invalid_metainfo$"):
-        HttpMetainfoResolver(
-            transport=FakeTransport([_response(200, _torrent(info))])
-        ).resolve("https://example.invalid/v2")
+def test_v2_identity_resolution_defers_semantic_validation_to_qbt(public_dns, info):
+    result = HttpMetainfoResolver(
+        transport=FakeTransport([_response(200, _torrent(info))])
+    ).resolve("https://example.invalid/v2")
+    assert result.infohash_v1 is None
+    assert result.infohash_v2 == hashlib.sha256(info).hexdigest()
 
 
-def test_v1_metainfo_rejects_piece_hash_count_inconsistent_with_size(public_dns):
+def test_v1_identity_resolution_defers_piece_count_validation_to_qbt(public_dns):
     info = _v1_info(extra=b"6:source1:x")
     # Replace the one 20-byte piece hash with two while retaining a one-byte file.
     info = info.replace(b"6:pieces20:" + b"x" * 20, b"6:pieces40:" + b"x" * 40)
+    result = HttpMetainfoResolver(
+        transport=FakeTransport([_response(200, _torrent(info))])
+    ).resolve("https://example.invalid/v1")
+    assert result.infohash_v1 == hashlib.sha1(info).hexdigest()
+
+
+def test_bep47_padding_and_symlink_entries_are_not_rejected_by_resolver(public_dns):
+    files = (
+        b"l"
+        b"d4:attr1:p6:lengthi1ee"
+        b"d4:attr1:l4:pathl4:linke12:symlink pathl6:targetee"
+        b"e"
+    )
+    info = (
+        b"d5:files" + files
+        + b"4:name1:a12:piece lengthi16384e6:pieces20:"
+        + b"x" * 20
+        + b"e"
+    )
+    result = HttpMetainfoResolver(
+        transport=FakeTransport([_response(200, _torrent(info))])
+    ).resolve("https://example.invalid/bep47")
+    assert result.infohash_v1 == hashlib.sha1(info).hexdigest()
+
+
+def test_semantically_suspect_canonical_candidates_are_identity_only(public_dns):
+    # length+files is deliberately not called valid here. The resolver only
+    # establishes a canonical v1 identity; stopped qBT precheck decides validity.
+    v1 = (
+        b"d5:filesle6:lengthi1e4:name1:a12:piece lengthi1e6:pieces0:e"
+    )
+    # A root empty-key file tree is likewise left to qBT/BEP52 validation after
+    # exact v2 identity calculation.
+    v2_root_file = (
+        b"d9:file treed0:d6:lengthi1eee12:meta versioni2e4:name1:a"
+        b"12:piece lengthi16384ee"
+    )
+    # This multi-piece file has no top-level piece-layers dictionary. Identity
+    # is still deterministic; the stopped qBT precheck owns acceptance.
+    v2_missing_layers = (
+        b"d9:file treed1:ad0:d6:lengthi32768e11:pieces root32:"
+        + b"r" * 32
+        + b"eee12:meta versioni2e4:name1:a12:piece lengthi16384ee"
+    )
+    resolver = HttpMetainfoResolver(
+        transport=FakeTransport(
+            [
+                _response(200, _torrent(v1)),
+                _response(200, _torrent(v2_root_file)),
+                _response(200, _torrent(v2_missing_layers)),
+            ]
+        )
+    )
+    v1_result = resolver.resolve("https://example.invalid/suspect-v1")
+    root_result = resolver.resolve("https://example.invalid/root-file")
+    layers_result = resolver.resolve("https://example.invalid/missing-layers")
+    assert v1_result.infohash_v1 == hashlib.sha1(v1).hexdigest()
+    assert root_result.infohash_v2 == hashlib.sha256(v2_root_file).hexdigest()
+    assert layers_result.infohash_v2 == hashlib.sha256(v2_missing_layers).hexdigest()
+
+
+def test_canonical_non_torrent_info_dictionary_is_rejected(public_dns):
     with pytest.raises(LinkResolutionError, match="^invalid_metainfo$"):
         HttpMetainfoResolver(
-            transport=FakeTransport([_response(200, _torrent(info))])
-        ).resolve("https://example.invalid/v1")
+            transport=FakeTransport([_response(200, _torrent(b"d4:name1:ae"))])
+        ).resolve("https://example.invalid/object")
 
 
 def test_http_redirect_is_relative_bounded_and_revalidated(public_dns):
