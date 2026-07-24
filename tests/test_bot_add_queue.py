@@ -113,6 +113,7 @@ def test_private_sqlite_preparation_uses_explicit_0600_without_umask(
 
     monkeypatch.setattr(db_module, "_ENFORCE_POSIX_SQLITE_MODE", True)
     monkeypatch.setattr(db_module, "_SQLITE_NOFOLLOW", 0x20000)
+    monkeypatch.setattr(db_module.os, "geteuid", lambda: 0, raising=False)
 
     def fake_open(path, flags, mode=None, *, dir_fd=None):
         opened.append(
@@ -164,6 +165,7 @@ def test_private_sqlite_preparation_fails_closed_on_nofollow_error(
     db = tmp_path / "state.sqlite"
     monkeypatch.setattr(db_module, "_ENFORCE_POSIX_SQLITE_MODE", True)
     monkeypatch.setattr(db_module, "_SQLITE_NOFOLLOW", 0x20000)
+    monkeypatch.setattr(db_module.os, "geteuid", lambda: 0, raising=False)
 
     def reject_link(path, _flags, _mode=None, *, dir_fd=None):
         if dir_fd is None:
@@ -186,6 +188,44 @@ def test_private_sqlite_preparation_fails_closed_on_nofollow_error(
     )
 
     with pytest.raises(db_module.SQLiteSecurityError, match="symbolic link"):
+        db_module._prepare_private_sqlite(db)
+
+
+def test_private_sqlite_preparation_rejects_foreign_owned_parent(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "state.sqlite"
+    closed: list[int] = []
+    monkeypatch.setattr(db_module, "_ENFORCE_POSIX_SQLITE_MODE", True)
+    monkeypatch.setattr(db_module, "_SQLITE_NOFOLLOW", 0x20000)
+    monkeypatch.setattr(db_module.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(db_module.os, "open", lambda *_args, **_kwargs: 40)
+    monkeypatch.setattr(
+        db_module.os,
+        "fstat",
+        lambda _fd: os.stat_result(
+            (stat.S_IFDIR | 0o700, 2, 1, 1, 2000, 0, 0, 0, 0, 0)
+        ),
+    )
+    monkeypatch.setattr(db_module.os, "close", lambda fd: closed.append(int(fd)))
+
+    with pytest.raises(db_module.SQLiteSecurityError, match="parent directory owner"):
+        db_module._prepare_private_sqlite(db)
+    assert closed == [40]
+
+
+def test_private_sqlite_preparation_requires_nofollow_support(tmp_path, monkeypatch):
+    db = tmp_path / "state.sqlite"
+    monkeypatch.setattr(db_module, "_ENFORCE_POSIX_SQLITE_MODE", True)
+    monkeypatch.setattr(db_module, "_SQLITE_NOFOLLOW", 0)
+    monkeypatch.setattr(db_module.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(
+        db_module.os,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("writer must fail before opening paths"),
+    )
+
+    with pytest.raises(db_module.SQLiteSecurityError, match="O_NOFOLLOW"):
         db_module._prepare_private_sqlite(db)
 
 
@@ -287,6 +327,55 @@ def test_posix_writer_requires_a_private_parent_directory(tmp_path):
             db_module._connect(shared / "state.sqlite")
     finally:
         shared.chmod(0o700)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() != 0,
+    reason="root is required to create a foreign-owned directory",
+)
+def test_posix_writer_rejects_foreign_owned_private_parent(tmp_path):
+    foreign_uid = 65534
+    private = tmp_path / "foreign-parent"
+    private.mkdir(mode=0o700)
+    os.chown(private, foreign_uid, -1)
+    try:
+        with pytest.raises(db_module.SQLiteSecurityError, match="parent directory owner"):
+            db_module._connect(private / "state.sqlite")
+    finally:
+        os.chown(private, os.geteuid(), -1)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() != 0,
+    reason="root is required to create a foreign-owned database",
+)
+def test_posix_writer_rejects_foreign_owned_main_database(tmp_path):
+    private = tmp_path / "private-main"
+    private.mkdir(mode=0o700)
+    db = private / "state.sqlite"
+    db.touch(mode=0o600)
+    os.chown(db, 65534, -1)
+
+    with pytest.raises(db_module.SQLiteSecurityError, match="database owner"):
+        db_module._connect(db)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() != 0,
+    reason="root is required to create a foreign-owned sidecar",
+)
+def test_posix_writer_rejects_foreign_owned_sidecar(tmp_path):
+    private = tmp_path / "private-sidecar"
+    private.mkdir(mode=0o700)
+    db = private / "state.sqlite"
+    con = db_module._connect(db)
+    con.close()
+    wal = Path(f"{db}-wal")
+    wal.touch(mode=0o600)
+    os.chown(wal, 65534, -1)
+
+    with pytest.raises(db_module.SQLiteSecurityError, match="sidecar.*owner"):
+        db_module._connect(db)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX inode semantics are required")

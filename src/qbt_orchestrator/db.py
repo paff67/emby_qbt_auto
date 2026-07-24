@@ -26,6 +26,7 @@ class _SQLiteSecurityGuard:
     parent_fd: int
     file_fd: int
     fingerprint: tuple[int, int]
+    effective_uid: int
     _closed: bool = False
 
     def close(self) -> None:
@@ -50,13 +51,6 @@ def _open_nofollow(
     dir_fd: int,
     mode: int | None = None,
 ) -> int:
-    if not _SQLITE_NOFOLLOW:
-        try:
-            existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None and stat.S_ISLNK(existing.st_mode):
-            raise OSError(errno.ELOOP, "symbolic link rejected")
     if mode is None:
         return os.open(name, flags | _SQLITE_NOFOLLOW, dir_fd=dir_fd)
     return os.open(name, flags | _SQLITE_NOFOLLOW, mode, dir_fd=dir_fd)
@@ -72,6 +66,12 @@ def _prepare_private_sqlite(path: str | Path) -> _SQLiteSecurityGuard | None:
     if not _ENFORCE_POSIX_SQLITE_MODE:
         return None
     db_path = Path(path)
+    if not _SQLITE_NOFOLLOW:
+        raise _security_error(db_path, "O_NOFOLLOW support is required for writable databases")
+    try:
+        effective_uid = int(os.geteuid())
+    except AttributeError as exc:  # pragma: no cover - guarded by POSIX feature flag
+        raise _security_error(db_path, "effective owner identity is unavailable") from exc
     parent_path = os.fspath(db_path.parent)
     parent_flags = os.O_RDONLY | _SQLITE_DIRECTORY | _SQLITE_CLOEXEC | _SQLITE_NOFOLLOW
     parent_fd: int | None = None
@@ -86,6 +86,8 @@ def _prepare_private_sqlite(path: str | Path) -> _SQLiteSecurityGuard | None:
         parent_stat = os.fstat(parent_fd)
         if not stat.S_ISDIR(parent_stat.st_mode):
             raise _security_error(db_path, "parent path is not a directory")
+        if int(parent_stat.st_uid) != effective_uid:
+            raise _security_error(db_path, "parent directory owner does not match effective uid")
         if parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise _security_error(
                 db_path,
@@ -107,6 +109,8 @@ def _prepare_private_sqlite(path: str | Path) -> _SQLiteSecurityGuard | None:
         file_stat = os.fstat(file_fd)
         if not stat.S_ISREG(file_stat.st_mode):
             raise _security_error(db_path, "database must be a regular file")
+        if int(file_stat.st_uid) != effective_uid:
+            raise _security_error(db_path, "database owner does not match effective uid")
         os.fchmod(file_fd, _SQLITE_PRIVATE_MODE)
 
         sidecar_flags = os.O_RDONLY | _SQLITE_CLOEXEC | _SQLITE_NONBLOCK
@@ -132,6 +136,11 @@ def _prepare_private_sqlite(path: str | Path) -> _SQLiteSecurityGuard | None:
                     raise _security_error(
                         db_path, f"SQLite sidecar {suffix} must be a regular file"
                     )
+                if int(sidecar_stat.st_uid) != effective_uid:
+                    raise _security_error(
+                        db_path,
+                        f"SQLite sidecar {suffix} owner does not match effective uid",
+                    )
                 os.fchmod(sidecar_fd, _SQLITE_PRIVATE_MODE)
             finally:
                 if sidecar_fd is not None:
@@ -143,6 +152,7 @@ def _prepare_private_sqlite(path: str | Path) -> _SQLiteSecurityGuard | None:
             parent_fd=parent_fd,
             file_fd=file_fd,
             fingerprint=(int(file_stat.st_dev), int(file_stat.st_ino)),
+            effective_uid=effective_uid,
         )
     except Exception:
         if file_fd is not None:
@@ -164,7 +174,11 @@ def _verify_private_sqlite(
     except OSError as exc:
         raise _security_error(guard.path, "database path changed during connect") from exc
     actual_fingerprint = (int(actual_stat.st_dev), int(actual_stat.st_ino))
-    if not stat.S_ISREG(actual_stat.st_mode) or actual_fingerprint != guard.fingerprint:
+    if (
+        not stat.S_ISREG(actual_stat.st_mode)
+        or int(actual_stat.st_uid) != guard.effective_uid
+        or actual_fingerprint != guard.fingerprint
+    ):
         raise _security_error(guard.path, "database path changed during connect")
 
     verify_fd: int | None = None
@@ -176,7 +190,11 @@ def _verify_private_sqlite(
         )
         verify_stat = os.fstat(verify_fd)
         verify_fingerprint = (int(verify_stat.st_dev), int(verify_stat.st_ino))
-        if not stat.S_ISREG(verify_stat.st_mode) or verify_fingerprint != guard.fingerprint:
+        if (
+            not stat.S_ISREG(verify_stat.st_mode)
+            or int(verify_stat.st_uid) != guard.effective_uid
+            or verify_fingerprint != guard.fingerprint
+        ):
             raise _security_error(guard.path, "database path changed during connect")
     except OSError as exc:
         raise _security_error(guard.path, "database path changed during connect") from exc
