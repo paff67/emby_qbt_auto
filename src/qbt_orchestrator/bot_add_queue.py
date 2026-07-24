@@ -54,6 +54,12 @@ _SUBMITTED_BATCH_STATES = frozenset(
 _IDEMPOTENT_SUBMIT_STATES = _SUBMITTED_BATCH_STATES | {"complete"}
 _CANCELLABLE_ITEM_STATES = _ITEM_STATES - {"enrolled", "enrolled_hold", "cancelled"}
 _MANUAL_RETRY_TARGET_STATES = frozenset({"waiting_probe_slot", "metadata_retry_wait"})
+_METADATA_CALLBACK_TARGETS = {
+    "retry_now": "waiting_probe_slot",
+    "retry_24h": "metadata_retry_wait",
+    "cancel": "cancelled",
+}
+_METADATA_RETRY_DELAY_SEC = 24 * 60 * 60
 _METADATA_LEASE_STATES = frozenset(
     {
         "resolving",
@@ -89,7 +95,7 @@ _ALLOWED_TRANSITIONS = {
     "metadata_retry_wait": frozenset(
         {"waiting_probe_slot", "metadata_wait", "metadata_unavailable", "failed", "cancelled"}
     ),
-    "metadata_unavailable": _MANUAL_RETRY_TARGET_STATES,
+    "metadata_unavailable": _MANUAL_RETRY_TARGET_STATES | {"cancelled"},
     "prechecking": frozenset(
         {"duplicate_local", "duplicate_remote", "needs_confirmation", "ready", "failed", "cancelled"}
     ),
@@ -548,6 +554,15 @@ class BotAddQueueRepository:
             batch_state = self._batch_state_in_transaction(con, int(row["batch_id"]))
             if batch_state not in _SUBMITTED_BATCH_STATES:
                 raise ValueError("batch_not_submitted")
+            if str(row["state"]) == "metadata_retry_wait" and any(
+                value is not None and int(value) > now
+                for value in (
+                    row["metadata_retry_at"],
+                    row["metadata_next_poll_at"],
+                    row["next_run_at"],
+                )
+            ):
+                raise ValueError("metadata_retry_not_due")
             current_owner = row["metadata_lease_owner"]
             current_until = row["metadata_lease_until"]
             if (
@@ -560,7 +575,8 @@ class BotAddQueueRepository:
             next_generation = current_generation + 1
             cursor = con.execute(
                 "update bot_add_items set metadata_lease_owner=?,metadata_lease_generation=?,"
-                "metadata_lease_until=?,updated_at=? where id=? and state=? "
+                "metadata_lease_until=?,metadata_retry_at=null,metadata_next_poll_at=null,"
+                "next_run_at=null,updated_at=? where id=? and state=? "
                 "and metadata_lease_generation=?",
                 (
                     lease_owner,
@@ -708,6 +724,7 @@ class BotAddQueueRepository:
         metadata_lease_owner: str | None = None,
         metadata_lease_generation: int | None = None,
         approval_generation: int | None = None,
+        metadata_action: str | None = None,
     ) -> dict[str, Any]:
         item_key = self._positive_id(item_id, "item_id")
         if not isinstance(expected, (set, frozenset)) or not expected:
@@ -741,6 +758,14 @@ class BotAddQueueRepository:
             if approval_generation is None
             else self._positive_id(approval_generation, "approval_generation")
         )
+        expected_metadata_action = None
+        if metadata_action is not None:
+            if (
+                not isinstance(metadata_action, str)
+                or metadata_action not in _METADATA_CALLBACK_TARGETS
+            ):
+                raise ValueError("metadata_action")
+            expected_metadata_action = metadata_action
         now = self._timestamp()
 
         def txn(con: sqlite3.Connection) -> dict[str, Any]:
@@ -758,6 +783,25 @@ class BotAddQueueRepository:
                 old_state == "metadata_unavailable"
                 and target_state in _MANUAL_RETRY_TARGET_STATES
             )
+            metadata_callback = (
+                old_state == "metadata_unavailable"
+                and target_state in set(_METADATA_CALLBACK_TARGETS.values())
+            )
+            required_metadata_action = next(
+                (
+                    action
+                    for action, action_target in _METADATA_CALLBACK_TARGETS.items()
+                    if action_target == target_state
+                ),
+                None,
+            )
+            if metadata_callback and expected_metadata_action is None:
+                raise ValueError("metadata_action_required")
+            if metadata_callback and expected_metadata_action != required_metadata_action:
+                raise ValueError("metadata_action_mismatch")
+            if not metadata_callback and expected_metadata_action is not None:
+                raise ValueError("metadata_action_unexpected")
+            metadata_cancel = metadata_callback and target_state == "cancelled"
             held_release = old_state == "enrolled_hold" and target_state == "enrolled"
             cancelled_held_release = batch_state == "cancelled" and held_release
             if batch_state == "draft":
@@ -766,7 +810,9 @@ class BotAddQueueRepository:
                 batch_state == "cancelled" and not cancelled_held_release
             ):
                 raise ValueError("batch_not_active")
-            if batch_state == "complete" and not (manual_retry or held_release):
+            if batch_state == "complete" and not (
+                manual_retry or held_release or metadata_cancel
+            ):
                 raise ValueError("batch_not_active")
             if (
                 batch_state not in _SUBMITTED_BATCH_STATES | {"complete"}
@@ -794,6 +840,7 @@ class BotAddQueueRepository:
             approval_required = (
                 (old_state == "enrolling" and target_state in {"enrolled", "enrolled_hold", "failed"})
                 or held_release
+                or metadata_callback
             )
             if approval_required and expected_approval_generation is None:
                 raise ValueError("approval_token_required")
@@ -826,7 +873,7 @@ class BotAddQueueRepository:
                     )
 
             assignments: dict[str, Any] = dict(proposed_fields)
-            if target_state == "enrolling":
+            if target_state in {"enrolling", "metadata_unavailable"}:
                 assignments["approval_generation"] = int(
                     row["approval_generation"] or 0
                 ) + 1
@@ -834,6 +881,19 @@ class BotAddQueueRepository:
                 assignments["approval_generation"] = int(
                     row["approval_generation"] or 0
                 ) + 1
+            elif metadata_callback:
+                assignments["approval_generation"] = int(
+                    row["approval_generation"] or 0
+                ) + 1
+            if expected_metadata_action == "retry_24h":
+                retry_at = now + _METADATA_RETRY_DELAY_SEC
+                assignments["metadata_retry_at"] = retry_at
+                assignments["metadata_next_poll_at"] = retry_at
+                assignments["next_run_at"] = retry_at
+            elif expected_metadata_action == "retry_now":
+                assignments["metadata_retry_at"] = None
+                assignments["metadata_next_poll_at"] = None
+                assignments["next_run_at"] = None
             if target_state in _AUTOMATIC_TERMINAL_ITEM_STATES:
                 for field in _AUTOMATIC_TERMINAL_CLEAR_FIELDS:
                     assignments[field] = None

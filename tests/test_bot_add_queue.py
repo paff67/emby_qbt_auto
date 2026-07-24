@@ -1697,7 +1697,8 @@ def test_metadata_unavailable_retains_raw_and_manual_retry_reopens_complete_batc
         {"metadata_unavailable"},
         "metadata_retry_wait",
         "manual_retry",
-        {"metadata_retry_at": 1_800_000_300},
+        metadata_action="retry_24h",
+        approval_generation=unavailable["approval_generation"],
     )
 
     assert retried["state"] == "metadata_retry_wait"
@@ -1707,6 +1708,156 @@ def test_metadata_unavailable_retains_raw_and_manual_retry_reopens_complete_batc
     assert reopened_batch["failed_count"] == 0
     assert queue.submitted_nonterminal_count() == 1
     assert queue.list_shards(batch["id"])[0]["processed_count"] == 0
+
+
+def test_metadata_callbacks_are_generation_fenced_across_repeated_exhaustion(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    first = queue.transition_item(
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
+    )
+
+    with pytest.raises(ValueError, match="^metadata_action_required$"):
+        queue.transition_item(
+            item["id"],
+            {"metadata_unavailable"},
+            "waiting_probe_slot",
+            "not_authorized_by_reason",
+            approval_generation=first["approval_generation"],
+        )
+    with pytest.raises(ValueError, match="^approval_generation_conflict$"):
+        queue.transition_item(
+            item["id"],
+            {"metadata_unavailable"},
+            "waiting_probe_slot",
+            "retry",
+            metadata_action="retry_now",
+            approval_generation=first["approval_generation"] + 1,
+        )
+
+    first_retry = queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        "waiting_probe_slot",
+        "retry",
+        metadata_action="retry_now",
+        approval_generation=first["approval_generation"],
+    )
+    assert first_retry["approval_generation"] == first["approval_generation"] + 1
+    with pytest.raises(ValueError, match="^state_conflict$"):
+        queue.transition_item(
+            item["id"],
+            {"metadata_unavailable"},
+            "waiting_probe_slot",
+            "duplicate_callback",
+            metadata_action="retry_now",
+            approval_generation=first["approval_generation"],
+        )
+
+    second = queue.transition_item(
+        item["id"],
+        {"waiting_probe_slot"},
+        "metadata_unavailable",
+        "probe_exhausted_again",
+    )
+    assert second["approval_generation"] == first_retry["approval_generation"] + 1
+    with pytest.raises(ValueError, match="^approval_generation_conflict$"):
+        queue.transition_item(
+            item["id"],
+            {"metadata_unavailable"},
+            "waiting_probe_slot",
+            "stale_first_callback",
+            metadata_action="retry_now",
+            approval_generation=first["approval_generation"],
+        )
+    second_retry = queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        "waiting_probe_slot",
+        "new_callback",
+        metadata_action="retry_now",
+        approval_generation=second["approval_generation"],
+    )
+    assert second_retry["approval_generation"] == second["approval_generation"] + 1
+
+
+def test_metadata_retry_24h_is_persisted_and_does_not_claim_probe_slot(queue_fixture):
+    queue, clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    unavailable = queue.transition_item(
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
+    )
+
+    delayed = queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        "metadata_retry_wait",
+        "retry_later",
+        metadata_action="retry_24h",
+        approval_generation=unavailable["approval_generation"],
+    )
+
+    due_at = clock.value + 24 * 60 * 60
+    assert delayed["approval_generation"] == unavailable["approval_generation"] + 1
+    assert delayed["metadata_retry_at"] == due_at
+    assert delayed["metadata_next_poll_at"] == due_at
+    assert delayed["next_run_at"] == due_at
+    with pytest.raises(ValueError, match="^metadata_retry_not_due$"):
+        queue.claim_metadata_lease(item["id"], "worker", clock.value + 60)
+    assert queue.get_item(item["id"])["metadata_lease_owner"] is None
+
+    clock.advance(24 * 60 * 60)
+    claimed = queue.claim_metadata_lease(item["id"], "worker", clock.value + 60)
+    assert claimed["metadata_lease_owner"] == "worker"
+
+
+def test_metadata_cancel_consumes_token_without_reopening_complete_batch(queue_fixture):
+    queue, _clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    unavailable = queue.transition_item(
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
+    )
+    completed_at = queue.get_batch(batch["id"])["completed_at"]
+
+    with pytest.raises(ValueError, match="^approval_generation_conflict$"):
+        queue.transition_item(
+            item["id"],
+            {"metadata_unavailable"},
+            "cancelled",
+            "cancel",
+            metadata_action="cancel",
+            approval_generation=unavailable["approval_generation"] + 1,
+        )
+    cancelled = queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        "cancelled",
+        "cancel",
+        metadata_action="cancel",
+        approval_generation=unavailable["approval_generation"],
+    )
+
+    assert cancelled["approval_generation"] == unavailable["approval_generation"] + 1
+    assert queue.get_item(item["id"], include_raw=True)["raw_input"] is None
+    terminal_batch = queue.get_batch(batch["id"])
+    assert terminal_batch["state"] == "complete"
+    assert terminal_batch["completed_at"] == completed_at
+    assert terminal_batch["failed_count"] == 0
+    assert queue.submitted_nonterminal_count() == 0
+    with pytest.raises(ValueError, match="^batch_not_cancellable$"):
+        queue.cancel_batch(batch["id"], "operator")
 
 
 def test_expired_metadata_unavailable_raw_is_cleared_and_cannot_retry(tmp_path):
@@ -1723,7 +1874,7 @@ def test_expired_metadata_unavailable_raw_is_cleared_and_cannot_retry(tmp_path):
     queue.submit(batch["id"])
     item = queue.list_items(batch["id"])[0]
     queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
-    queue.transition_item(
+    unavailable = queue.transition_item(
         item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
     )
     clock.advance(10)
@@ -1735,6 +1886,8 @@ def test_expired_metadata_unavailable_raw_is_cleared_and_cannot_retry(tmp_path):
             "metadata_retry_wait",
             "manual_retry",
             {"metadata_retry_at": 200, "attempts": 9},
+            metadata_action="retry_24h",
+            approval_generation=unavailable["approval_generation"],
         )
 
     persisted = queue.get_item(item["id"], include_raw=True)
@@ -1764,7 +1917,7 @@ def test_manual_retry_reopen_respects_global_backlog_atomically(tmp_path):
     queue.submit(retry_batch["id"])
     retry_item = queue.list_items(retry_batch["id"])[0]
     queue.transition_item(retry_item["id"], {"received"}, "resolving", "resolve")
-    queue.transition_item(
+    unavailable = queue.transition_item(
         retry_item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
     )
     blocking_batch = queue.open_draft("2", "2")
@@ -1778,6 +1931,8 @@ def test_manual_retry_reopen_respects_global_backlog_atomically(tmp_path):
             "waiting_probe_slot",
             "manual_retry",
             {"attempts": 7},
+            metadata_action="retry_now",
+            approval_generation=unavailable["approval_generation"],
         )
 
     unchanged = queue.get_item(retry_item["id"], include_raw=True)
@@ -1794,6 +1949,8 @@ def test_manual_retry_reopen_respects_global_backlog_atomically(tmp_path):
         {"metadata_unavailable"},
         "waiting_probe_slot",
         "manual_retry",
+        metadata_action="retry_now",
+        approval_generation=unavailable["approval_generation"],
     )
     assert queue.get_batch(retry_batch["id"])["state"] == "processing"
     assert queue.submitted_nonterminal_count() == 1
