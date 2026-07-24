@@ -204,11 +204,23 @@ def test_bc_link_requires_canonical_base64_padding_bits():
 
 @pytest.mark.parametrize(
     "name",
-    ["..", "%2e%2e", "safe%5C..", "%EF%BC%8Fetc"],
+    ["..", "%2e%2e", "%2F", "safe%5C..", "%EF%BC%8Fetc"],
 )
-def test_bc_link_rejects_normalized_path_like_names(name):
+def test_bc_task_name_is_opaque_and_path_like_names_remain_valid(name):
+    result = parse_download_link(_bc_link(name=name))
+    assert result.infohash_v1 == V1
+    assert not hasattr(result, "name")
+
+
+@pytest.mark.parametrize("name", ["%00", "%E2%80%AE"])
+def test_bc_task_name_rejects_ascii_and_unicode_control_characters(name):
     with pytest.raises(LinkResolutionError, match="^invalid_bc_link$"):
         parse_download_link(_bc_link(name=name))
+
+
+def test_bc_task_name_has_a_decoded_utf8_length_limit():
+    with pytest.raises(LinkResolutionError, match="^invalid_bc_link$"):
+        parse_download_link(_bc_link(name="a" * 4097))
 
 
 @pytest.mark.parametrize(

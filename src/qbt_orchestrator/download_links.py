@@ -25,6 +25,7 @@ _DEFAULT_MAX_BODY = 10 * 1024 * 1024
 _MAX_BENCODE_DEPTH = 64
 _MAX_BENCODE_ELEMENTS = 100_000
 _MAX_INTEGER_DIGITS = 80
+_MAX_BC_TASK_NAME_BYTES = 4096
 _DNS_WORKERS = 4
 _DNS_PENDING = 8
 _HEX = frozenset("0123456789abcdefABCDEF")
@@ -500,22 +501,19 @@ def _parse_magnet(value: str, input_sha256: str) -> ResolvedDownloadLink:
     )
 
 
-def _strict_unquote_name(value: str) -> str:
+def _validate_bc_task_name(value: str) -> None:
     _validate_percent_encoding(value)
     try:
-        decoded = unquote_to_bytes(value).decode("utf-8", "strict")
+        encoded = unquote_to_bytes(value)
+        decoded = encoded.decode("utf-8", "strict")
     except UnicodeError:
         _fail("invalid_bc_link")
-    decoded = unicodedata.normalize("NFKC", decoded)
     if (
         not decoded
-        or _CONTROL_RE.search(decoded)
-        or "/" in decoded
-        or "\\" in decoded
-        or decoded in {".", ".."}
+        or len(encoded) > _MAX_BC_TASK_NAME_BYTES
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in decoded)
     ):
         _fail("invalid_bc_link")
-    return decoded
 
 
 def _parse_bc(value: str, input_sha256: str) -> ResolvedDownloadLink:
@@ -534,7 +532,7 @@ def _parse_bc(value: str, input_sha256: str) -> ResolvedDownloadLink:
     pieces = plain.split("/")
     if len(pieces) != 5 or pieces[0] != "AA" or pieces[4] != "ZZ":
         _fail("invalid_bc_link")
-    _strict_unquote_name(pieces[1])
+    _validate_bc_task_name(pieces[1])
     if not _BC_SIZE_RE.fullmatch(pieces[2]):
         _fail("invalid_bc_link")
     infohash = _normalize_btih(pieces[3])
