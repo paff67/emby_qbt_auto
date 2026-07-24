@@ -1189,16 +1189,42 @@ def test_submit_persists_expiry_before_reporting_expired_draft(queue_fixture):
     assert queue.list_shards(batch["id"]) == []
 
 
-def test_expiry_wins_over_conflicting_replay_and_is_not_rolled_back(queue_fixture):
+def test_expired_draft_preserves_source_conflict_semantics(queue_fixture):
     queue, clock, _db = queue_fixture
     batch = queue.open_draft("1", "1")
     queue.append_message(batch["id"], 1, _magnets(0, 1))
     clock.advance(1800)
 
-    with pytest.raises(ValueError, match="^draft_expired$"):
+    with pytest.raises(ValueError, match="^source_message_conflict$"):
         queue.append_message(batch["id"], 1, _magnets(10, 1))
 
     assert queue.get_batch(batch["id"])["state"] == "draft_expired"
+
+
+def test_expired_draft_replay_returns_existing_batch_without_restoring_raw(queue_fixture):
+    queue, clock, db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    links = _magnets(0, 2)
+    queue.append_message(batch["id"], 1, links)
+    event_count = len(queue.list_events(batch["id"]))
+    clock.advance(1800)
+
+    replay = queue.append_message(batch["id"], 1, links)
+
+    assert replay["id"] == batch["id"]
+    assert replay["state"] == "draft_expired"
+    assert replay["idempotent"] is True
+    assert replay["inserted_count"] == 0
+    assert len(queue.list_events(batch["id"])) == event_count + 1
+    con = readonly_connect(db)
+    try:
+        assert con.execute(
+            "select count(*) from bot_add_items "
+            "where batch_id=? and (raw_input is not null or raw_input_expires_at is not null)",
+            (batch["id"],),
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
 
 
 def test_cancel_clears_raw_cancels_enrolling_and_preserves_only_enrolled_items(queue_fixture):

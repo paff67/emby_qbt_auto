@@ -188,8 +188,29 @@ class BotAddQueueRepository:
             if batch is None:
                 raise ValueError("batch_not_found")
             state = str(batch["state"])
+            expected_signature = [
+                (index, str(link["input_sha256"]))
+                for index, link in enumerate(proposed)
+            ]
             if state == "draft_expired":
-                return {"__error__": "draft_expired"}
+                expired_message = list(
+                    con.execute(
+                        "select source_index,input_sha256 from bot_add_items "
+                        "where batch_id=? and source_message_id=? order by source_index",
+                        (batch_key, source_message_id),
+                    )
+                )
+                if not expired_message:
+                    return {"__error__": "draft_expired"}
+                expired_signature = [
+                    (int(row["source_index"]), str(row["input_sha256"]))
+                    for row in expired_message
+                ]
+                if expired_signature != expected_signature:
+                    return {"__error__": "source_message_conflict"}
+                result = self._batch_in_transaction(con, batch_key)
+                result.update({"inserted_count": 0, "idempotent": True})
+                return result
 
             existing_message = list(
                 con.execute(
@@ -200,10 +221,6 @@ class BotAddQueueRepository:
                     (str(batch["chat_id"]), source_message_id),
                 )
             )
-            expected_signature = [
-                (index, str(link["input_sha256"]))
-                for index, link in enumerate(proposed)
-            ]
             if existing_message:
                 existing_batch_ids = {int(row["batch_id"]) for row in existing_message}
                 existing_signature = [
