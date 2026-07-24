@@ -61,6 +61,11 @@ _METADATA_CALLBACK_TARGETS = {
 }
 _METADATA_RETRY_DELAY_SEC = 24 * 60 * 60
 _METADATA_APPROVAL_WINDOW_SEC = 15 * 60
+_METADATA_RETRY_NOW_ATTEMPT = 0
+_METADATA_RETRY_24H_STORED_ATTEMPT = 2
+# Lease claims fence workers but deliberately do not mutate probe attempts.
+# Before probing, the coordinator must use its fenced lease transition into
+# metadata_wait to advance stored attempt 2 to the permitted final attempt 3.
 _METADATA_LEASE_STATES = frozenset(
     {
         "resolving",
@@ -549,6 +554,7 @@ class BotAddQueueRepository:
     def claim_metadata_lease(
         self, item_id: int, owner: str, lease_until: int
     ) -> dict[str, Any]:
+        """Fence a worker lease; the coordinator owns probe-attempt advancement."""
         item_key = self._positive_id(item_id, "item_id")
         lease_owner = self._identity(owner, "owner")
         now = self._timestamp()
@@ -557,6 +563,14 @@ class BotAddQueueRepository:
         def txn(con: sqlite3.Connection) -> dict[str, Any]:
             self._begin_immediate(con)
             row = self._item_in_transaction(con, item_key)
+            current_owner = row["metadata_lease_owner"]
+            current_until = row["metadata_lease_until"]
+            if (
+                current_owner is not None
+                and current_until is not None
+                and int(current_until) > now
+            ):
+                raise ValueError("metadata_lease_active")
             if str(row["state"]) not in _METADATA_LEASE_STATES:
                 raise ValueError("metadata_lease_state")
             batch_state = self._batch_state_in_transaction(con, int(row["batch_id"]))
@@ -588,14 +602,6 @@ class BotAddQueueRepository:
                     required_raw_until=required_raw_until,
                 )
                 return {"__error__": "raw_input_unavailable"}
-            current_owner = row["metadata_lease_owner"]
-            current_until = row["metadata_lease_until"]
-            if (
-                current_owner is not None
-                and current_until is not None
-                and int(current_until) > now
-            ):
-                raise ValueError("metadata_lease_active")
             current_generation = int(row["metadata_lease_generation"] or 0)
             next_generation = current_generation + 1
             cursor = con.execute(
@@ -947,15 +953,24 @@ class BotAddQueueRepository:
                 assignments["approval_generation"] = int(
                     row["approval_generation"] or 0
                 ) + 1
+            if expected_metadata_action in {"retry_now", "retry_24h"}:
+                assignments["metadata_probe_started_at"] = None
+                assignments["metadata_probe_deadline"] = None
+                assignments["metadata_lease_owner"] = None
+                assignments["metadata_lease_until"] = None
             if expected_metadata_action == "retry_24h":
                 retry_at = now + _METADATA_RETRY_DELAY_SEC
+                assignments["metadata_probe_attempt"] = (
+                    _METADATA_RETRY_24H_STORED_ATTEMPT
+                )
                 assignments["metadata_retry_at"] = retry_at
                 assignments["metadata_next_poll_at"] = retry_at
                 assignments["next_run_at"] = retry_at
             elif expected_metadata_action == "retry_now":
-                assignments["metadata_retry_at"] = None
+                assignments["metadata_probe_attempt"] = _METADATA_RETRY_NOW_ATTEMPT
+                assignments["metadata_retry_at"] = now
                 assignments["metadata_next_poll_at"] = None
-                assignments["next_run_at"] = None
+                assignments["next_run_at"] = now
             if target_state in _AUTOMATIC_TERMINAL_ITEM_STATES:
                 for field in _AUTOMATIC_TERMINAL_CLEAR_FIELDS:
                     assignments[field] = None

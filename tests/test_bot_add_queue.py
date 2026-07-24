@@ -1567,6 +1567,42 @@ def test_concurrent_metadata_claims_have_one_generation_winner(tmp_path, monkeyp
     assert stored["metadata_lease_owner"] in {"worker-0", "worker-1"}
 
 
+def test_active_metadata_lease_precedes_raw_window_checks_and_expires_for_takeover(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = _QueueClock(100)
+    queue = BotAddQueueRepository(
+        db,
+        limits=AddQueueLimits(raw_input_ttl_sec=1_000),
+        now=clock,
+    )
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolve")
+    first = queue.claim_metadata_lease(item["id"], "worker-a", 150)
+
+    with pytest.raises(ValueError, match="^metadata_lease_active$"):
+        queue.claim_metadata_lease(item["id"], "worker-b", 2_000)
+
+    protected = queue.get_item(item["id"], include_raw=True)
+    assert protected["state"] == "resolving"
+    assert protected["raw_input"] is not None
+    assert protected["metadata_lease_owner"] == "worker-a"
+    assert protected["metadata_lease_until"] == 150
+    assert protected["metadata_lease_generation"] == first["metadata_lease_generation"]
+    assert protected["approval_generation"] == 0
+
+    clock.advance(51)
+    takeover = queue.claim_metadata_lease(item["id"], "worker-b", 200)
+    assert takeover["metadata_lease_owner"] == "worker-b"
+    assert takeover["metadata_lease_until"] == 200
+    assert takeover["metadata_lease_generation"] == (
+        first["metadata_lease_generation"] + 1
+    )
+
+
 def test_enrollment_generation_is_required_and_completed_at_is_stable(queue_fixture):
     queue, clock, _db = queue_fixture
     batch = queue.open_draft("1", "1")
@@ -1785,6 +1821,74 @@ def test_metadata_callbacks_are_generation_fenced_across_repeated_exhaustion(que
     assert second_retry["approval_generation"] == second["approval_generation"] + 1
 
 
+@pytest.mark.parametrize(
+    (
+        "metadata_action",
+        "target_state",
+        "expected_attempt",
+        "due_offset",
+        "expected_next_poll_offset",
+    ),
+    [
+        ("retry_now", "waiting_probe_slot", 0, 0, None),
+        ("retry_24h", "metadata_retry_wait", 2, 24 * 60 * 60, 24 * 60 * 60),
+    ],
+)
+def test_metadata_retry_actions_reset_three_window_probe_policy(
+    queue_fixture,
+    metadata_action,
+    target_state,
+    expected_attempt,
+    due_offset,
+    expected_next_poll_offset,
+):
+    queue, clock, _db = queue_fixture
+    batch = queue.open_draft("1", "1")
+    queue.append_message(batch["id"], 1, _magnets(0, 1))
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(
+        item["id"],
+        {"received"},
+        "resolving",
+        "third_probe_window",
+        {
+            "metadata_probe_attempt": 3,
+            "metadata_probe_started_at": clock.value - 10,
+            "metadata_probe_deadline": clock.value + 10,
+            "metadata_next_poll_at": clock.value + 1,
+            "metadata_retry_at": clock.value - 20,
+            "next_run_at": clock.value - 20,
+        },
+    )
+    unavailable = queue.transition_item(
+        item["id"], {"resolving"}, "metadata_unavailable", "probe_exhausted"
+    )
+
+    retried = queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        target_state,
+        "operator_action",
+        metadata_action=metadata_action,
+        approval_generation=unavailable["approval_generation"],
+    )
+
+    assert retried["metadata_probe_attempt"] == expected_attempt
+    assert retried["metadata_probe_started_at"] is None
+    assert retried["metadata_probe_deadline"] is None
+    assert retried["metadata_lease_owner"] is None
+    assert retried["metadata_lease_until"] is None
+    assert retried["metadata_retry_at"] == clock.value + due_offset
+    assert retried["next_run_at"] == clock.value + due_offset
+    expected_next_poll = (
+        None
+        if expected_next_poll_offset is None
+        else clock.value + expected_next_poll_offset
+    )
+    assert retried["metadata_next_poll_at"] == expected_next_poll
+
+
 def test_metadata_retry_24h_is_persisted_and_does_not_claim_probe_slot(queue_fixture):
     queue, clock, _db = queue_fixture
     batch = queue.open_draft("1", "1")
@@ -1817,6 +1921,7 @@ def test_metadata_retry_24h_is_persisted_and_does_not_claim_probe_slot(queue_fix
     clock.advance(24 * 60 * 60)
     claimed = queue.claim_metadata_lease(item["id"], "worker", clock.value + 60)
     assert claimed["metadata_lease_owner"] == "worker"
+    assert claimed["metadata_probe_attempt"] == 2
 
 
 def test_metadata_retry_24h_requires_raw_ttl_through_approval_window(tmp_path):
