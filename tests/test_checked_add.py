@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
 
 import pytest
 
@@ -181,7 +181,7 @@ def test_remote_index_locked_source_preserves_previous_snapshot(state_db, tmp_pa
 
 
 def test_remote_index_rejects_overlong_keys_instead_of_truncating_them(state_db):
-    path = "gcrypt:/" + "x" * 1100 + ".mp4"
+    path = "gcrypt:/" + "x" * 5000 + ".mp4"
     result = RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 100).replace_rows(
         [{"video_path": path, "normalized_id": "BBAN-582", "size": 1000}]
     )
@@ -228,6 +228,10 @@ def test_remote_index_older_concurrent_snapshot_cannot_overwrite_newer(state_db)
 
     assert newer.status == "refreshed"
     assert results[0].status == "superseded"
+    assert results[0].generation == newer.generation
+    assert results[0].attempted_generation < results[0].generation
+    assert results[0].row_count == newer.row_count
+    assert results[0].refreshed_at == newer.refreshed_at
     assert [row["normalized_id"] for row in _remote_rows(state_db)] == ["NEW-001"]
 
 
@@ -258,8 +262,11 @@ def test_remote_index_delayed_success_applies_after_newer_attempt_fails(state_db
     thread.join(timeout=5)
 
     assert failed.status == "preserved"
+    assert failed.generation == 1
+    assert failed.attempted_generation == 3
     assert results[0].status == "refreshed"
     assert results[0].generation == 2
+    assert results[0].attempted_generation == 2
     assert [row["normalized_id"] for row in _remote_rows(state_db)] == ["GEN-002"]
 
 
@@ -294,6 +301,8 @@ def test_remote_index_delayed_older_success_loses_to_newer_success(state_db):
 
     assert newer.status == "refreshed"
     assert results[0].status == "superseded"
+    assert results[0].generation == 3
+    assert results[0].attempted_generation == 2
     assert [row["normalized_id"] for row in _remote_rows(state_db)] == ["GEN-003"]
 
 
@@ -339,6 +348,22 @@ def test_select_primary_video_does_not_drop_legal_media_because_of_name(name):
     assert selected.name == name
 
 
+@pytest.mark.parametrize("bad_index", [1.0, 1.5, True, " 1", "+1", "01", "1.0"])
+def test_select_primary_video_rejects_non_strict_file_indexes(bad_index):
+    assert select_primary_video(
+        [{"index": bad_index, "name": "movie.mp4", "size": 500 * 1024**2}]
+    ) is None
+
+
+@pytest.mark.parametrize("valid_index,expected", [(3, 3), ("3", 3), ("0", 0)])
+def test_select_primary_video_accepts_integer_or_strict_decimal_index(valid_index, expected):
+    selected = select_primary_video(
+        [{"index": valid_index, "name": "movie.mp4", "size": 500 * 1024**2}]
+    )
+    assert selected is not None
+    assert selected.index == expected
+
+
 def test_filename_normalizer_adapter_reuses_injected_normalizer_and_canonicalizes_id():
     normalizer = RecordingNormalizer({"normalized_id": "bban_582", "confidence": 0.9})
     adapter = FilenameNormalizerAdapter(normalizer)
@@ -371,6 +396,16 @@ def test_filename_normalizer_adapter_returns_unrecognized_on_exception_or_unsafe
     assert unsafe.normalize("movie.mp4").normalized_id is None
 
 
+@pytest.mark.parametrize("confidence", [None, float("nan"), float("inf"), True])
+def test_filename_normalizer_adapter_treats_missing_nonfinite_or_bool_confidence_as_zero(
+    confidence,
+):
+    result = FilenameNormalizerAdapter(
+        RecordingNormalizer({"normalized_id": "BBAN-582", "confidence": confidence})
+    ).normalize("BBAN-582.mp4")
+    assert result.confidence == 0.0
+
+
 def test_duplicate_matcher_classifies_exact_size_and_variant(state_db):
     RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 100).replace_rows(
         [{
@@ -400,7 +435,43 @@ def test_fuzzy_name_is_warning_only(state_db):
 
     assert result.decision == "ready"
     assert result.warnings == ("fuzzy_name_only",)
-    assert result.evidence == ("fuzzy:BBAN-583",)
+    assert result.evidence[0].startswith("fuzzy_sha256:")
+
+
+@pytest.mark.parametrize(
+    "confidence,expected,warning",
+    [
+        (0.0, "ready", "low_confidence_media_id"),
+        (0.799, "ready", "low_confidence_media_id"),
+        (0.8, "duplicate_remote", None),
+    ],
+)
+def test_duplicate_matcher_requires_configured_normalizer_confidence(
+    state_db, confidence, expected, warning
+):
+    RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 100).replace_rows(
+        [{"video_path": "gcrypt:/a.mp4", "normalized_id": "BBAN-582", "size": 1000}]
+    )
+    matcher = DuplicateMatcher(
+        state_db,
+        normalizer=RecordingNormalizer(
+            {"normalized_id": "BBAN-582", "confidence": confidence}
+        ),
+        min_normalizer_confidence=0.8,
+    )
+    result = matcher.decide("BBAN-582.mp4", 1000)
+    assert result.decision == expected
+    assert (warning in result.warnings) if warning else not result.warnings
+
+
+@pytest.mark.parametrize("threshold", [-0.01, 1.01, True, "0.8", float("nan")])
+def test_duplicate_matcher_validates_min_normalizer_confidence(state_db, threshold):
+    with pytest.raises(ValueError, match="min_normalizer_confidence"):
+        DuplicateMatcher(
+            state_db,
+            normalizer=RecordingNormalizer(),
+            min_normalizer_confidence=threshold,
+        )
 
 
 def test_prior_successful_canonical_identity_is_local_duplicate_but_transient_rows_are_not(state_db):
@@ -427,6 +498,55 @@ def test_prior_successful_canonical_identity_is_local_duplicate_but_transient_ro
     assert matcher.decide("x.mp4", 1000, canonical_identity="btih:failed").decision == "ready"
 
 
+def test_local_identity_evidence_is_fingerprinted_not_echoed(state_db):
+    secret_identity = "https://user:pass@example.test/private?token=QUERYSECRET"
+    def txn(con):
+        batch = con.execute(
+            "insert into bot_add_batches(batch_key,chat_id,user_id,state,created_at,updated_at) "
+            "values('secret-batch','chat','user','complete',1,1)"
+        ).lastrowid
+        con.execute(
+            "insert into bot_add_items(batch_id,source_message_id,source_index,input_kind,"
+            "redacted_input,input_sha256,canonical_identity,state,created_at,updated_at) "
+            "values(?,1,0,'magnet','redacted','secret-sha',?,'enrolled',1,1)",
+            (batch, secret_identity),
+        )
+    write_transaction(state_db, txn)
+    result = DuplicateMatcher(state_db, normalizer=RecordingNormalizer()).decide(
+        "movie.mp4", 1000, canonical_identity=secret_identity
+    )
+    rendered = repr(asdict(result))
+    assert result.decision == "duplicate_local"
+    assert "identity_sha256:" in rendered
+    assert "user:pass" not in rendered
+    assert "QUERYSECRET" not in rendered
+
+
+def test_exact_local_identity_precedes_low_confidence_filename(state_db):
+    identity = "btih:" + "ab" * 20
+    def txn(con):
+        batch = con.execute(
+            "insert into bot_add_batches(batch_key,chat_id,user_id,state,created_at,updated_at) "
+            "values('low-confidence-local','chat','user','complete',1,1)"
+        ).lastrowid
+        con.execute(
+            "insert into bot_add_items(batch_id,source_message_id,source_index,input_kind,"
+            "redacted_input,input_sha256,canonical_identity,state,created_at,updated_at) "
+            "values(?,2,0,'magnet','redacted','local-low-sha',?,'enrolled_hold',1,1)",
+            (batch, identity),
+        )
+    write_transaction(state_db, txn)
+    matcher = DuplicateMatcher(
+        state_db,
+        normalizer=RecordingNormalizer(
+            {"normalized_id": "BBAN-582", "confidence": 0.0}
+        ),
+    )
+    assert matcher.decide(
+        "BBAN-582.mp4", 1000, canonical_identity=identity
+    ).decision == "duplicate_local"
+
+
 def test_remote_multiple_rows_any_trusted_size_match_wins_deterministically(state_db):
     RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 100).replace_rows(
         [
@@ -440,8 +560,8 @@ def test_remote_multiple_rows_any_trusted_size_match_wins_deterministically(stat
     result = matcher.decide("BBAN-582.mp4", 1050)
 
     assert result.decision == "duplicate_remote"
-    assert [match.video_path for match in result.matches] == sorted(
-        match.video_path for match in result.matches
+    assert [match.path_sha256 for match in result.matches] == sorted(
+        match.path_sha256 for match in result.matches
     )
     assert len(result.evidence) <= 20
 
@@ -465,10 +585,42 @@ def test_remote_match_after_evidence_limit_still_decides_duplicate_and_is_includ
     )
 
     assert result.decision == "duplicate_remote"
-    assert any(match.video_path.endswith("z-decisive.mp4") for match in result.matches)
+    decisive = next(match for match in result.matches if match.size_close)
+    assert len(decisive.path_sha256) == 64
     assert len(result.matches) <= 20
     assert len(result.evidence) <= 20
     assert any("count=21" in item and "truncated=true" in item for item in result.evidence)
+
+
+def test_duplicate_decision_never_projects_opaque_remote_path_or_credentials(state_db):
+    path = "https://user:pass@example.test/private/TOKEN123/movie.mp4?auth=QUERYSECRET"
+    RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 100).replace_rows(
+        [{"video_path": path, "normalized_id": "BBAN-582", "size": 1000, "status": "done?token=STATUSSECRET"}]
+    )
+    result = DuplicateMatcher(state_db, normalizer=RecordingNormalizer()).decide(
+        "BBAN-582.mp4", 1000
+    )
+    rendered = repr(asdict(result)) + repr(result.evidence)
+    assert result.decision == "duplicate_remote"
+    for secret in ("user:pass", "TOKEN123", "QUERYSECRET", "STATUSSECRET", path):
+        assert secret not in rendered
+    assert result.matches[0].status == "unknown"
+    assert len(result.matches[0].path_sha256) == 64
+
+
+def test_remote_index_preserves_opaque_unicode_paths_as_distinct_keys(state_db):
+    fullwidth = "gcrypt:/Ａ/movie.mp4"
+    ascii_path = "gcrypt:/A/movie.mp4"
+    result = RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 100).replace_rows(
+        [
+            {"video_path": fullwidth, "normalized_id": "BBAN-582", "size": 1000},
+            {"video_path": ascii_path, "normalized_id": "BBAN-582", "size": 1000},
+        ]
+    )
+    assert result.row_count == 2
+    assert [row["video_path"] for row in _remote_rows(state_db)] == sorted(
+        [fullwidth, ascii_path]
+    )
 
 
 @pytest.mark.parametrize(
@@ -545,6 +697,88 @@ def test_remote_index_apply_failure_rolls_back_replace_and_returns_safe_result(s
     assert [row["normalized_id"] for row in _remote_rows(state_db)] == ["OLD-001"]
 
 
+def test_remote_index_fails_closed_on_partial_invalid_source_snapshot(state_db):
+    RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 99).replace_rows(
+        [{"video_path": "gcrypt:/old.mp4", "normalized_id": "OLD-001", "size": 1}]
+    )
+    result = RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 100).replace_rows(
+        [
+            {"video_path": "gcrypt:/new.mp4", "normalized_id": "NEW-001", "size": 2},
+            {"video_path": "bad\npath.mp4", "normalized_id": "BAD-001", "size": 3},
+        ]
+    )
+    assert result.status == "preserved"
+    assert result.error_code == "source_snapshot_invalid"
+    assert result.source_row_count == 2
+    assert result.invalid_row_count == 1
+    assert [row["normalized_id"] for row in _remote_rows(state_db)] == ["OLD-001"]
+
+
+def test_remote_index_preserves_old_snapshot_when_source_budget_is_exceeded(state_db):
+    RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 99).replace_rows(
+        [{"video_path": "gcrypt:/old.mp4", "normalized_id": "OLD-001", "size": 1}]
+    )
+    result = RemoteMediaIndex(
+        state_db,
+        backfill_db=None,
+        now=lambda: 100,
+        max_source_rows=1,
+        max_source_bytes=1024,
+    ).replace_rows(
+        [
+            {"video_path": "gcrypt:/a.mp4", "normalized_id": "AAA-001", "size": 1},
+            {"video_path": "gcrypt:/b.mp4", "normalized_id": "BBB-001", "size": 1},
+        ]
+    )
+    assert result.status == "preserved"
+    assert result.error_code == "source_snapshot_limit"
+    assert result.source_row_count == 2
+    assert [row["normalized_id"] for row in _remote_rows(state_db)] == ["OLD-001"]
+
+
+def test_remote_index_source_reader_is_streamed_and_closable(state_db, tmp_path):
+    source = tmp_path / "stream-source.sqlite"
+    _create_backfill(
+        source,
+        [("gcrypt:/a.mp4", "AAA-001", 1, "a.mp4", "done")],
+    )
+    rows = RemoteMediaIndex(state_db, backfill_db=source)._read_source_rows()
+    assert not isinstance(rows, (list, tuple))
+    assert dict(next(iter(rows)))["normalized_id"] == "AAA-001"
+    rows.close()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_source_rows": 0},
+        {"max_source_rows": True},
+        {"max_source_bytes": 0},
+        {"max_source_bytes": True},
+    ],
+)
+def test_remote_index_validates_source_budgets(state_db, kwargs):
+    with pytest.raises(ValueError):
+        RemoteMediaIndex(state_db, backfill_db=None, **kwargs)
+
+
+def test_remote_index_enforces_source_byte_budget_without_replacing(state_db):
+    RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 99).replace_rows(
+        [{"video_path": "gcrypt:/old.mp4", "normalized_id": "OLD-001", "size": 1}]
+    )
+    result = RemoteMediaIndex(
+        state_db,
+        backfill_db=None,
+        now=lambda: 100,
+        max_source_bytes=16,
+    ).replace_rows(
+        [{"video_path": "gcrypt:/new.mp4", "normalized_id": "NEW-001", "size": 2}]
+    )
+    assert result.status == "preserved"
+    assert result.error_code == "source_snapshot_limit"
+    assert [row["normalized_id"] for row in _remote_rows(state_db)] == ["OLD-001"]
+
+
 @pytest.mark.parametrize("candidate,remote", [(None, 100), (0, 100), (100, None), (100, 0), (True, 100)])
 def test_unknown_or_invalid_size_requires_confirmation_for_exact_id(
     state_db, candidate, remote
@@ -590,4 +824,5 @@ def test_duplicate_queries_use_identity_and_remote_indexes(state_db):
     finally:
         con.close()
     assert "idx_bot_add_items_canonical_identity" in local_plan
-    assert "idx_remote_media_normalized_id" in remote_plan
+    assert "idx_remote_media_normalized_path" in remote_plan
+    assert "TEMP B-TREE" not in remote_plan.upper()

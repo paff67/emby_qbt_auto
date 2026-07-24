@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import sqlite3
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Iterable, Mapping, Protocol
 
 from .db import readonly_connect, write_transaction
 from .media import FallbackFilenameNormalizer, _MEDIA_EXTS
@@ -18,9 +19,14 @@ _REMOTE_SOURCE = "backfill"
 _DEFAULT_TTL_SEC = 6 * 3600
 _MAX_REMOTE_MATCHES = 20
 _MAX_EVIDENCE = 20
-_MAX_PATH_CHARS = 1024
+_MAX_PATH_BYTES = 4096
 _MAX_NAME_CHARS = 512
 _SQLITE_MAX_INTEGER = (1 << 63) - 1
+_DEFAULT_MAX_SOURCE_ROWS = 1_000_000
+_DEFAULT_MAX_SOURCE_BYTES = 256 * 1024 * 1024
+_SAFE_REMOTE_STATUSES = frozenset(
+    {"done", "verified", "complete", "uploaded", "remote_probe"}
+)
 _MEDIA_ID = re.compile(r"(?:[A-Z0-9]{1,16}-){1,2}\d{2,9}")
 
 
@@ -35,6 +41,9 @@ class RemoteIndexRefreshResult:
     generation: int
     refreshed_at: int | None
     error_code: str | None = None
+    attempted_generation: int | None = None
+    source_row_count: int = 0
+    invalid_row_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -54,12 +63,10 @@ class NormalizationResult:
 
 @dataclass(frozen=True)
 class RemoteMediaMatch:
-    video_path: str
     normalized_id: str
     size: int | None
     status: str
-    source: str
-    updated_at: int
+    path_sha256: str
     size_close: bool
     size_diff_ratio: float | None
 
@@ -79,6 +86,28 @@ class _RemoteMatchScan:
     total_count: int
     matches: tuple[RemoteMediaMatch, ...]
     decisive_match: RemoteMediaMatch | None
+
+
+@dataclass(frozen=True)
+class _IndexedRemoteMatch:
+    video_path: str = field(repr=False)
+    projected: RemoteMediaMatch
+
+
+@dataclass(frozen=True)
+class _PreparedSnapshot:
+    rows: tuple[tuple[Any, ...], ...]
+    source_row_count: int
+    invalid_row_count: int
+    source_bytes: int
+
+
+class _SnapshotRejected(ValueError):
+    def __init__(self, code: str, *, source_row_count: int, invalid_row_count: int):
+        self.code = code
+        self.source_row_count = source_row_count
+        self.invalid_row_count = invalid_row_count
+        super().__init__(code)
 
 
 def _safe_text(
@@ -102,6 +131,37 @@ def _canonical_media_id(value: Any) -> str | None:
     if not _MEDIA_ID.fullmatch(text):
         return None
     return text
+
+
+def _opaque_video_path(value: Any) -> str | None:
+    if type(value) is not str or not value:
+        return None
+    if any(unicodedata.category(char) == "Cc" for char in value):
+        return None
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeError:
+        return None
+    if len(encoded) > _MAX_PATH_BYTES:
+        return None
+    return value
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", "strict")).hexdigest()
+
+
+def _strict_file_index(value: Any) -> int | None:
+    if type(value) is int:
+        return value if 0 <= value <= _SQLITE_MAX_INTEGER else None
+    if (
+        type(value) is str
+        and len(value) <= 19
+        and re.fullmatch(r"(?:0|[1-9]\d*)", value)
+    ):
+        parsed = int(value)
+        return parsed if parsed <= _SQLITE_MAX_INTEGER else None
+    return None
 
 
 def _known_positive_size(value: Any) -> int | None:
@@ -147,14 +207,9 @@ def select_primary_video(
         raw_index = _mapping_value(item, "index")
         if raw_index is None:
             index = ordinal
-        elif isinstance(raw_index, bool):
-            continue
         else:
-            try:
-                index = int(raw_index)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if index < 0:
+            index = _strict_file_index(raw_index)
+            if index is None:
                 continue
         progress_raw = _mapping_value(item, "progress")
         progress: float | None = None
@@ -190,10 +245,13 @@ class FilenameNormalizerAdapter:
             return NormalizationResult(None, 0.0, "normalizer_failed")
         normalized_id = _canonical_media_id(payload.get("normalized_id"))
         raw_confidence = payload.get("confidence", 0.0)
-        try:
-            confidence = float(raw_confidence)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(raw_confidence, bool):
             confidence = 0.0
+        else:
+            try:
+                confidence = float(raw_confidence)
+            except (TypeError, ValueError, OverflowError):
+                confidence = 0.0
         if not math.isfinite(confidence):
             confidence = 0.0
         confidence = min(1.0, max(0.0, confidence))
@@ -222,25 +280,48 @@ class RemoteMediaIndex:
         backfill_db: str | Path | None,
         now=None,
         ttl_sec: int = _DEFAULT_TTL_SEC,
+        max_source_rows: int = _DEFAULT_MAX_SOURCE_ROWS,
+        max_source_bytes: int = _DEFAULT_MAX_SOURCE_BYTES,
     ):
-        if isinstance(ttl_sec, bool) or not isinstance(ttl_sec, int) or ttl_sec <= 0:
-            raise ValueError("ttl_sec")
+        for name, value in (
+            ("ttl_sec", ttl_sec),
+            ("max_source_rows", max_source_rows),
+            ("max_source_bytes", max_source_bytes),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(name)
         self.state_db = Path(state_db)
         self.backfill_db = Path(backfill_db) if backfill_db is not None else None
         self.now = now or (lambda: int(time.time()))
         self.ttl_sec = ttl_sec
+        self.max_source_rows = max_source_rows
+        self.max_source_bytes = max_source_bytes
 
     def replace_rows(self, rows: Iterable[Mapping[str, Any]]) -> RemoteIndexRefreshResult:
         now = int(self.now())
         generation, _ = self._begin_refresh(now, force=True)
         try:
             prepared = self._prepare_rows(rows, updated_at=now)
+        except _SnapshotRejected as exc:
+            return self._preserve(
+                generation,
+                now,
+                exc.code,
+                source_row_count=exc.source_row_count,
+                invalid_row_count=exc.invalid_row_count,
+            )
         except Exception:
             return self._preserve(generation, now, "source_snapshot_invalid")
         try:
             return self._apply_snapshot(generation, now, prepared)
         except Exception:
-            return self._preserve(generation, now, "snapshot_apply_failed")
+            return self._preserve(
+                generation,
+                now,
+                "snapshot_apply_failed",
+                source_row_count=prepared.source_row_count,
+                invalid_row_count=prepared.invalid_row_count,
+            )
 
     def refresh(self, *, force: bool = False) -> RemoteIndexRefreshResult:
         now = int(self.now())
@@ -249,8 +330,18 @@ class RemoteMediaIndex:
             return fresh
         if self.backfill_db is None:
             return self._preserve(generation, now, "source_unconfigured")
+        source_rows = None
         try:
-            rows = self._prepare_rows(self._read_source_rows(), updated_at=now)
+            source_rows = self._read_source_rows()
+            rows = self._prepare_rows(source_rows, updated_at=now)
+        except _SnapshotRejected as exc:
+            return self._preserve(
+                generation,
+                now,
+                exc.code,
+                source_row_count=exc.source_row_count,
+                invalid_row_count=exc.invalid_row_count,
+            )
         except sqlite3.DatabaseError as exc:
             message = str(exc).lower()
             code = "source_schema_error" if "no such table" in message or "no such column" in message else "source_unavailable"
@@ -259,34 +350,33 @@ class RemoteMediaIndex:
             return self._preserve(generation, now, "source_unavailable")
         except Exception:
             return self._preserve(generation, now, "source_snapshot_invalid")
+        finally:
+            close = getattr(source_rows, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         try:
             return self._apply_snapshot(generation, now, rows)
         except Exception:
-            return self._preserve(generation, now, "snapshot_apply_failed")
+            return self._preserve(
+                generation,
+                now,
+                "snapshot_apply_failed",
+                source_row_count=rows.source_row_count,
+                invalid_row_count=rows.invalid_row_count,
+            )
 
-    def matches(self, normalized_id: str) -> tuple[dict[str, Any], ...]:
-        media_id = _canonical_media_id(normalized_id)
-        if media_id is None:
-            return ()
-        con = readonly_connect(self.state_db)
-        try:
-            rows = con.execute(
-                "select video_path,normalized_id,size,raw_basename,status,source,updated_at "
-                "from remote_media_index where normalized_id=? "
-                "order by video_path limit ?",
-                (media_id, _MAX_REMOTE_MATCHES),
-            ).fetchall()
-            return tuple(dict(row) for row in rows)
-        finally:
-            con.close()
-
-    def _read_source_rows(self) -> Sequence[sqlite3.Row]:
+    def _read_source_rows(self) -> Iterable[sqlite3.Row]:
         assert self.backfill_db is not None
-        con = readonly_connect(self.backfill_db)
-        try:
-            return list(con.execute(self.SOURCE_QUERY))
-        finally:
-            con.close()
+        def stream():
+            con = readonly_connect(self.backfill_db)
+            try:
+                yield from con.execute(self.SOURCE_QUERY)
+            finally:
+                con.close()
+        return stream()
 
     def _begin_refresh(
         self, now: int, *, force: bool
@@ -310,10 +400,10 @@ class RemoteMediaIndex:
                 and now - refreshed_at < self.ttl_sec
             ):
                 return 0, RemoteIndexRefreshResult(
-                    "fresh",
-                    int(row["row_count"]),
-                    int(row["applied_generation"]),
-                    refreshed_at,
+                    status="fresh",
+                    row_count=int(row["row_count"]),
+                    generation=int(row["applied_generation"]),
+                    refreshed_at=refreshed_at,
                 )
             generation = int(row["requested_generation"]) + 1
             con.execute(
@@ -326,7 +416,7 @@ class RemoteMediaIndex:
         return write_transaction(self.state_db, txn)
 
     def _apply_snapshot(
-        self, generation: int, now: int, rows: tuple[tuple[Any, ...], ...]
+        self, generation: int, now: int, snapshot: _PreparedSnapshot
     ) -> RemoteIndexRefreshResult:
         def txn(con: sqlite3.Connection):
             state = con.execute(
@@ -336,30 +426,58 @@ class RemoteMediaIndex:
             ).fetchone()
             if state is None or generation <= int(state["applied_generation"]):
                 return RemoteIndexRefreshResult(
-                    "superseded",
-                    int(state["row_count"]) if state else 0,
-                    generation,
-                    int(state["refreshed_at"]) if state and state["refreshed_at"] is not None else None,
+                    status="superseded",
+                    row_count=int(state["row_count"]) if state else 0,
+                    generation=int(state["applied_generation"]) if state else 0,
+                    refreshed_at=(
+                        int(state["refreshed_at"])
+                        if state and state["refreshed_at"] is not None
+                        else None
+                    ),
+                    attempted_generation=generation,
+                    source_row_count=snapshot.source_row_count,
+                    invalid_row_count=snapshot.invalid_row_count,
                 )
             con.execute("delete from remote_media_index where source=?", (_REMOTE_SOURCE,))
             con.executemany(
                 "insert into remote_media_index("
                 "video_path,normalized_id,size,raw_basename,status,source,updated_at) "
                 "values(?,?,?,?,?,?,?)",
-                rows,
+                snapshot.rows,
             )
             con.execute(
                 "update remote_media_index_refresh_state set applied_generation=?,"
                 "refreshed_at=?,row_count=?,last_attempt_at=?,last_result='refreshed' "
                 "where source=? and applied_generation<?",
-                (generation, now, len(rows), now, _REMOTE_SOURCE, generation),
+                (
+                    generation,
+                    now,
+                    len(snapshot.rows),
+                    now,
+                    _REMOTE_SOURCE,
+                    generation,
+                ),
             )
-            return RemoteIndexRefreshResult("refreshed", len(rows), generation, now)
+            return RemoteIndexRefreshResult(
+                status="refreshed",
+                row_count=len(snapshot.rows),
+                generation=generation,
+                refreshed_at=now,
+                attempted_generation=generation,
+                source_row_count=snapshot.source_row_count,
+                invalid_row_count=snapshot.invalid_row_count,
+            )
 
         return write_transaction(self.state_db, txn)
 
     def _preserve(
-        self, generation: int, now: int, error_code: str
+        self,
+        generation: int,
+        now: int,
+        error_code: str,
+        *,
+        source_row_count: int = 0,
+        invalid_row_count: int = 0,
     ) -> RemoteIndexRefreshResult:
         def txn(con: sqlite3.Connection):
             state = con.execute(
@@ -369,7 +487,14 @@ class RemoteMediaIndex:
             ).fetchone()
             if state is None:
                 return RemoteIndexRefreshResult(
-                    "preserved", 0, 0, None, error_code
+                    status="preserved",
+                    row_count=0,
+                    generation=0,
+                    refreshed_at=None,
+                    error_code=error_code,
+                    attempted_generation=generation,
+                    source_row_count=source_row_count,
+                    invalid_row_count=invalid_row_count,
                 )
             if int(state["requested_generation"]) == generation:
                 con.execute(
@@ -378,36 +503,68 @@ class RemoteMediaIndex:
                     (now, error_code, _REMOTE_SOURCE, generation),
                 )
             return RemoteIndexRefreshResult(
-                "preserved",
-                int(state["row_count"]),
-                int(state["applied_generation"]),
-                int(state["refreshed_at"]) if state["refreshed_at"] is not None else None,
-                error_code,
+                status="preserved",
+                row_count=int(state["row_count"]),
+                generation=int(state["applied_generation"]),
+                refreshed_at=(
+                    int(state["refreshed_at"])
+                    if state["refreshed_at"] is not None
+                    else None
+                ),
+                error_code=error_code,
+                attempted_generation=generation,
+                source_row_count=source_row_count,
+                invalid_row_count=invalid_row_count,
             )
 
         return write_transaction(self.state_db, txn)
 
-    @staticmethod
     def _prepare_rows(
-        rows: Iterable[Mapping[str, Any]], *, updated_at: int
-    ) -> tuple[tuple[Any, ...], ...]:
+        self, rows: Iterable[Mapping[str, Any]], *, updated_at: int
+    ) -> _PreparedSnapshot:
         by_path: dict[str, tuple[Any, ...]] = {}
+        source_row_count = 0
+        invalid_row_count = 0
+        source_bytes = 0
         for raw in rows:
+            source_row_count += 1
+            if source_row_count > self.max_source_rows:
+                raise _SnapshotRejected(
+                    "source_snapshot_limit",
+                    source_row_count=source_row_count,
+                    invalid_row_count=invalid_row_count,
+                )
             if not hasattr(raw, "get"):
                 raw = dict(raw)
-            video_path = _safe_text(raw.get("video_path"), limit=_MAX_PATH_CHARS)
-            normalized_id = _canonical_media_id(raw.get("normalized_id"))
-            if video_path is None or normalized_id is None:
+            values = tuple(
+                raw.get(name)
+                for name in ("video_path", "normalized_id", "size", "raw_basename", "status")
+            )
+            try:
+                source_bytes += sum(self._source_value_bytes(value) for value in values)
+            except (TypeError, UnicodeError):
+                invalid_row_count += 1
                 continue
-            raw_size = raw.get("size")
+            if source_bytes > self.max_source_bytes:
+                raise _SnapshotRejected(
+                    "source_snapshot_limit",
+                    source_row_count=source_row_count,
+                    invalid_row_count=invalid_row_count,
+                )
+            video_path = _opaque_video_path(values[0])
+            normalized_id = _canonical_media_id(values[1])
+            if video_path is None or normalized_id is None or video_path in by_path:
+                invalid_row_count += 1
+                continue
+            raw_size = values[2]
             size = _known_positive_size(raw_size)
             if raw_size in (0, "0"):
                 size = None
             raw_basename = _safe_text(
-                raw.get("raw_basename"), limit=255, allow_empty=True, truncate=True
+                values[3], limit=255, allow_empty=True, truncate=True
             ) or ""
             status = _safe_text(
-                raw.get("status"), limit=64, allow_empty=True, truncate=True
+                values[4], limit=64, allow_empty=True, truncate=True
             ) or ""
             row = (
                 video_path,
@@ -419,7 +576,30 @@ class RemoteMediaIndex:
                 updated_at,
             )
             by_path[video_path] = row
-        return tuple(by_path[path] for path in sorted(by_path))
+        if invalid_row_count:
+            raise _SnapshotRejected(
+                "source_snapshot_invalid",
+                source_row_count=source_row_count,
+                invalid_row_count=invalid_row_count,
+            )
+        return _PreparedSnapshot(
+            rows=tuple(by_path[path] for path in sorted(by_path)),
+            source_row_count=source_row_count,
+            invalid_row_count=0,
+            source_bytes=source_bytes,
+        )
+
+    @staticmethod
+    def _source_value_bytes(value: Any) -> int:
+        if value is None:
+            return 0
+        if type(value) is str:
+            return len(value.encode("utf-8", "strict"))
+        if type(value) is bytes:
+            return len(value)
+        if type(value) in {bool, int, float}:
+            return 8
+        raise TypeError("unsupported source value")
 
 
 class DuplicateMatcher:
@@ -429,6 +609,7 @@ class DuplicateMatcher:
         *,
         normalizer: FilenameNormalizer | FilenameNormalizerAdapter | None = None,
         size_tolerance_ratio: float = 0.15,
+        min_normalizer_confidence: float = 0.8,
     ):
         if isinstance(size_tolerance_ratio, bool) or not isinstance(
             size_tolerance_ratio, (int, float)
@@ -437,6 +618,13 @@ class DuplicateMatcher:
         tolerance = float(size_tolerance_ratio)
         if not math.isfinite(tolerance) or not 0 <= tolerance <= 1:
             raise ValueError("size_tolerance_ratio")
+        if isinstance(min_normalizer_confidence, bool) or not isinstance(
+            min_normalizer_confidence, (int, float)
+        ):
+            raise ValueError("min_normalizer_confidence")
+        confidence_threshold = float(min_normalizer_confidence)
+        if not math.isfinite(confidence_threshold) or not 0 <= confidence_threshold <= 1:
+            raise ValueError("min_normalizer_confidence")
         self.state_db = Path(state_db)
         self.normalizer = (
             normalizer
@@ -445,6 +633,7 @@ class DuplicateMatcher:
         )
         self.size_tolerance_ratio = tolerance
         self._tolerance_decimal = Decimal(str(tolerance))
+        self.min_normalizer_confidence = confidence_threshold
         self.remote_index = RemoteMediaIndex(
             self.state_db, backfill_db=None, now=lambda: int(time.time())
         )
@@ -463,7 +652,7 @@ class DuplicateMatcher:
                 "duplicate_local",
                 "canonical_identity_already_enrolled",
                 None,
-                evidence=(f"identity:{identity[:128]}",),
+                evidence=(f"identity_sha256:{_sha256_text(identity)}",),
             )
 
         normalized = self.normalizer.normalize(primary_name)
@@ -472,7 +661,7 @@ class DuplicateMatcher:
         fuzzy = self._safe_fuzzy_matches(fuzzy_matches)
         if fuzzy:
             warnings.append("fuzzy_name_only")
-            evidence.extend(f"fuzzy:{value}" for value in fuzzy)
+            evidence.extend(f"fuzzy_sha256:{value}" for value in fuzzy)
         if normalized.normalized_id is None:
             if normalized.reason in {"normalizer_failed", "normalizer_invalid_result", "normalizer_invalid_id"}:
                 warnings.append("normalization_unavailable")
@@ -480,6 +669,15 @@ class DuplicateMatcher:
                 "ready",
                 "no_exact_remote_media_id",
                 None,
+                evidence=tuple(evidence[:_MAX_EVIDENCE]),
+                warnings=tuple(dict.fromkeys(warnings)),
+            )
+        if normalized.confidence < self.min_normalizer_confidence:
+            warnings.append("low_confidence_media_id")
+            return DuplicateDecision(
+                "ready",
+                "normalized_media_id_below_confidence_threshold",
+                normalized.normalized_id,
                 evidence=tuple(evidence[:_MAX_EVIDENCE]),
                 warnings=tuple(dict.fromkeys(warnings)),
             )
@@ -505,7 +703,7 @@ class DuplicateMatcher:
             evidence_matches.sort(
                 key=lambda item: (
                     item != scan.decisive_match,
-                    item.video_path,
+                    item.path_sha256,
                 )
             )
         for match in evidence_matches:
@@ -515,7 +713,7 @@ class DuplicateMatcher:
                 else f"{match.size_diff_ratio:.6f}"
             )
             remote_evidence.append(
-                f"remote:{match.video_path[:160]}:size={match.size}:diff={ratio_text}"
+                f"remote:path_sha256={match.path_sha256}:size={match.size}:diff={ratio_text}"
             )
         evidence = remote_evidence + evidence
         return DuplicateDecision(
@@ -538,12 +736,17 @@ class DuplicateMatcher:
                 (normalized_id,),
             )
             total_count = 0
-            samples: list[RemoteMediaMatch] = []
-            decisive: RemoteMediaMatch | None = None
+            samples: list[_IndexedRemoteMatch] = []
+            decisive: _IndexedRemoteMatch | None = None
             for raw_row in rows:
                 total_count += 1
                 row = dict(raw_row)
-                remote_size = _known_positive_size(row.get("size"))
+                opaque_path = _opaque_video_path(row.get("video_path"))
+                remote_size = (
+                    _known_positive_size(row.get("size"))
+                    if opaque_path is not None
+                    else None
+                )
                 ratio: float | None = None
                 close = False
                 if candidate_size is not None and remote_size is not None:
@@ -552,26 +755,23 @@ class DuplicateMatcher:
                     close = Decimal(difference) <= self._tolerance_decimal * Decimal(
                         remote_size
                     )
-                updated_at = row.get("updated_at")
-                match = RemoteMediaMatch(
-                    video_path=_safe_text(
-                        row.get("video_path"), limit=_MAX_PATH_CHARS
-                    ) or "[invalid-path]",
-                    normalized_id=normalized_id,
-                    size=remote_size,
-                    status=_safe_text(
-                        row.get("status"), limit=64, allow_empty=True, truncate=True
-                    ) or "",
-                    source=_safe_text(
-                        row.get("source"), limit=64, allow_empty=True, truncate=True
-                    ) or "",
-                    updated_at=(
-                        updated_at
-                        if type(updated_at) is int and 0 <= updated_at <= _SQLITE_MAX_INTEGER
-                        else 0
+                raw_status = row.get("status")
+                status = (
+                    raw_status
+                    if type(raw_status) is str and raw_status in _SAFE_REMOTE_STATUSES
+                    else "unknown"
+                )
+                path_sha256 = _sha256_text(opaque_path or "[invalid-opaque-path]")
+                match = _IndexedRemoteMatch(
+                    video_path=opaque_path or "",
+                    projected=RemoteMediaMatch(
+                        normalized_id=normalized_id,
+                        size=remote_size,
+                        status=status,
+                        path_sha256=path_sha256,
+                        size_close=close,
+                        size_diff_ratio=ratio,
                     ),
-                    size_close=close,
-                    size_diff_ratio=ratio,
                 )
                 if len(samples) < _MAX_REMOTE_MATCHES:
                     samples.append(match)
@@ -582,8 +782,15 @@ class DuplicateMatcher:
                     samples[-1] = decisive
                 else:
                     samples.append(decisive)
-            samples.sort(key=lambda item: item.video_path)
-            return _RemoteMatchScan(total_count, tuple(samples), decisive)
+            projected = sorted(
+                (item.projected for item in samples),
+                key=lambda item: item.path_sha256,
+            )
+            return _RemoteMatchScan(
+                total_count,
+                tuple(projected),
+                decisive.projected if decisive is not None else None,
+            )
         finally:
             con.close()
 
@@ -605,10 +812,13 @@ class DuplicateMatcher:
         seen: set[str] = set()
         for value in values:
             safe = _safe_text(value, limit=240, truncate=True)
-            if safe is None or safe in seen:
+            if safe is None:
                 continue
-            seen.add(safe)
-            result.append(safe)
+            fingerprint = _sha256_text(safe)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            result.append(fingerprint)
             if len(result) >= _MAX_EVIDENCE:
                 break
         return tuple(result)

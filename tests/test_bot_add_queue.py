@@ -819,6 +819,19 @@ def test_remote_media_index_has_primary_key_and_normalized_id_index(tmp_path):
         assert ("normalized_id",) in _index_columns(
             con, "remote_media_index"
         ).values()
+        assert ("normalized_id", "video_path") in _index_columns(
+            con, "remote_media_index"
+        ).values()
+        ordered_plan = " ".join(
+            str(row[3])
+            for row in con.execute(
+                "explain query plan select video_path,size from remote_media_index "
+                "where normalized_id=? order by video_path",
+                ("BBAN-582",),
+            )
+        )
+        assert "idx_remote_media_normalized_path" in ordered_plan
+        assert "TEMP B-TREE" not in ordered_plan.upper()
     finally:
         con.close()
 

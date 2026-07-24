@@ -782,6 +782,8 @@ def migration_sql() -> list[str]:
         "updated_at integer not null)",
         "create index if not exists idx_remote_media_normalized_id "
         "on remote_media_index(normalized_id)",
+        "create index if not exists idx_remote_media_normalized_path "
+        "on remote_media_index(normalized_id,video_path)",
         "create table if not exists remote_media_index_refresh_state("
         "source text primary key,"
         "requested_generation integer not null default 0 check(requested_generation>=0),"
