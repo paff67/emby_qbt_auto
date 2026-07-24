@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
+import stat
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
+import qbt_orchestrator.db as db_module
 from qbt_orchestrator.db import migrate, readonly_connect
 
 
@@ -76,6 +83,100 @@ ITEM_STATES = {
     "failed",
     "cancelled",
 }
+
+
+def test_writer_connection_applies_private_sqlite_preparation(tmp_path, monkeypatch):
+    db = tmp_path / "state.sqlite"
+    calls: list[Path] = []
+    original = db_module._prepare_private_sqlite
+
+    def record(path):
+        calls.append(Path(path))
+        original(path)
+
+    monkeypatch.setattr(db_module, "_prepare_private_sqlite", record)
+    con = db_module._connect(db)
+    con.close()
+
+    assert calls == [db]
+
+
+def test_private_sqlite_preparation_uses_explicit_0600_without_umask(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "state.sqlite"
+    opened: list[tuple[str, int, int]] = []
+    closed: list[int] = []
+    hardened: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(db_module, "_ENFORCE_POSIX_SQLITE_MODE", True)
+
+    def fake_open(path, flags, mode):
+        opened.append((os.fspath(path), int(flags), int(mode)))
+        return 41
+
+    monkeypatch.setattr(db_module.os, "open", fake_open)
+    monkeypatch.setattr(db_module.os, "close", lambda fd: closed.append(int(fd)))
+    monkeypatch.setattr(
+        db_module.os,
+        "chmod",
+        lambda path, mode: hardened.append((os.fspath(path), int(mode))),
+    )
+
+    db_module._prepare_private_sqlite(db)
+
+    assert opened == [(str(db), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)]
+    assert closed == [41]
+    assert hardened == [
+        (str(db), 0o600),
+        (f"{db}-wal", 0o600),
+        (f"{db}-shm", 0o600),
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not available")
+def test_posix_writer_creates_private_database_wal_and_shm_under_umask_022(tmp_path):
+    db = tmp_path / "state.sqlite"
+    root = Path(__file__).resolve().parents[1]
+    script = """
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+from qbt_orchestrator.db import _connect
+
+db = Path(sys.argv[1])
+os.umask(0o022)
+con = _connect(db)
+con.execute("pragma journal_mode=WAL")
+con.execute("create table permission_probe(id integer primary key, value text)")
+con.execute("insert into permission_probe(value) values('safe')")
+con.commit()
+paths = [db, Path(f"{db}-wal"), Path(f"{db}-shm")]
+print(json.dumps({path.name: stat.S_IMODE(path.stat().st_mode) for path in paths}))
+con.close()
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(root / "src"), str(root), env.get("PYTHONPATH", "")]
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(db)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    modes = json.loads(completed.stdout)
+
+    assert modes == {
+        "state.sqlite": stat.S_IRUSR | stat.S_IWUSR,
+        "state.sqlite-wal": stat.S_IRUSR | stat.S_IWUSR,
+        "state.sqlite-shm": stat.S_IRUSR | stat.S_IWUSR,
+    }
 
 
 def _table_names(con: sqlite3.Connection) -> set[str]:

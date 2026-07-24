@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, atexit, json, queue, sqlite3, threading, time
+import asyncio, atexit, json, os, queue, sqlite3, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -7,7 +7,35 @@ from typing import Any, Callable, Dict, List
 from .hash_identity import canonical_torrent_hash
 
 
+_ENFORCE_POSIX_SQLITE_MODE = os.name == "posix"
+_SQLITE_PRIVATE_MODE = 0o600
+
+
+def _prepare_private_sqlite(path: str | Path) -> None:
+    """Secure a writable SQLite database before SQLite can create sidecars.
+
+    An explicit create mode avoids a process-wide umask change, which would be
+    unsafe in the daemon's worker threads.  Existing database/WAL/SHM files are
+    tightened as well.  Read-only connections deliberately bypass this path.
+    """
+    if not _ENFORCE_POSIX_SQLITE_MODE:
+        return
+    db_path = os.fspath(path)
+    try:
+        fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, _SQLITE_PRIVATE_MODE)
+    except FileExistsError:
+        pass
+    else:
+        os.close(fd)
+    for candidate in (db_path, f"{db_path}-wal", f"{db_path}-shm"):
+        try:
+            os.chmod(candidate, _SQLITE_PRIVATE_MODE)
+        except FileNotFoundError:
+            continue
+
+
 def _connect(path: str | Path) -> sqlite3.Connection:
+    _prepare_private_sqlite(path)
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("pragma foreign_keys=ON")
