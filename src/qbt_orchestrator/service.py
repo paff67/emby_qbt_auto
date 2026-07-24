@@ -298,6 +298,7 @@ class DaemonRuntime:
         orphan_janitor=None,
         junk_janitor=None,
         observe_promotion_service: ObservePromotionService | None = None,
+        metadata_probe_coordinator=None,
         junk_file_refresh_limit: int = 3,
         carousel_service=None,
         carousel_enabled: bool = True,
@@ -445,6 +446,7 @@ class DaemonRuntime:
         self.orphan_janitor = orphan_janitor
         self.junk_janitor = junk_janitor
         self.observe_promotion_service = observe_promotion_service
+        self.metadata_probe_coordinator = metadata_probe_coordinator
         self.path_reconciler = path_reconciler
         self.preemption_service = preemption_service
         self.soak_dry_run = soak_dry_run or dry_run
@@ -574,12 +576,31 @@ class DaemonRuntime:
         signal.signal(signal.SIGINT, self.stop)
 
     def _default_loop_tasks(self) -> list[LoopTask]:
-        return [
+        tasks = [
             LoopTask("planner", 15, self.planner_tick, max_runtime_sec=2),
             LoopTask("file_batch", 60, self.file_batch_tick, max_runtime_sec=5),
             LoopTask("maintenance", 300, self.maintenance_tick, max_runtime_sec=5),
             LoopTask("carousel", 1800, self.carousel_tick, max_runtime_sec=2),
         ]
+        if self.metadata_probe_coordinator is not None:
+            tasks.append(
+                LoopTask(
+                    "metadata_probe",
+                    5,
+                    self.metadata_probe_tick,
+                    max_runtime_sec=2,
+                )
+            )
+        return tasks
+
+    def metadata_probe_tick(self) -> dict:
+        if self.metadata_probe_coordinator is None:
+            return {"status": "disabled"}
+        snapshots, sync_healthy, _sampled = self._capture_safety_snapshot()
+        return self.metadata_probe_coordinator.tick(
+            sync_healthy=sync_healthy,
+            snapshots=snapshots,
+        )
 
     def maintenance_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
@@ -1369,6 +1390,7 @@ class DaemonRuntime:
                 "batch_live_verify": bool(self.batch_live_verify),
                 "background_event_workers": bool(self.background_event_workers),
                 "background_periodic_workers": bool(self.background_periodic_workers),
+                "metadata_probe": self.metadata_probe_coordinator is not None,
                 "scheduler_alerts": bool(self.scheduler_alert_service.config.enabled)
                 if hasattr(self.scheduler_alert_service, "config")
                 else False,

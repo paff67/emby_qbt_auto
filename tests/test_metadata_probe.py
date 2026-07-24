@@ -1,0 +1,626 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from qbt_orchestrator.db import migrate
+
+
+class Clock:
+    def __init__(self, value: int = 1_900_000_000):
+        self.value = value
+
+    def __call__(self) -> int:
+        return self.value
+
+    def advance(self, seconds: int) -> None:
+        self.value += seconds
+
+
+class RecordingExecutor:
+    def __init__(self, *, result: bool = True):
+        self.result = result
+        self.posts: list[tuple[str, dict]] = []
+
+    def qbt_post(self, path, payload):
+        self.posts.append((path, dict(payload)))
+        return self.result
+
+    def qbt_post_guarded(self, path, payload, *, guard):
+        if not guard():
+            return False
+        return self.qbt_post(path, payload)
+
+
+class SnapshotQbt:
+    def __init__(self, files=None):
+        self.files = list(files or [])
+        self.file_reads: list[str] = []
+
+    def torrent_files(self, torrent_hash):
+        self.file_reads.append(torrent_hash)
+        return [dict(row) for row in self.files]
+
+
+def test_precheck_gateway_uses_existing_executor_and_fixed_safe_payload():
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    executor = RecordingExecutor()
+    gateway = QbtPrecheckGateway(SnapshotQbt(), executor)
+    magnet = "magnet:?" + "xt=urn:btih:" + "a" * 40
+    tag = "add-item-" + "b" * 32
+
+    gateway.add_magnet(magnet, tag)
+    gateway.stop("c" * 40)
+    gateway.zero_file_priorities(
+        "c" * 40,
+        [{"index": 2}, {"index": 0}, {"index": 2}],
+    )
+    gateway.remove_registration("c" * 40)
+
+    assert executor.posts == [
+        (
+            "/api/v2/torrents/add",
+            {
+                "urls": magnet,
+                "category": "precheck",
+                "tags": f"precheck,metadata-probe,{tag},hold",
+                "stopped": "false",
+                "dlLimit": "1024",
+            },
+        ),
+        ("/api/v2/torrents/stop", {"hashes": "c" * 40}),
+        (
+            "/api/v2/torrents/filePrio",
+            {"hash": "c" * 40, "id": "0|2", "priority": "0"},
+        ),
+        (
+            "/api/v2/torrents/delete",
+            {"hashes": "c" * 40, "deleteFiles": "false"},
+        ),
+    ]
+
+
+def test_precheck_gateway_reconciles_an_exact_opaque_tag_and_rejects_ambiguity():
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    tag = "add-item-" + "d" * 32
+    gateway = QbtPrecheckGateway(SnapshotQbt(), RecordingExecutor())
+    gateway.set_snapshots(
+        {
+            "a" * 40: {"hash": "a" * 40, "tags": f"hold,{tag}", "state": "metaDL"},
+            "b" * 40: {"hash": "b" * 40, "tags": "hold,unrelated"},
+        }
+    )
+    assert gateway.find_by_tag(tag)["hash"] == "a" * 40
+
+    gateway.set_snapshots(
+        {
+            "a" * 40: {"hash": "a" * 40, "tags": tag},
+            "b" * 40: {"hash": "b" * 40, "tags": tag},
+        }
+    )
+    with pytest.raises(ValueError, match="^qbt_precheck_tag_ambiguous$"):
+        gateway.find_by_tag(tag)
+
+
+def test_precheck_gateway_validation_never_calls_executor_for_unsafe_inputs():
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    executor = RecordingExecutor()
+    gateway = QbtPrecheckGateway(SnapshotQbt(), executor)
+    with pytest.raises(ValueError, match="^magnet_uri$"):
+        gateway.add_magnet("https://example.test/file", "add-item-" + "a" * 32)
+    with pytest.raises(ValueError, match="^qbt_precheck_tag$"):
+        gateway.add_magnet(
+            "magnet:?" + "xt=urn:btih:" + "a" * 40,
+            "hold,precheck",
+        )
+    with pytest.raises(ValueError, match="^torrent_hash$"):
+        gateway.stop("not-a-hash")
+    with pytest.raises(ValueError, match="^file_index$"):
+        gateway.zero_file_priorities("a" * 40, [{"index": -1}])
+    assert executor.posts == []
+
+
+def test_precheck_gateway_uses_executor_guard_to_fence_stale_metadata_lease():
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    executor = RecordingExecutor()
+    gateway = QbtPrecheckGateway(SnapshotQbt(), executor)
+
+    assert gateway.stop("a" * 40, guard=lambda: False) is False
+    assert executor.posts == []
+    assert gateway.stop("a" * 40, guard=lambda: True) is True
+    assert executor.posts == [
+        ("/api/v2/torrents/stop", {"hashes": "a" * 40})
+    ]
+
+
+def test_global_dry_run_never_calls_real_qbt_precheck_write():
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    class Qbt(SnapshotQbt):
+        def post(self, _path, _payload):
+            raise AssertionError("dry-run must not call qBT")
+
+    executor = Executor(Qbt(), dry_run=True)
+    gateway = QbtPrecheckGateway(executor.qbt, executor)
+    assert gateway.add_magnet(
+        "magnet:?" + "xt=urn:btih:" + "a" * 40,
+        "add-item-" + "b" * 32,
+    ) is True
+    assert executor.action_log[-1].status == "dry_run"
+
+
+def test_metadata_probe_config_keeps_only_fixed_personal_instance_controls():
+    from qbt_orchestrator.metadata_probe import MetadataProbeConfig
+
+    config = MetadataProbeConfig()
+    assert config.slots == 3
+    assert config.poll_interval_sec == 5
+    assert config.windows_sec == (300, 600, 900)
+    assert config.backoffs_sec == (1800, 21600)
+    assert config.payload_limit_bps == 1024
+    assert config.lease_sec == 30
+    with pytest.raises(ValueError, match="slots"):
+        MetadataProbeConfig(slots=0)
+
+
+class FakeProbeGateway:
+    def __init__(self):
+        self.by_tag: dict[str, dict] = {}
+        self.files_by_hash: dict[str, list[dict]] = {}
+        self.added: list[tuple[str, str]] = []
+        self.stopped: list[str] = []
+        self.zeroed: list[str] = []
+        self.removed: list[str] = []
+        self.find_calls: list[str] = []
+        self.fail_add = False
+        self.lose_add_response = False
+
+    def set_snapshots(self, _snapshots):
+        return None
+
+    def add_magnet(self, magnet: str, tag: str, *, guard=None):
+        if guard is not None and not guard():
+            return False
+        self.added.append((magnet, tag))
+        if self.fail_add:
+            raise RuntimeError("transport failed; secret input must not be copied")
+        query = parse_qs(urlsplit(magnet).query)
+        torrent_hash = query["xt"][0].split(":")[-1].lower()
+        self.by_tag.setdefault(
+            tag,
+            {"hash": torrent_hash, "tags": f"precheck,{tag},hold", "state": "metaDL"},
+        )
+        self.files_by_hash.setdefault(
+            torrent_hash,
+            [{"index": 0, "name": "video.mkv", "priority": 1}],
+        )
+        if self.lose_add_response:
+            raise RuntimeError("response lost")
+        return True
+
+    def find_by_tag(self, tag: str):
+        self.find_calls.append(tag)
+        row = self.by_tag.get(tag)
+        return None if row is None else dict(row)
+
+    @staticmethod
+    def metadata_ready(snapshot):
+        return "meta" not in str(snapshot.get("state") or "").lower()
+
+    def stop(self, torrent_hash: str, *, guard=None):
+        if guard is not None and not guard():
+            return False
+        self.stopped.append(torrent_hash)
+        return True
+
+    def torrent_files(self, torrent_hash: str):
+        return [dict(row) for row in self.files_by_hash.get(torrent_hash, [])]
+
+    def zero_file_priorities(self, torrent_hash: str, files, *, guard=None):
+        if guard is not None and not guard():
+            return False
+        self.zeroed.append(torrent_hash)
+        for row in self.files_by_hash[torrent_hash]:
+            row["priority"] = 0
+        return True
+
+    @staticmethod
+    def all_priorities_zero(files):
+        return bool(files) and all(int(row.get("priority") or 0) == 0 for row in files)
+
+    def remove_registration(self, torrent_hash: str, *, guard=None):
+        if guard is not None and not guard():
+            return False
+        self.removed.append(torrent_hash)
+        return True
+
+
+def _probe_fixture(tmp_path, *, batches: list[int], clock=None, owner="worker-a"):
+    from qbt_orchestrator.bot_add_queue import BotAddQueueRepository
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = clock or Clock()
+    queue = BotAddQueueRepository(db, now=clock)
+    item_ids: list[int] = []
+    next_hash = 1
+    for count in batches:
+        batch = queue.open_draft("chat", f"user-{len(item_ids)}")
+        links = [
+            "magnet:?" + "xt=urn:btih:" + f"{value:040x}"
+            for value in range(next_hash, next_hash + count)
+        ]
+        next_hash += count
+        queue.append_message(batch["id"], 100 + batch["id"], links)
+        queue.submit(batch["id"])
+        for item in queue.list_items(batch["id"]):
+            queue.transition_item(item["id"], {"received"}, "resolving", "resolved")
+            queue.transition_item(
+                item["id"], {"resolving"}, "waiting_probe_slot", "probe_required"
+            )
+            item_ids.append(item["id"])
+    gateway = FakeProbeGateway()
+    coordinator = MetadataProbeCoordinator(queue, gateway, owner=owner, now=clock)
+    return queue, gateway, coordinator, clock, item_ids, db
+
+
+def test_coordinator_uses_three_slots_and_round_robins_across_batches(tmp_path):
+    queue, gateway, coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[2, 1, 1]
+    )
+
+    result = coordinator.tick(sync_healthy=True)
+
+    assert len(result["started"]) == 3
+    started = [queue.get_item(item_id) for item_id in result["started"]]
+    assert len({item["batch_id"] for item in started}) == 3
+    assert all(item["state"] == "metadata_wait" for item in started)
+    assert all(item["metadata_probe_attempt"] == 1 for item in started)
+    assert all(item["metadata_probe_deadline"] == clock.value + 300 for item in started)
+    assert len(gateway.added) == 3
+    waiting = [queue.get_item(item_id) for item_id in item_ids if item_id not in result["started"]]
+    assert [item["state"] for item in waiting] == ["waiting_probe_slot"]
+
+
+def test_single_batch_can_fill_all_three_probe_slots(tmp_path):
+    queue, _gateway, coordinator, _clock, _item_ids, _db = _probe_fixture(
+        tmp_path, batches=[4]
+    )
+    result = coordinator.tick()
+    assert len(result["started"]) == 3
+    assert sum(
+        item["state"] == "metadata_wait"
+        for item in queue.list_items(queue.get_item(result["started"][0])["batch_id"])
+    ) == 3
+
+
+def test_polling_is_due_only_and_tick_never_sleeps(tmp_path, monkeypatch):
+    _queue, gateway, coordinator, clock, _item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    monkeypatch.setattr(
+        "time.sleep", lambda *_args: pytest.fail("coordinator tick must not sleep")
+    )
+    coordinator.tick()
+    calls_after_start = len(gateway.find_calls)
+    clock.advance(4)
+    coordinator.tick()
+    assert len(gateway.find_calls) == calls_after_start
+    clock.advance(1)
+    coordinator.tick()
+    assert len(gateway.find_calls) == calls_after_start + 1
+
+
+def test_ready_probe_is_stopped_zeroed_verified_and_left_for_prechecking(tmp_path):
+    queue, gateway, coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    gateway.by_tag[item["qbt_precheck_tag"]]["state"] = "stoppedDL"
+    clock.advance(5)
+
+    result = coordinator.tick()
+
+    ready = queue.get_item(item_ids[0])
+    assert result["ready"] == [item_ids[0]]
+    assert ready["state"] == "prechecking"
+    assert ready["metadata_lease_owner"] is None
+    assert gateway.stopped == [ready["qbt_hash"]]
+    assert gateway.zeroed == [ready["qbt_hash"]]
+    assert gateway.files_by_hash[ready["qbt_hash"]][0]["priority"] == 0
+
+
+def test_probe_windows_and_backoffs_end_in_metadata_unavailable(tmp_path):
+    queue, gateway, coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    coordinator.tick()
+    registered_hash = queue.get_item(item_ids[0])["qbt_hash"]
+
+    clock.advance(300)
+    first = coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    assert first["timed_out"] == [item_ids[0]]
+    assert item["state"] == "metadata_retry_wait"
+    assert item["metadata_retry_at"] == clock.value + 1800
+    assert gateway.removed == [registered_hash]
+
+    clock.advance(1800)
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    assert item["metadata_probe_attempt"] == 2
+    assert item["metadata_probe_deadline"] == clock.value + 600
+    clock.advance(600)
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    assert item["state"] == "metadata_retry_wait"
+    assert item["metadata_retry_at"] == clock.value + 21600
+
+    clock.advance(21600)
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    assert item["metadata_probe_attempt"] == 3
+    assert item["metadata_probe_deadline"] == clock.value + 900
+    clock.advance(900)
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    assert item["state"] == "metadata_unavailable"
+    assert item["approval_generation"] == 1
+    assert item["metadata_lease_owner"] is None
+
+
+def test_active_lease_blocks_second_worker_and_expired_lease_recovers_by_tag(tmp_path):
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+
+    queue, gateway, first, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1], owner="worker-a"
+    )
+    first.tick()
+    first_lease = queue.get_item(item_ids[0])
+    second = MetadataProbeCoordinator(queue, gateway, owner="worker-b", now=clock)
+    assert second.tick()["started"] == []
+    assert len(gateway.added) == 1
+
+    clock.advance(31)
+    recovered = second.tick()
+    assert recovered["recovered"] == [item_ids[0]]
+    assert len(gateway.added) == 1
+    assert queue.get_item(item_ids[0])["metadata_lease_owner"] == "worker-b"
+    with pytest.raises(ValueError, match="^metadata_lease_conflict$"):
+        queue.update_metadata_probe(
+            item_ids[0],
+            "worker-a",
+            first_lease["metadata_lease_generation"],
+            {"last_error": "stale"},
+        )
+
+
+def test_qbt_failure_keeps_item_recoverable_without_persisting_raw_error(tmp_path):
+    queue, gateway, coordinator, _clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    gateway.fail_add = True
+
+    result = coordinator.tick()
+
+    item = queue.get_item(item_ids[0])
+    assert result["errors"] == 1
+    assert item["state"] == "metadata_wait"
+    assert item["metadata_lease_owner"] == "worker-a"
+    assert item["last_error"] == "qbt_precheck_failed"
+    assert "magnet" not in item["last_error"]
+
+
+def test_qbt_failure_stops_new_claims_and_deduplicates_repeated_error_counts(tmp_path):
+    queue, gateway, coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[3]
+    )
+    gateway.fail_add = True
+
+    first = coordinator.tick()
+    assert first["errors"] == 1
+    assert sum(queue.get_item(item_id)["state"] == "metadata_wait" for item_id in item_ids) == 1
+
+    clock.advance(5)
+    repeated = coordinator.tick()
+    assert repeated["errors"] == 0
+    assert sum(queue.get_item(item_id)["state"] == "metadata_wait" for item_id in item_ids) == 1
+
+
+def test_lost_add_response_is_reconciled_by_tag_without_duplicate_add(tmp_path):
+    queue, gateway, coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    gateway.lose_add_response = True
+    first = coordinator.tick()
+    assert first["errors"] == 1
+    assert len(gateway.added) == 1
+
+    gateway.lose_add_response = False
+    clock.advance(5)
+    recovered = coordinator.tick()
+    assert recovered["errors"] == 0
+    assert len(gateway.added) == 1
+    assert queue.get_item(item_ids[0])["qbt_hash"] is not None
+    assert queue.get_item(item_ids[0])["last_error"] is None
+
+
+def test_draft_and_not_due_retry_items_do_not_take_probe_slots(tmp_path):
+    from qbt_orchestrator.bot_add_queue import BotAddQueueRepository
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = Clock()
+    queue = BotAddQueueRepository(db, now=clock)
+    draft = queue.open_draft("chat", "user")
+    queue.append_message(
+        draft["id"], 1, ["magnet:?" + "xt=urn:btih:" + "a" * 40]
+    )
+    gateway = FakeProbeGateway()
+    coordinator = MetadataProbeCoordinator(queue, gateway, owner="worker", now=clock)
+
+    assert coordinator.tick()["started"] == []
+    assert gateway.added == []
+
+    queue.submit(draft["id"])
+    item = queue.list_items(draft["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolved")
+    queue.transition_item(item["id"], {"resolving"}, "metadata_unavailable", "failed")
+    unavailable = queue.get_item(item["id"])
+    queue.transition_item(
+        item["id"],
+        {"metadata_unavailable"},
+        "metadata_retry_wait",
+        "retry_later",
+        approval_generation=unavailable["approval_generation"],
+        metadata_action="retry_24h",
+    )
+    assert coordinator.tick()["started"] == []
+    assert gateway.added == []
+
+
+def test_probe_does_not_add_when_raw_input_expires_before_probe_window(tmp_path):
+    from qbt_orchestrator.bot_add_queue import AddQueueLimits, BotAddQueueRepository
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    clock = Clock()
+    queue = BotAddQueueRepository(
+        db,
+        now=clock,
+        limits=AddQueueLimits(raw_input_ttl_sec=100),
+    )
+    batch = queue.open_draft("chat", "user")
+    queue.append_message(
+        batch["id"], 1, ["magnet:?" + "xt=urn:btih:" + "a" * 40]
+    )
+    queue.submit(batch["id"])
+    item = queue.list_items(batch["id"])[0]
+    queue.transition_item(item["id"], {"received"}, "resolving", "resolved")
+    queue.transition_item(
+        item["id"], {"resolving"}, "waiting_probe_slot", "probe_required"
+    )
+    gateway = FakeProbeGateway()
+
+    MetadataProbeCoordinator(queue, gateway, owner="worker", now=clock).tick()
+
+    stored = queue.get_item(item["id"])
+    assert stored["state"] == "metadata_unavailable"
+    assert stored["metadata_lease_owner"] is None
+    assert gateway.added == []
+
+def test_unhealthy_sync_suspends_without_claiming_or_writing(tmp_path):
+    queue, gateway, coordinator, _clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    result = coordinator.tick(sync_healthy=False)
+    assert result["suspended"] is True
+    assert queue.get_item(item_ids[0])["state"] == "waiting_probe_slot"
+    assert gateway.added == []
+
+
+def test_daemon_runtime_only_schedules_optional_metadata_probe_and_passes_sync_snapshot(
+    tmp_path,
+):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class Qbt:
+        def get_maindata(self, rid):
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "a" * 40: {
+                        "hash": "a" * 40,
+                        "tags": "precheck,add-item-" + "b" * 32,
+                        "state": "metaDL",
+                    }
+                },
+                "server_state": {},
+            }
+
+    class Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        def tick(self, *, sync_healthy, snapshots):
+            self.calls.append((sync_healthy, snapshots))
+            return {"started": []}
+
+    coordinator = Coordinator()
+    runtime = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=Qbt(),
+        executor=RecordingExecutor(),
+        free_bytes_provider=lambda: 10 * 1024**3,
+        dry_run=True,
+        carousel_enabled=False,
+        metadata_probe_coordinator=coordinator,
+    )
+    runtime.tick_safety()
+
+    assert "metadata_probe" in [task.name for task in runtime.loop_tasks]
+    runtime.metadata_probe_tick()
+    assert coordinator.calls[0][0] is True
+    assert "a" * 40 in coordinator.calls[0][1]
+
+    disabled = DaemonRuntime(
+        state_db=tmp_path / "disabled.sqlite",
+        qbt=Qbt(),
+        executor=RecordingExecutor(),
+        free_bytes_provider=lambda: 10 * 1024**3,
+        dry_run=True,
+        carousel_enabled=False,
+    )
+    assert "metadata_probe" not in [task.name for task in disabled.loop_tasks]
+    assert disabled.metadata_probe_tick() == {"status": "disabled"}
+
+
+def test_cli_metadata_probe_feature_flag_defaults_off_and_enables_one_coordinator(
+    tmp_path, monkeypatch
+):
+    import argparse
+    from qbt_orchestrator import cli
+
+    class Qbt:
+        def post(self, _path, _payload):
+            return "Ok."
+
+        def torrent_files(self, _torrent_hash):
+            return []
+
+    monkeypatch.setattr(cli, "_build_qbt_client_from_env", lambda *_args: Qbt())
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(tmp_path / "state.sqlite"))
+    monkeypatch.setenv("QBT_ORCH_DRY_RUN", "1")
+    monkeypatch.setenv("QBT_ORCH_ORPHAN_JANITOR", "0")
+    monkeypatch.setenv("QBT_ORCH_JUNK_JANITOR", "0")
+    monkeypatch.setenv("QBT_ORCH_CAROUSEL", "0")
+    monkeypatch.setenv("QBT_ORCH_QBT_PREFERENCES_GUARD", "0")
+    monkeypatch.setenv("QBT_ORCH_PATH_RECONCILE", "0")
+    monkeypatch.delenv("QBT_ORCH_METADATA_PROBE_ENABLED", raising=False)
+    ns = argparse.Namespace(
+        cmd="daemon",
+        dry_run=True,
+        config=None,
+        safety_interval=0,
+        max_safety_ticks=1,
+    )
+
+    disabled, _ = cli._build_runtime(ns, tmp_path / "state.sqlite")
+    assert disabled.metadata_probe_coordinator is None
+
+    monkeypatch.setenv("QBT_ORCH_METADATA_PROBE_ENABLED", "1")
+    enabled, _ = cli._build_runtime(ns, tmp_path / "state.sqlite")
+    assert enabled.metadata_probe_coordinator is not None
+    assert [task.name for task in enabled.loop_tasks].count("metadata_probe") == 1

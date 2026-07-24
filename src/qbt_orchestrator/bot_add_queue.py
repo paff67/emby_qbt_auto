@@ -156,6 +156,19 @@ _AUTOMATIC_TERMINAL_CLEAR_FIELDS = frozenset(
     }
 )
 _RAW_INPUT_FIELDS = frozenset({"raw_input", "raw_input_expires_at"})
+_METADATA_PROGRESS_FIELDS = frozenset(
+    {
+        "qbt_hash",
+        "qbt_precheck_tag",
+        "metadata_probe_attempt",
+        "metadata_probe_started_at",
+        "metadata_probe_deadline",
+        "metadata_next_poll_at",
+        "metadata_retry_at",
+        "next_run_at",
+        "last_error",
+    }
+)
 _SAFE_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _MAX_RAW_INPUT_TTL_SEC = 7 * 86400
 
@@ -712,6 +725,53 @@ class BotAddQueueRepository:
             generation,
             fence=False,
         )
+
+    def update_metadata_probe(
+        self,
+        item_id: int,
+        owner: str,
+        generation: int,
+        fields: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Update probe progress while the caller still owns its lease."""
+        item_key = self._positive_id(item_id, "item_id")
+        lease_owner = self._identity(owner, "owner")
+        token_generation = self._positive_id(generation, "metadata_lease_generation")
+        proposed = dict(fields)
+        if not proposed or not set(proposed) <= _METADATA_PROGRESS_FIELDS:
+            raise ValueError("metadata_progress_fields")
+        now = self._timestamp()
+
+        def txn(con: sqlite3.Connection) -> dict[str, Any]:
+            self._begin_immediate(con)
+            row = self._item_in_transaction(con, item_key)
+            if (
+                str(row["metadata_lease_owner"] or "") != lease_owner
+                or int(row["metadata_lease_generation"] or 0) != token_generation
+                or row["metadata_lease_until"] is None
+                or int(row["metadata_lease_until"]) <= now
+            ):
+                raise ValueError("metadata_lease_conflict")
+            ordered = sorted(proposed)
+            assignments = ",".join(f"{field}=?" for field in ordered)
+            cursor = con.execute(
+                f"update bot_add_items set {assignments},updated_at=? "
+                "where id=? and metadata_lease_owner=? "
+                "and metadata_lease_generation=? and metadata_lease_until>?",
+                (
+                    *(proposed[field] for field in ordered),
+                    now,
+                    item_key,
+                    lease_owner,
+                    token_generation,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("metadata_lease_conflict")
+            return self._safe_item_in_transaction(con, item_key)
+
+        return dict(write_transaction(self.state_db, txn))
 
     def fence_metadata_lease(
         self, item_id: int, owner: str, generation: int

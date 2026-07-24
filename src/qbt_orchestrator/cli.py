@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Sequence
 from .config import load_config
 from .carousel import CarouselService
+from .bot_add_queue import BotAddQueueRepository
 from .capacity_reclaim import DeadPartialReclaimer
 from .capacity_assessment import CapacityAssessmentBuilder, CapacityAssessmentStore
 from .db import migrate, readonly_connect, readonly_counts, recover_jobs
@@ -20,9 +21,11 @@ from .junk_janitor import JunkJanitorService
 from .maintenance import SQLiteMaintenanceService
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
 from .observe_promotion import ObservePromotionConfig, ObservePromotionService
+from .metadata_probe import MetadataProbeCoordinator
 from .orphan_janitor import OrphanJanitorService
 from .path_reconcile import QbtPathReconciler
 from .preferences import QbtPreferencesGuard
+from .qbt_precheck import QbtPrecheckGateway
 from .promotion import MediaPromotionRepository, MediaPromotionRunner
 from .runtime import BotCommandRepository, BotNotificationRepository, CleanupRequestRunner, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
@@ -383,6 +386,15 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     qbt_cfg = cfg.qbt if cfg else None
     qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)
     executor = Executor(qbt, dry_run=dry_run, state_db=state_db)
+    metadata_probe_enabled = (
+        _truthy(os.environ.get("QBT_ORCH_METADATA_PROBE_ENABLED")) is True
+    )
+    metadata_probe_coordinator = None
+    if metadata_probe_enabled:
+        metadata_probe_coordinator = MetadataProbeCoordinator(
+            BotAddQueueRepository(state_db),
+            QbtPrecheckGateway(qbt, executor),
+        )
     capacity_assessment_builder = CapacityAssessmentBuilder(
         viability_stale_sec=viability_stale_sec
     )
@@ -779,6 +791,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         orphan_janitor=orphan_janitor,
         junk_janitor=junk_janitor,
         observe_promotion_service=observe_promotion_service,
+        metadata_probe_coordinator=metadata_probe_coordinator,
         junk_file_refresh_limit=int(os.environ.get("QBT_ORCH_JUNK_FILE_REFRESH_LIMIT", "3")),
         carousel_service=carousel_service,
         carousel_enabled=carousel_enabled,
