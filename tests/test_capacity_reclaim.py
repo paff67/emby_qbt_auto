@@ -3146,6 +3146,90 @@ def test_complete_requires_verified_tag_outcome_when_recheck_succeeded(tmp_path)
     assert _capacity_reclaim_rows(db)[0]["state"] == "deleted"
 
 
+def _archive_tags_reclaimer(tmp_path, executor):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir(parents=True, exist_ok=True)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    return DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        disk_free_bytes=lambda _path: 0,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+
+def test_apply_archive_tags_preserves_auto_and_requires_both_labels(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import RECLAIM_ARCHIVE_TAGS_CSV
+
+    executor = RecordingExecutor({"h": {"tags": "auto", "state": "stoppedDL"}})
+    executor.acquire_hash_mutation_lease("h", "reclaim:1:4")
+    reclaimer = _archive_tags_reclaimer(tmp_path, executor)
+
+    outcome = reclaimer._apply_reclaim_archive_tags("h", "reclaim:1:4")
+
+    assert outcome == "applied"
+    assert executor.posts == [
+        (
+            "/api/v2/torrents/addTags",
+            {"hashes": "h", "tags": RECLAIM_ARCHIVE_TAGS_CSV},
+        )
+    ]
+    assert executor.post_lease_tokens == ["reclaim:1:4"]
+    tags = {
+        part.strip()
+        for part in str(executor.torrent_info("h")["tags"]).split(",")
+        if part.strip()
+    }
+    assert {"auto", "capacity-reclaimed", "hold"} <= tags
+
+
+def test_apply_archive_tags_rejects_partial_readback_missing_hold(tmp_path):
+    class MissingHoldExecutor(RecordingExecutor):
+        def torrent_info(self, torrent_hash, timeout=None):
+            # Pretend addTags succeeded but hold never became visible.
+            return {
+                "hash": torrent_hash,
+                "state": "stoppedDL",
+                "tags": "auto, capacity-reclaimed",
+            }
+
+    executor = MissingHoldExecutor({"h": {"tags": "auto", "state": "stoppedDL"}})
+    executor.acquire_hash_mutation_lease("h", "reclaim:1:4")
+    reclaimer = _archive_tags_reclaimer(tmp_path, executor)
+
+    with pytest.raises(
+        RuntimeError,
+        match="reclaim archive tag verification failed: missing=hold",
+    ):
+        reclaimer._apply_reclaim_archive_tags("h", "reclaim:1:4")
+
+
+def test_apply_archive_tags_returns_torrent_absent_for_adapter_placeholder(
+    tmp_path,
+):
+    class AbsentExecutor(RecordingExecutor):
+        def torrent_info(self, torrent_hash, timeout=None):
+            return {"hash": torrent_hash}
+
+    executor = AbsentExecutor({"h": {"tags": "auto", "state": "stoppedDL"}})
+    executor.acquire_hash_mutation_lease("h", "reclaim:1:4")
+    reclaimer = _archive_tags_reclaimer(tmp_path, executor)
+
+    assert reclaimer._apply_reclaim_archive_tags("h", "reclaim:1:4") == (
+        "torrent_absent"
+    )
+
+
 CAPACITY_RECLAIM_TRIGGER_NAMES = (
     "trg_capacity_reclaim_lock_job_insert",
     "trg_capacity_reclaim_lock_job_update",
