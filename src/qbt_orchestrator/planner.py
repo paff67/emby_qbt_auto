@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from .budget import future_growth_by_hash, resource_claims_from_rows
 from .capacity_assessment import CapacityAssessment, project_progress_health
 from .capacity_reclaim import capacity_reclaim_locked_hashes
+from .carousel import DEFAULT_PROBE_DURATION_SEC, confirm_availability_probes_started
 from .db import assert_hash_not_reclaim_locked, readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
 from .hash_identity import canonical_torrent_hash
@@ -245,7 +246,11 @@ class DownloadPlanner:
         dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
         carousel_states = self._carousel_state_rows(now)
         dead_hashes |= {h for h, state in carousel_states.items() if state == "dead"}
-        dead_hashes -= {h for h, state in carousel_states.items() if state in {"probing", "soak"}}
+        dead_hashes -= {
+            h
+            for h, state in carousel_states.items()
+            if state in {"pending", "probing", "soak"}
+        }
         dead_hashes -= forced_active_hashes
         dead_hashes -= reclaim_locked_hashes
         cooldown_hashes -= reclaim_locked_hashes
@@ -285,7 +290,11 @@ class DownloadPlanner:
             dead_hashes = {h for h, row in previous_allocations.items() if str(row.get("desired_state")) == "dead"}
             carousel_states = self._carousel_state_rows(now)
             dead_hashes |= {h for h, state in carousel_states.items() if state == "dead"}
-            dead_hashes -= {h for h, state in carousel_states.items() if state in {"probing", "soak"}}
+            dead_hashes -= {
+                h
+                for h, state in carousel_states.items()
+                if state in {"pending", "probing", "soak"}
+            }
             dead_hashes -= forced_active_hashes
             dead_hashes -= reclaim_locked_hashes
             cooldown_hashes -= reclaim_locked_hashes
@@ -448,11 +457,52 @@ class DownloadPlanner:
             previous_allocations=previous_allocations,
             excluded_hashes=reclaim_locked_hashes,
         )
+        reserved_by_hash = {
+            (canonical_torrent_hash(t.get("hash")) or str(t.get("hash"))): self._reservation_target_bytes(
+                t, capacity_probe_hashes
+            )
+            for t in selected
+            if canonical_torrent_hash(t.get("hash")) or t.get("hash")
+        }
         if not self.dry_run:
-            self._sync_active_download_reservations(selected, {str(t["hash"]) for t in managed}, now)
+            self._sync_active_download_reservations(
+                reserved_by_hash,
+                {str(t["hash"]) for t in managed},
+                now,
+            )
         generation = self._flush_persistence_batch()
         self._apply_seq_desired(seq_desired_actions, plan_generation=generation)
-        self._qbt_post("/api/v2/torrents/start", start_hashes, plan_generation=generation)
+        started_ok = self._qbt_post(
+            "/api/v2/torrents/start",
+            start_hashes,
+            plan_generation=generation,
+        )
+        if started_ok and not self.dry_run:
+            selected_completed = {
+                (canonical_torrent_hash(t.get("hash")) or str(t.get("hash"))): max(
+                    0,
+                    int(
+                        t.get("completed_bytes")
+                        or t.get("completed")
+                        or t.get("downloaded")
+                        or 0
+                    ),
+                )
+                for t in selected
+                if canonical_torrent_hash(t.get("hash")) or t.get("hash")
+            }
+            confirm_map = {
+                h: selected_completed.get(canonical_torrent_hash(h) or h, 0)
+                for h in start_hashes
+                if (canonical_torrent_hash(h) or h) in capacity_probe_hashes
+            }
+            if confirm_map:
+                confirm_availability_probes_started(
+                    self.state_db,
+                    confirm_map,
+                    now=now,
+                    probe_duration_sec=DEFAULT_PROBE_DURATION_SEC,
+                )
         self._qbt_post("/api/v2/torrents/stop", paused_hashes, plan_generation=generation)
         return PlannerResult(
             selected_hashes,
@@ -830,26 +880,27 @@ class DownloadPlanner:
             lambda con: con.executemany(HEALTH_UPSERT_SQL, [self._health_params(row) for row in rows]),
         )
 
-    def _qbt_post(self, path: str, hashes: list[str], plan_generation: int | None = None) -> None:
+    def _qbt_post(self, path: str, hashes: list[str], plan_generation: int | None = None) -> bool:
         if not hashes:
-            return
+            return False
         payload = {"hashes": "|".join(hashes)}
         if self.dry_run:
             self._action(path, payload, "dry_run", True)
-            return
+            return False
         try:
             guard = lambda: self._is_generation_current(plan_generation)
             if hasattr(self.executor, "qbt_post_guarded") and plan_generation is not None:
                 applied = bool(self.executor.qbt_post_guarded(path, payload, guard=guard))
                 if not applied:
                     self._action(path, payload, "skipped_stale_generation", False)
-                    return
+                    return False
             else:
                 if plan_generation is not None and not guard():
                     self._action(path, payload, "skipped_stale_generation", False)
-                    return
+                    return False
                 self.executor.qbt_post(path, payload)
             self._action(path, payload, "succeeded", False)
+            return True
         except Exception as exc:
             self._action(path, payload, "failed", False, str(exc))
             raise
@@ -1050,11 +1101,16 @@ class DownloadPlanner:
         finally:
             con.close()
 
-    def _sync_active_download_reservations(self, selected: list[Mapping[str, Any]], managed_hashes: set[str], now: int) -> None:
+    def _sync_active_download_reservations(
+        self,
+        reserved_by_hash: Mapping[str, int],
+        managed_hashes: set[str],
+        now: int,
+    ) -> None:
         selected_by_hash = {
-            canonical_torrent_hash(t.get("hash")): int(t.get("amount_left") or 0)
-            for t in selected
-            if canonical_torrent_hash(t.get("hash"))
+            canonical_torrent_hash(torrent_hash): max(0, int(value))
+            for torrent_hash, value in reserved_by_hash.items()
+            if canonical_torrent_hash(torrent_hash)
         }
         managed_hashes = {
             canonical_torrent_hash(h)
@@ -1110,6 +1166,16 @@ class DownloadPlanner:
 
         for torrent_hash, bytes_reserved in selected_by_hash.items():
             assert_hash_not_reclaim_locked(con, torrent_hash)
+            allocation = con.execute(
+                "select reserved_bytes from scheduler_allocations where lower(trim(hash))=?",
+                (torrent_hash,),
+            ).fetchone()
+            if allocation is not None and int(allocation["reserved_bytes"] or 0) != int(bytes_reserved):
+                raise AssertionError(
+                    f"reservation mismatch for {torrent_hash}: "
+                    f"scheduler_allocations.reserved_bytes={allocation['reserved_bytes']} "
+                    f"resource_reservations.bytes={bytes_reserved}"
+                )
             existing_ids = active_by_hash.get(torrent_hash) or []
             keep_id = existing_ids[0] if existing_ids else None
             expires_at = int(now) + 120

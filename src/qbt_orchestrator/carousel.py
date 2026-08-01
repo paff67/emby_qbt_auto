@@ -19,6 +19,7 @@ DEFAULT_PROBE_BUDGET_BYTES = 512 * MIB
 DEFAULT_PROBE_DURATION_SEC = 10 * 60
 DEFAULT_REPROBE_INTERVAL_SEC = 30 * 60
 DEFAULT_BACKOFF_SCHEDULE_SEC = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600)
+ACTIVE_CAROUSEL_STATES = frozenset({"pending", "probing"})
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -62,11 +63,195 @@ def _active_soak_cooldown_hashes(state_db: str | Path, now: int) -> set[str]:
         con.close()
 
 
+def _snapshot_dict(snapshots: Mapping[str, Any], h: str) -> dict[str, Any]:
+    raw = snapshots.get(h)
+    if raw is None:
+        return {}
+    if hasattr(raw, "__dict__"):
+        return dict(vars(raw))
+    return dict(raw)
+
+
+def list_availability_probe_candidates(
+    state_db: str | Path,
+    snapshots: Mapping[str, Any],
+    *,
+    now: int,
+    reprobe_interval_sec: int = DEFAULT_REPROBE_INTERVAL_SEC,
+    free_bytes: int | None = None,
+    min_free_bytes: int = 5 * GIB,
+    carousel_enabled: bool = True,
+    dry_run: bool = False,
+    concurrency: int = 1,
+) -> list[str]:
+    """Return hashes that would actually be eligible for a new probe request.
+
+    Shared by Carousel and capacity-state accounting so speculative probeable
+    counts cannot diverge from the live guard/filter path.
+    """
+
+    if not carousel_enabled or bool(dry_run) or int(concurrency) <= 0:
+        return []
+    if free_bytes is not None and int(free_bytes) < int(min_free_bytes):
+        return []
+
+    con = readonly_connect(state_db)
+    try:
+        rows = [
+            dict(r)
+            for r in con.execute(
+                "select hash,desired_state,reason,allocated_at from scheduler_allocations "
+                "where desired_state='dead' or reason='capacity_nonviable'"
+            )
+        ]
+        state_rows = {
+            str(r["hash"]): dict(r)
+            for r in con.execute("select * from carousel_state")
+        }
+        open_job_hashes = {
+            canonical_torrent_hash(r["hash"])
+            for r in con.execute(
+                f"select distinct hash from torrent_jobs where state in ({','.join('?' for _ in OPEN_JOB_STATES)})",
+                OPEN_JOB_STATES,
+            )
+            if canonical_torrent_hash(r["hash"])
+        }
+        active_claim_hashes = {
+            canonical_torrent_hash(r["hash"])
+            for r in con.execute(
+                "select distinct hash from resource_reservations where state='active' "
+                "and (expires_at is null or expires_at>?)",
+                (int(now),),
+            )
+            if canonical_torrent_hash(r["hash"])
+        }
+        active_probe_intents = {
+            canonical_torrent_hash(r["hash"])
+            for r in con.execute(
+                "select hash from scheduler_intents "
+                "where intent='availability_probe' and (expires_at is null or expires_at>?)",
+                (int(now),),
+            )
+            if canonical_torrent_hash(r["hash"])
+        }
+    finally:
+        con.close()
+
+    cooldown_hashes = _active_soak_cooldown_hashes(state_db, now)
+    reclaim_locked = capacity_reclaim_locked_hashes(state_db)
+    scored: list[tuple[int, int, str, str]] = []
+    seen: set[str] = set()
+    for row in rows:
+        h = str(row["hash"])
+        canonical = canonical_torrent_hash(h) or h
+        if canonical in seen:
+            continue
+        snap = _snapshot_dict(snapshots, h)
+        if not snap:
+            snap = _snapshot_dict(snapshots, canonical)
+        if not snap or not _is_managed(snap) or int(snap.get("amount_left") or 0) <= 0:
+            continue
+        if canonical in cooldown_hashes:
+            continue
+        if canonical in reclaim_locked:
+            continue
+        if canonical in open_job_hashes or canonical in active_claim_hashes:
+            continue
+        if canonical in active_probe_intents:
+            continue
+        state = state_rows.get(h) or state_rows.get(canonical)
+        last_probe_at = None if state is None else state.get("last_probe_at")
+        if state:
+            state_name = str(state.get("state") or "")
+            if state_name in ACTIVE_CAROUSEL_STATES:
+                continue
+            backoff_until = state.get("backoff_until")
+            if backoff_until is not None and int(backoff_until) > now:
+                continue
+            if state_name == "soak":
+                if str(row.get("reason") or "") != "capacity_nonviable":
+                    continue
+                if last_probe_at is not None and now - int(last_probe_at) < int(reprobe_interval_sec):
+                    continue
+        # Never-probed first, then oldest last_probe_at, then hash.
+        never_probed = 0 if last_probe_at is None else 1
+        probe_age = 0 if last_probe_at is None else int(last_probe_at)
+        scored.append((never_probed, probe_age, canonical, h))
+        seen.add(canonical)
+    scored.sort()
+    return [item[3] for item in scored]
+
+
+def confirm_availability_probes_started(
+    state_db: str | Path,
+    completed_by_hash: Mapping[str, int],
+    *,
+    now: int,
+    probe_duration_sec: int = DEFAULT_PROBE_DURATION_SEC,
+) -> list[str]:
+    """Promote pending probe intents to confirmed probing after a real qBT start."""
+
+    confirmed: list[str] = []
+    intent_repo = SchedulerIntentRepository(state_db)
+
+    def txn(con: sqlite3.Connection) -> None:
+        for raw_hash, completed in completed_by_hash.items():
+            torrent_hash = canonical_torrent_hash(raw_hash) or str(raw_hash)
+            intent = con.execute(
+                "select hash,expires_at,data_json from scheduler_intents "
+                "where component='carousel' and lower(trim(hash))=? "
+                "and intent='availability_probe' "
+                "and (expires_at is null or expires_at>?) "
+                "order by rowid desc limit 1",
+                (torrent_hash, int(now)),
+            ).fetchone()
+            if intent is None:
+                continue
+            state = con.execute(
+                "select state from carousel_state where lower(trim(hash))=? "
+                "order by rowid desc limit 1",
+                (torrent_hash,),
+            ).fetchone()
+            if state is not None and str(state["state"]) == "probing":
+                continue
+            expires_at = (
+                int(intent["expires_at"])
+                if intent["expires_at"] is not None
+                else int(now) + int(probe_duration_sec)
+            )
+            con.execute(
+                "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_until,backoff_level,updated_at) "
+                "values(?,?,?,?,?,?,?) "
+                "on conflict(hash) do update set state='probing', probe_started_at=excluded.probe_started_at, "
+                "last_probe_at=excluded.last_probe_at, backoff_until=null, updated_at=excluded.updated_at",
+                (torrent_hash, "probing", int(now), int(now), None, 0, int(now)),
+            )
+            intent_repo.upsert_in_transaction(
+                con,
+                SchedulerIntent(
+                    "carousel",
+                    torrent_hash,
+                    "availability_probe",
+                    40,
+                    expires_at,
+                    {
+                        "phase": "probing",
+                        "probe_started_completed_bytes": max(0, int(completed)),
+                    },
+                ),
+            )
+            confirmed.append(torrent_hash)
+
+    if completed_by_hash:
+        write_transaction(state_db, txn)
+    return confirmed
+
+
 class CarouselService:
     """Bounded availability-probe loop for dead / capacity-nonviable torrents.
 
-    Probes refresh tracker/peer/availability evidence.  They do not grant a
-    full-finish budget; promotion requires complete sources or real progress.
+    Carousel only requests probes.  Confirmed probing (probe_started_at +
+    completed baseline) happens after Planner actually starts the torrent.
     """
 
     def __init__(
@@ -79,6 +264,7 @@ class CarouselService:
         backoff_schedule_sec: tuple[int, ...] = DEFAULT_BACKOFF_SCHEDULE_SEC,
         min_free_bytes: int = 5 * GIB,
         reprobe_interval_sec: int = DEFAULT_REPROBE_INTERVAL_SEC,
+        probe_budget_bytes: int = DEFAULT_PROBE_BUDGET_BYTES,
         live_verify: bool = False,
         now: Callable[[], int] | None = None,
     ):
@@ -91,6 +277,7 @@ class CarouselService:
         self.backoff_schedule_sec = tuple(int(x) for x in backoff_schedule_sec) or (30 * 60,)
         self.min_free_bytes = int(min_free_bytes)
         self.reprobe_interval_sec = max(0, int(reprobe_interval_sec))
+        self.probe_budget_bytes = max(0, int(probe_budget_bytes))
         self.now = now or (lambda: int(time.time()))
         self.intent_repository = SchedulerIntentRepository(self.state_db)
 
@@ -104,9 +291,27 @@ class CarouselService:
             return result
         promoted, stopped = self._reconcile_active_probes(snapshots, now)
         if free_bytes is not None and int(free_bytes) < self.min_free_bytes:
-            data = {"free_bytes": int(free_bytes), "min_free_bytes": self.min_free_bytes, "dry_run": self.dry_run}
+            cancelled = self._cancel_active_probes(now, reason="disk_guard")
+            stopped = list(stopped) + cancelled
+            data = {
+                "free_bytes": int(free_bytes),
+                "min_free_bytes": self.min_free_bytes,
+                "dry_run": self.dry_run,
+                "cancelled_probes": cancelled,
+            }
             self._event("warning", "suspended_disk_guard", "carousel suspended because disk free space is below live guard", data)
-            result = {"suspended": True, "reason": "disk_guard", "started": [], "promoted": promoted, "stopped": stopped, "active_probes": self._active_probe_count(), "dry_run": self.dry_run, "live_verify": self.live_verify, "effective_concurrency": effective_concurrency, **data}
+            result = {
+                "suspended": True,
+                "reason": "disk_guard",
+                "started": [],
+                "promoted": promoted,
+                "stopped": stopped,
+                "active_probes": self._active_probe_count(),
+                "dry_run": self.dry_run,
+                "live_verify": self.live_verify,
+                "effective_concurrency": effective_concurrency,
+                **data,
+            }
             self._metrics(result)
             return result
 
@@ -136,11 +341,17 @@ class CarouselService:
         promoted: list[str] = []
         expired: list[str] = []
         con = _connect(self.state_db)
-        rows = [dict(r) for r in con.execute("select * from carousel_state where state='probing' order by probe_started_at,hash")]
+        rows = [
+            dict(r)
+            for r in con.execute(
+                "select * from carousel_state where state in ('pending','probing') "
+                "order by coalesce(probe_started_at, updated_at),hash"
+            )
+        ]
         intent_rows = {
             canonical_torrent_hash(r["hash"]): dict(r)
             for r in con.execute(
-                "select hash,data_json from scheduler_intents "
+                "select hash,expires_at,data_json from scheduler_intents "
                 "where component='carousel' and intent='availability_probe'"
             )
             if canonical_torrent_hash(r["hash"])
@@ -148,17 +359,40 @@ class CarouselService:
         con.close()
         for row in rows:
             h = str(row["hash"])
+            canonical = canonical_torrent_hash(h) or h
+            state_name = str(row.get("state") or "")
+            intent = intent_rows.get(canonical)
+            if state_name == "pending":
+                expires_at = None if intent is None else intent.get("expires_at")
+                started_marker = row.get("updated_at")
+                pending_age = now - int(started_marker if started_marker is not None else now)
+                expired_pending = (
+                    expires_at is not None and int(expires_at) <= now
+                ) or pending_age >= self.probe_duration_sec
+                if expired_pending:
+                    expired.append(h)
+                    level = int(row.get("backoff_level") or 0)
+                    backoff = self.backoff_schedule_sec[min(level, len(self.backoff_schedule_sec) - 1)]
+                    self._mark_dead(h, now, backoff_until=now + backoff, backoff_level=level + 1)
+                    self._decision(h, "dead", "carousel_probe_pending_expired", {"backoff_sec": backoff})
+                continue
+
             snap = self._snapshot(snapshots, h)
-            started_completed = self._probe_started_completed_bytes(intent_rows.get(canonical_torrent_hash(h) or h))
-            if self._probe_succeeded(snap, started_completed):
+            started_completed = self._probe_started_completed_bytes(intent)
+            budget_exhausted = (
+                started_completed is not None
+                and (_completed_bytes(snap) - int(started_completed)) >= self.probe_budget_bytes
+            )
+            if self._probe_succeeded(snap, started_completed) or budget_exhausted:
                 self._mark_soak(h, now)
                 self._decision(
                     h,
                     "soak",
-                    "carousel_probe_succeeded",
+                    "carousel_probe_succeeded" if not budget_exhausted else "carousel_probe_budget_exhausted",
                     {
                         "probe_started_at": row.get("probe_started_at"),
                         "probe_started_completed_bytes": started_completed,
+                        "probe_budget_bytes": self.probe_budget_bytes,
                     },
                 )
                 promoted.append(h)
@@ -172,6 +406,25 @@ class CarouselService:
                 self._decision(h, "dead", "carousel_no_swarm", {"probe_started_at": started_at, "backoff_sec": backoff})
         return promoted, expired
 
+    def _cancel_active_probes(self, now: int, *, reason: str) -> list[str]:
+        con = _connect(self.state_db)
+        rows = [
+            dict(r)
+            for r in con.execute(
+                "select hash,backoff_level from carousel_state where state in ('pending','probing')"
+            )
+        ]
+        con.close()
+        cancelled: list[str] = []
+        for row in rows:
+            h = str(row["hash"])
+            level = int(row.get("backoff_level") or 0)
+            backoff = self.backoff_schedule_sec[min(level, len(self.backoff_schedule_sec) - 1)]
+            self._mark_dead(h, now, backoff_until=now + backoff, backoff_level=level + 1)
+            self._decision(h, "dead", f"carousel_{reason}_cancel", {"backoff_sec": backoff})
+            cancelled.append(h)
+        return cancelled
+
     def _start_new_probes(self, snapshots: Mapping[str, Any], now: int, capacity: int) -> list[str]:
         if capacity <= 0 or self.concurrency <= 0:
             return []
@@ -179,92 +432,32 @@ class CarouselService:
         selected = candidates[:capacity]
         if not selected:
             return []
+        if self.dry_run:
+            for h in selected:
+                self._decision(
+                    h,
+                    "carousel_probe",
+                    "carousel_probe_dry_run",
+                    {"concurrency": self.concurrency, "dry_run": True},
+                )
+            return selected
         for h in selected:
-            snap = self._snapshot(snapshots, h)
-            self._mark_probing(h, now, _completed_bytes(snap))
-            self._decision(h, "carousel_probe", "carousel_probe_started", {"concurrency": self.concurrency})
+            self._mark_probe_pending(h, now)
+            self._decision(h, "carousel_probe", "carousel_probe_requested", {"concurrency": self.concurrency})
         return selected
 
     def _probe_candidates(self, snapshots: Mapping[str, Any], now: int) -> list[str]:
-        con = _connect(self.state_db)
-        rows = [
-            dict(r)
-            for r in con.execute(
-                "select hash,desired_state,reason from scheduler_allocations "
-                "where desired_state='dead' or reason='capacity_nonviable' "
-                "order by allocated_at,hash"
-            )
-        ]
-        state_rows = {
-            str(r["hash"]): dict(r)
-            for r in con.execute("select * from carousel_state")
-        }
-        open_job_hashes = {
-            canonical_torrent_hash(r["hash"])
-            for r in con.execute(
-                f"select distinct hash from torrent_jobs where state in ({','.join('?' for _ in OPEN_JOB_STATES)})",
-                OPEN_JOB_STATES,
-            )
-            if canonical_torrent_hash(r["hash"])
-        }
-        active_claim_hashes = {
-            canonical_torrent_hash(r["hash"])
-            for r in con.execute(
-                "select distinct hash from resource_reservations where state='active' "
-                "and (expires_at is null or expires_at>?)",
-                (now,),
-            )
-            if canonical_torrent_hash(r["hash"])
-        }
-        active_probe_intents = {
-            canonical_torrent_hash(r["hash"])
-            for r in con.execute(
-                "select hash from scheduler_intents "
-                "where intent='availability_probe' and (expires_at is null or expires_at>?)",
-                (now,),
-            )
-            if canonical_torrent_hash(r["hash"])
-        }
-        con.close()
-        cooldown_hashes = _active_soak_cooldown_hashes(self.state_db, now)
-        reclaim_locked = capacity_reclaim_locked_hashes(self.state_db)
-        out: list[str] = []
-        seen: set[str] = set()
-        for row in rows:
-            h = str(row["hash"])
-            canonical = canonical_torrent_hash(h) or h
-            if canonical in seen:
-                continue
-            snap = self._snapshot(snapshots, h)
-            if not snap or not _is_managed(snap) or int(snap.get("amount_left") or 0) <= 0:
-                continue
-            if canonical in cooldown_hashes:
-                continue
-            if canonical in reclaim_locked:
-                continue
-            if canonical in open_job_hashes or canonical in active_claim_hashes:
-                continue
-            if canonical in active_probe_intents:
-                continue
-            state = state_rows.get(h) or state_rows.get(canonical)
-            if state:
-                state_name = str(state.get("state") or "")
-                if state_name == "probing":
-                    continue
-                backoff_until = state.get("backoff_until")
-                if backoff_until is not None and int(backoff_until) > now:
-                    continue
-                if state_name == "soak":
-                    # Re-enter probe only when still capacity-nonviable and the
-                    # re-probe interval since last_probe_at has elapsed.
-                    if str(row.get("reason") or "") != "capacity_nonviable":
-                        continue
-                    last_probe_at = state.get("last_probe_at")
-                    if last_probe_at is not None and now - int(last_probe_at) < self.reprobe_interval_sec:
-                        continue
-            seen.add(canonical)
-            out.append(h)
-        return out
+        return list_availability_probe_candidates(
+            self.state_db,
+            snapshots,
+            now=now,
+            reprobe_interval_sec=self.reprobe_interval_sec,
+            free_bytes=None,
+            min_free_bytes=self.min_free_bytes,
+            carousel_enabled=True,
+            dry_run=False,
+            concurrency=self.concurrency,
+        )
 
     # Backward-compatible name used by older tests/helpers.
     def _dead_candidates(self, snapshots: Mapping[str, Any], now: int) -> list[str]:
@@ -272,17 +465,27 @@ class CarouselService:
 
     def _active_probe_count(self) -> int:
         con = _connect(self.state_db)
+        count = int(
+            con.execute(
+                "select count(*) from carousel_state where state in ('pending','probing')"
+            ).fetchone()[0]
+        )
+        con.close()
+        return count
+
+    def confirmed_probe_count(self) -> int:
+        con = _connect(self.state_db)
         count = int(con.execute("select count(*) from carousel_state where state='probing'").fetchone()[0])
         con.close()
         return count
 
-    def _mark_probing(self, h: str, now: int, started_completed_bytes: int = 0) -> None:
+    def _mark_probe_pending(self, h: str, now: int) -> None:
         def txn(con: sqlite3.Connection) -> None:
             con.execute(
                 "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_until,backoff_level,updated_at) values(?,?,?,?,?,?,?) "
-                "on conflict(hash) do update set state=excluded.state, probe_started_at=excluded.probe_started_at, "
-                "last_probe_at=excluded.last_probe_at, backoff_until=null, updated_at=excluded.updated_at",
-                (h, "probing", now, now, None, 0, now),
+                "on conflict(hash) do update set state=excluded.state, probe_started_at=null, "
+                "backoff_until=null, updated_at=excluded.updated_at",
+                (h, "pending", None, None, None, 0, now),
             )
             self.intent_repository.upsert_in_transaction(
                 con,
@@ -292,7 +495,7 @@ class CarouselService:
                     "availability_probe",
                     40,
                     now + int(self.probe_duration_sec),
-                    {"probe_started_completed_bytes": int(started_completed_bytes)},
+                    {"phase": "pending"},
                 ),
             )
 
@@ -312,7 +515,7 @@ class CarouselService:
         def txn(con: sqlite3.Connection) -> None:
             con.execute(
                 "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_until,backoff_level,updated_at) values(?,?,?,?,?,?,?) "
-                "on conflict(hash) do update set state='dead', last_probe_at=excluded.last_probe_at, "
+                "on conflict(hash) do update set state='dead', probe_started_at=null, last_probe_at=excluded.last_probe_at, "
                 "backoff_until=excluded.backoff_until, backoff_level=excluded.backoff_level, updated_at=excluded.updated_at",
                 (h, "dead", None, now, backoff_until, backoff_level, now),
             )
@@ -361,34 +564,31 @@ class CarouselService:
 
     @staticmethod
     def _snapshot(snapshots: Mapping[str, Any], h: str) -> dict[str, Any]:
-        raw = snapshots.get(h)
-        if raw is None:
-            return {}
-        if hasattr(raw, "__dict__"):
-            return dict(vars(raw))
-        return dict(raw)
+        return _snapshot_dict(snapshots, h)
 
     @staticmethod
-    def _probe_started_completed_bytes(intent_row: Mapping[str, Any] | None) -> int:
+    def _probe_started_completed_bytes(intent_row: Mapping[str, Any] | None) -> int | None:
         if not intent_row:
-            return 0
+            return None
         try:
             data = json.loads(str(intent_row.get("data_json") or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
-            return 0
+            return None
         if not isinstance(data, dict):
-            return 0
+            return None
+        if "probe_started_completed_bytes" not in data:
+            return None
         try:
-            return max(0, int(data.get("probe_started_completed_bytes") or 0))
+            return max(0, int(data["probe_started_completed_bytes"]))
         except (TypeError, ValueError):
-            return 0
+            return None
 
     @staticmethod
-    def _probe_succeeded(snapshot: Mapping[str, Any], started_completed_bytes: int) -> bool:
+    def _probe_succeeded(snapshot: Mapping[str, Any], started_completed_bytes: int | None) -> bool:
         """Promote only on complete sources or real download progress.
 
-        Leech peers alone may justify continued probing elsewhere, but they do
-        not prove the torrent can finish.
+        Missing completed baselines must not treat pre-existing bytes as probe
+        progress.  Leech peers alone never prove finishability.
         """
 
         if not snapshot:
@@ -405,6 +605,8 @@ class CarouselService:
         dlspeed = int(snapshot.get("dlspeed_bps") or snapshot.get("dlspeed") or 0)
         if dlspeed > 0:
             return True
+        if started_completed_bytes is None:
+            return False
         return _completed_bytes(snapshot) > int(started_completed_bytes)
 
     @staticmethod

@@ -28,7 +28,7 @@ from .capacity_state import (
     build_capacity_observation_from_assessment,
     detect_capacity_state,
 )
-from .carousel import CarouselService
+from .carousel import CarouselService, list_availability_probe_candidates
 from .daemon import SafetyMonitor
 from .db import migrate, readonly_connect, start_persistent_write_actor, stop_write_actor, write_transaction
 from .file_batch import FileBatchService
@@ -821,6 +821,7 @@ class DaemonRuntime:
                 cooldown_hashes=cooldown_hashes,
                 planned_selected_count=len(result.selected_hashes),
                 now=planner_now,
+                free_bytes=free_bytes,
             )
             if sync_healthy
             else {
@@ -1451,8 +1452,9 @@ class DaemonRuntime:
         cooldown_hashes: set[str],
         planned_selected_count: int,
         now: int,
+        free_bytes: int,
     ) -> dict[str, int]:
-        """Count real full-finish / probe admissions for capacity-state reasons."""
+        """Count real full-finish / confirmed-probe admissions for capacity state."""
 
         reclaim_locked = capacity_reclaim_locked_hashes(self.state_db)
         cooldown = {
@@ -1476,20 +1478,10 @@ class DaemonRuntime:
                     "select count(*) from carousel_state where state='probing'"
                 ).fetchone()[0]
             )
-            if active_probe_count == 0:
-                active_probe_count = int(
-                    con.execute(
-                        "select count(*) from scheduler_intents "
-                        "where intent='availability_probe' "
-                        "and (expires_at is null or expires_at>?)",
-                        (int(now),),
-                    ).fetchone()[0]
-                )
         finally:
             con.close()
 
         full_finish_runnable = 0
-        probeable = 0
         cooldown_count = 0
         for fallback_hash, raw in snapshots.items():
             torrent = dict(raw)
@@ -1512,8 +1504,24 @@ class DaemonRuntime:
             )
             if admission == "full_finish":
                 full_finish_runnable += 1
-            elif admission == "probe":
-                probeable += 1
+
+        carousel = self.carousel_service
+        if carousel is None:
+            probeable = 0
+        else:
+            probeable = len(
+                list_availability_probe_candidates(
+                    self.state_db,
+                    snapshots,
+                    now=int(now),
+                    reprobe_interval_sec=int(carousel.reprobe_interval_sec),
+                    free_bytes=int(free_bytes),
+                    min_free_bytes=int(carousel.min_free_bytes),
+                    carousel_enabled=True,
+                    dry_run=bool(carousel.dry_run),
+                    concurrency=int(carousel.concurrency),
+                )
+            )
         return {
             "full_finish_runnable_count": full_finish_runnable,
             "probeable_count": probeable,

@@ -99,6 +99,8 @@ def test_capacity_state_reasons_prefer_admission_stats_over_stale_viable():
         planned_selected_count=1,
         active_probe_count=0,
         full_finish_runnable_count=1,
+        probeable_count=0,
+        cooldown_count=0,
     ).reason == "feasible_work_selected"
     assert detect_capacity_state(
         mode="drain",
@@ -107,15 +109,25 @@ def test_capacity_state_reasons_prefer_admission_stats_over_stale_viable():
         disk_releasing_jobs=0,
         capacity_pressure=True,
         active_probe_count=1,
+        planned_selected_count=0,
+        full_finish_runnable_count=0,
+        probeable_count=0,
+        cooldown_count=0,
     ).reason == "availability_probe_active"
-    assert detect_capacity_state(
+    # Speculative probeable / cooldown must not mask pressure deadlock.
+    pressure_probeable = detect_capacity_state(
         mode="drain",
         managed_incomplete=3,
         feasible_full_finish=0,
         disk_releasing_jobs=0,
         capacity_pressure=True,
         probeable_count=2,
-    ).reason == "availability_probe_pending"
+        planned_selected_count=0,
+        active_probe_count=0,
+        full_finish_runnable_count=0,
+        cooldown_count=0,
+    )
+    assert pressure_probeable.state == "capacity_deadlock"
     assert detect_capacity_state(
         mode="drain",
         managed_incomplete=3,
@@ -127,6 +139,30 @@ def test_capacity_state_reasons_prefer_admission_stats_over_stale_viable():
         active_probe_count=0,
         full_finish_runnable_count=0,
         probeable_count=0,
+    ).state == "capacity_deadlock"
+    assert detect_capacity_state(
+        mode="normal",
+        managed_incomplete=3,
+        feasible_full_finish=0,
+        disk_releasing_jobs=0,
+        capacity_pressure=False,
+        planned_selected_count=0,
+        active_probe_count=0,
+        probeable_count=2,
+        full_finish_runnable_count=0,
+        cooldown_count=0,
+    ).reason == "availability_probe_pending"
+    assert detect_capacity_state(
+        mode="normal",
+        managed_incomplete=3,
+        feasible_full_finish=0,
+        disk_releasing_jobs=0,
+        capacity_pressure=False,
+        planned_selected_count=0,
+        active_probe_count=0,
+        probeable_count=0,
+        full_finish_runnable_count=0,
+        cooldown_count=3,
     ).reason == "cooldown_wait"
     assert detect_capacity_state(
         mode="normal",
@@ -140,6 +176,36 @@ def test_capacity_state_reasons_prefer_admission_stats_over_stale_viable():
         full_finish_runnable_count=0,
         cooldown_count=0,
     ).reason == "no_runnable_source"
+
+
+def test_explicit_zero_admission_stats_are_not_treated_as_absent():
+    from qbt_orchestrator.capacity_state import detect_capacity_state
+
+    # Legacy path without admission kwargs still trusts feasible_full_finish.
+    legacy = detect_capacity_state(
+        mode="drain",
+        managed_incomplete=3,
+        feasible_full_finish=1,
+        disk_releasing_jobs=0,
+        capacity_pressure=True,
+    )
+    assert legacy.state == "progress_possible"
+    assert legacy.reason == "feasible_work_exists"
+
+    # Explicit zeros mean "no admitted work", even if observation feasible > 0.
+    explicit = detect_capacity_state(
+        mode="drain",
+        managed_incomplete=3,
+        feasible_full_finish=1,
+        disk_releasing_jobs=0,
+        capacity_pressure=True,
+        planned_selected_count=0,
+        active_probe_count=0,
+        probeable_count=0,
+        full_finish_runnable_count=0,
+        cooldown_count=0,
+    )
+    assert explicit.state == "capacity_deadlock"
 
 
 def test_capacity_observation_excludes_hold_and_orders_manual_candidates():

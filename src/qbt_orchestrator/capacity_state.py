@@ -75,32 +75,41 @@ def detect_capacity_state(
     feasible_full_finish: int,
     disk_releasing_jobs: int,
     capacity_pressure: bool = False,
-    full_finish_runnable_count: int = 0,
-    probeable_count: int = 0,
-    active_probe_count: int = 0,
-    cooldown_count: int = 0,
-    planned_selected_count: int = 0,
+    full_finish_runnable_count: int | None = None,
+    probeable_count: int | None = None,
+    active_probe_count: int | None = None,
+    cooldown_count: int | None = None,
+    planned_selected_count: int | None = None,
 ) -> CapacityResult:
     """Classify aggregate capacity progress using scheduler-admission evidence.
 
-    ``feasible_full_finish`` remains the budget-feasibility signal. Admission
-    counts prevent cooled-down viable torrents from claiming progress when
-    nothing is selected or probing.
+    Explicit zeros in admission stats are meaningful.  Defaults remain ``None``
+    so legacy callers without admission stats keep the old feasible_full_finish
+    path.  Under capacity pressure, only real selected work, confirmed active
+    probes, or disk-releasing jobs block deadlock — speculative probeable /
+    cooldown waits do not.
     """
 
-    planned = max(0, int(planned_selected_count))
-    active_probes = max(0, int(active_probe_count))
-    probeable = max(0, int(probeable_count))
-    cooldown = max(0, int(cooldown_count))
-    full_finish_runnable = max(0, int(full_finish_runnable_count))
-    releasing = max(0, int(disk_releasing_jobs))
-    using_admission_stats = (
-        planned > 0
-        or active_probes > 0
-        or probeable > 0
-        or cooldown > 0
-        or full_finish_runnable > 0
+    using_admission_stats = any(
+        value is not None
+        for value in (
+            full_finish_runnable_count,
+            probeable_count,
+            active_probe_count,
+            cooldown_count,
+            planned_selected_count,
+        )
     )
+    planned = 0 if planned_selected_count is None else max(0, int(planned_selected_count))
+    active_probes = 0 if active_probe_count is None else max(0, int(active_probe_count))
+    probeable = 0 if probeable_count is None else max(0, int(probeable_count))
+    cooldown = 0 if cooldown_count is None else max(0, int(cooldown_count))
+    full_finish_runnable = (
+        0 if full_finish_runnable_count is None else max(0, int(full_finish_runnable_count))
+    )
+    releasing = max(0, int(disk_releasing_jobs))
+    pressure = str(mode) == "drain" or bool(capacity_pressure)
+
     # Observation feasible_full_finish can still count cooled viable torrents.
     # When admission stats are present, only trust feasible work that is also
     # currently full-finish admitted (or legacy callers with no admission stats).
@@ -112,6 +121,28 @@ def detect_capacity_state(
         return CapacityResult("progress_possible", "feasible_work_selected", actions=[])
     if active_probes > 0:
         return CapacityResult("progress_possible", "availability_probe_active", actions=[])
+    if releasing > 0:
+        return CapacityResult("progress_possible", "feasible_work_selected", actions=[])
+    if pressure:
+        if (
+            int(managed_incomplete) > 0
+            and feasible == 0
+            and active_probes == 0
+            and releasing == 0
+        ):
+            return CapacityResult(
+                "capacity_deadlock",
+                "no_finishable_or_releasing_work",
+                actions=[],
+            )
+        if feasible > 0:
+            return CapacityResult(
+                "progress_possible",
+                "feasible_work_selected" if using_admission_stats else "feasible_work_exists",
+                actions=[],
+            )
+        return CapacityResult("progress_possible", "no_runnable_source", actions=[])
+
     if probeable > 0:
         return CapacityResult("progress_possible", "availability_probe_pending", actions=[])
     if feasible > 0:
@@ -122,17 +153,6 @@ def detect_capacity_state(
         )
     if cooldown > 0:
         return CapacityResult("progress_possible", "cooldown_wait", actions=[])
-    if releasing > 0:
-        return CapacityResult("progress_possible", "feasible_work_selected", actions=[])
-    if (
-        (str(mode) == "drain" or bool(capacity_pressure))
-        and int(managed_incomplete) > 0
-        and feasible == 0
-        and probeable == 0
-        and active_probes == 0
-        and releasing == 0
-    ):
-        return CapacityResult("capacity_deadlock", "no_finishable_or_releasing_work", actions=[])
     return CapacityResult("progress_possible", "no_runnable_source", actions=[])
 
 

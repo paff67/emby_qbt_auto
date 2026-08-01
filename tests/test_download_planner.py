@@ -368,6 +368,16 @@ def test_planner_availability_probe_uses_capped_reserve_budget(tmp_path):
     )[0]
     assert reserved["reason"] == "budget_fit"
     assert reserved["reserved_bytes"] == AVAILABILITY_PROBE_RESERVE_BYTES
+    claim = _rows(
+        db,
+        "select bytes,state from resource_reservations "
+        "where hash='h' and kind='active_download' and state='active'",
+    )[0]
+    assert claim["bytes"] == AVAILABILITY_PROBE_RESERVE_BYTES
+    assert claim["bytes"] == reserved["reserved_bytes"]
+    state = _rows(db, "select state,probe_started_at from carousel_state where hash='h'")[0]
+    assert state["state"] == "probing"
+    assert state["probe_started_at"] == 30_000
 
 
 def test_planner_consumes_active_intents_and_owns_one_plan_generation():
