@@ -765,38 +765,6 @@ def test_direct_planner_tick_recovery_failure_precedes_safety(tmp_path):
     con.close()
 
 
-@pytest.mark.parametrize("signature_error", [TypeError("opaque"), ValueError("opaque")])
-def test_runtime_rejects_uninspectable_capacity_reclaimer_signature(
-    tmp_path,
-    monkeypatch,
-    signature_error,
-):
-    from qbt_orchestrator import service
-
-    class OpaqueReclaimer:
-        def run(self, *_args, **_kwargs):
-            raise AssertionError("not called")
-
-    monkeypatch.setattr(
-        service.inspect,
-        "signature",
-        lambda _callable: (_ for _ in ()).throw(signature_error),
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="capacity reclaimer run signature cannot be inspected safely",
-    ):
-        service.DaemonRuntime(
-            state_db=tmp_path / "state.sqlite",
-            qbt=FakeQbt(),
-            executor=FakeExecutor(),
-            free_bytes_provider=lambda: 6 * 1024**3,
-            dry_run=True,
-            capacity_reclaimer=OpaqueReclaimer(),
-        )
-
-
 @pytest.mark.parametrize("scheduler_engine_mode", ["legacy", "shadow", "live"])
 def test_capacity_assessment_metric_is_once_per_generation_in_all_scheduler_modes(
     tmp_path,

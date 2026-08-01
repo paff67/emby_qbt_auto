@@ -381,8 +381,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     viability_stale_sec = int(
         os.environ.get("QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC", "1800")
     )
-    # Startup reclaim fences are hydrated by Executor, so the durable schema
-    # must exist before the shared mutation gateway is constructed.
+    # Startup order is load-bearing for reclaim fencing:
+    # 1) migrate() must finalize legacy aborted_paused rows and drop capacity
+    #    triggers before any Executor is constructed;
+    # 2) Executor then hydrates durable mutation leases only for remaining
+    #    locked reclaim states (aborted_paused is already terminal, so it never
+    #    receives a lease and needs no extra release).
     migrate(state_db, dry_run=False)
     qbt_cfg = cfg.qbt if cfg else None
     qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)

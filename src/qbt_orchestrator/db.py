@@ -856,6 +856,8 @@ def migration_sql() -> list[str]:
         "alter table capacity_reclaims add column file_selection_fingerprint text",
         "alter table capacity_reclaims add column target_free_bytes integer not null default 0",
         "alter table bot_commands add column last_error text",
+        # Single-daemon Python coordination + Executor mutation leases own reclaim
+        # fencing. Capacity SQLite triggers are removed and never recreated.
         "drop trigger if exists trg_capacity_reclaim_lock_job_insert",
         "drop trigger if exists trg_capacity_reclaim_lock_job_update",
         "drop trigger if exists trg_capacity_reclaim_lock_reservation_insert",
@@ -871,108 +873,19 @@ def migration_sql() -> list[str]:
         "drop trigger if exists trg_capacity_reclaim_fence_capacity_state_insert",
         "drop trigger if exists trg_capacity_reclaim_fence_capacity_state_update",
         "drop trigger if exists trg_capacity_reclaim_fence_capacity_state_delete",
-        "create trigger if not exists trg_capacity_reclaim_lock_job_insert "
-        "before insert on torrent_jobs "
-        "when NEW.hash is not null "
-        "and NEW.state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait') "
-        "and exists(select 1 from capacity_reclaims cr "
-        "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
-        "begin select raise(abort,'capacity_reclaim_locked'); end",
-        "create trigger if not exists trg_capacity_reclaim_lock_job_update "
-        "before update of hash,state on torrent_jobs "
-        "when NEW.state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait') "
-        "and exists(select 1 from capacity_reclaims cr where "
-        "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
-        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
-        "begin select raise(abort,'capacity_reclaim_locked'); end",
-        "create trigger if not exists trg_capacity_reclaim_lock_reservation_insert "
-        "before insert on resource_reservations "
-        "when NEW.hash is not null and NEW.state='active' "
-        "and exists(select 1 from capacity_reclaims cr "
-        "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
-        "begin select raise(abort,'capacity_reclaim_locked'); end",
-        "create trigger if not exists trg_capacity_reclaim_lock_reservation_update "
-        "before update on resource_reservations "
-        "when NEW.state='active' "
-        "and exists(select 1 from capacity_reclaims cr where "
-        "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
-        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
-        "begin select raise(abort,'capacity_reclaim_locked'); end",
-        "create trigger if not exists trg_capacity_reclaim_lock_soak_insert "
-        "before insert on soak_state "
-        "when NEW.hash is not null and NEW.cooldown_until is not null "
-        "and NEW.cooldown_until>0 "
-        "and exists(select 1 from capacity_reclaims cr "
-        "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
-        "begin select raise(abort,'capacity_reclaim_locked'); end",
-        "create trigger if not exists trg_capacity_reclaim_lock_soak_update "
-        "before update on soak_state "
-        "when NEW.cooldown_until is not null "
-        "and NEW.cooldown_until>0 "
-        "and exists(select 1 from capacity_reclaims cr where "
-        "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
-        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
-        "begin select raise(abort,'capacity_reclaim_locked'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_assessment_insert "
-        "before insert on capacity_assessment_state "
-        "when exists(select 1 from capacity_reclaims "
-        "where state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_assessment_update "
-        "before update on capacity_assessment_state "
-        "when exists(select 1 from capacity_reclaims "
-        "where state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_assessment_delete "
-        "before delete on capacity_assessment_state "
-        "when exists(select 1 from capacity_reclaims "
-        "where state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_health_insert "
-        "before insert on torrent_health "
-        "when exists(select 1 from capacity_reclaims cr "
-        "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "and cr.state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_health_update "
-        "before update of hash,capacity_generation,capacity_viable,reclaimable_since,no_progress_since "
-        "on torrent_health "
-        "when exists(select 1 from capacity_reclaims cr where "
-        "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
-        "and cr.state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_health_delete "
-        "before delete on torrent_health "
-        "when exists(select 1 from capacity_reclaims cr "
-        "where lower(trim(cr.hash))=lower(trim(OLD.hash)) "
-        "and cr.state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_capacity_state_insert "
-        "before insert on capacity_state "
-        "when exists(select 1 from capacity_reclaims "
-        "where state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_capacity_state_delete "
-        "before delete on capacity_state "
-        "when exists(select 1 from capacity_reclaims "
-        "where state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
-        "create trigger if not exists trg_capacity_reclaim_fence_capacity_state_update "
-        "before update on capacity_state "
-        "when exists(select 1 from capacity_reclaims "
-        "where state in ('deleting','quarantined')) "
-        "begin select raise(abort,'capacity_reclaim_delete_in_progress'); end",
+        # Retire legacy confirmation rows before Executor hydrates durable leases.
+        # migrate() must run before Executor construction so these never become
+        # reclaim mutation leases.
+        "update capacity_reclaims set state='cancelled',"
+        "recheck_state='not_requested',"
+        "recheck_error=coalesce(nullif(trim(recheck_error),''),'legacy_confirmation_removed'),"
+        "updated_at=cast(strftime('%s','now') as integer) "
+        "where state='aborted_paused'",
         "insert or ignore into schema_migrations(version,name,applied_at) values(15,'shared_capacity_assessment_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(16,'telegram_add_queue_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(17,'remote_media_index_refresh_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(18,'automatic_capacity_reclaim_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(19,'capacity_reclaim_p0_simplify_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(3,'resource_ledger_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(4,'capacity_state_v1',strftime('%s','now'))",

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import inspect
 import json
 import signal
 import sqlite3
@@ -376,23 +375,12 @@ class DaemonRuntime:
             )
         )
         self.capacity_reclaimer = capacity_reclaimer
-        self._capacity_reclaimer_accepts_assessment = False
-        if capacity_reclaimer is not None:
-            try:
-                self._capacity_reclaimer_accepts_assessment = (
-                    "assessment"
-                    in inspect.signature(capacity_reclaimer.run).parameters
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "capacity reclaimer run signature cannot be inspected safely"
-                ) from exc
+        # Formal reclaimers always accept assessment=; incomplete fakes are unsupported.
+        self._capacity_reclaimer_accepts_assessment = capacity_reclaimer is not None
         self.capacity_recovery_reclaimer = (
             capacity_recovery_reclaimer
             if capacity_recovery_reclaimer is not None
             else capacity_reclaimer
-            if self._capacity_reclaimer_accepts_assessment
-            else None
         )
         self._capacity_recovery_preflight_done = False
         self.capacity_reclaim_interval_sec = max(
