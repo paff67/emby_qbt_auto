@@ -280,6 +280,96 @@ def test_planner_capacity_nonviable_bypass_matrix(
     ) == [{"reason_code": expected_reason}]
 
 
+def test_planner_availability_probe_uses_capped_reserve_budget(tmp_path):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import (
+        AVAILABILITY_PROBE_RESERVE_BYTES,
+        DownloadPlanner,
+    )
+    from qbt_orchestrator.scheduler_intents import (
+        SchedulerIntent,
+        SchedulerIntentRepository,
+    )
+    from tests.fakes import FakeExecutor
+    from tests.test_capacity_assessment import nonviable_assessment
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    SchedulerIntentRepository(db).upsert(
+        SchedulerIntent(
+            "carousel",
+            "h",
+            "availability_probe",
+            40,
+            30_100,
+            {"probe_started_completed_bytes": 0},
+        )
+    )
+    executor = FakeExecutor()
+    planner = DownloadPlanner(
+        state_db=db,
+        executor=executor,
+        dry_run=False,
+        active_slots=1,
+        disk_floor_bytes=0,
+        now=lambda: 30_000,
+    )
+    amount_left = 20 * 1024**3
+    free_bytes = 11 * 1024**3
+    assessment = nonviable_assessment(
+        observed_at=30_000,
+        no_progress_since=1_000,
+    ).with_generation(7)
+    # Override amount_left in assessment torrent evidence via a fresh build.
+    from qbt_orchestrator.capacity_assessment import CapacityAssessmentBuilder
+
+    assessment = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "amount_left": amount_left,
+                "completed": 100,
+                "availability": 0.5,
+                "num_seeds": 0,
+                "num_complete": 0,
+            }
+        },
+        {"h": {"no_progress_since": 1_000}},
+        observed_at=30_000,
+        scheduler_mode="drain",
+        free_bytes=free_bytes,
+        target_free_bytes=free_bytes + 1,
+        available_growth_bytes=free_bytes,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    ).with_generation(7)
+
+    result = planner.plan_and_apply(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "state": "stoppedDL",
+                "amount_left": amount_left,
+                "size": amount_left + 100,
+            }
+        },
+        free_bytes=free_bytes,
+        sync_healthy=True,
+        capacity_assessment=assessment,
+    )
+
+    assert result.selected_hashes == ["h"]
+    assert ("/api/v2/torrents/start", {"hashes": "h"}) in executor.posts
+    reserved = _rows(
+        db,
+        "select reserved_bytes,reason from scheduler_allocations where hash='h'",
+    )[0]
+    assert reserved["reason"] == "budget_fit"
+    assert reserved["reserved_bytes"] == AVAILABILITY_PROBE_RESERVE_BYTES
+
+
 def test_planner_consumes_active_intents_and_owns_one_plan_generation():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.planner import DownloadPlanner

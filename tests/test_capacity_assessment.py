@@ -9,6 +9,7 @@ from qbt_orchestrator.capacity_assessment import (
     CapacityAssessmentStore,
     TorrentCapacityEvidence,
     project_progress_health,
+    scheduler_admission,
 )
 from qbt_orchestrator.db import migrate, readonly_connect
 
@@ -95,6 +96,79 @@ def test_progress_health_projection_preserves_or_starts_stall_without_growth(
     )
 
     assert projected["no_progress_since"] == expected
+
+
+def test_full_finish_viable_aliases_strict_viable():
+    evidence = _evidence(viable=True)
+    assert evidence.full_finish_viable is True
+    assert _evidence(viable=False).full_finish_viable is False
+
+
+def test_scheduler_admission_classifies_blocked_full_finish_and_probe():
+    viable = _evidence(viable=True)
+    nonviable = _evidence(viable=False)
+    snapshot = {"hash": "h", "tags": "auto", "category": "auto"}
+
+    assert (
+        scheduler_admission(
+            snapshot,
+            viable,
+            cooldown=False,
+            reclaim_locked=False,
+            probe_backoff_active=False,
+        )
+        == "full_finish"
+    )
+    assert (
+        scheduler_admission(
+            snapshot,
+            nonviable,
+            cooldown=False,
+            reclaim_locked=False,
+            probe_backoff_active=False,
+        )
+        == "probe"
+    )
+    assert (
+        scheduler_admission(
+            snapshot,
+            nonviable,
+            cooldown=True,
+            reclaim_locked=False,
+            probe_backoff_active=False,
+        )
+        == "blocked"
+    )
+    assert (
+        scheduler_admission(
+            {"hash": "h", "tags": "auto,hold", "category": "auto"},
+            nonviable,
+            cooldown=False,
+            reclaim_locked=False,
+            probe_backoff_active=False,
+        )
+        == "blocked"
+    )
+    assert (
+        scheduler_admission(
+            snapshot,
+            nonviable,
+            cooldown=False,
+            reclaim_locked=True,
+            probe_backoff_active=False,
+        )
+        == "blocked"
+    )
+    assert (
+        scheduler_admission(
+            snapshot,
+            nonviable,
+            cooldown=False,
+            reclaim_locked=False,
+            probe_backoff_active=True,
+        )
+        == "blocked"
+    )
 
 
 def nonviable_assessment(*, observed_at, no_progress_since):

@@ -735,8 +735,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             state_db,
             executor,
             dry_run=carousel_dry_run,
-            concurrency=int(os.environ.get("QBT_ORCH_CAROUSEL_CONCURRENCY", "3")),
-            probe_duration_sec=int(os.environ.get("QBT_ORCH_CAROUSEL_PROBE_DURATION_SEC", "1800")),
+            concurrency=int(os.environ.get("QBT_ORCH_CAROUSEL_CONCURRENCY", "1")),
+            probe_duration_sec=int(os.environ.get("QBT_ORCH_CAROUSEL_PROBE_DURATION_SEC", "600")),
             min_free_bytes=int(float(os.environ.get("QBT_ORCH_CAROUSEL_MIN_FREE_GB", "5")) * 1024**3),
             live_verify=carousel_live_verify,
         )

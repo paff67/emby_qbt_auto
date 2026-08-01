@@ -356,6 +356,13 @@ class CapacityReclaimAuditStore:
             (torrent_hash, now),
         ).fetchone() is not None:
             return "active_cooldown"
+        if con.execute(
+            "select 1 from scheduler_intents where lower(trim(hash))=? "
+            "and intent='availability_probe' "
+            "and (expires_at is null or expires_at>?) limit 1",
+            (torrent_hash, now),
+        ).fetchone() is not None:
+            return "availability_probe_active"
         return None
 
     def reserve(self, candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -1497,6 +1504,7 @@ class DeadPartialReclaimer:
             open_jobs,
             active_claims,
             active_cooldowns,
+            active_availability_probes,
         ) = self._eligibility_state()
         all_paths = self._snapshot_paths(snapshots)
         snapshots_by_hash = {
@@ -1546,7 +1554,7 @@ class DeadPartialReclaimer:
             ):
                 reject("complete_source")
                 continue
-            if evidence.viable:
+            if evidence.viable or evidence.full_finish_viable:
                 reject("capacity_viable")
                 continue
             row = eligible_rows.get(torrent_hash)
@@ -1591,6 +1599,9 @@ class DeadPartialReclaimer:
                 continue
             if torrent_hash in active_cooldowns:
                 reject("active_cooldown")
+                continue
+            if torrent_hash in active_availability_probes:
+                reject("availability_probe_active")
                 continue
             host_path = self._host_path(torrent.get("content_path"))
             if host_path is None:
@@ -2728,7 +2739,7 @@ class DeadPartialReclaimer:
 
     def _eligibility_state(
         self,
-    ) -> tuple[dict[str, dict[str, Any]], set[str], set[str], set[str]]:
+    ) -> tuple[dict[str, dict[str, Any]], set[str], set[str], set[str], set[str]]:
         con = readonly_connect(self.state_db)
         try:
             rows = con.execute(
@@ -2748,6 +2759,12 @@ class DeadPartialReclaimer:
             cooldowns = con.execute(
                 "select hash from soak_state where cooldown_until is not null "
                 "and cooldown_until>?",
+                (int(self.now()),),
+            ).fetchall()
+            probes = con.execute(
+                "select hash from scheduler_intents "
+                "where intent='availability_probe' "
+                "and (expires_at is null or expires_at>?)",
                 (int(self.now()),),
             ).fetchall()
         finally:
@@ -2771,6 +2788,11 @@ class DeadPartialReclaimer:
             {
                 canonical_torrent_hash(row["hash"])
                 for row in cooldowns
+                if canonical_torrent_hash(row["hash"])
+            },
+            {
+                canonical_torrent_hash(row["hash"])
+                for row in probes
                 if canonical_torrent_hash(row["hash"])
             },
         )
@@ -2976,7 +2998,15 @@ class DeadPartialReclaimer:
                 "and cooldown_until>? limit 1",
                 (torrent_hash, now),
             ).fetchone()
-            return cooldown is not None
+            if cooldown is not None:
+                return True
+            probe = con.execute(
+                "select 1 from scheduler_intents where lower(trim(hash))=? "
+                "and intent='availability_probe' "
+                "and (expires_at is null or expires_at>?) limit 1",
+                (torrent_hash, now),
+            ).fetchone()
+            return probe is not None
         finally:
             con.close()
 

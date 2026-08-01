@@ -87,6 +87,61 @@ def test_progress_possible_for_non_drain_or_any_feasible_release_path():
     assert detect_capacity_state(mode="drain", managed_incomplete=10, feasible_full_finish=0, disk_releasing_jobs=1).state == "progress_possible"
 
 
+def test_capacity_state_reasons_prefer_admission_stats_over_stale_viable():
+    from qbt_orchestrator.capacity_state import detect_capacity_state
+
+    assert detect_capacity_state(
+        mode="drain",
+        managed_incomplete=3,
+        feasible_full_finish=1,
+        disk_releasing_jobs=0,
+        capacity_pressure=True,
+        planned_selected_count=1,
+        active_probe_count=0,
+        full_finish_runnable_count=1,
+    ).reason == "feasible_work_selected"
+    assert detect_capacity_state(
+        mode="drain",
+        managed_incomplete=3,
+        feasible_full_finish=0,
+        disk_releasing_jobs=0,
+        capacity_pressure=True,
+        active_probe_count=1,
+    ).reason == "availability_probe_active"
+    assert detect_capacity_state(
+        mode="drain",
+        managed_incomplete=3,
+        feasible_full_finish=0,
+        disk_releasing_jobs=0,
+        capacity_pressure=True,
+        probeable_count=2,
+    ).reason == "availability_probe_pending"
+    assert detect_capacity_state(
+        mode="drain",
+        managed_incomplete=3,
+        feasible_full_finish=1,
+        disk_releasing_jobs=0,
+        capacity_pressure=True,
+        cooldown_count=3,
+        planned_selected_count=0,
+        active_probe_count=0,
+        full_finish_runnable_count=0,
+        probeable_count=0,
+    ).reason == "cooldown_wait"
+    assert detect_capacity_state(
+        mode="normal",
+        managed_incomplete=3,
+        feasible_full_finish=0,
+        disk_releasing_jobs=0,
+        capacity_pressure=False,
+        planned_selected_count=0,
+        active_probe_count=0,
+        probeable_count=0,
+        full_finish_runnable_count=0,
+        cooldown_count=0,
+    ).reason == "no_runnable_source"
+
+
 def test_capacity_observation_excludes_hold_and_orders_manual_candidates():
     from qbt_orchestrator.capacity_state import build_capacity_observation
 
@@ -928,6 +983,13 @@ def test_daemon_rechecks_pressure_after_live_reclaim(
                 now - 3_600,
                 now - 3_600,
             ),
+        )
+        # Probe already failed and is backing off, so capacity state can enter
+        # deadlock instead of availability_probe_pending.
+        con.execute(
+            "insert into carousel_state(hash,state,last_probe_at,backoff_until,backoff_level,updated_at) "
+            "values('stuck','dead',?,?,1,?)",
+            (now - 60, now + 3_600, now),
         )
         con.commit()
         con.close()

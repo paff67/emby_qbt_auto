@@ -19,6 +19,7 @@ from .capacity_assessment import (
     CapacityAssessmentBuilder,
     CapacityAssessmentStore,
     project_progress_health,
+    scheduler_admission,
 )
 from .capacity_state import (
     CapacityResult,
@@ -476,7 +477,14 @@ class DaemonRuntime:
         if carousel_service is not None:
             self.carousel_service = carousel_service
         elif carousel_enabled:
-            self.carousel_service = CarouselService(self.state_db, self.executor, dry_run=self.carousel_dry_run)
+            self.carousel_service = CarouselService(
+                self.state_db,
+                self.executor,
+                dry_run=self.carousel_dry_run,
+                concurrency=1,
+                probe_duration_sec=10 * 60,
+                min_free_bytes=5 * 1024**3,
+            )
         else:
             self.carousel_service = None
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
@@ -571,7 +579,7 @@ class DaemonRuntime:
             LoopTask("planner", 15, self.planner_tick, max_runtime_sec=2),
             LoopTask("file_batch", 60, self.file_batch_tick, max_runtime_sec=5),
             LoopTask("maintenance", 300, self.maintenance_tick, max_runtime_sec=5),
-            LoopTask("carousel", 1800, self.carousel_tick, max_runtime_sec=2),
+            LoopTask("carousel", 60, self.carousel_tick, max_runtime_sec=2),
         ]
         if self.metadata_probe_coordinator is not None:
             tasks.append(
@@ -806,11 +814,32 @@ class DaemonRuntime:
             available_growth_bytes=result.budget_bytes,
             selected_hashes=set(result.selected_hashes),
         )
+        admission_stats = (
+            self._scheduler_admission_stats(
+                assessment_snapshots,
+                assessment,
+                cooldown_hashes=cooldown_hashes,
+                planned_selected_count=len(result.selected_hashes),
+                now=planner_now,
+            )
+            if sync_healthy
+            else {
+                "full_finish_runnable_count": 0,
+                "probeable_count": 0,
+                "active_probe_count": 0,
+                "cooldown_count": 0,
+                "planned_selected_count": 0,
+            }
+        )
         capacity_details = capacity_observation.as_details()
         capacity_details.update(
             {
                 "assessment_incumbent_count": len(assessment.selected_hashes),
-                "planned_selected_count": len(result.selected_hashes),
+                "planned_selected_count": admission_stats["planned_selected_count"],
+                "full_finish_runnable_count": admission_stats["full_finish_runnable_count"],
+                "probeable_count": admission_stats["probeable_count"],
+                "active_probe_count": admission_stats["active_probe_count"],
+                "cooldown_count": admission_stats["cooldown_count"],
                 "sync_healthy": sync_healthy,
             }
         )
@@ -821,6 +850,11 @@ class DaemonRuntime:
                 feasible_full_finish=capacity_observation.feasible_full_finish,
                 disk_releasing_jobs=capacity_observation.disk_releasing_jobs,
                 capacity_pressure=free_bytes < self.drain_exit_bytes,
+                full_finish_runnable_count=admission_stats["full_finish_runnable_count"],
+                probeable_count=admission_stats["probeable_count"],
+                active_probe_count=admission_stats["active_probe_count"],
+                cooldown_count=admission_stats["cooldown_count"],
+                planned_selected_count=admission_stats["planned_selected_count"],
             )
             if sync_healthy
             else CapacityResult(
@@ -1408,6 +1442,85 @@ class DaemonRuntime:
             dynamic_guard_bytes=max(0, self.disk_floor_bytes - self.emergency_floor_bytes),
             claims=external_claims,
         )
+
+    def _scheduler_admission_stats(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        assessment,
+        *,
+        cooldown_hashes: set[str],
+        planned_selected_count: int,
+        now: int,
+    ) -> dict[str, int]:
+        """Count real full-finish / probe admissions for capacity-state reasons."""
+
+        reclaim_locked = capacity_reclaim_locked_hashes(self.state_db)
+        cooldown = {
+            canonical
+            for item in cooldown_hashes
+            if (canonical := canonical_torrent_hash(item))
+        }
+        con = readonly_connect(self.state_db)
+        try:
+            probe_backoff = {
+                canonical_torrent_hash(row["hash"])
+                for row in con.execute(
+                    "select hash from carousel_state "
+                    "where backoff_until is not null and backoff_until>?",
+                    (int(now),),
+                ).fetchall()
+                if canonical_torrent_hash(row["hash"])
+            }
+            active_probe_count = int(
+                con.execute(
+                    "select count(*) from carousel_state where state='probing'"
+                ).fetchone()[0]
+            )
+            if active_probe_count == 0:
+                active_probe_count = int(
+                    con.execute(
+                        "select count(*) from scheduler_intents "
+                        "where intent='availability_probe' "
+                        "and (expires_at is null or expires_at>?)",
+                        (int(now),),
+                    ).fetchone()[0]
+                )
+        finally:
+            con.close()
+
+        full_finish_runnable = 0
+        probeable = 0
+        cooldown_count = 0
+        for fallback_hash, raw in snapshots.items():
+            torrent = dict(raw)
+            torrent_hash = canonical_torrent_hash(
+                torrent.get("hash") or fallback_hash
+            )
+            if not torrent_hash:
+                continue
+            evidence = assessment.torrents.get(torrent_hash)
+            if evidence is None or not evidence.managed or not evidence.incomplete:
+                continue
+            if torrent_hash in cooldown:
+                cooldown_count += 1
+            admission = scheduler_admission(
+                torrent,
+                evidence,
+                cooldown=torrent_hash in cooldown,
+                reclaim_locked=torrent_hash in reclaim_locked,
+                probe_backoff_active=torrent_hash in probe_backoff,
+            )
+            if admission == "full_finish":
+                full_finish_runnable += 1
+            elif admission == "probe":
+                probeable += 1
+        return {
+            "full_finish_runnable_count": full_finish_runnable,
+            "probeable_count": probeable,
+            "active_probe_count": active_probe_count,
+            "cooldown_count": cooldown_count,
+            "planned_selected_count": max(0, int(planned_selected_count)),
+        }
 
     def _scheduler_incumbent_hashes(self, now: int) -> set[str]:
         if self.scheduler_min_residency_sec <= 0:

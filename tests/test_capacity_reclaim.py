@@ -1163,6 +1163,7 @@ def test_reclaim_rejects_unusable_assessment_availability(tmp_path, availability
         ("job", "open_job"),
         ("reservation", "active_reservation"),
         ("cooldown", "active_cooldown"),
+        ("availability_probe", "availability_probe_active"),
     ],
 )
 def test_reclaim_rejects_active_database_protections(tmp_path, protection, reason):
@@ -1186,6 +1187,11 @@ def test_reclaim_rejects_active_database_protections(tmp_path, protection, reaso
         con.execute(
             "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at) "
             "values('h','batch',1,'active',0,6000)"
+        )
+    elif protection == "availability_probe":
+        con.execute(
+            "insert into scheduler_intents(component,hash,intent,priority,expires_at,data_json) "
+            "values('carousel','h','availability_probe',40,6000,'{}')"
         )
     else:
         con.execute(
@@ -3686,6 +3692,7 @@ def test_mark_deleting_rechecks_persistent_capacity_episode(tmp_path):
         ("job", "open_job"),
         ("reservation", "active_reservation"),
         ("cooldown", "active_cooldown"),
+        ("availability_probe", "availability_probe_active"),
     ],
 )
 def test_reserve_atomically_rejects_existing_protection_without_creating_lease(
@@ -3706,6 +3713,11 @@ def test_reserve_atomically_rejects_existing_protection_without_creating_lease(
         con.execute(
             "insert into resource_reservations(hash,kind,bytes,state,expires_at) "
             "values('h','batch',1,'active',6000)"
+        )
+    elif protection == "availability_probe":
+        con.execute(
+            "insert into scheduler_intents(component,hash,intent,priority,expires_at,data_json) "
+            "values('carousel','h','availability_probe',40,6000,'{}')"
         )
     else:
         con.execute(

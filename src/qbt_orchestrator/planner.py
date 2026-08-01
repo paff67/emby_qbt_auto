@@ -20,6 +20,7 @@ from .scheduler_intents import SchedulerIntentRepository
 
 
 STOPPED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "stopped"}
+AVAILABILITY_PROBE_RESERVE_BYTES = 512 * 1024**2
 
 ALLOCATION_UPSERT_SQL = (
     "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason,owner,plan_generation) "
@@ -329,15 +330,21 @@ class DownloadPlanner:
         )
         regular_candidates = [t for t in candidates if str(t.get("hash")) not in forced_active_hashes]
         for torrent in forced_candidates:
-            amount_left = int(torrent.get("amount_left") or 0)
-            incremental_reserved_bytes = max(0, amount_left - int(active_reservations.get(str(torrent.get("hash")), 0)))
+            h = str(torrent.get("hash"))
+            reserved_target = self._reservation_target_bytes(torrent, capacity_probe_hashes)
+            incremental_reserved_bytes = max(
+                0, reserved_target - int(active_reservations.get(h, 0))
+            )
             if len(selected) >= slot_limit or used + incremental_reserved_bytes > budget:
                 continue
             selected.append(torrent)
             used += incremental_reserved_bytes
         for torrent in regular_candidates:
-            amount_left = int(torrent.get("amount_left") or 0)
-            incremental_reserved_bytes = max(0, amount_left - int(active_reservations.get(str(torrent.get("hash")), 0)))
+            h = str(torrent.get("hash"))
+            reserved_target = self._reservation_target_bytes(torrent, capacity_probe_hashes)
+            incremental_reserved_bytes = max(
+                0, reserved_target - int(active_reservations.get(h, 0))
+            )
             if len(selected) >= slot_limit or used + incremental_reserved_bytes > budget:
                 continue
             selected.append(torrent)
@@ -384,6 +391,7 @@ class DownloadPlanner:
                     seq_desired_actions.append((h, False))
         for torrent in candidates:
             h = str(torrent["hash"])
+            canonical_h = canonical_torrent_hash(h) or h
             if h in selected_set:
                 reason = "recovery_budget_fit" if mode == "recovery" else "budget_fit"
                 seq = False if h in forced_active_hashes else desired_seq_dl(
@@ -392,8 +400,20 @@ class DownloadPlanner:
                     int(torrent.get("num_peers") or 0),
                     int(torrent.get("stalled_seconds") or 0),
                 )
-                self._allocation(h, "active", "stable", int(torrent.get("amount_left") or 0), seq, now, reason)
-                self._decision(h, "active", reason, {"reserved_bytes": int(torrent.get("amount_left") or 0), "budget_bytes": budget, "external_reserved_bytes": int(external_reserved_bytes or 0), "mode": mode})
+                reserved_bytes = self._reservation_target_bytes(torrent, capacity_probe_hashes)
+                self._allocation(h, "active", "stable", reserved_bytes, seq, now, reason)
+                self._decision(
+                    h,
+                    "active",
+                    reason,
+                    {
+                        "reserved_bytes": reserved_bytes,
+                        "budget_bytes": budget,
+                        "external_reserved_bytes": int(external_reserved_bytes or 0),
+                        "mode": mode,
+                        "availability_probe": canonical_h in capacity_probe_hashes,
+                    },
+                )
                 if h in forced_active_hashes and self._needs_seq_desired(h, False, previous_allocations):
                     seq_desired_actions.append((h, False))
                 elif seq and self._needs_seq_desired(h, True, previous_allocations):
@@ -449,6 +469,19 @@ class DownloadPlanner:
         if self.recovery_enabled and int(free_bytes) < int(self.recovery_enter_bytes):
             return "recovery"
         return "normal"
+
+    @staticmethod
+    def _reservation_target_bytes(
+        torrent: Mapping[str, Any],
+        capacity_probe_hashes: set[str],
+    ) -> int:
+        """Reserve a capped budget for availability probes; full leftover otherwise."""
+
+        amount_left = max(0, int(torrent.get("amount_left") or 0))
+        h = canonical_torrent_hash(torrent.get("hash")) or str(torrent.get("hash") or "")
+        if h in capacity_probe_hashes:
+            return min(amount_left, AVAILABILITY_PROBE_RESERVE_BYTES)
+        return amount_left
 
     def _candidate_lists(
         self,

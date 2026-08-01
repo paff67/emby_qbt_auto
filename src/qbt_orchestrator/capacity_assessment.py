@@ -24,6 +24,44 @@ class TorrentCapacityEvidence:
     viable: bool
     viability_reason: str
 
+    @property
+    def full_finish_viable(self) -> bool:
+        """Strict full-finish viability; alias of ``viable`` for clearer call sites."""
+
+        return self.viable
+
+
+def has_hold(snapshot: Mapping[str, Any]) -> bool:
+    tags = {
+        part.strip()
+        for part in str(snapshot.get("tags") or "").split(",")
+        if part.strip()
+    }
+    return "hold" in tags
+
+
+def scheduler_admission(
+    snapshot: Mapping[str, Any],
+    evidence: TorrentCapacityEvidence,
+    *,
+    cooldown: bool,
+    reclaim_locked: bool,
+    probe_backoff_active: bool,
+) -> str:
+    """Classify whether a torrent may full-finish, probe, or stay blocked.
+
+    ``probe`` only admits a short availability refresh; it does not imply the
+    torrent can finish under the remaining capacity budget.
+    """
+
+    if cooldown or reclaim_locked or has_hold(snapshot):
+        return "blocked"
+    if evidence.full_finish_viable:
+        return "full_finish"
+    if not probe_backoff_active:
+        return "probe"
+    return "blocked"
+
 
 @dataclass(frozen=True)
 class CapacityAssessment:

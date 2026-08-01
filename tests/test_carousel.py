@@ -67,9 +67,9 @@ def test_carousel_service_emits_at_most_three_probe_intents_without_qbt_writes()
             "select component,hash,intent,priority,expires_at from scheduler_intents order by hash",
         )
         assert intents == [
-            {"component": "carousel", "hash": "h1", "intent": "availability_probe", "priority": 40, "expires_at": 2800},
-            {"component": "carousel", "hash": "h2", "intent": "availability_probe", "priority": 40, "expires_at": 2800},
-            {"component": "carousel", "hash": "h3", "intent": "availability_probe", "priority": 40, "expires_at": 2800},
+            {"component": "carousel", "hash": "h1", "intent": "availability_probe", "priority": 40, "expires_at": 1600},
+            {"component": "carousel", "hash": "h2", "intent": "availability_probe", "priority": 40, "expires_at": 1600},
+            {"component": "carousel", "hash": "h3", "intent": "availability_probe", "priority": 40, "expires_at": 1600},
         ]
         allocations = _rows(db, "select hash,allocated_at,reason from scheduler_allocations order by hash")
         assert all(row["allocated_at"] == 100 and row["reason"] == "test_dead" for row in allocations)
@@ -81,42 +81,54 @@ def test_carousel_service_emits_at_most_three_probe_intents_without_qbt_writes()
         ]
 
 
-def test_carousel_service_promotes_probe_with_swarm_and_stops_expired_dead_probe():
+def test_carousel_service_promotes_probe_with_seeds_and_stops_expired_dead_probe():
     from qbt_orchestrator.carousel import CarouselService
     from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.scheduler_intents import SchedulerIntent, SchedulerIntentRepository
 
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "state.sqlite"
         migrate(db, dry_run=False)
-        _seed_dead_allocations(db, ["hot", "cold"])
+        _seed_dead_allocations(db, ["hot", "cold", "leech"])
         con = sqlite3.connect(db)
         con.execute("insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_level,updated_at) values('hot','probing',900,900,0,900)")
         con.execute("insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_level,updated_at) values('cold','probing',0,0,0,0)")
+        con.execute("insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_level,updated_at) values('leech','probing',900,900,0,900)")
         con.commit(); con.close()
+        intents = SchedulerIntentRepository(db)
+        intents.upsert(SchedulerIntent("carousel", "hot", "availability_probe", 40, 2800, {"probe_started_completed_bytes": 10}))
+        intents.upsert(SchedulerIntent("carousel", "cold", "availability_probe", 40, 2800, {"probe_started_completed_bytes": 0}))
+        intents.upsert(SchedulerIntent("carousel", "leech", "availability_probe", 40, 2800, {"probe_started_completed_bytes": 5}))
         executor = RecordingExecutor()
         svc = CarouselService(db, executor, dry_run=False, concurrency=3, probe_duration_sec=1800, now=lambda: 2000)
         snapshots = {
-            "hot": {"hash": "hot", "category": "auto", "amount_left": 1, "num_seeds": 0, "num_peers": 2},
-            "cold": {"hash": "cold", "category": "auto", "amount_left": 1, "num_seeds": 0, "num_peers": 0},
+            "hot": {"hash": "hot", "category": "auto", "amount_left": 1, "num_seeds": 1, "num_peers": 0, "completed": 10},
+            "cold": {"hash": "cold", "category": "auto", "amount_left": 1, "num_seeds": 0, "num_peers": 0, "completed": 0},
+            "leech": {"hash": "leech", "category": "auto", "amount_left": 1, "num_seeds": 0, "num_peers": 4, "completed": 5, "dlspeed": 0},
         }
 
         result = svc.run_once(snapshots, sync_healthy=True)
 
         assert result["promoted"] == ["hot"]
         assert result["stopped"] == ["cold"]
+        assert "leech" not in result["promoted"]
+        assert "leech" not in result["stopped"]
         assert executor.posts == []
         assert executor.seq == []
-        assert _rows(db, "select * from scheduler_intents") == []
+        remaining = _rows(db, "select hash,intent from scheduler_intents order by hash")
+        assert remaining == [{"hash": "leech", "intent": "availability_probe"}]
         alloc = _rows(db, "select hash,desired_state,slot_kind,reason from scheduler_allocations order by hash")
         assert {r["hash"]: (r["desired_state"], r["slot_kind"], r["reason"]) for r in alloc} == {
             "cold": ("dead", "dead", "test_dead"),
             "hot": ("dead", "dead", "test_dead"),
+            "leech": ("dead", "dead", "test_dead"),
         }
         states = {r["hash"]: r for r in _rows(db, "select hash,state,backoff_level,backoff_until from carousel_state order by hash")}
         assert states["hot"]["state"] == "soak"
         assert states["cold"]["state"] == "dead"
         assert states["cold"]["backoff_level"] == 1
         assert states["cold"]["backoff_until"] == 2000 + 30 * 60
+        assert states["leech"]["state"] == "probing"
 
 
 def test_carousel_can_probe_dead_allocation_created_by_planner_health_policy():
@@ -272,6 +284,84 @@ def test_daemon_default_carousel_loop_uses_sync_cache_not_not_configured():
         assert result["started"] == ["h1"]
         assert result["dry_run"] is True
 
+
+
+def test_carousel_accepts_capacity_nonviable_and_reprobes_soak_after_interval():
+    from qbt_orchestrator.carousel import CarouselService
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,allocated_at,reason) "
+            "values('stuck','soak','soak','soak',100,'capacity_nonviable')"
+        )
+        con.execute(
+            "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_level,updated_at) "
+            "values('stuck','soak',100,100,0,100)"
+        )
+        con.commit()
+        con.close()
+        svc = CarouselService(
+            db,
+            RecordingExecutor(),
+            dry_run=False,
+            concurrency=1,
+            reprobe_interval_sec=30 * 60,
+            now=lambda: 100 + 30 * 60,
+        )
+
+        result = svc.run_once(
+            {
+                "stuck": {
+                    "hash": "stuck",
+                    "category": "auto",
+                    "amount_left": 20 * 1024**3,
+                    "num_seeds": 0,
+                    "num_peers": 0,
+                    "availability": 0.4,
+                }
+            },
+            sync_healthy=True,
+            free_bytes=8 * 1024**3,
+        )
+
+        assert result["started"] == ["stuck"]
+        assert _rows(db, "select hash,state from carousel_state") == [
+            {"hash": "stuck", "state": "probing"}
+        ]
+        assert _rows(db, "select hash,intent from scheduler_intents") == [
+            {"hash": "stuck", "intent": "availability_probe"}
+        ]
+
+
+def test_carousel_excludes_active_soak_cooldown_from_probe_queue():
+    from qbt_orchestrator.carousel import CarouselService
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        _seed_dead_allocations(db, ["cooled"])
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into soak_state(hash,state,cooldown_until,updated_at,reason) "
+            "values('cooled','soak_cooldown',2000,1000,'active_slow')"
+        )
+        con.commit()
+        con.close()
+        svc = CarouselService(db, RecordingExecutor(), dry_run=False, concurrency=1, now=lambda: 1500)
+
+        result = svc.run_once(
+            {"cooled": {"hash": "cooled", "category": "auto", "amount_left": 1}},
+            sync_healthy=True,
+            free_bytes=8 * 1024**3,
+        )
+
+        assert result["started"] == []
+        assert _rows(db, "select * from carousel_state") == []
 
 
 def test_carousel_live_verify_caps_probe_to_one_and_records_metrics():

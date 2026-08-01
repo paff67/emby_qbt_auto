@@ -6,9 +6,19 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .capacity_reclaim import OPEN_JOB_STATES, capacity_reclaim_locked_hashes
 from .db import readonly_connect, write_transaction
+from .hash_identity import canonical_torrent_hash
 from .observability import redact
 from .scheduler_intents import SchedulerIntent, SchedulerIntentRepository
+
+
+MIB = 1024**2
+GIB = 1024**3
+DEFAULT_PROBE_BUDGET_BYTES = 512 * MIB
+DEFAULT_PROBE_DURATION_SEC = 10 * 60
+DEFAULT_REPROBE_INTERVAL_SEC = 30 * 60
+DEFAULT_BACKOFF_SCHEDULE_SEC = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600)
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -25,12 +35,38 @@ def _is_managed(torrent: Mapping[str, Any]) -> bool:
     return (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
 
 
-class CarouselService:
-    """Dead torrent carousel probe loop.
+def _completed_bytes(snapshot: Mapping[str, Any]) -> int:
+    for field in ("completed_bytes", "completed", "downloaded"):
+        if snapshot.get(field) is not None:
+            try:
+                return max(0, int(snapshot.get(field) or 0))
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
-    Dead torrents are normally stopped.  Every carousel tick probes a bounded
-    number of dead candidates, disables sequential download, and either
-    promotes them back to Soak when swarm appears or stops them with backoff.
+
+def _active_soak_cooldown_hashes(state_db: str | Path, now: int) -> set[str]:
+    con = readonly_connect(state_db)
+    try:
+        return {
+            canonical
+            for row in con.execute(
+                "select hash from soak_state "
+                "where state='soak_cooldown' and cooldown_until is not null "
+                "and cooldown_until>?",
+                (int(now),),
+            ).fetchall()
+            if (canonical := canonical_torrent_hash(row["hash"]))
+        }
+    finally:
+        con.close()
+
+
+class CarouselService:
+    """Bounded availability-probe loop for dead / capacity-nonviable torrents.
+
+    Probes refresh tracker/peer/availability evidence.  They do not grant a
+    full-finish budget; promotion requires complete sources or real progress.
     """
 
     def __init__(
@@ -38,10 +74,11 @@ class CarouselService:
         state_db: str | Path,
         executor,
         dry_run: bool = True,
-        concurrency: int = 3,
-        probe_duration_sec: int = 30 * 60,
-        backoff_schedule_sec: tuple[int, ...] = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600),
-        min_free_bytes: int = 5 * 1024**3,
+        concurrency: int = 1,
+        probe_duration_sec: int = DEFAULT_PROBE_DURATION_SEC,
+        backoff_schedule_sec: tuple[int, ...] = DEFAULT_BACKOFF_SCHEDULE_SEC,
+        min_free_bytes: int = 5 * GIB,
+        reprobe_interval_sec: int = DEFAULT_REPROBE_INTERVAL_SEC,
         live_verify: bool = False,
         now: Callable[[], int] | None = None,
     ):
@@ -53,6 +90,7 @@ class CarouselService:
         self.probe_duration_sec = int(probe_duration_sec)
         self.backoff_schedule_sec = tuple(int(x) for x in backoff_schedule_sec) or (30 * 60,)
         self.min_free_bytes = int(min_free_bytes)
+        self.reprobe_interval_sec = max(0, int(reprobe_interval_sec))
         self.now = now or (lambda: int(time.time()))
         self.intent_repository = SchedulerIntentRepository(self.state_db)
 
@@ -99,13 +137,30 @@ class CarouselService:
         expired: list[str] = []
         con = _connect(self.state_db)
         rows = [dict(r) for r in con.execute("select * from carousel_state where state='probing' order by probe_started_at,hash")]
+        intent_rows = {
+            canonical_torrent_hash(r["hash"]): dict(r)
+            for r in con.execute(
+                "select hash,data_json from scheduler_intents "
+                "where component='carousel' and intent='availability_probe'"
+            )
+            if canonical_torrent_hash(r["hash"])
+        }
         con.close()
         for row in rows:
             h = str(row["hash"])
             snap = self._snapshot(snapshots, h)
-            if self._has_swarm(snap):
+            started_completed = self._probe_started_completed_bytes(intent_rows.get(canonical_torrent_hash(h) or h))
+            if self._probe_succeeded(snap, started_completed):
                 self._mark_soak(h, now)
-                self._decision(h, "soak", "carousel_swarm_seen", {"probe_started_at": row.get("probe_started_at")})
+                self._decision(
+                    h,
+                    "soak",
+                    "carousel_probe_succeeded",
+                    {
+                        "probe_started_at": row.get("probe_started_at"),
+                        "probe_started_completed_bytes": started_completed,
+                    },
+                )
                 promoted.append(h)
                 continue
             started_at = int(row["probe_started_at"]) if row.get("probe_started_at") is not None else now
@@ -120,40 +175,100 @@ class CarouselService:
     def _start_new_probes(self, snapshots: Mapping[str, Any], now: int, capacity: int) -> list[str]:
         if capacity <= 0 or self.concurrency <= 0:
             return []
-        candidates = self._dead_candidates(snapshots, now)
+        candidates = self._probe_candidates(snapshots, now)
         selected = candidates[:capacity]
         if not selected:
             return []
         for h in selected:
-            self._mark_probing(h, now)
+            snap = self._snapshot(snapshots, h)
+            self._mark_probing(h, now, _completed_bytes(snap))
             self._decision(h, "carousel_probe", "carousel_probe_started", {"concurrency": self.concurrency})
         return selected
 
-    def _dead_candidates(self, snapshots: Mapping[str, Any], now: int) -> list[str]:
+    def _probe_candidates(self, snapshots: Mapping[str, Any], now: int) -> list[str]:
         con = _connect(self.state_db)
         rows = [
             dict(r)
             for r in con.execute(
-                "select hash from scheduler_allocations where desired_state='dead' order by allocated_at,hash"
+                "select hash,desired_state,reason from scheduler_allocations "
+                "where desired_state='dead' or reason='capacity_nonviable' "
+                "order by allocated_at,hash"
             )
         ]
-        state_rows = {str(r["hash"]): dict(r) for r in con.execute("select * from carousel_state")}
+        state_rows = {
+            str(r["hash"]): dict(r)
+            for r in con.execute("select * from carousel_state")
+        }
+        open_job_hashes = {
+            canonical_torrent_hash(r["hash"])
+            for r in con.execute(
+                f"select distinct hash from torrent_jobs where state in ({','.join('?' for _ in OPEN_JOB_STATES)})",
+                OPEN_JOB_STATES,
+            )
+            if canonical_torrent_hash(r["hash"])
+        }
+        active_claim_hashes = {
+            canonical_torrent_hash(r["hash"])
+            for r in con.execute(
+                "select distinct hash from resource_reservations where state='active' "
+                "and (expires_at is null or expires_at>?)",
+                (now,),
+            )
+            if canonical_torrent_hash(r["hash"])
+        }
+        active_probe_intents = {
+            canonical_torrent_hash(r["hash"])
+            for r in con.execute(
+                "select hash from scheduler_intents "
+                "where intent='availability_probe' and (expires_at is null or expires_at>?)",
+                (now,),
+            )
+            if canonical_torrent_hash(r["hash"])
+        }
         con.close()
+        cooldown_hashes = _active_soak_cooldown_hashes(self.state_db, now)
+        reclaim_locked = capacity_reclaim_locked_hashes(self.state_db)
         out: list[str] = []
+        seen: set[str] = set()
         for row in rows:
             h = str(row["hash"])
+            canonical = canonical_torrent_hash(h) or h
+            if canonical in seen:
+                continue
             snap = self._snapshot(snapshots, h)
             if not snap or not _is_managed(snap) or int(snap.get("amount_left") or 0) <= 0:
                 continue
-            state = state_rows.get(h)
+            if canonical in cooldown_hashes:
+                continue
+            if canonical in reclaim_locked:
+                continue
+            if canonical in open_job_hashes or canonical in active_claim_hashes:
+                continue
+            if canonical in active_probe_intents:
+                continue
+            state = state_rows.get(h) or state_rows.get(canonical)
             if state:
-                if state.get("state") in {"probing", "soak"}:
+                state_name = str(state.get("state") or "")
+                if state_name == "probing":
                     continue
                 backoff_until = state.get("backoff_until")
                 if backoff_until is not None and int(backoff_until) > now:
                     continue
+                if state_name == "soak":
+                    # Re-enter probe only when still capacity-nonviable and the
+                    # re-probe interval since last_probe_at has elapsed.
+                    if str(row.get("reason") or "") != "capacity_nonviable":
+                        continue
+                    last_probe_at = state.get("last_probe_at")
+                    if last_probe_at is not None and now - int(last_probe_at) < self.reprobe_interval_sec:
+                        continue
+            seen.add(canonical)
             out.append(h)
         return out
+
+    # Backward-compatible name used by older tests/helpers.
+    def _dead_candidates(self, snapshots: Mapping[str, Any], now: int) -> list[str]:
+        return self._probe_candidates(snapshots, now)
 
     def _active_probe_count(self) -> int:
         con = _connect(self.state_db)
@@ -161,7 +276,7 @@ class CarouselService:
         con.close()
         return count
 
-    def _mark_probing(self, h: str, now: int) -> None:
+    def _mark_probing(self, h: str, now: int, started_completed_bytes: int = 0) -> None:
         def txn(con: sqlite3.Connection) -> None:
             con.execute(
                 "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_until,backoff_level,updated_at) values(?,?,?,?,?,?,?) "
@@ -177,7 +292,7 @@ class CarouselService:
                     "availability_probe",
                     40,
                     now + int(self.probe_duration_sec),
-                    {},
+                    {"probe_started_completed_bytes": int(started_completed_bytes)},
                 ),
             )
 
@@ -254,5 +369,46 @@ class CarouselService:
         return dict(raw)
 
     @staticmethod
+    def _probe_started_completed_bytes(intent_row: Mapping[str, Any] | None) -> int:
+        if not intent_row:
+            return 0
+        try:
+            data = json.loads(str(intent_row.get("data_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0
+        if not isinstance(data, dict):
+            return 0
+        try:
+            return max(0, int(data.get("probe_started_completed_bytes") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _probe_succeeded(snapshot: Mapping[str, Any], started_completed_bytes: int) -> bool:
+        """Promote only on complete sources or real download progress.
+
+        Leech peers alone may justify continued probing elsewhere, but they do
+        not prove the torrent can finish.
+        """
+
+        if not snapshot:
+            return False
+        num_seeds = int(snapshot.get("num_seeds") or snapshot.get("num_complete") or 0)
+        if num_seeds > 0:
+            return True
+        try:
+            availability = snapshot.get("availability")
+            if availability is not None and float(availability) >= 1.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        dlspeed = int(snapshot.get("dlspeed_bps") or snapshot.get("dlspeed") or 0)
+        if dlspeed > 0:
+            return True
+        return _completed_bytes(snapshot) > int(started_completed_bytes)
+
+    @staticmethod
     def _has_swarm(snapshot: Mapping[str, Any]) -> bool:
+        """Deprecated peer-or-seed check kept for callers; prefer ``_probe_succeeded``."""
+
         return int(snapshot.get("num_seeds") or 0) > 0 or int(snapshot.get("num_peers") or 0) > 0
