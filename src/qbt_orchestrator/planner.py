@@ -10,7 +10,7 @@ from typing import Any, Mapping
 from .budget import future_growth_by_hash, resource_claims_from_rows
 from .capacity_assessment import CapacityAssessment, project_progress_health
 from .capacity_reclaim import capacity_reclaim_locked_hashes
-from .db import readonly_connect, write_transaction
+from .db import assert_hash_not_reclaim_locked, readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
 from .hash_identity import canonical_torrent_hash
 from .models import LifecycleState
@@ -922,6 +922,8 @@ class DownloadPlanner:
                     [self._allocation_params(row, plan_generation) for row in batch.allocations],
                 )
             if batch.soak_cooldowns:
+                for row in batch.soak_cooldowns:
+                    assert_hash_not_reclaim_locked(con, row["hash"])
                 con.executemany(
                     "insert into soak_state(hash,state,ema_dlspeed_bps,cooldown_until,last_stopped_at,exposure_bytes,last_sample_at,updated_at,reason) "
                     "values(?,?,?,?,?,?,?,?,?) "
@@ -1074,6 +1076,7 @@ class DownloadPlanner:
             )
 
         for torrent_hash, bytes_reserved in selected_by_hash.items():
+            assert_hash_not_reclaim_locked(con, torrent_hash)
             existing_ids = active_by_hash.get(torrent_hash) or []
             keep_id = existing_ids[0] if existing_ids else None
             expires_at = int(now) + 120
@@ -1116,15 +1119,16 @@ class DownloadPlanner:
                 {"hash": hash, "now": int(now), "cooldown_until": cooldown_until, "reason": reason}
             )
             return
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
+        def txn(con: sqlite3.Connection) -> None:
+            assert_hash_not_reclaim_locked(con, hash)
+            con.execute(
                 "insert into soak_state(hash,state,ema_dlspeed_bps,cooldown_until,last_stopped_at,exposure_bytes,last_sample_at,updated_at,reason) "
                 "values(?,?,?,?,?,?,?,?,?) "
                 "on conflict(hash) do update set state=excluded.state,cooldown_until=excluded.cooldown_until,last_stopped_at=excluded.last_stopped_at,exposure_bytes=excluded.exposure_bytes,updated_at=excluded.updated_at,reason=excluded.reason",
                 (hash, "soak_cooldown", 0, cooldown_until, now, 0, now, now, reason),
-            ),
-        )
+            )
+
+        write_transaction(self.state_db, txn)
 
     def _mark_soak_resident(self, hash: str, now: int, reason: str) -> None:
         hash = canonical_torrent_hash(hash)

@@ -14,7 +14,11 @@ from typing import Any, Callable, Mapping
 from urllib.parse import quote
 
 from .capacity_assessment import CapacityAssessment, TorrentCapacityEvidence
-from .db import readonly_connect, write_transaction
+from .db import (
+    CAPACITY_RECLAIM_LOCKED_STATES,
+    readonly_connect,
+    write_transaction,
+)
 from .hash_identity import canonical_torrent_hash
 from .observability import redact
 
@@ -35,19 +39,8 @@ OPEN_JOB_STATES = (
     "promotion_wait",
     "cleanup_wait",
 )
-# Only rows that can still mutate qBT or the payload own a mutation lease.
-# Historical confirmation/terminal states must never fence normal scheduling.
-RECLAIM_LOCKED_STATES = frozenset(
-    {
-        "stopping",
-        "deleting",
-        "quarantined",
-        "deleted",
-        "recheck_pending",
-        "partial_or_unknown",
-        "stop_unknown",
-    }
-)
+# Shared with db.assert_hash_not_reclaim_locked — keep a single locked-state list.
+RECLAIM_LOCKED_STATES = frozenset(CAPACITY_RECLAIM_LOCKED_STATES)
 MAGNET_PREFIX = "mag" + "net:?"
 PROGRESS_EPSILON = 1e-9
 CONTENT_SIZE_FIELDS = ("size", "total_size", "wanted_size")

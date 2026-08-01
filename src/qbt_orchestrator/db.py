@@ -7,6 +7,43 @@ from typing import Any, Callable, Dict, List
 from .hash_identity import canonical_torrent_hash
 
 
+CAPACITY_RECLAIM_LOCKED_STATES = (
+    "stopping",
+    "deleting",
+    "quarantined",
+    "deleted",
+    "recheck_pending",
+    "partial_or_unknown",
+    "stop_unknown",
+)
+
+
+class CapacityReclaimLockedError(RuntimeError):
+    """Raised when a write would race an in-flight capacity reclaim fence."""
+
+
+def assert_hash_not_reclaim_locked(
+    con: sqlite3.Connection,
+    torrent_hash: str | None,
+) -> None:
+    """Fail closed inside an open write transaction if hash is reclaim-locked.
+
+    Empty hashes are ignored. Locked states are owned by the single-daemon
+    reclaimer + Executor mutation leases; SQLite triggers are not used.
+    """
+    canonical = canonical_torrent_hash(torrent_hash)
+    if not canonical:
+        return
+    placeholders = ",".join("?" for _ in CAPACITY_RECLAIM_LOCKED_STATES)
+    row = con.execute(
+        "select 1 from capacity_reclaims "
+        f"where lower(trim(hash))=? and state in ({placeholders}) limit 1",
+        (canonical, *CAPACITY_RECLAIM_LOCKED_STATES),
+    ).fetchone()
+    if row is not None:
+        raise CapacityReclaimLockedError(f"capacity_reclaim_locked:{canonical}")
+
+
 _ENFORCE_POSIX_SQLITE_MODE = os.name == "posix"
 _SQLITE_PRIVATE_MODE = 0o600
 _SQLITE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)

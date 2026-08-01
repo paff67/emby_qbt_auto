@@ -1104,39 +1104,43 @@ def test_resume_command_canonicalizes_hash_and_blocks_on_reclaim_lease():
         assert qbt.posts == []
 
 
-def test_queue_command_reclaim_trigger_becomes_blocked_without_creating_job():
-    from qbt_orchestrator.db import migrate
+def _seed_reclaim_locked_row(db: Path, torrent_hash: str = "h", state: str = "stopping"):
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,created_at,updated_at"
+        ") values(?,?,?,?,?,?,?,?,?)",
+        (
+            f"reclaim:{torrent_hash}",
+            torrent_hash,
+            torrent_hash.upper(),
+            "mag" + f"net:?xt=urn:btih:{torrent_hash}",
+            str(db.parent / torrent_hash),
+            f"/downloads/{torrent_hash}",
+            state,
+            100,
+            100,
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def test_queue_command_reclaim_python_fence_becomes_blocked_without_creating_job():
+    from qbt_orchestrator.db import CapacityReclaimLockedError, migrate
     from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
     from tests.fakes import FakeExecutor
 
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "state.sqlite"
         migrate(db, dry_run=False)
-        con = sqlite3.connect(db)
-        con.execute(
-            "insert into capacity_reclaims("
-            "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,created_at,updated_at"
-            ") values(?,?,?,?,?,?,?,?,?)",
-            (
-                "reclaim:h",
-                "h",
-                "H",
-                "mag" + "net:?xt=urn:btih:h",
-                str(Path(td) / "h"),
-                "/downloads/h",
-                "stopping",
-                100,
-                100,
-            ),
-        )
-        con.commit()
-        con.close()
+        _seed_reclaim_locked_row(db)
         commands = BotCommandRepository(db, now=lambda: 100)
         commands.insert_command("queue-locked", 100, 2, "queue", {"args": [" H "]})
 
         with pytest.raises(
-            sqlite3.IntegrityError,
-            match="capacity_reclaim_locked",
+            CapacityReclaimLockedError,
+            match="capacity_reclaim_locked:h",
         ):
             CommandProcessor(commands, FakeExecutor()).run_next()
 
@@ -1144,6 +1148,82 @@ def test_queue_command_reclaim_trigger_becomes_blocked_without_creating_job():
         assert command["state"] == "blocked"
         assert command["last_error"] == "capacity_reclaim_locked"
         assert _rows(db, "select * from torrent_jobs") == []
+
+
+def test_python_reclaim_fence_blocks_job_and_reservation_create_but_allows_release():
+    from qbt_orchestrator.db import (
+        CapacityReclaimLockedError,
+        assert_hash_not_reclaim_locked,
+        migrate,
+        write_transaction,
+    )
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        _seed_reclaim_locked_row(db, state="deleting")
+        jobs = TorrentJobRepository(db, now=lambda: 100)
+
+        with pytest.raises(CapacityReclaimLockedError, match="capacity_reclaim_locked:h"):
+            jobs.enqueue("h", None, "upload", {"source": "fence"})
+
+        assert _rows(db, "select * from torrent_jobs") == []
+
+        def create_reservation(con):
+            assert_hash_not_reclaim_locked(con, "h")
+            con.execute(
+                "insert into resource_reservations("
+                "hash,kind,bytes,state,created_at) values('h','batch',1,'active',1)"
+            )
+
+        with pytest.raises(CapacityReclaimLockedError):
+            write_transaction(db, create_reservation)
+
+        def release_reservation(con):
+            con.execute(
+                "insert into resource_reservations("
+                "hash,kind,bytes,state,created_at) values('h','batch',1,'active',1)"
+            )
+            # Direct SQL insert bypasses fence; release path must stay unfenced.
+            con.execute(
+                "update resource_reservations set state='released', released_at=2 "
+                "where hash='h' and state='active'"
+            )
+
+        write_transaction(db, release_reservation)
+        rows = _rows(db, "select state from resource_reservations")
+        assert rows == [{"state": "released"}]
+
+
+def test_python_reclaim_fence_blocks_planner_and_soak_cooldown_writes():
+    from qbt_orchestrator.db import CapacityReclaimLockedError, migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from qbt_orchestrator.soak_queue import SoakQueueConfig, SoakQueueService
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        _seed_reclaim_locked_row(db, state="stop_unknown")
+        planner = DownloadPlanner(
+            db,
+            FakeExecutor(),
+            dry_run=False,
+            now=lambda: 100,
+        )
+        with pytest.raises(CapacityReclaimLockedError, match="capacity_reclaim_locked:h"):
+            planner._mark_soak_cooldown("h", 100, "fence-test")
+
+        soak = SoakQueueService(
+            db,
+            FakeExecutor(),
+            dry_run=False,
+            config=SoakQueueConfig(),
+            now=lambda: 100,
+        )
+        with pytest.raises(CapacityReclaimLockedError, match="capacity_reclaim_locked:h"):
+            soak._preempt_active(["h"], 100)
 
 
 def test_pause_timeout_fails_command_and_propagates_error():

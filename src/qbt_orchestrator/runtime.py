@@ -9,7 +9,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
-from .db import readonly_connect, write_transaction
+from .db import (
+    CapacityReclaimLockedError,
+    assert_hash_not_reclaim_locked,
+    readonly_connect,
+    write_transaction,
+)
 from .executor import QbtMutationLeaseBlocked
 from .hash_identity import canonical_torrent_hash
 from .cleanup_policy import cleanup_eligibility
@@ -217,6 +222,7 @@ class TorrentJobRepository:
         torrent_hash = canonical_torrent_hash(hash) or None
         phase = "queued_copy" if job_type in {"upload", "sidecar_upload"} else None
         def txn(con: sqlite3.Connection) -> int:
+            assert_hash_not_reclaim_locked(con, torrent_hash)
             cur = con.execute(
                 "insert into torrent_jobs(hash,batch_id,job_type,state,phase,priority,payload_json,parent_job_id,created_at,updated_at) "
                 "values(?,?,?,?,?,?,?,?,?,?)",
@@ -832,6 +838,7 @@ class UploadJobRunner:
                 (batch_id,),
             ).fetchone()
             h = canonical_torrent_hash(row.get("hash")) or None
+            assert_hash_not_reclaim_locked(con, h)
             if existing:
                 con.execute(
                     "update resource_reservations set hash=?,accounting_class='current_pinned',owner='upload_job_runner',"
@@ -1295,6 +1302,10 @@ class CleanupRequestRunner:
                 return [], "blocked"
 
             ids = [int(r["id"]) for r in rows]
+            for matched in rows:
+                assert_hash_not_reclaim_locked(
+                    con, canonical_torrent_hash(matched.get("hash"))
+                )
             placeholders = ",".join("?" for _ in ids)
             con.execute(f"update torrent_batches set state='cleanup_requested', updated_at=? where id in ({placeholders})", (now, *ids))
             con.execute(
@@ -1734,6 +1745,8 @@ class CommandProcessor:
     def _exception_terminal_state(exc: Exception) -> tuple[str, str]:
         if isinstance(exc, QbtMutationLeaseBlocked):
             return "blocked", str(redact(str(exc)))
+        if isinstance(exc, CapacityReclaimLockedError):
+            return "blocked", "capacity_reclaim_locked"
         message = str(exc)
         lowered = message.lower()
         for marker in (
