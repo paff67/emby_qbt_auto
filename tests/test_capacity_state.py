@@ -1004,11 +1004,14 @@ def test_daemon_rechecks_pressure_after_live_reclaim(
         assert result["capacity"]["details"]["nonviable_finish"] == 1
         assert result["planner"]["selected_hashes"] == []
         assert result["capacity_reclaim"]["planned"] == planned
-        assert reclaimer.calls[0][1] == {
-            "capacity_state": "capacity_deadlock",
-            "free_bytes": int(3.25 * GIB),
-            "target_free_bytes": 5 * GIB,
-        }
+        reclaim_kwargs = reclaimer.calls[0][1]
+        assert reclaim_kwargs["capacity_state"] == "capacity_deadlock"
+        assert reclaim_kwargs["free_bytes"] == int(3.25 * GIB)
+        assert reclaim_kwargs["target_free_bytes"] == 5 * GIB
+        # Formal reclaimers always receive the committed assessment; incomplete
+        # signature probing was removed in the P0 simplify pass.
+        assert "assessment" in reclaim_kwargs
+        assert int(reclaim_kwargs["assessment"].generation) == 1
         assert len(alerts.deadlocks) == 1
         transition, alert_kwargs = alerts.deadlocks[0]
         assert transition.state == expected_capacity_state
