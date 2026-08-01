@@ -3019,6 +3019,46 @@ def _seed_post_delete_reclaim_row(db: Path, tmp_path: Path, *, state: str = "del
     return audit, reclaim_id, _direct_reclaim_candidate(tmp_path, "h")
 
 
+def test_tag_pending_notification_dedupes_within_hour_bucket(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    clock = {"now": 5_000}
+    managed = tmp_path / "incomplete"
+    managed.mkdir(parents=True, exist_ok=True)
+    (managed / "h").mkdir(exist_ok=True)
+    _capacity_health(db, "h")
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: clock["now"]
+    )
+    reservation = audit.reserve(_direct_reclaim_candidate(tmp_path, "h"))
+    reclaim_id = int(reservation["reclaim_id"])
+    con = sqlite3.connect(db)
+    con.execute(
+        "update capacity_reclaims set state='deleted', recheck_state='requested' "
+        "where id=?",
+        (reclaim_id,),
+    )
+    con.commit()
+    con.close()
+
+    audit.mark_tag_pending(reclaim_id, 4, "first failure")
+    audit.mark_tag_pending(reclaim_id, 4, "second failure same hour")
+    assert len(_capacity_reclaim_notifications(db)) == 1
+
+    clock["now"] = 5_000 + 3_601
+    audit.mark_tag_pending(reclaim_id, 4, "third failure next hour")
+    notices = _capacity_reclaim_notifications(db)
+    assert len(notices) == 2
+    assert all(notice["level"] == "warning" for notice in notices)
+    assert all(
+        "待添加标签：capacity-reclaimed, hold" in notice["message"]
+        for notice in notices
+    )
+
+
 def test_mark_tag_pending_audit_redacts_error_and_queues_warning(tmp_path):
     from qbt_orchestrator.db import migrate
 
