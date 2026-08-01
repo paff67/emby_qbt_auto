@@ -1,12 +1,16 @@
 from __future__ import annotations
-import argparse, json, os, shutil, sqlite3
+import argparse, json, logging, os, shutil, sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 from .config import load_config
 from .carousel import CarouselService
 from .bot_add_queue import BotAddQueueRepository
-from .capacity_reclaim import DeadPartialReclaimer
+from .capacity_reclaim import (
+    CAPACITY_BLOCKING_RECOVERY_STATES,
+    CAPACITY_NONBLOCKING_RECONCILE_STATES,
+    DeadPartialReclaimer,
+)
 from .capacity_assessment import CapacityAssessmentBuilder, CapacityAssessmentStore
 from .checked_add import CheckedAddService, DuplicateMatcher
 from .db import migrate, readonly_connect, readonly_counts, recover_jobs
@@ -32,11 +36,12 @@ from .runtime import BotCommandRepository, BotNotificationRepository, CleanupReq
 from .runtime import ObservabilityStore
 from .seeding_preemption import PreemptionConfig, SeedingPreemptionService
 from .service import (
-    CAPACITY_RECOVERY_PENDING_STATES,
     DaemonRuntime,
     build_telegram_supervisor_from_env,
 )
 from .soak_queue import SoakQueueConfig
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PassthroughBackfill:
@@ -381,8 +386,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     viability_stale_sec = int(
         os.environ.get("QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC", "1800")
     )
-    # Startup reclaim fences are hydrated by Executor, so the durable schema
-    # must exist before the shared mutation gateway is constructed.
+    # Startup order is load-bearing for reclaim fencing:
+    # 1) migrate() must finalize legacy aborted_paused rows and drop capacity
+    #    triggers before any Executor is constructed;
+    # 2) Executor then hydrates durable mutation leases only for remaining
+    #    locked reclaim states (aborted_paused is already terminal, so it never
+    #    receives a lease and needs no extra release).
     migrate(state_db, dry_run=False)
     qbt_cfg = cfg.qbt if cfg else None
     qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)
@@ -470,24 +479,48 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         )
     con = readonly_connect(state_db)
     try:
-        recovery_placeholders = ",".join(
-            "?" for _ in CAPACITY_RECOVERY_PENDING_STATES
+        blocking_placeholders = ",".join(
+            "?" for _ in CAPACITY_BLOCKING_RECOVERY_STATES
         )
-        capacity_recovery_required = bool(
+        nonblocking_placeholders = ",".join(
+            "?" for _ in CAPACITY_NONBLOCKING_RECONCILE_STATES
+        )
+        blocking_recovery_count = int(
             con.execute(
-                f"select 1 from capacity_reclaims where state in "
-                f"({recovery_placeholders}) limit 1",
-                CAPACITY_RECOVERY_PENDING_STATES,
-            ).fetchone()
+                f"select count(*) from capacity_reclaims where state in "
+                f"({blocking_placeholders})",
+                CAPACITY_BLOCKING_RECOVERY_STATES,
+            ).fetchone()[0]
+            or 0
+        )
+        nonblocking_recovery_count = int(
+            con.execute(
+                f"select count(*) from capacity_reclaims where state in "
+                f"({nonblocking_placeholders})",
+                CAPACITY_NONBLOCKING_RECONCILE_STATES,
+            ).fetchone()[0]
+            or 0
         )
     finally:
         con.close()
-    if capacity_recovery_required:
-        if dry_run:
-            raise RuntimeError(
-                "capacity reclaim recovery is required; global dry-run cannot "
-                "safely reconcile durable recovery rows"
-            )
+    capacity_recovery_required = blocking_recovery_count > 0
+    durable_recovery_present = (
+        blocking_recovery_count + nonblocking_recovery_count
+    ) > 0
+    if capacity_recovery_required and dry_run:
+        raise RuntimeError(
+            "capacity reclaim recovery is required; global dry-run cannot "
+            f"safely reconcile durable recovery rows "
+            f"(blocking={blocking_recovery_count})"
+        )
+    if dry_run and nonblocking_recovery_count > 0 and not capacity_recovery_required:
+        LOGGER.warning(
+            "capacity reclaim nonblocking durable rows pending under global "
+            "dry-run; live reconcile skipped pending=%s states=%s",
+            nonblocking_recovery_count,
+            ",".join(CAPACITY_NONBLOCKING_RECONCILE_STATES),
+        )
+    if durable_recovery_present and not dry_run:
         if capacity_reclaimer is not None and not capacity_reclaimer.dry_run:
             capacity_recovery_reclaimer = capacity_reclaimer
         else:

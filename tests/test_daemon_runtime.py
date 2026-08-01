@@ -765,38 +765,6 @@ def test_direct_planner_tick_recovery_failure_precedes_safety(tmp_path):
     con.close()
 
 
-@pytest.mark.parametrize("signature_error", [TypeError("opaque"), ValueError("opaque")])
-def test_runtime_rejects_uninspectable_capacity_reclaimer_signature(
-    tmp_path,
-    monkeypatch,
-    signature_error,
-):
-    from qbt_orchestrator import service
-
-    class OpaqueReclaimer:
-        def run(self, *_args, **_kwargs):
-            raise AssertionError("not called")
-
-    monkeypatch.setattr(
-        service.inspect,
-        "signature",
-        lambda _callable: (_ for _ in ()).throw(signature_error),
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="capacity reclaimer run signature cannot be inspected safely",
-    ):
-        service.DaemonRuntime(
-            state_db=tmp_path / "state.sqlite",
-            qbt=FakeQbt(),
-            executor=FakeExecutor(),
-            free_bytes_provider=lambda: 6 * 1024**3,
-            dry_run=True,
-            capacity_reclaimer=OpaqueReclaimer(),
-        )
-
-
 @pytest.mark.parametrize("scheduler_engine_mode", ["legacy", "shadow", "live"])
 def test_capacity_assessment_metric_is_once_per_generation_in_all_scheduler_modes(
     tmp_path,
@@ -3384,6 +3352,125 @@ def test_daemon_file_batch_live_bypasses_backpressure_for_disk_releasing_upload(
         assert jobs == [("old",), ("new",)]
         assert event is None
 
+
+
+def test_path_conflict_reclaim_fence_does_not_abort_planner_tick_via_soak():
+    """Durable partial_or_unknown must not kill planner_tick through SoakQueue.
+
+    Reproduction: path_conflict_manual fence + stopped auto torrent used to reach
+    SoakQueue reservation sync, raise CapacityReclaimLockedError, and abort the
+    whole planner generation for unrelated torrents.
+    """
+    from qbt_orchestrator.capacity_reclaim import PATH_CONFLICT_MANUAL
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+    from qbt_orchestrator.soak_queue import SoakQueueConfig
+
+    class SnapshotQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "h": {
+                        "hash": "h",
+                        "name": "Conflict",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 900,
+                        "size": 1000,
+                        "progress": 0.1,
+                        "num_seeds": 1,
+                    },
+                    "safe": {
+                        "hash": "safe",
+                        "name": "Safe",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 9,
+                        "size": 10,
+                        "progress": 0.9,
+                        "num_seeds": 1,
+                    },
+                },
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        db = root / "state.sqlite"
+        managed = root / "incomplete"
+        conflict_payload = managed / "h"
+        quarantine_payload = (
+            managed / ".qbt-orchestrator-reclaim" / "reclaim-1"
+        )
+        conflict_payload.mkdir(parents=True)
+        quarantine_payload.mkdir(parents=True)
+        (conflict_payload / "part").write_bytes(b"x" * 4096)
+        (quarantine_payload / "part").write_bytes(b"y" * 4096)
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into capacity_reclaims("
+            "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+            "capacity_generation,recheck_error,created_at,updated_at) "
+            "values(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "h:1",
+                "h",
+                "Conflict",
+                "magnet:?xt=h",
+                str(conflict_payload.resolve()),
+                "/downloads/incomplete/h",
+                "partial_or_unknown",
+                4,
+                PATH_CONFLICT_MANUAL,
+                1,
+                1,
+            ),
+        )
+        con.commit()
+        con.close()
+
+        executor = FakeExecutor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=SnapshotQbt(),
+            executor=executor,
+            free_bytes_provider=lambda: 20 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            planner_dry_run=False,
+            planner_active_slots=1,
+            soak_enabled=True,
+            soak_dry_run=False,
+            soak_config=SoakQueueConfig(
+                resident_slots=1,
+                min_free_bytes=0,
+                disk_floor_bytes=0,
+                max_qbt_active_downloads=16,
+            ),
+        )
+        daemon.tick_safety()
+        result = daemon.planner_tick()
+
+        assert "planner" in result
+        assert result["planner"]["plan_generation"] == 1
+        assert "h" not in result["soak_queue"]["started"]
+        assert "h" not in result["planner"]["selected_hashes"]
+        assert result["soak_queue"]["started"] == ["safe"]
+        assert result["planner"]["selected_hashes"] == ["safe"]
+        assert ("/api/v2/torrents/start", {"hashes": "safe"}) in executor.posts
+        assert ("/api/v2/torrents/start", {"hashes": "h"}) not in executor.posts
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select state, recheck_error from capacity_reclaims where hash='h'"
+        ).fetchone()
+        con.close()
+        assert row == ("partial_or_unknown", PATH_CONFLICT_MANUAL)
 
 
 def test_runtime_planner_tick_runs_soak_queue_before_planner_and_protects_residents():

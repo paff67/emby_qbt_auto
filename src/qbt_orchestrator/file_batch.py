@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .budget import future_growth_by_hash, resource_claims_from_rows
-from .db import readonly_connect, write_transaction
+from .db import assert_hash_not_reclaim_locked, readonly_connect, write_transaction
 from .decision_recorder import DecisionEntry, DecisionRecorder
 from .hash_identity import canonical_torrent_hash
 from .io_governor import JobPriority
@@ -966,6 +966,7 @@ class FileBatchService:
                 "select id from resource_reservations where batch_id=? and kind='cleanup_pending' order by id limit 1",
                 (int(batch_id),),
             ).fetchone()
+            assert_hash_not_reclaim_locked(con, h)
             if existing:
                 con.execute(
                     "update resource_reservations set hash=?,accounting_class='current_pinned',owner='file_batch',"
@@ -1287,6 +1288,7 @@ class FileBatchService:
         now = int(self.now())
         lease_until = now + self.reservation_ttl_sec
         def txn(con: sqlite3.Connection) -> int:
+            assert_hash_not_reclaim_locked(con, h)
             batch_no = self._next_batch_no(con, h)
             cur = con.execute(
                 "insert into torrent_batches(hash,batch_no,state,mode,indices_json,total_bytes,reserved_bytes,piece_size,selected_extents,piece_spill_overhead_bytes,payload_efficiency,priority_applied,lease_until,last_progress_at,last_progress_bytes,source_present,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1376,6 +1378,7 @@ class FileBatchService:
             previous = max(0, int(row["last_progress_bytes"] or 0))
             lease_until = row["lease_until"]
             if observed > previous:
+                assert_hash_not_reclaim_locked(con, h)
                 renewed_until = now + self.reservation_ttl_sec
                 con.execute(
                     "update torrent_batches set state=case when state='suspect_expired' then 'downloading' else state end,"
@@ -1407,6 +1410,7 @@ class FileBatchService:
                 return "initialized"
 
             if now >= int(lease_until):
+                assert_hash_not_reclaim_locked(con, h)
                 con.execute(
                     "update torrent_batches set state='suspect_expired',source_present=1,updated_at=? where id=?",
                     (now, int(batch_id)),

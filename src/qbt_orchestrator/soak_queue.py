@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .budget import future_growth_by_hash, resource_claims_from_rows
-from .db import readonly_connect, write_transaction
+from .db import assert_hash_not_reclaim_locked, readonly_connect, write_transaction
 from .decision_recorder import DecisionRecorder
 from .observability import redact
 from .scheduler_intents import SchedulerIntent, SchedulerIntentRepository
@@ -575,6 +575,7 @@ class SoakQueueService:
                     "where kind='active_download' and state='active' and hash=?",
                     (now, "hot_soak_preempted_active", h),
                 )
+                assert_hash_not_reclaim_locked(con, h)
                 self.intent_repository.upsert_in_transaction(
                     con,
                     SchedulerIntent(
@@ -665,6 +666,7 @@ class SoakQueueService:
         if stale:
             def txn(con: sqlite3.Connection) -> None:
                 for h in stale:
+                    assert_hash_not_reclaim_locked(con, h)
                     con.execute(
                         "update soak_state set state='soak_cooldown', cooldown_until=?, last_stopped_at=?, exposure_bytes=0, updated_at=?, reason=? where hash=?",
                         (now + int(self.config.cooldown_sec), now, now, "resident_pause", h),
@@ -714,6 +716,7 @@ class SoakQueueService:
             for row in con.execute("select id,hash from resource_reservations where kind='soak_probe' and state='active'").fetchall():
                 existing.setdefault(str(row["hash"] or ""), []).append(int(row["id"]))
             for h, bytes_reserved in exposures.items():
+                assert_hash_not_reclaim_locked(con, h)
                 ids = existing.get(h) or []
                 keep_id = ids[0] if ids else None
                 expires_at = now + 120
