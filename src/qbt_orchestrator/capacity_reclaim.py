@@ -41,6 +41,22 @@ OPEN_JOB_STATES = (
 )
 # Shared with db.assert_hash_not_reclaim_locked — keep a single locked-state list.
 RECLAIM_LOCKED_STATES = frozenset(CAPACITY_RECLAIM_LOCKED_STATES)
+# Blocking recovery must converge before Planner starts a new generation.
+CAPACITY_BLOCKING_RECOVERY_STATES = (
+    "stopping",
+    "deleting",
+    "quarantined",
+    "deleted",
+    "recheck_pending",
+)
+# Unknown fences reconcile opportunistically and never block other hashes.
+CAPACITY_NONBLOCKING_RECONCILE_STATES = (
+    "stop_unknown",
+    "partial_or_unknown",
+)
+CAPACITY_RECOVERY_RECONCILE_STATES = (
+    CAPACITY_BLOCKING_RECOVERY_STATES + CAPACITY_NONBLOCKING_RECONCILE_STATES
+)
 MAGNET_PREFIX = "mag" + "net:?"
 PROGRESS_EPSILON = 1e-9
 CONTENT_SIZE_FIELDS = ("size", "total_size", "wanted_size")
@@ -952,11 +968,12 @@ class CapacityReclaimAuditStore:
     def recovery_rows(self) -> list[dict[str, Any]]:
         con = readonly_connect(self.state_db)
         try:
+            placeholders = ",".join("?" for _ in CAPACITY_RECOVERY_RECONCILE_STATES)
             rows = con.execute(
                 "select * from capacity_reclaims where "
-                "state in ('stopping','deleting','quarantined','deleted','recheck_pending',"
-                "'partial_or_unknown','stop_unknown') "
+                f"state in ({placeholders}) "
                 "order by capacity_generation,id",
+                CAPACITY_RECOVERY_RECONCILE_STATES,
             ).fetchall()
             return [dict(row) for row in rows]
         finally:
@@ -965,10 +982,11 @@ class CapacityReclaimAuditStore:
     def locked_rows(self) -> list[dict[str, Any]]:
         con = readonly_connect(self.state_db)
         try:
+            placeholders = ",".join("?" for _ in CAPACITY_RECOVERY_RECONCILE_STATES)
             rows = con.execute(
                 "select id,hash,capacity_generation,state from capacity_reclaims "
-                "where state in ('stopping','deleting','quarantined','deleted',"
-                "'recheck_pending','partial_or_unknown','stop_unknown') order by id"
+                f"where state in ({placeholders}) order by id",
+                CAPACITY_RECOVERY_RECONCILE_STATES,
             ).fetchall()
             return [dict(row) for row in rows]
         finally:
@@ -1592,6 +1610,9 @@ class DeadPartialReclaimer:
                 **candidate,
                 "file_selection_fingerprint": fingerprint,
             }
+            # Attempt budget starts at the reserve call itself. Successful,
+            # rejected, and recoverable reserve outcomes all consume one slot.
+            attempt_count += 1
             try:
                 reservation = self.audit.reserve(candidate)
             except Exception as exc:
@@ -1602,8 +1623,6 @@ class DeadPartialReclaimer:
                 reject(str(reservation.get("reason") or "reservation_failed"))
                 continue
 
-            # Attempt budget starts at successful reserve.
-            attempt_count += 1
             reclaim_id = int(reservation["reclaim_id"])
             lease_token = self._reclaim_mutation_lease_token(
                 reclaim_id,
@@ -1686,12 +1705,50 @@ class DeadPartialReclaimer:
                     break
                 continue
 
-            current, stop_reason = self._wait_until_stopped(torrent_hash)
-            if stop_reason is not None:
+            try:
+                current, stop_reason = self._wait_until_stopped(torrent_hash)
+            except Exception as exc:
+                # Stop POST already went out; confirmation transport/auth failures
+                # fence as stop_unknown, keep the lease, and end the tick.
+                system_reason = classify_qbt_exception(exc)
+                reject(system_reason)
+                errors.append(f"{torrent_hash}: {exc}")
+                try:
+                    if not self.audit.mark_stop_unknown(
+                        int(reclaim_id),
+                        generation,
+                        "stop_confirmation_failed",
+                        f"{system_reason}: {exc}",
+                    ):
+                        errors.append(
+                            f"{torrent_hash}: failed to persist unknown stop confirmation"
+                        )
+                except Exception as audit_exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to persist unknown stop: {audit_exc}"
+                    )
+                break
+            if stop_reason == "stop_timeout":
                 tick_outcome = abort_paused(stop_reason)
                 if tick_outcome == "break":
                     break
                 continue
+            if stop_reason is not None:
+                # Unexpected local reason — fail closed without cancelling via
+                # abort_paused so the stopping fence remains if marking fails.
+                reject(stop_reason)
+                try:
+                    self.audit.mark_stop_unknown(
+                        int(reclaim_id),
+                        generation,
+                        "stop_confirmation_failed",
+                        stop_reason,
+                    )
+                except Exception as audit_exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to persist unknown stop: {audit_exc}"
+                    )
+                break
             assert current is not None
 
             # Gate 2: post-stop recheck — one fresh inventory + one live rejection.
@@ -2932,21 +2989,22 @@ class DeadPartialReclaimer:
         self,
         torrent_hash: str,
     ) -> tuple[dict[str, Any] | None, str | None]:
+        """Poll until stopped or the local deadline expires.
+
+        Only local deadline / poll exhaustion returns ``stop_timeout``. qBT API
+        connection, auth, HTTP, and transport failures propagate to the caller
+        so the live loop can fence ``stop_unknown`` without cancelling.
+        """
         deadline = float(self.monotonic()) + self.stop_timeout_sec
         for attempt in range(self.stop_max_polls):
             remaining = deadline - float(self.monotonic())
             if remaining <= 0:
                 break
-            try:
-                current = dict(
-                    self._qbt_call_with_timeout(
-                        "torrent_info", torrent_hash, timeout=remaining
-                    )
+            current = dict(
+                self._qbt_call_with_timeout(
+                    "torrent_info", torrent_hash, timeout=remaining
                 )
-            except TimeoutError:
-                return None, "stop_timeout"
-            except Exception:
-                return None, "stop_confirmation_failed"
+            )
             if float(self.monotonic()) >= deadline:
                 return None, "stop_timeout"
             if _is_stopped_download_state(current.get("state")):

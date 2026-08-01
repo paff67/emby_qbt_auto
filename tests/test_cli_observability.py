@@ -720,6 +720,66 @@ def test_cli_fails_closed_when_durable_recovery_is_required_in_global_dry_run(
         cli._build_runtime(Ns(), db)
 
 
+@pytest.mark.parametrize("unknown_state", ["stop_unknown", "partial_or_unknown"])
+def test_cli_constructs_live_recovery_for_nonblocking_durable_rows_when_feature_off(
+    monkeypatch,
+    tmp_path,
+    unknown_state,
+):
+    from qbt_orchestrator import cli
+    from qbt_orchestrator.db import migrate
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("runtime construction must not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = False
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    db = tmp_path / "state.sqlite"
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,?,1,1,1)",
+        (
+            str((managed / "h").resolve()),
+            "/downloads/incomplete/h",
+            unknown_state,
+        ),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+    monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM", "0")
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_DRY_RUN", "1")
+    monkeypatch.setenv("QBT_ORCH_HOST_DOWNLOADS", str(tmp_path))
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_ROOT", str(managed))
+
+    runtime, _ = cli._build_runtime(Ns(), db)
+    try:
+        assert runtime.capacity_reclaimer is None
+        assert runtime.capacity_recovery_reclaimer is not None
+        assert runtime.capacity_recovery_reclaimer.dry_run is False
+        assert runtime.capacity_recovery_reclaimer.max_per_tick == 0
+    finally:
+        runtime.executor.close(timeout=1)
+
+
 @pytest.mark.parametrize(
     "manual_state",
     ["aborted_paused", "partial_or_unknown", "stop_unknown", "reclaimed"],

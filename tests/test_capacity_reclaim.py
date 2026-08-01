@@ -5527,23 +5527,35 @@ def test_stop_timeout_continues_to_second_candidate_same_tick(tmp_path):
     (managed / "first" / "part").write_bytes(b"x" * 8192)
     (managed / "second" / "part").write_bytes(b"x" * 4096)
 
-    class TimeoutThenOk(RecordingExecutor):
+    class FirstNeverStops(RecordingExecutor):
+        """Local stop_timeout: first stays non-stopped; second stops normally.
+
+        Transport TimeoutError during confirmation is a different path
+        (stop_unknown + end tick) and is covered separately.
+        """
+
         def __init__(self):
-            super().__init__(snapshots)
-            self.stop_seen = set()
+            super().__init__(snapshots, stop_updates_state=False)
+            self._clock = 0.0
 
         def qbt_post(self, path, payload, *, lease_token=None):
             result = super().qbt_post(path, payload, lease_token=lease_token)
-            if path.endswith("/stop"):
-                self.stop_seen.add(str(payload["hashes"]))
+            if path.endswith("/stop") and str(payload.get("hashes")) == "second":
+                self.info.setdefault("second", {})["state"] = "stoppedDL"
             return result
 
         def torrent_info(self, torrent_hash, timeout=None):
-            if str(torrent_hash) == "first" and "first" in self.stop_seen:
-                raise TimeoutError("stop wait timed out")
-            return super().torrent_info(torrent_hash, timeout=timeout)
+            current = super().torrent_info(torrent_hash, timeout=timeout)
+            if str(torrent_hash) == "first":
+                current["state"] = "downloading"
+                # Advance fake monotonic so the local stop deadline expires.
+                self._clock += 1.0
+            return current
 
-    executor = TimeoutThenOk()
+        def monotonic(self):
+            return self._clock
+
+    executor = FirstNeverStops()
     reclaimer = DeadPartialReclaimer(
         db,
         executor,
@@ -5555,8 +5567,10 @@ def test_stop_timeout_continues_to_second_candidate_same_tick(tmp_path):
         min_reclaimable_age_sec=3_600,
         min_reclaim_bytes=1,
         max_per_tick=2,
-        stop_timeout_sec=1.0,
+        stop_timeout_sec=0.5,
+        stop_poll_interval_sec=0,
         sleep=lambda _seconds: None,
+        monotonic=executor.monotonic,
         now=lambda: 5_000,
     )
 
@@ -5625,6 +5639,114 @@ def test_qbt_system_failure_ends_tick_immediately(tmp_path):
     assert result.reclaimed == 0
     assert result.rejection_counts["stop_failed"] == 1
     assert (managed / "second" / "part").exists()
+
+
+def test_stop_confirmation_connection_failure_fences_stop_unknown_and_ends_tick(
+    tmp_path,
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+
+    hashes = ("first", "second")
+    managed, db, snapshots = _prepare_multi_candidates(tmp_path, hashes)
+
+    class ConfirmFailsAfterStop(RecordingExecutor):
+        def torrent_info(self, torrent_hash, timeout=None):
+            stopped = any(
+                path.endswith("/stop") and body.get("hashes") == torrent_hash
+                for path, body in self.posts
+            )
+            if stopped:
+                raise ConnectionError("qBT confirmation connection reset")
+            return super().torrent_info(torrent_hash, timeout=timeout)
+
+    executor = ConfirmFailsAfterStop(snapshots)
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        disk_free_bytes=lambda _path: 0,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        max_per_tick=2,
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        snapshots,
+        assessment=_assessment_for_hashes(hashes, generation=4),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=100_000,
+    )
+
+    stops = [body["hashes"] for path, body in executor.posts if path.endswith("/stop")]
+    rows = _capacity_reclaim_rows(db)
+    assert stops == ["first"]
+    assert len(rows) == 1
+    assert rows[0]["state"] == "stop_unknown"
+    assert str(rows[0]["recheck_error"]).startswith("qbt_unreachable:")
+    assert "first" in executor.hash_mutation_leases
+    assert result.rejection_counts["qbt_unreachable"] == 1
+    assert (managed / "second" / "part").exists()
+
+
+def test_tick_caps_consecutive_reserve_rejects_at_three(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import (
+        CapacityReclaimAuditStore,
+        DeadPartialReclaimer,
+        MAX_CANDIDATE_ATTEMPTS_PER_TICK,
+    )
+
+    hashes = ("a", "b", "c", "d")
+    managed, db, snapshots = _prepare_multi_candidates(tmp_path, hashes)
+    reserve_calls = []
+    original_reserve = CapacityReclaimAuditStore.reserve
+
+    def counting_reserve(self, candidate):
+        reserve_calls.append(str(candidate["hash"]))
+        result = original_reserve(self, candidate)
+        if result.get("reserved"):
+            return {
+                **result,
+                "reserved": False,
+                "reason": "capacity_episode_changed",
+            }
+        return result
+
+    CapacityReclaimAuditStore.reserve = counting_reserve
+    try:
+        executor = RecordingExecutor(snapshots)
+        reclaimer = DeadPartialReclaimer(
+            db,
+            executor,
+            host_downloads=tmp_path,
+            container_downloads="/downloads",
+            managed_root=managed,
+            dry_run=False,
+            disk_free_bytes=lambda _path: 0,
+            min_reclaimable_age_sec=3_600,
+            min_reclaim_bytes=1,
+            max_per_tick=4,
+            now=lambda: 5_000,
+        )
+        result = reclaimer.run(
+            snapshots,
+            assessment=_assessment_for_hashes(hashes, generation=4),
+            capacity_state="capacity_deadlock",
+            free_bytes=0,
+            target_free_bytes=100_000,
+        )
+    finally:
+        CapacityReclaimAuditStore.reserve = original_reserve
+
+    assert MAX_CANDIDATE_ATTEMPTS_PER_TICK == 3
+    assert len(reserve_calls) == 3
+    assert result.planned == 0
+    assert result.rejection_counts["capacity_episode_changed"] == 3
+    assert not any(path.endswith("/stop") for path, _ in executor.posts)
 
 
 @pytest.mark.parametrize(

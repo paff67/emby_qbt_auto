@@ -54,13 +54,13 @@ from .telegram_control import TelegramAuthorizer
 from .work_items import build_full_finish_work_items
 
 
-CAPACITY_RECOVERY_PENDING_STATES = (
-    "stopping",
-    "deleting",
-    "quarantined",
-    "deleted",
-    "recheck_pending",
+from .capacity_reclaim import (
+    CAPACITY_BLOCKING_RECOVERY_STATES,
+    CAPACITY_NONBLOCKING_RECONCILE_STATES,
 )
+
+# Startup / planner preflight only waits on blocking recovery states.
+CAPACITY_RECOVERY_PENDING_STATES = CAPACITY_BLOCKING_RECOVERY_STATES
 CAPACITY_RECOVERY_PREFLIGHT_MAX_ROUNDS = 8
 
 
@@ -642,6 +642,11 @@ class DaemonRuntime:
             free_bytes=free_bytes,
             allow_live_recovery=sync_healthy,
         )
+        if sync_healthy:
+            self._reconcile_nonblocking_capacity_reclaims(
+                snapshots,
+                free_bytes=free_bytes,
+            )
         scheduler_mode = self._next_scheduler_mode(free_bytes)
         if self.soak_queue_service is not None and sync_healthy:
             soak_result = self.soak_queue_service.run_once(
@@ -1046,6 +1051,62 @@ class DaemonRuntime:
             return [dict(row) for row in rows]
         finally:
             con.close()
+
+    def _reconcile_nonblocking_capacity_reclaims(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+        *,
+        free_bytes: int,
+    ) -> None:
+        """Opportunistically reconcile stop_unknown / partial_or_unknown fences.
+
+        Failures stay fenced on their hash and are recorded, but never block
+        Planner generation advancement for other torrents.
+        """
+        if self.capacity_recovery_reclaimer is None:
+            return
+        if self.dry_run or bool(getattr(self.capacity_recovery_reclaimer, "dry_run", True)):
+            return
+        placeholders = ",".join("?" for _ in CAPACITY_NONBLOCKING_RECONCILE_STATES)
+        con = readonly_connect(self.state_db)
+        try:
+            pending = con.execute(
+                f"select count(*) from capacity_reclaims where state in ({placeholders})",
+                CAPACITY_NONBLOCKING_RECONCILE_STATES,
+            ).fetchone()[0]
+        finally:
+            con.close()
+        if int(pending or 0) <= 0:
+            return
+        try:
+            result = self.capacity_recovery_reclaimer.run(
+                snapshots,
+                assessment=None,
+                capacity_state="nonblocking_reconcile",
+                free_bytes=int(free_bytes),
+                target_free_bytes=self.drain_exit_bytes,
+            )
+        except Exception as exc:
+            self.obs.event(
+                "warning",
+                "capacity_reclaim",
+                "nonblocking_reconcile_failed",
+                str(redact(f"nonblocking capacity reclaim reconcile failed: {exc}")),
+                {"pending": int(pending)},
+            )
+            return
+        errors = list(getattr(result, "errors", ()) or ())
+        if errors:
+            self.obs.event(
+                "warning",
+                "capacity_reclaim",
+                "nonblocking_reconcile_errors",
+                str(redact("; ".join(str(error) for error in errors))),
+                {
+                    "pending": int(pending),
+                    "errors": [str(redact(str(error))) for error in errors],
+                },
+            )
 
     def _fail_capacity_recovery_preflight(
         self,
