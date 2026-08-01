@@ -3481,6 +3481,158 @@ def test_tag_pending_does_not_block_startup_or_unrelated_planner_selection():
         assert state == "tag_pending"
 
 
+def test_tag_pending_nonblocking_retry_failure_keeps_other_hashes_schedulable(
+    tmp_path,
+):
+    """Continuous addTags failure stays fenced on stuck; planner still picks safe."""
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.service import DaemonRuntime
+    from qbt_orchestrator.soak_queue import SoakQueueConfig
+
+    class FailAddTagsQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.posts = []
+
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "stuck": {
+                        "hash": "stuck",
+                        "name": "Stuck",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 900,
+                        "size": 1000,
+                        "progress": 0.1,
+                        "num_seeds": 1,
+                    },
+                    "safe": {
+                        "hash": "safe",
+                        "name": "Safe",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 9,
+                        "size": 10,
+                        "progress": 0.9,
+                        "num_seeds": 1,
+                    },
+                },
+                "server_state": {},
+            }
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+            if str(path).endswith("/addTags"):
+                raise RuntimeError("addTags unavailable")
+            return True
+
+        def torrent_info(self, torrent_hash, timeout=None):
+            return {
+                "hash": str(torrent_hash),
+                "state": "stoppedDL",
+                "tags": "auto",
+            }
+
+    db = tmp_path / "state.sqlite"
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_assessment_state("
+        "id,current_generation,observed_at,summary_json) values(1,4,1,'{}')"
+    )
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,recheck_state,recheck_error,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "stuck:1",
+            "stuck",
+            "Stuck",
+            "magnet:?xt=stuck",
+            str(managed / "stuck"),
+            "/downloads/incomplete/stuck",
+            "tag_pending",
+            4,
+            "requested",
+            "post_reclaim_tag_failed:fixture",
+            1,
+            1,
+        ),
+    )
+    con.commit()
+    con.close()
+
+    qbt = FailAddTagsQbt()
+    executor = Executor(qbt, dry_run=False, state_db=db)
+    recovery = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        max_per_tick=0,
+        disk_free_bytes=lambda _path: 0,
+        notification_chat_ids=["100"],
+        now=lambda: 5_000,
+    )
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 20 * 1024**3,
+        dry_run=False,
+        safety_interval=0,
+        planner_dry_run=False,
+        planner_active_slots=1,
+        soak_enabled=True,
+        soak_dry_run=False,
+        soak_config=SoakQueueConfig(
+            resident_slots=1,
+            min_free_bytes=0,
+            disk_floor_bytes=0,
+            max_qbt_active_downloads=16,
+        ),
+        capacity_recovery_reclaimer=recovery,
+    )
+    try:
+        daemon.tick_safety()
+        result = daemon.planner_tick()
+
+        con = sqlite3.connect(db)
+        stuck_state = con.execute(
+            "select state from capacity_reclaims where hash='stuck'"
+        ).fetchone()[0]
+        con.close()
+        assert stuck_state == "tag_pending"
+        assert result["planner"]["plan_generation"] == 1
+        assert "safe" in result["planner"]["selected_hashes"]
+        assert "stuck" not in result["planner"]["selected_hashes"]
+        assert "stuck" not in result["soak_queue"]["started"]
+        assert any(path.endswith("/addTags") for path, _ in qbt.posts)
+        assert not any(
+            path.endswith("/start") and payload.get("hashes") == "stuck"
+            for path, payload in qbt.posts
+        )
+        assert any(
+            path.endswith("/start") and payload.get("hashes") == "safe"
+            for path, payload in qbt.posts
+        )
+    finally:
+        executor.close(timeout=1)
+
+
 def test_path_conflict_reclaim_fence_does_not_abort_planner_tick_via_soak():
     """Durable partial_or_unknown must not kill planner_tick through SoakQueue.
 

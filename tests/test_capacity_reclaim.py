@@ -3307,6 +3307,106 @@ def test_successful_reclaim_finalizes_only_after_archive_tags(tmp_path):
     assert "Archive Me" in notices[0]["message"]
 
 
+def test_tag_pending_reconcile_retries_add_tags_without_redeleting(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import (
+        CapacityReclaimAuditStore,
+        DeadPartialReclaimer,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir(parents=True)
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = _direct_reclaim_candidate(tmp_path, "h")
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: 5_000
+    )
+    reservation = audit.reserve(candidate)
+    reclaim_id = int(reservation["reclaim_id"])
+    con = sqlite3.connect(db)
+    con.execute(
+        "update capacity_reclaims set state='tag_pending',"
+        "recheck_state='requested',"
+        "recheck_error='post_reclaim_tag_failed:fixture' where id=?",
+        (reclaim_id,),
+    )
+    con.commit()
+    con.close()
+
+    class FlakyAddTagsExecutor(RecordingExecutor):
+        def __init__(self):
+            super().__init__({"h": {"tags": "auto", "state": "stoppedDL"}})
+            self.fail_add_tags = True
+
+        def qbt_post(self, path, payload, *, lease_token=None):
+            if path.endswith("/addTags") and self.fail_add_tags:
+                self.posts.append((path, payload))
+                self.post_lease_tokens.append(lease_token)
+                self.fail_add_tags = False
+                raise RuntimeError("addTags temporarily unavailable")
+            return super().qbt_post(path, payload, lease_token=lease_token)
+
+    executor = FlakyAddTagsExecutor()
+    token = f"reclaim:{reclaim_id}:4"
+    assert executor.acquire_hash_mutation_lease("h", token) is True
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        disk_free_bytes=lambda _path: 0,
+        max_per_tick=0,
+        notification_chat_ids=["100"],
+        now=lambda: 5_000,
+    )
+
+    first = reclaimer.run(
+        {},
+        assessment=None,
+        capacity_state="nonblocking_reconcile",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+    assert _capacity_reclaim_rows(db)[0]["state"] == "tag_pending"
+    assert "h" in executor.hash_mutation_leases
+    assert first.errors == []
+
+    second = reclaimer.run(
+        {},
+        assessment=None,
+        capacity_state="nonblocking_reconcile",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["state"] == "reclaimed"
+    assert row["recheck_error"] is None
+    tags = {
+        part.strip()
+        for part in str(executor.torrent_info("h")["tags"]).split(",")
+        if part.strip()
+    }
+    assert {"capacity-reclaimed", "hold"} <= tags
+    assert "h" not in executor.hash_mutation_leases
+    assert second.errors == []
+    assert [path for path, _ in executor.posts] == [
+        "/api/v2/torrents/addTags",
+        "/api/v2/torrents/addTags",
+    ]
+    assert not any(path.endswith(("/stop", "/recheck", "/delete")) for path, _ in executor.posts)
+    info_notices = [
+        notice
+        for notice in _capacity_reclaim_notifications(db)
+        if notice["level"] == "info"
+    ]
+    assert len(info_notices) == 1
+    assert "标签：capacity-reclaimed, hold" in info_notices[0]["message"]
+
+
 def test_tag_pending_keeps_lease_when_add_tags_fails_after_delete(tmp_path):
     from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
     from qbt_orchestrator.db import migrate

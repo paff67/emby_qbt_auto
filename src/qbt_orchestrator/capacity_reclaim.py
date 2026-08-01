@@ -2233,6 +2233,43 @@ class DeadPartialReclaimer:
             same_generation = (
                 current_generation > 0 and row_generation == current_generation
             )
+            if state == "tag_pending":
+                # Lightweight post-reclaim tag retry only — never re-run stop,
+                # quarantine, delete, recheck, or filesystem recovery checks.
+                try:
+                    tag_outcome = self._apply_reclaim_archive_tags(
+                        torrent_hash, lease_token
+                    )
+                except Exception as exc:
+                    try:
+                        self.audit.mark_tag_pending(
+                            reclaim_id, row_generation, str(exc)
+                        )
+                    except Exception as audit_exc:
+                        errors.append(
+                            f"{torrent_hash}: failed to persist tag pending: {audit_exc}"
+                        )
+                    continue
+                try:
+                    completed = self.audit.complete(
+                        reclaim_id,
+                        row,
+                        recheck_error=None,
+                        tag_outcome=tag_outcome,
+                    )
+                    if str(completed.get("state")) == "reclaimed":
+                        lease_error = self._release_reclaim_mutation_lease(
+                            torrent_hash, lease_token
+                        )
+                        if lease_error is not None:
+                            errors.append(f"{torrent_hash}: {lease_error}")
+                except Exception as audit_exc:
+                    errors.append(
+                        f"{torrent_hash}: failed to complete tag pending reclaim: "
+                        f"{audit_exc}"
+                    )
+                continue
+
             if state == "stopping":
                 try:
                     current = self._qbt_call_with_timeout(
