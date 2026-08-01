@@ -49,10 +49,12 @@ CAPACITY_BLOCKING_RECOVERY_STATES = (
     "deleted",
     "recheck_pending",
 )
-# Unknown fences reconcile opportunistically and never block other hashes.
+# Unknown fences and post-reclaim tag_pending reconcile opportunistically and
+# never block other hashes.
 CAPACITY_NONBLOCKING_RECONCILE_STATES = (
     "stop_unknown",
     "partial_or_unknown",
+    "tag_pending",
 )
 CAPACITY_RECOVERY_RECONCILE_STATES = (
     CAPACITY_BLOCKING_RECOVERY_STATES + CAPACITY_NONBLOCKING_RECONCILE_STATES

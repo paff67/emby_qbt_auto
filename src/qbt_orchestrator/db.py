@@ -15,6 +15,7 @@ CAPACITY_RECLAIM_LOCKED_STATES = (
     "recheck_pending",
     "partial_or_unknown",
     "stop_unknown",
+    "tag_pending",
 )
 
 

@@ -1150,6 +1150,25 @@ def test_queue_command_reclaim_python_fence_becomes_blocked_without_creating_job
         assert _rows(db, "select * from torrent_jobs") == []
 
 
+def test_python_reclaim_fence_blocks_enqueue_for_tag_pending_hash():
+    from qbt_orchestrator.db import CapacityReclaimLockedError, migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        _seed_reclaim_locked_row(db, state="tag_pending")
+        jobs = TorrentJobRepository(db, now=lambda: 100)
+
+        with pytest.raises(
+            CapacityReclaimLockedError,
+            match="capacity_reclaim_locked:h",
+        ):
+            jobs.enqueue("h", None, "upload", {"source": "tag-pending-fence"})
+
+        assert _rows(db, "select * from torrent_jobs") == []
+
+
 def test_python_reclaim_fence_blocks_job_and_reservation_create_but_allows_release():
     from qbt_orchestrator.db import (
         CapacityReclaimLockedError,

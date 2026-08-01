@@ -3354,6 +3354,110 @@ def test_daemon_file_batch_live_bypasses_backpressure_for_disk_releasing_upload(
 
 
 
+def test_tag_pending_does_not_block_startup_or_unrelated_planner_selection():
+    """tag_pending is nonblocking: other hashes still advance planner generation."""
+    from qbt_orchestrator.service import (
+        CAPACITY_RECOVERY_PENDING_STATES,
+        DaemonRuntime,
+    )
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.soak_queue import SoakQueueConfig
+
+    class SnapshotQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "stuck": {
+                        "hash": "stuck",
+                        "name": "Stuck",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 900,
+                        "size": 1000,
+                        "progress": 0.1,
+                        "num_seeds": 1,
+                    },
+                    "safe": {
+                        "hash": "safe",
+                        "name": "Safe",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 9,
+                        "size": 10,
+                        "progress": 0.9,
+                        "num_seeds": 1,
+                    },
+                },
+                "server_state": {},
+            }
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into capacity_reclaims("
+            "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+            "capacity_generation,recheck_state,recheck_error,created_at,updated_at) "
+            "values(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "stuck:1",
+                "stuck",
+                "Stuck",
+                "magnet:?xt=stuck",
+                str(Path(td) / "stuck"),
+                "/downloads/incomplete/stuck",
+                "tag_pending",
+                4,
+                "requested",
+                "post_reclaim_tag_failed:fixture",
+                1,
+                1,
+            ),
+        )
+        con.commit()
+        con.close()
+
+        assert "tag_pending" not in CAPACITY_RECOVERY_PENDING_STATES
+
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=SnapshotQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 20 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            planner_dry_run=False,
+            planner_active_slots=1,
+            soak_enabled=True,
+            soak_dry_run=False,
+            soak_config=SoakQueueConfig(
+                resident_slots=1,
+                min_free_bytes=0,
+                disk_floor_bytes=0,
+                max_qbt_active_downloads=16,
+            ),
+        )
+        daemon.tick_safety()
+        result = daemon.planner_tick()
+
+        assert result["planner"]["plan_generation"] == 1
+        assert "safe" in result["planner"]["selected_hashes"]
+        assert "stuck" not in result["planner"]["selected_hashes"]
+        assert "stuck" not in result["soak_queue"]["started"]
+        con = sqlite3.connect(db)
+        state = con.execute(
+            "select state from capacity_reclaims where hash='stuck'"
+        ).fetchone()[0]
+        con.close()
+        assert state == "tag_pending"
+
+
 def test_path_conflict_reclaim_fence_does_not_abort_planner_tick_via_soak():
     """Durable partial_or_unknown must not kill planner_tick through SoakQueue.
 

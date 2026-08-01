@@ -53,6 +53,7 @@ def test_executor_startup_hydrates_only_active_reclaim_states_before_first_mutat
         ("quarantined", "quarantined"),
         ("released", "released"),
         ("cancelled", "cancelled"),
+        ("pendingtag", "tag_pending"),
     ):
         _seed_reclaim(db, torrent_hash, state, 4)
 
@@ -70,6 +71,10 @@ def test_executor_startup_hydrates_only_active_reclaim_states_before_first_mutat
             executor.qbt_post(
                 "/api/v2/torrents/start", {"hashes": "Quarantined"}
             )
+        with pytest.raises(QbtMutationLeaseBlocked):
+            executor.qbt_post(
+                "/api/v2/torrents/start", {"hashes": "pendingtag"}
+            )
         assert executor.qbt_post(
             "/api/v2/torrents/start", {"hashes": "released"}
         ) is True
@@ -82,6 +87,7 @@ def test_executor_startup_hydrates_only_active_reclaim_states_before_first_mutat
     assert [entry.status for entry in executor.action_log] == [
         "succeeded",
         "succeeded",
+        "skipped_hash_lease",
         "skipped_hash_lease",
         "succeeded",
         "succeeded",

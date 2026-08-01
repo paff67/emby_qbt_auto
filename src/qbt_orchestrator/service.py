@@ -1109,10 +1109,10 @@ class DaemonRuntime:
         *,
         free_bytes: int,
     ) -> None:
-        """Opportunistically reconcile stop_unknown / partial_or_unknown fences.
+        """Opportunistically reconcile unknown fences and post-reclaim tag_pending rows.
 
-        Failures stay fenced on their hash and are recorded, but never block
-        Planner generation advancement for other torrents.
+        Each row remains fenced on its own hash; failures never block Planner
+        generation advancement for unrelated torrents.
         """
         if self.capacity_recovery_reclaimer is None:
             return

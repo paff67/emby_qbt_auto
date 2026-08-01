@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 from .action_dispatcher import ActionDispatcher, ActionPriority
-from .db import readonly_connect
+from .db import CAPACITY_RECLAIM_LOCKED_STATES, readonly_connect
 from .hash_identity import canonical_torrent_hash
 from .models import ActionLogEntry
 from .observability import redact
@@ -74,14 +74,15 @@ class Executor:
         """Load durable reclaim fences before a dispatcher can accept work."""
         assert self.state_db is not None
         try:
+            placeholders = ",".join("?" for _ in CAPACITY_RECLAIM_LOCKED_STATES)
             con = readonly_connect(self.state_db)
             try:
                 rows = con.execute(
                     "select id,hash,capacity_generation,state "
                     "from capacity_reclaims "
-                    "where state in ('stopping','deleting','quarantined','deleted',"
-                    "'recheck_pending','partial_or_unknown','stop_unknown') "
-                    "order by id desc"
+                    f"where state in ({placeholders}) "
+                    "order by id desc",
+                    CAPACITY_RECLAIM_LOCKED_STATES,
                 ).fetchall()
             finally:
                 con.close()
