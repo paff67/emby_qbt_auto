@@ -2965,6 +2965,138 @@ def test_capacity_reclaim_lock_helper_keeps_all_nonreleased_states_locked(tmp_pa
     )
 
 
+def _seed_post_delete_reclaim_row(db: Path, tmp_path: Path, *, state: str = "deleted"):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimAuditStore
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir(parents=True, exist_ok=True)
+    (managed / "h").mkdir(exist_ok=True)
+    _capacity_health(db, "h")
+    audit = CapacityReclaimAuditStore(
+        db, notification_chat_ids=["100"], now=lambda: 5_000
+    )
+    reservation = audit.reserve(_direct_reclaim_candidate(tmp_path, "h"))
+    assert reservation["reserved"] is True
+    reclaim_id = int(reservation["reclaim_id"])
+    con = sqlite3.connect(db)
+    con.execute(
+        "update capacity_reclaims set state=?, recheck_state='requested',"
+        "recheck_error=null where id=?",
+        (state, reclaim_id),
+    )
+    con.commit()
+    con.close()
+    return audit, reclaim_id, _direct_reclaim_candidate(tmp_path, "h")
+
+
+def test_mark_tag_pending_audit_redacts_error_and_queues_warning(tmp_path):
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    audit, reclaim_id, _candidate = _seed_post_delete_reclaim_row(
+        db, tmp_path, state="deleted"
+    )
+
+    result = audit.mark_tag_pending(
+        reclaim_id,
+        4,
+        "HTTP 503 bot 123456:secret-token unavailable",
+    )
+
+    assert result["state"] == "tag_pending"
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["state"] == "tag_pending"
+    assert row["recheck_state"] == "requested"
+    assert str(row["recheck_error"]).startswith("post_reclaim_tag_failed:")
+    assert "123456:secret-token" not in str(row["recheck_error"])
+    notices = _capacity_reclaim_notifications(db)
+    assert len(notices) == 1
+    assert notices[0]["level"] == "warning"
+    payload = json.loads(notices[0]["payload_json"])
+    assert payload["hash"] == "h"
+    assert payload["name"] == "Reclaim h"
+    assert payload["reclaim_id"] == reclaim_id
+    assert payload["reason"] == "post_reclaim_tag_failed"
+    assert payload["archive_tags"] == ["capacity-reclaimed", "hold"]
+    assert "123456:secret-token" not in notices[0]["message"]
+    assert "capacity-reclaimed, hold" in notices[0]["message"]
+
+    # Idempotent refresh in the same hour must not create a second notice row.
+    again = audit.mark_tag_pending(
+        reclaim_id, 4, "HTTP 503 bot 123456:secret-token unavailable"
+    )
+    assert again["state"] == "tag_pending"
+    assert len(_capacity_reclaim_notifications(db)) == 1
+    assert len(_capacity_reclaim_rows(db)) == 1
+
+
+def test_complete_tag_outcome_applied_clears_error_from_tag_pending(tmp_path):
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    audit, reclaim_id, candidate = _seed_post_delete_reclaim_row(
+        db, tmp_path, state="deleted"
+    )
+    audit.mark_tag_pending(reclaim_id, 4, "temporary tag failure")
+
+    completed = audit.complete(
+        reclaim_id,
+        candidate,
+        recheck_error=None,
+        tag_outcome="applied",
+    )
+
+    assert completed["state"] == "reclaimed"
+    assert completed["tag_outcome"] == "applied"
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["state"] == "reclaimed"
+    assert row["recheck_state"] == "requested"
+    assert row["recheck_error"] is None
+    notices = [
+        notice
+        for notice in _capacity_reclaim_notifications(db)
+        if notice["level"] == "info"
+    ]
+    assert len(notices) == 1
+    assert "标签：capacity-reclaimed, hold" in notices[0]["message"]
+    payload = json.loads(notices[0]["payload_json"])
+    assert payload["archive_tags"] == ["capacity-reclaimed", "hold"]
+    assert payload["tag_outcome"] == "applied"
+
+
+def test_complete_tag_outcome_torrent_absent_records_terminal_warning(tmp_path):
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    audit, reclaim_id, candidate = _seed_post_delete_reclaim_row(
+        db, tmp_path, state="recheck_pending"
+    )
+
+    completed = audit.complete(
+        reclaim_id,
+        candidate,
+        recheck_error=None,
+        tag_outcome="torrent_absent",
+    )
+
+    assert completed["state"] == "reclaimed"
+    assert completed["tag_outcome"] == "torrent_absent"
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["state"] == "reclaimed"
+    assert row["recheck_error"] == "torrent_absent_after_reclaim"
+    notices = _capacity_reclaim_notifications(db)
+    assert len(notices) == 1
+    assert notices[0]["level"] == "warning"
+    assert "无法添加归档标签" in notices[0]["message"]
+    payload = json.loads(notices[0]["payload_json"])
+    assert payload["tag_outcome"] == "torrent_absent"
+    assert payload["recheck_error"] == "torrent_absent_after_reclaim"
+    assert payload["archive_tags"] == ["capacity-reclaimed", "hold"]
+
+
 CAPACITY_RECLAIM_TRIGGER_NAMES = (
     "trg_capacity_reclaim_lock_job_insert",
     "trg_capacity_reclaim_lock_job_update",

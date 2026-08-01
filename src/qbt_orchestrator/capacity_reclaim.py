@@ -59,6 +59,9 @@ CAPACITY_NONBLOCKING_RECONCILE_STATES = (
 CAPACITY_RECOVERY_RECONCILE_STATES = (
     CAPACITY_BLOCKING_RECOVERY_STATES + CAPACITY_NONBLOCKING_RECONCILE_STATES
 )
+# Fixed personal-deploy archive tags. addTags is idempotent; no env override.
+RECLAIM_ARCHIVE_TAGS = ("capacity-reclaimed", "hold")
+RECLAIM_ARCHIVE_TAGS_CSV = ",".join(RECLAIM_ARCHIVE_TAGS)
 MAGNET_PREFIX = "mag" + "net:?"
 PROGRESS_EPSILON = 1e-9
 CONTENT_SIZE_FIELDS = ("size", "total_size", "wanted_size")
@@ -1047,53 +1050,159 @@ class CapacityReclaimAuditStore:
 
         return dict(write_transaction(self.state_db, txn))
 
+    def mark_tag_pending(
+        self,
+        reclaim_id: int,
+        generation: int,
+        error: str,
+    ) -> dict[str, Any]:
+        """Persist post-reclaim archive-tag failure without releasing the lease.
+
+        Accepts deleted / recheck_pending / tag_pending. Keeps recheck_state=
+        requested because recheck already succeeded; only tagging is pending.
+        """
+        now = int(self.now())
+        detail = self._safe_error(error) or "unknown"
+        if detail.startswith("post_reclaim_tag_failed:"):
+            safe_error = detail[:2000]
+        else:
+            safe_error = f"post_reclaim_tag_failed:{detail}"[:2000]
+        allowed_states = ("deleted", "recheck_pending", "tag_pending")
+
+        def txn(con) -> dict[str, Any]:
+            row = con.execute(
+                "select * from capacity_reclaims where id=? and capacity_generation=?",
+                (int(reclaim_id), int(generation)),
+            ).fetchone()
+            if row is None or str(row["state"]) not in allowed_states:
+                raise RuntimeError("capacity reclaim tag pending state changed")
+            placeholders = ",".join("?" for _ in allowed_states)
+            changed = con.execute(
+                "update capacity_reclaims set state='tag_pending',"
+                "recheck_state='requested',recheck_error=?,updated_at=? "
+                f"where id=? and capacity_generation=? and state in ({placeholders})",
+                (
+                    safe_error,
+                    now,
+                    int(reclaim_id),
+                    int(generation),
+                    *allowed_states,
+                ),
+            )
+            if int(changed.rowcount or 0) != 1:
+                raise RuntimeError("capacity reclaim tag pending state changed")
+            row = con.execute(
+                "select * from capacity_reclaims where id=?", (int(reclaim_id),)
+            ).fetchone()
+            assert row is not None
+            notification_ids = self._enqueue_notification(
+                con,
+                row,
+                kind="tag_pending",
+                level="warning",
+                message=(
+                    "qBT 容量回收已释放本地空间，但归档标签暂未确认，将自动重试。\n"
+                    f"种子名：{row['name']}\n"
+                    f"Hash：{row['hash']}\n"
+                    f"待添加标签：{', '.join(RECLAIM_ARCHIVE_TAGS)}\n"
+                    f"原因：{safe_error}"
+                ),
+                payload={
+                    "hash": canonical_torrent_hash(row["hash"]),
+                    "name": str(row["name"]),
+                    "reason": "post_reclaim_tag_failed",
+                    "error": safe_error,
+                    "reclaim_id": int(row["id"]),
+                    "archive_tags": list(RECLAIM_ARCHIVE_TAGS),
+                },
+                now=now,
+            )
+            return {
+                "reclaim_id": int(row["id"]),
+                "notification_ids": notification_ids,
+                "state": "tag_pending",
+                "recheck_state": "requested",
+                "recheck_error": safe_error,
+            }
+
+        return dict(write_transaction(self.state_db, txn))
+
     def complete(
         self,
         reclaim_id: int,
         candidate: Mapping[str, Any],
         *,
         recheck_error: str | None,
+        tag_outcome: str = "applied",
     ) -> dict[str, Any]:
         generation = int(candidate.get("capacity_generation") or 0)
         if recheck_error is not None:
             return self.mark_recheck_pending(
                 reclaim_id, generation, recheck_error
             )
+        outcome = str(tag_outcome or "").strip()
+        if outcome not in {"applied", "torrent_absent"}:
+            raise ValueError(f"unsupported reclaim tag_outcome: {tag_outcome!r}")
         identity = self._identity(candidate)
         now = int(self.now())
-        full_magnet = identity["magnet_uri"]
-        prefix = (
-            "qBT 编排器自动容量回收完成\n"
-            f"种子名：{identity['name']}\n"
-            f"Hash：{identity['hash']}\n"
-            f"释放空间：{identity['allocated_bytes'] / 1024**3:.2f} GiB\n"
-            "状态：已请求重新校验\n"
-            "磁力链接：\n"
+        terminal_error = (
+            None if outcome == "applied" else "torrent_absent_after_reclaim"
         )
-        push_magnet = full_magnet
-        if len(prefix) + len(push_magnet) > 4000:
-            push_magnet = (
-                MAGNET_PREFIX
-                + "xt=urn:btih:"
-                + quote(identity["hash"], safe="")
-                + "&dn="
-                + quote(identity["name"], safe="")
+        archive_tags = list(RECLAIM_ARCHIVE_TAGS)
+        if outcome == "applied":
+            level = "info"
+            prefix = (
+                "qBT 编排器自动容量回收完成\n"
+                f"种子名：{identity['name']}\n"
+                f"Hash：{identity['hash']}\n"
+                f"释放空间：{identity['allocated_bytes'] / 1024**3:.2f} GiB\n"
+                "状态：已请求重新校验\n"
+                f"标签：{', '.join(RECLAIM_ARCHIVE_TAGS)}\n"
+                "磁力链接：\n"
             )
-        message = prefix + push_magnet
+            full_magnet = identity["magnet_uri"]
+            push_magnet = full_magnet
+            if len(prefix) + len(push_magnet) > 4000:
+                push_magnet = (
+                    MAGNET_PREFIX
+                    + "xt=urn:btih:"
+                    + quote(identity["hash"], safe="")
+                    + "&dn="
+                    + quote(identity["name"], safe="")
+                )
+            message = prefix + push_magnet
+        else:
+            level = "warning"
+            message = (
+                "qBT 容量回收已完成，但 qBT 中已不存在该种子，无法添加归档标签。\n"
+                f"种子名：{identity['name']}\n"
+                f"Hash：{identity['hash']}"
+            )
         payload = {
             **identity,
             "reclaim_id": int(reclaim_id),
             "recheck_state": "requested",
-            "recheck_error": None,
+            "recheck_error": terminal_error,
+            "archive_tags": archive_tags,
+            "tag_outcome": outcome,
         }
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        allowed_states = ("deleted", "recheck_pending", "tag_pending")
 
         def txn(con) -> dict[str, Any]:
+            placeholders = ",".join("?" for _ in allowed_states)
             changed = con.execute(
                 "update capacity_reclaims set state='reclaimed',recheck_state='requested',"
-                "recheck_error=null,reclaimed_at=?,updated_at=? where id=? "
-                "and capacity_generation=? and state in ('deleted','recheck_pending')",
-                (now, now, int(reclaim_id), generation),
+                "recheck_error=?,reclaimed_at=?,updated_at=? where id=? "
+                f"and capacity_generation=? and state in ({placeholders})",
+                (
+                    terminal_error,
+                    now,
+                    now,
+                    int(reclaim_id),
+                    generation,
+                    *allowed_states,
+                ),
             )
             if int(changed.rowcount or 0) != 1:
                 raise RuntimeError("capacity reclaim completion state changed")
@@ -1105,7 +1214,7 @@ class CapacityReclaimAuditStore:
                 con,
                 row,
                 kind="reclaimed",
-                level="info",
+                level=level,
                 message=message,
                 payload=json.loads(payload_json),
                 now=now,
@@ -1115,6 +1224,8 @@ class CapacityReclaimAuditStore:
                 "notification_ids": notification_ids,
                 "state": "reclaimed",
                 "recheck_state": "requested",
+                "recheck_error": terminal_error,
+                "tag_outcome": outcome,
             }
 
         return dict(write_transaction(self.state_db, txn))
