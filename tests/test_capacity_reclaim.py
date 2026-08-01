@@ -127,6 +127,26 @@ class RecordingExecutor:
         if path.endswith("/stop") and self.stop_updates_state:
             torrent_hash = str(payload["hashes"])
             self.info.setdefault(torrent_hash, {})["state"] = "stoppedDL"
+        if path.endswith("/addTags"):
+            torrent_hash = str(payload["hashes"])
+            current = self.info.setdefault(torrent_hash, {})
+            # Preserve existing tags (default torrent_info baseline is "auto").
+            baseline = (
+                str(current["tags"])
+                if "tags" in current
+                else "auto"
+            )
+            tags = {
+                part.strip()
+                for part in baseline.split(",")
+                if part.strip()
+            }
+            tags.update(
+                part.strip()
+                for part in str(payload.get("tags") or "").split(",")
+                if part.strip()
+            )
+            current["tags"] = ", ".join(sorted(tags))
         return True
 
     def torrent_info(self, torrent_hash, timeout=None):
@@ -461,8 +481,18 @@ def test_dead_partial_reclaimer_live_resets_payload_but_keeps_torrent_record():
         assert executor.posts == [
             ("/api/v2/torrents/stop", {"hashes": "dead-one"}),
             ("/api/v2/torrents/recheck", {"hashes": "dead-one"}),
+            (
+                "/api/v2/torrents/addTags",
+                {"hashes": "dead-one", "tags": "capacity-reclaimed,hold"},
+            ),
         ]
         assert not any(path == "/api/v2/torrents/delete" for path, _ in executor.posts)
+        tags = {
+            part.strip()
+            for part in str(executor.info["dead-one"].get("tags") or "").split(",")
+            if part.strip()
+        }
+        assert {"auto", "capacity-reclaimed", "hold"} <= tags
 
 
 def test_dead_partial_reclaimer_rejects_protected_active_or_overlapping_paths():
@@ -2998,18 +3028,16 @@ def test_mark_tag_pending_audit_redacts_error_and_queues_warning(tmp_path):
         db, tmp_path, state="deleted"
     )
 
-    result = audit.mark_tag_pending(
-        reclaim_id,
-        4,
-        "HTTP 503 bot 123456:secret-token unavailable",
-    )
+    secret = "123456:" + "secret-token"
+    error = f"HTTP 503 bot {secret} unavailable"
+    result = audit.mark_tag_pending(reclaim_id, 4, error)
 
     assert result["state"] == "tag_pending"
     row = _capacity_reclaim_rows(db)[0]
     assert row["state"] == "tag_pending"
     assert row["recheck_state"] == "requested"
     assert str(row["recheck_error"]).startswith("post_reclaim_tag_failed:")
-    assert "123456:secret-token" not in str(row["recheck_error"])
+    assert secret not in str(row["recheck_error"])
     notices = _capacity_reclaim_notifications(db)
     assert len(notices) == 1
     assert notices[0]["level"] == "warning"
@@ -3019,13 +3047,11 @@ def test_mark_tag_pending_audit_redacts_error_and_queues_warning(tmp_path):
     assert payload["reclaim_id"] == reclaim_id
     assert payload["reason"] == "post_reclaim_tag_failed"
     assert payload["archive_tags"] == ["capacity-reclaimed", "hold"]
-    assert "123456:secret-token" not in notices[0]["message"]
+    assert secret not in notices[0]["message"]
     assert "capacity-reclaimed, hold" in notices[0]["message"]
 
     # Idempotent refresh in the same hour must not create a second notice row.
-    again = audit.mark_tag_pending(
-        reclaim_id, 4, "HTTP 503 bot 123456:secret-token unavailable"
-    )
+    again = audit.mark_tag_pending(reclaim_id, 4, error)
     assert again["state"] == "tag_pending"
     assert len(_capacity_reclaim_notifications(db)) == 1
     assert len(_capacity_reclaim_rows(db)) == 1
@@ -3091,10 +3117,33 @@ def test_complete_tag_outcome_torrent_absent_records_terminal_warning(tmp_path):
     assert len(notices) == 1
     assert notices[0]["level"] == "warning"
     assert "无法添加归档标签" in notices[0]["message"]
+    assert "磁力链接：" in notices[0]["message"]
+    assert "magnet:?" in notices[0]["message"]
     payload = json.loads(notices[0]["payload_json"])
     assert payload["tag_outcome"] == "torrent_absent"
     assert payload["recheck_error"] == "torrent_absent_after_reclaim"
     assert payload["archive_tags"] == ["capacity-reclaimed", "hold"]
+    assert payload["magnet_uri"].startswith("magnet:?")
+
+
+def test_complete_requires_verified_tag_outcome_when_recheck_succeeded(tmp_path):
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    audit, reclaim_id, candidate = _seed_post_delete_reclaim_row(
+        db, tmp_path, state="deleted"
+    )
+
+    with pytest.raises(ValueError, match="verified tag_outcome is required"):
+        audit.complete(reclaim_id, candidate, recheck_error=None)
+
+    with pytest.raises(ValueError, match="verified tag_outcome is required"):
+        audit.complete(
+            reclaim_id, candidate, recheck_error=None, tag_outcome=None
+        )
+
+    assert _capacity_reclaim_rows(db)[0]["state"] == "deleted"
 
 
 CAPACITY_RECLAIM_TRIGGER_NAMES = (
@@ -4863,11 +4912,12 @@ def test_reclaim_lease_blocks_internal_mutators_after_delete_authorization(
         "/api/v2/torrents/filePrio",
         "/api/v2/torrents/start",
     ]
-    assert executor.post_lease_tokens == [token, token]
+    assert executor.post_lease_tokens == [token, token, token]
+    assert [path for path, _payload in executor.posts][-2:] == [
+        "/api/v2/torrents/recheck",
+        "/api/v2/torrents/addTags",
+    ]
     assert executor.hash_mutation_leases == {}
-
-
-
 
 
 def test_recovery_hydrates_all_locked_hash_leases_before_first_qbt_call(tmp_path):
@@ -4936,7 +4986,12 @@ def test_recovery_hydrates_all_locked_hash_leases_before_first_qbt_call(tmp_path
     )
     rows = {row["hash"]: row for row in _capacity_reclaim_rows(db)}
     assert rows["h"]["state"] == "reclaimed"
-    assert executor.post_lease_tokens == [executor.expected_leases["h"]]
+    token = executor.expected_leases["h"]
+    assert executor.post_lease_tokens == [token, token]
+    assert [path for path, _payload in executor.posts] == [
+        "/api/v2/torrents/recheck",
+        "/api/v2/torrents/addTags",
+    ]
     assert executor.hash_mutation_leases == {}
 
 

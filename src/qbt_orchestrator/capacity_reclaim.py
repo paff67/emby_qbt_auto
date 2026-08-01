@@ -1127,13 +1127,28 @@ class CapacityReclaimAuditStore:
 
         return dict(write_transaction(self.state_db, txn))
 
+    @staticmethod
+    def _magnet_for_message(identity: Mapping[str, Any], *, prefix: str) -> str:
+        """Return a magnet string that fits the Telegram message budget."""
+        full_magnet = str(identity.get("magnet_uri") or "")
+        push_magnet = full_magnet
+        if len(prefix) + len(push_magnet) > 4000:
+            push_magnet = (
+                MAGNET_PREFIX
+                + "xt=urn:btih:"
+                + quote(str(identity.get("hash") or ""), safe="")
+                + "&dn="
+                + quote(str(identity.get("name") or ""), safe="")
+            )
+        return push_magnet
+
     def complete(
         self,
         reclaim_id: int,
         candidate: Mapping[str, Any],
         *,
         recheck_error: str | None,
-        tag_outcome: str = "applied",
+        tag_outcome: str | None = None,
     ) -> dict[str, Any]:
         generation = int(candidate.get("capacity_generation") or 0)
         if recheck_error is not None:
@@ -1142,7 +1157,10 @@ class CapacityReclaimAuditStore:
             )
         outcome = str(tag_outcome or "").strip()
         if outcome not in {"applied", "torrent_absent"}:
-            raise ValueError(f"unsupported reclaim tag_outcome: {tag_outcome!r}")
+            raise ValueError(
+                "verified tag_outcome is required "
+                f"(got {tag_outcome!r}; expected 'applied' or 'torrent_absent')"
+            )
         identity = self._identity(candidate)
         now = int(self.now())
         terminal_error = (
@@ -1160,24 +1178,16 @@ class CapacityReclaimAuditStore:
                 f"标签：{', '.join(RECLAIM_ARCHIVE_TAGS)}\n"
                 "磁力链接：\n"
             )
-            full_magnet = identity["magnet_uri"]
-            push_magnet = full_magnet
-            if len(prefix) + len(push_magnet) > 4000:
-                push_magnet = (
-                    MAGNET_PREFIX
-                    + "xt=urn:btih:"
-                    + quote(identity["hash"], safe="")
-                    + "&dn="
-                    + quote(identity["name"], safe="")
-                )
-            message = prefix + push_magnet
+            message = prefix + self._magnet_for_message(identity, prefix=prefix)
         else:
             level = "warning"
-            message = (
+            prefix = (
                 "qBT 容量回收已完成，但 qBT 中已不存在该种子，无法添加归档标签。\n"
                 f"种子名：{identity['name']}\n"
-                f"Hash：{identity['hash']}"
+                f"Hash：{identity['hash']}\n"
+                "磁力链接：\n"
             )
+            message = prefix + self._magnet_for_message(identity, prefix=prefix)
         payload = {
             **identity,
             "reclaim_id": int(reclaim_id),
@@ -2141,11 +2151,31 @@ class DeadPartialReclaimer:
                 recheck_error = str(exc)
                 errors.append(f"{torrent_hash}: {exc}")
             try:
-                audit = self.audit.complete(
-                    int(reclaim_id), candidate, recheck_error=recheck_error
-                )
+                if recheck_error is not None:
+                    audit = self.audit.complete(
+                        int(reclaim_id),
+                        candidate,
+                        recheck_error=recheck_error,
+                    )
+                else:
+                    try:
+                        tag_outcome = self._apply_reclaim_archive_tags(
+                            torrent_hash, lease_token
+                        )
+                    except Exception as tag_exc:
+                        # Durable pending; keep lease. Hourly TG covers the alert.
+                        audit = self.audit.mark_tag_pending(
+                            int(reclaim_id), generation, str(tag_exc)
+                        )
+                    else:
+                        audit = self.audit.complete(
+                            int(reclaim_id),
+                            candidate,
+                            recheck_error=None,
+                            tag_outcome=tag_outcome,
+                        )
                 completed.append({**candidate, **audit})
-                if recheck_error is None:
+                if str(audit.get("state")) == "reclaimed":
                     reclaimed += 1
                     lease_error = self._release_reclaim_mutation_lease(
                         torrent_hash, lease_token
@@ -2488,11 +2518,28 @@ class DeadPartialReclaimer:
                     recheck_error = str(exc)
                     errors.append(f"{torrent_hash}: {exc}")
                 try:
-                    completed = self.audit.complete(
-                        reclaim_id,
-                        row,
-                        recheck_error=recheck_error,
-                    )
+                    if recheck_error is not None:
+                        completed = self.audit.complete(
+                            reclaim_id,
+                            row,
+                            recheck_error=recheck_error,
+                        )
+                    else:
+                        try:
+                            tag_outcome = self._apply_reclaim_archive_tags(
+                                torrent_hash, lease_token
+                            )
+                        except Exception as tag_exc:
+                            self.audit.mark_tag_pending(
+                                reclaim_id, row_generation, str(tag_exc)
+                            )
+                            continue
+                        completed = self.audit.complete(
+                            reclaim_id,
+                            row,
+                            recheck_error=None,
+                            tag_outcome=tag_outcome,
+                        )
                     if str(completed.get("state")) == "reclaimed":
                         lease_error = self._release_reclaim_mutation_lease(
                             torrent_hash, lease_token
@@ -3135,6 +3182,42 @@ class DeadPartialReclaimer:
     ) -> Any:
         method = getattr(self.executor.qbt, method_name)
         return method(*args, timeout=timeout)
+
+    def _apply_reclaim_archive_tags(
+        self,
+        torrent_hash: str,
+        lease_token: str,
+    ) -> str:
+        """Return 'applied' or 'torrent_absent'; raise on retryable failure."""
+        applied = self.executor.qbt_post(
+            "/api/v2/torrents/addTags",
+            {
+                "hashes": torrent_hash,
+                "tags": RECLAIM_ARCHIVE_TAGS_CSV,
+            },
+            lease_token=lease_token,
+        )
+        if applied is False:
+            raise RuntimeError("qBT addTags rejected by mutation lease")
+        snapshot = self._qbt_call_with_timeout(
+            "torrent_info",
+            torrent_hash,
+            timeout=self.inventory_timeout_sec,
+        )
+        if not isinstance(snapshot, Mapping) or "state" not in snapshot:
+            return "torrent_absent"
+        tags = {
+            part.strip()
+            for part in str(snapshot.get("tags") or "").split(",")
+            if part.strip()
+        }
+        missing = [tag for tag in RECLAIM_ARCHIVE_TAGS if tag not in tags]
+        if missing:
+            raise RuntimeError(
+                "reclaim archive tag verification failed: "
+                f"missing={','.join(missing)}"
+            )
+        return "applied"
 
     def _fresh_path_inventory(
         self,

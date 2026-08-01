@@ -1662,10 +1662,26 @@ def test_real_capacity_recovery_preflight_runs_multiple_rounds_to_reclaimed(
         def __init__(self):
             super().__init__()
             self.posts = []
+            self.tags = {"h": {"auto"}}
 
         def post(self, path, payload):
-            self.posts.append((path, payload))
+            self.posts.append((path, dict(payload)))
+            if str(path).endswith("/addTags"):
+                torrent_hash = str(payload.get("hashes") or "")
+                self.tags.setdefault(torrent_hash, set()).update(
+                    part.strip()
+                    for part in str(payload.get("tags") or "").split(",")
+                    if part.strip()
+                )
             return True
+
+        def torrent_info(self, torrent_hash, timeout=None):
+            torrent_hash = str(torrent_hash)
+            return {
+                "hash": torrent_hash,
+                "state": "stoppedDL",
+                "tags": ", ".join(sorted(self.tags.get(torrent_hash, {"auto"}))),
+            }
 
     qbt = RecoveryQbt()
     executor = Executor(qbt, dry_run=False, state_db=db)
@@ -1728,7 +1744,14 @@ def test_real_capacity_recovery_preflight_runs_multiple_rounds_to_reclaimed(
         assert recovery_assessments[0:2] == [None, None]
         assert recovery_assessments[2].generation == payload["capacity"]["assessment_generation"]
         assert json.loads(event)["rounds"] == 2
-        assert qbt.posts == [("/api/v2/torrents/recheck", {"hashes": "h"})]
+        assert qbt.posts == [
+            ("/api/v2/torrents/recheck", {"hashes": "h"}),
+            (
+                "/api/v2/torrents/addTags",
+                {"hashes": "h", "tags": "capacity-reclaimed,hold"},
+            ),
+        ]
+        assert {"auto", "capacity-reclaimed", "hold"} <= qbt.tags["h"]
     finally:
         executor.close(timeout=1)
 
