@@ -3245,12 +3245,16 @@ class DeadPartialReclaimer:
         expected_dev: int,
         *,
         expected_identity: FilesystemIdentity | None = None,
-        require_expected_dev: bool = True,
     ) -> None:
+        """Recursively delete without following symlinks.
+
+        Every node must stay on ``expected_dev``. Directories that are mount
+        points are rejected before ``scandir`` so nested mounts are never entered.
+        """
         metadata = self._lstat(path)
         if self._is_symlink(metadata):
             raise UnsafeFilesystemObject(f"symlink rejected: {path}")
-        if require_expected_dev and int(metadata.st_dev) != int(expected_dev):
+        if int(metadata.st_dev) != int(expected_dev):
             raise UnsafeFilesystemObject(f"cross-device payload rejected: {path}")
         if expected_identity is not None and not self._same_identity(
             metadata, expected_identity
@@ -3259,24 +3263,21 @@ class DeadPartialReclaimer:
         identity = FilesystemIdentity(
             int(metadata.st_dev), int(metadata.st_ino), int(metadata.st_mode)
         )
-        if statmod.S_ISDIR(int(metadata.st_mode)):
+        mode = int(metadata.st_mode)
+        if statmod.S_ISDIR(mode):
+            if os.path.ismount(path):
+                raise UnsafeFilesystemObject(f"mount point rejected: {path}")
             with os.scandir(path) as entries:
                 children = [path / entry.name for entry in entries]
             for child in children:
-                # Children only need symlink/special rejection; same-FS was
-                # already enforced for the top-level quarantine rename.
-                self._remove_node_no_follow(
-                    child,
-                    expected_dev,
-                    require_expected_dev=False,
-                )
+                self._remove_node_no_follow(child, expected_dev)
             current = self._lstat(path)
             if not self._same_identity(current, identity):
                 raise FilesystemIdentityChanged(
                     f"directory changed before removal: {path}"
                 )
             os.rmdir(path)
-        elif statmod.S_ISREG(int(metadata.st_mode)):
+        elif statmod.S_ISREG(mode):
             current = self._lstat(path)
             if not self._same_identity(current, identity):
                 raise FilesystemIdentityChanged(f"file changed before removal: {path}")

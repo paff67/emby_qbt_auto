@@ -18,6 +18,58 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _normalize_overlay_st_dev(monkeypatch, request):
+    """Normalize overlay file/parent st_dev skew for same-device success paths.
+
+    Opt out with ``@pytest.mark.real_st_dev`` when a test intentionally asserts
+    cross-device or mount-boundary rejection.
+    """
+    if request.node.get_closest_marker("real_st_dev") is not None:
+        return
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+
+    original = DeadPartialReclaimer._lstat
+
+    def _lstat(path):
+        path = Path(path)
+        metadata = original(path)
+        st_dev = int(metadata.st_dev)
+        if statmod.S_ISREG(int(metadata.st_mode)):
+            try:
+                st_dev = int(original(path.parent).st_dev)
+            except OSError:
+                pass
+        return SimpleNamespace(
+            st_mode=int(metadata.st_mode),
+            st_ino=int(metadata.st_ino),
+            st_dev=st_dev,
+            st_nlink=int(getattr(metadata, "st_nlink", 1) or 1),
+            st_uid=int(getattr(metadata, "st_uid", 0) or 0),
+            st_gid=int(getattr(metadata, "st_gid", 0) or 0),
+            st_size=int(getattr(metadata, "st_size", 0) or 0),
+            st_blocks=int(getattr(metadata, "st_blocks", 0) or 0),
+            st_file_attributes=int(
+                getattr(metadata, "st_file_attributes", 0) or 0
+            ),
+        )
+
+    monkeypatch.setattr(DeadPartialReclaimer, "_lstat", staticmethod(_lstat))
+    original_ismount = os.path.ismount
+
+    def _ismount(value):
+        path = Path(value)
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            return original_ismount(value)
+        if not statmod.S_ISDIR(mode):
+            return False
+        return original_ismount(value)
+
+    monkeypatch.setattr(os.path, "ismount", _ismount)
+
+
 class RecordingExecutor:
     def __init__(self, info=None, *, files=None, stop_updates_state=True):
         self.posts = []
@@ -3212,7 +3264,6 @@ def test_live_reclaim_atomically_quarantines_identity_before_deletion(
         (payload / "part").write_bytes(b"x" * 4096)
     else:
         payload.write_bytes(b"x" * 4096)
-    before = payload.lstat()
     db = tmp_path / "state.sqlite"
     migrate(db, dry_run=False)
     _capacity_health(db, "h")
@@ -3229,6 +3280,7 @@ def test_live_reclaim_atomically_quarantines_identity_before_deletion(
         min_reclaim_bytes=1,
         now=lambda: 5_000,
     )
+    before = reclaimer._lstat(payload)
     operations = []
     original_rename = reclaimer._rename_to_quarantine
     original_delete = reclaimer._delete_quarantine_path
@@ -3422,6 +3474,153 @@ def test_payload_tree_fence_rejects_candidate_mount_before_rename(tmp_path, monk
     assert rename_calls == []
 
 
+def _reclaimer_for_fs_unit(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    return DeadPartialReclaimer(
+        db,
+        RecordingExecutor(),
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=True,
+        min_reclaim_bytes=1,
+        now=lambda: 5_000,
+    )
+
+
+def test_remove_node_deletes_same_device_directory_and_file(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import FilesystemIdentity
+
+    reclaimer = _reclaimer_for_fs_unit(tmp_path)
+    payload = reclaimer.managed_root / "victim"
+    payload.mkdir()
+    child = payload / "part"
+    child.write_bytes(b"x" * 4096)
+    identity = reclaimer._capture_payload_identity(payload)
+
+    reclaimer._remove_node_no_follow(
+        payload,
+        identity.dev,
+        expected_identity=identity,
+    )
+
+    assert not payload.exists()
+    assert not child.exists()
+
+
+@pytest.mark.real_st_dev
+def test_remove_node_rejects_child_cross_device_without_mutating_tree(
+    tmp_path, monkeypatch
+):
+    from qbt_orchestrator.capacity_reclaim import (
+        FilesystemIdentity,
+        UnsafeFilesystemObject,
+    )
+
+    reclaimer = _reclaimer_for_fs_unit(tmp_path)
+    payload = reclaimer.managed_root / "victim"
+    payload.mkdir()
+    child = payload / "part"
+    child.write_bytes(b"keep-child")
+    marker = child.read_bytes()
+    identity = reclaimer._capture_payload_identity(payload)
+    original = reclaimer._lstat
+
+    def _lstat(path):
+        metadata = original(path)
+        if Path(path) == child:
+            return SimpleNamespace(
+                st_mode=int(metadata.st_mode),
+                st_ino=int(metadata.st_ino),
+                st_dev=int(identity.dev) + 99,
+                st_nlink=1,
+                st_size=int(metadata.st_size),
+                st_blocks=int(getattr(metadata, "st_blocks", 0) or 0),
+            )
+        return metadata
+
+    monkeypatch.setattr(type(reclaimer), "_lstat", staticmethod(_lstat))
+
+    with pytest.raises(UnsafeFilesystemObject, match="cross-device"):
+        reclaimer._remove_node_no_follow(
+            payload,
+            identity.dev,
+            expected_identity=identity,
+        )
+
+    assert payload.exists()
+    assert child.exists()
+    assert child.read_bytes() == marker
+
+
+@pytest.mark.real_st_dev
+def test_remove_node_rejects_child_mount_before_scandir(tmp_path, monkeypatch):
+    from qbt_orchestrator.capacity_reclaim import UnsafeFilesystemObject
+
+    reclaimer = _reclaimer_for_fs_unit(tmp_path)
+    payload = reclaimer.managed_root / "victim"
+    payload.mkdir()
+    nested = payload / "mnt"
+    nested.mkdir()
+    secret = nested / "secret.bin"
+    secret.write_bytes(b"do-not-touch")
+    identity = reclaimer._capture_payload_identity(payload)
+    original_ismount = os.path.ismount
+    scandir_calls = []
+    original_scandir = os.scandir
+
+    def _ismount(value):
+        return Path(value) == nested or original_ismount(value)
+
+    def _scandir(value):
+        scandir_calls.append(Path(value))
+        return original_scandir(value)
+
+    monkeypatch.setattr(os.path, "ismount", _ismount)
+    monkeypatch.setattr(os, "scandir", _scandir)
+
+    with pytest.raises(UnsafeFilesystemObject, match="mount point rejected"):
+        reclaimer._remove_node_no_follow(
+            payload,
+            identity.dev,
+            expected_identity=identity,
+        )
+
+    assert nested not in scandir_calls
+    assert secret.exists()
+    assert secret.read_bytes() == b"do-not-touch"
+    assert payload.exists()
+
+
+@pytest.mark.real_st_dev
+def test_remove_node_rejects_child_symlink_without_following(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import UnsafeFilesystemObject
+
+    reclaimer = _reclaimer_for_fs_unit(tmp_path)
+    external = tmp_path / "outside"
+    external.write_bytes(b"external")
+    payload = reclaimer.managed_root / "victim"
+    payload.mkdir()
+    link = payload / "link"
+    link.symlink_to(external)
+    identity = reclaimer._capture_payload_identity(payload)
+
+    with pytest.raises(UnsafeFilesystemObject, match="symlink rejected"):
+        reclaimer._remove_node_no_follow(
+            payload,
+            identity.dev,
+            expected_identity=identity,
+        )
+
+    assert link.is_symlink()
+    assert external.read_bytes() == b"external"
+    assert payload.exists()
 
 
 def test_mark_quarantined_failure_restores_original_and_never_deletes(tmp_path):

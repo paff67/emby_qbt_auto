@@ -13,4 +13,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "src"]
+markers = [
+  "real_st_dev: use real filesystem st_dev/ismount semantics without overlay normalization",
+]
 
