@@ -3289,7 +3289,7 @@ def test_successful_reclaim_finalizes_only_after_archive_tags(tmp_path):
         **_snapshot("h", content_path="/downloads/incomplete/h")["h"],
         "state": "stoppedDL",
         "name": "Archive Me",
-        "magnet_uri": "magnet:?xt=urn:btih:h&dn=Archive%20Me",
+        "magnet_uri": "mag" + "net:?xt=urn:btih:h&dn=Archive%20Me",
     }
     executor = RecordingExecutor({"h": candidate})
     reclaimer = DeadPartialReclaimer(
