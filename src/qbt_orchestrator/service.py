@@ -57,6 +57,7 @@ from .work_items import build_full_finish_work_items
 from .capacity_reclaim import (
     CAPACITY_BLOCKING_RECOVERY_STATES,
     CAPACITY_NONBLOCKING_RECONCILE_STATES,
+    capacity_reclaim_locked_hashes,
 )
 
 # Startup / planner preflight only waits on blocking recovery states.
@@ -649,10 +650,22 @@ class DaemonRuntime:
             )
         scheduler_mode = self._next_scheduler_mode(free_bytes)
         if self.soak_queue_service is not None and sync_healthy:
+            # Exclude reclaim-locked hashes before SoakQueue selection so a
+            # durable unknown/path-conflict fence cannot abort planner_tick via
+            # CapacityReclaimLockedError during reservation sync. Planner still
+            # applies its own second-layer exclusion on the full snapshot set.
+            reclaim_locked = capacity_reclaim_locked_hashes(self.state_db)
+            soak_snapshots = self._exclude_reclaim_locked_snapshots(
+                snapshots, reclaim_locked
+            )
+            soak_active_hashes = self._exclude_reclaim_locked_hashes(
+                set(), reclaim_locked
+            )
             soak_result = self.soak_queue_service.run_once(
-                snapshots,
+                soak_snapshots,
                 free_bytes=free_bytes,
                 sync_healthy=sync_healthy,
+                active_hashes=soak_active_hashes,
                 scheduler_mode=scheduler_mode,
             )
         else:
@@ -1051,6 +1064,44 @@ class DaemonRuntime:
             return [dict(row) for row in rows]
         finally:
             con.close()
+
+    @staticmethod
+    def _exclude_reclaim_locked_snapshots(
+        snapshots: Mapping[str, Mapping[str, Any]],
+        reclaim_locked: set[str],
+    ) -> dict[str, Mapping[str, Any]]:
+        """Drop reclaim-locked torrents from a snapshot map for SoakQueue input."""
+        if not reclaim_locked:
+            return dict(snapshots)
+        filtered: dict[str, Mapping[str, Any]] = {}
+        for key, row in snapshots.items():
+            identities = {
+                canonical_torrent_hash(key),
+                canonical_torrent_hash(
+                    row.get("hash") if isinstance(row, Mapping) else None
+                ),
+            }
+            if identities & reclaim_locked:
+                continue
+            filtered[key] = row
+        return filtered
+
+    @staticmethod
+    def _exclude_reclaim_locked_hashes(
+        hashes: set[str] | None,
+        reclaim_locked: set[str],
+    ) -> set[str]:
+        """Drop reclaim-locked identities from an active-hash set for SoakQueue."""
+        if not hashes:
+            return set()
+        if not reclaim_locked:
+            return {canonical_torrent_hash(value) for value in hashes if value}
+        return {
+            canonical
+            for value in hashes
+            if (canonical := canonical_torrent_hash(value))
+            and canonical not in reclaim_locked
+        }
 
     def _reconcile_nonblocking_capacity_reclaims(
         self,
