@@ -68,7 +68,7 @@ def test_planner_reclaim_lease_beats_every_forced_start_path(
 
     db = tmp_path / "state.sqlite"
     migrate(db, dry_run=False)
-    _seed_reclaim_lease(db, "h", "reclaimed")
+    _seed_reclaim_lease(db, "h", "stop_unknown")
     if intent is not None:
         SchedulerIntentRepository(db).upsert(
             SchedulerIntent(
@@ -129,7 +129,7 @@ def test_planner_stops_running_reclaim_lease_even_when_batch_forced(tmp_path):
 
     db = tmp_path / "state.sqlite"
     migrate(db, dry_run=False)
-    _seed_reclaim_lease(db, "h")
+    _seed_reclaim_lease(db, "h", "stopping")
     SchedulerIntentRepository(db).upsert(
         SchedulerIntent("batch", "h", "protect_batch", 50, 30_100, {})
     )

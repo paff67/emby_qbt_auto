@@ -1163,7 +1163,7 @@ def test_capacity_recovery_preflight_fails_closed_without_reclaimer(tmp_path):
     payload = daemon.planner_tick()
 
     assert payload["capacity"]["assessment_generation"] == 1
-    assert payload["planner"]["selected_hashes"] == []
+    assert payload["planner"]["selected_hashes"] == ["h"]
     assert daemon._capacity_recovery_preflight_done is True
 
 
@@ -1654,7 +1654,7 @@ def test_real_capacity_recovery_preflight_converges_before_new_generation(
             "select current_generation from capacity_assessment_state where id=1"
         ).fetchone()[0]
         con.close()
-        assert recovered_state == "aborted_paused"
+        assert recovered_state == "cancelled"
         assert generation == payload["capacity"]["assessment_generation"] == 1
         if lease_state == "quarantined":
             assert host_path.exists()

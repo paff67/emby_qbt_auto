@@ -41,7 +41,7 @@ def _seed_reclaim(db, torrent_hash, state, generation):
     return reclaim_id
 
 
-def test_executor_startup_hydrates_all_durable_reclaim_states_before_first_mutation(tmp_path):
+def test_executor_startup_hydrates_only_active_reclaim_states_before_first_mutation(tmp_path):
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
 
@@ -59,21 +59,17 @@ def test_executor_startup_hydrates_all_durable_reclaim_states_before_first_mutat
     qbt = RecordingQbt()
     executor = Executor(qbt, dry_run=False, state_db=db)
     try:
-        with pytest.raises(QbtMutationLeaseBlocked):
-            executor.qbt_post(
-                "/api/v2/torrents/start", {"hashes": " RECLAIMED "}
-            )
-        with pytest.raises(QbtMutationLeaseBlocked):
-            executor.qbt_post(
-                "/api/v2/torrents/filePrio",
-                {"hash": "ABORTED", "id": "0", "priority": "1"},
-            )
+        assert executor.qbt_post(
+            "/api/v2/torrents/start", {"hashes": " RECLAIMED "}
+        ) is True
+        assert executor.qbt_post(
+            "/api/v2/torrents/filePrio",
+            {"hash": "ABORTED", "id": "0", "priority": "1"},
+        ) is True
         with pytest.raises(QbtMutationLeaseBlocked):
             executor.qbt_post(
                 "/api/v2/torrents/start", {"hashes": "Quarantined"}
             )
-        assert qbt.posts == []
-
         assert executor.qbt_post(
             "/api/v2/torrents/start", {"hashes": "released"}
         ) is True
@@ -83,18 +79,22 @@ def test_executor_startup_hydrates_all_durable_reclaim_states_before_first_mutat
     finally:
         executor.close(timeout=1)
 
-    assert [entry.status for entry in executor.action_log[:3]] == [
+    assert [entry.status for entry in executor.action_log] == [
+        "succeeded",
+        "succeeded",
         "skipped_hash_lease",
-        "skipped_hash_lease",
-        "skipped_hash_lease",
+        "succeeded",
+        "succeeded",
     ]
-    assert [payload["hashes"] for _path, payload in qbt.posts] == [
-        "released",
-        "cancelled",
+    assert [path for path, _payload in qbt.posts] == [
+        "/api/v2/torrents/start",
+        "/api/v2/torrents/filePrio",
+        "/api/v2/torrents/start",
+        "/api/v2/torrents/start",
     ]
 
 
-def test_executor_startup_duplicate_hash_uses_highest_reclaim_id_and_records_warning(tmp_path, caplog):
+def test_executor_startup_ignores_terminal_duplicate_hash_row(tmp_path, caplog):
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
 
@@ -121,10 +121,8 @@ def test_executor_startup_duplicate_hash_uses_highest_reclaim_id_and_records_war
         executor.close(timeout=1)
 
     assert qbt.posts == [("/api/v2/torrents/start", {"hashes": "h"})]
-    assert executor.startup_reclaim_lease_warnings
-    assert f"keeping id={high_id}" in executor.startup_reclaim_lease_warnings[0]
-    assert f"ignoring id={low_id}" in executor.startup_reclaim_lease_warnings[0]
-    assert "multiple durable capacity reclaim leases" in caplog.text
+    assert executor.startup_reclaim_lease_warnings == []
+    assert "multiple durable capacity reclaim leases" not in caplog.text
 
 
 def test_executor_startup_hydration_fails_closed_when_reclaim_table_is_missing(tmp_path):

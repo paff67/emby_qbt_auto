@@ -877,7 +877,7 @@ def migration_sql() -> list[str]:
         "and NEW.state in ('queued','running','verify_pending','retry_wait','promotion_wait','cleanup_wait') "
         "and exists(select 1 from capacity_reclaims cr "
         "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "and cr.state not in ('released','cancelled')) "
+        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_job_update "
         "before update of hash,state on torrent_jobs "
@@ -885,14 +885,14 @@ def migration_sql() -> list[str]:
         "and exists(select 1 from capacity_reclaims cr where "
         "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
         "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
-        "and cr.state not in ('released','cancelled')) "
+        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_reservation_insert "
         "before insert on resource_reservations "
         "when NEW.hash is not null and NEW.state='active' "
         "and exists(select 1 from capacity_reclaims cr "
         "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "and cr.state not in ('released','cancelled')) "
+        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_reservation_update "
         "before update on resource_reservations "
@@ -900,7 +900,7 @@ def migration_sql() -> list[str]:
         "and exists(select 1 from capacity_reclaims cr where "
         "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
         "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
-        "and cr.state not in ('released','cancelled')) "
+        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_soak_insert "
         "before insert on soak_state "
@@ -908,7 +908,7 @@ def migration_sql() -> list[str]:
         "and NEW.cooldown_until>0 "
         "and exists(select 1 from capacity_reclaims cr "
         "where lower(trim(cr.hash))=lower(trim(NEW.hash)) "
-        "and cr.state not in ('released','cancelled')) "
+        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_lock_soak_update "
         "before update on soak_state "
@@ -917,7 +917,7 @@ def migration_sql() -> list[str]:
         "and exists(select 1 from capacity_reclaims cr where "
         "(lower(trim(cr.hash))=lower(trim(NEW.hash)) "
         "or lower(trim(cr.hash))=lower(trim(OLD.hash))) "
-        "and cr.state not in ('released','cancelled')) "
+        "and cr.state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown','stop_unknown')) "
         "begin select raise(abort,'capacity_reclaim_locked'); end",
         "create trigger if not exists trg_capacity_reclaim_fence_assessment_insert "
         "before insert on capacity_assessment_state "
@@ -972,6 +972,7 @@ def migration_sql() -> list[str]:
         "insert or ignore into schema_migrations(version,name,applied_at) values(15,'shared_capacity_assessment_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(16,'telegram_add_queue_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(17,'remote_media_index_refresh_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) values(18,'automatic_capacity_reclaim_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(2,'schema_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(3,'resource_ledger_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(4,'capacity_state_v1',strftime('%s','now'))",

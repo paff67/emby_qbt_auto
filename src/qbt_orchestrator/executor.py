@@ -79,7 +79,8 @@ class Executor:
                 rows = con.execute(
                     "select id,hash,capacity_generation,state "
                     "from capacity_reclaims "
-                    "where state is null or state not in ('released','cancelled') "
+                    "where state in ('stopping','deleting','quarantined','deleted',"
+                    "'recheck_pending','partial_or_unknown','stop_unknown') "
                     "order by id desc"
                 ).fetchall()
             finally:

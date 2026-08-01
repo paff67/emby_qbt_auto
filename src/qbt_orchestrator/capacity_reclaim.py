@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import os
+import posixpath
 import shutil
 import stat as statmod
 import time
@@ -35,7 +36,8 @@ OPEN_JOB_STATES = (
     "promotion_wait",
     "cleanup_wait",
 )
-RECLAIM_RELEASE_STATES = frozenset({"released", "cancelled"})
+# Only rows that can still mutate qBT or the payload own a mutation lease.
+# Historical confirmation/terminal states must never fence normal scheduling.
 RECLAIM_LOCKED_STATES = frozenset(
     {
         "stopping",
@@ -44,10 +46,7 @@ RECLAIM_LOCKED_STATES = frozenset(
         "deleted",
         "recheck_pending",
         "partial_or_unknown",
-        "aborted_paused",
         "stop_unknown",
-        "reclaimed",
-        "failed",
     }
 )
 MAGNET_PREFIX = "mag" + "net:?"
@@ -109,17 +108,15 @@ def _completed_bytes(item: Mapping[str, Any]) -> int | None:
 
 
 def capacity_reclaim_locked_hashes(state_db: str | Path) -> set[str]:
-    """Return hashes held by a durable reclaim lease.
-
-    Unknown states deliberately remain locked.  Only an explicit future human
-    confirmation transition to ``released`` or ``cancelled`` lifts the lease.
-    """
+    """Return hashes whose reclaim transaction is still actively reconciling."""
 
     con = readonly_connect(state_db)
     try:
+        placeholders = ",".join("?" for _ in RECLAIM_LOCKED_STATES)
         rows = con.execute(
             "select distinct hash from capacity_reclaims "
-            "where state not in ('released','cancelled')"
+            f"where state in ({placeholders})",
+            tuple(sorted(RECLAIM_LOCKED_STATES)),
         ).fetchall()
         return {
             canonical
@@ -342,10 +339,75 @@ class CapacityReclaimAuditStore:
             if not con.in_transaction:
                 con.execute("begin immediate")
             existing = con.execute(
-                "select id,state,capacity_generation from capacity_reclaims where reclaim_key=?",
+                "select id,state,capacity_generation,updated_at from capacity_reclaims where reclaim_key=?",
                 (identity["reclaim_key"],),
             ).fetchone()
             if existing is not None:
+                if str(existing["state"]) == "cancelled":
+                    if int(existing["updated_at"] or 0) >= now:
+                        return {
+                            "reclaim_id": int(existing["id"]),
+                            "state": "cancelled",
+                            "capacity_generation": int(
+                                existing["capacity_generation"] or 0
+                            ),
+                            "reserved": False,
+                            "reason": "reclaim_already_recorded",
+                        }
+                    reason = self._eligibility_reason(con, candidate)
+                    if reason is not None:
+                        return self._reservation_rejected(
+                            identity["capacity_generation"], reason
+                        )
+                    locked = con.execute(
+                        "select 1 from capacity_reclaims where lower(trim(hash))=? "
+                        "and id<>? and state in "
+                        "('stopping','deleting','quarantined','deleted',"
+                        "'recheck_pending','partial_or_unknown','stop_unknown') limit 1",
+                        (identity["hash"], int(existing["id"])),
+                    ).fetchone()
+                    if locked is not None:
+                        return self._reservation_rejected(
+                            identity["capacity_generation"],
+                            "capacity_reclaim_locked",
+                        )
+                    changed = con.execute(
+                        "update capacity_reclaims set hash=?,name=?,magnet_uri=?,"
+                        "host_path=?,content_path=?,allocated_bytes=?,completed_bytes=?,"
+                        "progress=?,dead_since=?,reclaimable_since=?,capacity_generation=?,"
+                        "capacity_reason=?,assessment_json=?,file_selection_fingerprint=?,"
+                        "target_free_bytes=?,state='stopping',recheck_state='not_requested',"
+                        "recheck_error=null,quarantine_path=null,filesystem_dev=null,"
+                        "filesystem_ino=null,reclaimed_at=null,updated_at=? "
+                        "where id=? and state='cancelled'",
+                        (
+                            identity["hash"],
+                            identity["name"],
+                            identity["magnet_uri"],
+                            identity["host_path"],
+                            identity["content_path"],
+                            identity["allocated_bytes"],
+                            identity["completed_bytes"],
+                            identity["progress"],
+                            identity["dead_since"],
+                            identity["reclaimable_since"],
+                            identity["capacity_generation"],
+                            identity["capacity_reason"],
+                            identity["assessment_json"],
+                            identity["file_selection_fingerprint"],
+                            identity["target_free_bytes"],
+                            now,
+                            int(existing["id"]),
+                        ),
+                    )
+                    if int(changed.rowcount or 0) == 1:
+                        return {
+                            "reclaim_id": int(existing["id"]),
+                            "state": "stopping",
+                            "capacity_generation": identity["capacity_generation"],
+                            "reserved": True,
+                            "reason": None,
+                        }
                 return {
                     "reclaim_id": int(existing["id"]),
                     "state": str(existing["state"]),
@@ -355,7 +417,8 @@ class CapacityReclaimAuditStore:
                 }
             locked = con.execute(
                 "select 1 from capacity_reclaims where lower(trim(hash))=? "
-                "and state not in ('released','cancelled') limit 1",
+                "and state in ('stopping','deleting','quarantined','deleted',"
+                "'recheck_pending','partial_or_unknown','stop_unknown') limit 1",
                 (identity["hash"],),
             ).fetchone()
             if locked is not None:
@@ -453,22 +516,21 @@ class CapacityReclaimAuditStore:
                 ).fetchone()
                 assert row is not None
             if target_state == "stop_unknown":
-                status_text = "停止结果未知，未执行删除，需人工确认任务状态。"
+                status_text = "停止结果未知，未执行删除；后续运行会自动确认。"
             else:
-                status_text = "任务已保持暂停，需人工确认继续或保留暂停。"
+                status_text = "文件状态暂不明确，未继续删除；后续运行会自动对账。"
             message = (
                 f"qBT 容量回收已中止；{status_text}\n"
                 f"种子名：{row['name']}\nHash：{row['hash']}\n原因：{reason}"
             )
-            payload = {
+            payload: dict[str, Any] = {
                 "hash": canonical_torrent_hash(row["hash"]),
                 "name": str(row["name"]),
                 "reason": str(reason),
                 "error": safe_error,
                 "reclaim_id": int(row["id"]),
-                "requires_confirmation": True,
-                "allowed_actions": ["resume", "keep_paused"],
             }
+            payload.update({"automatic": True, "outcome": "reconciling"})
             self._enqueue_notification(
                 con,
                 row,
@@ -481,22 +543,6 @@ class CapacityReclaimAuditStore:
             return True
 
         return bool(write_transaction(self.state_db, txn))
-
-    def mark_aborted_paused(
-        self,
-        reclaim_id: int,
-        generation: int,
-        reason: str,
-        error: str | None = None,
-    ) -> bool:
-        return self._mark_warning_state(
-            reclaim_id,
-            generation,
-            target_state="aborted_paused",
-            allowed_states=("stopping",),
-            reason=reason,
-            error=error,
-        )
 
     def mark_stop_unknown(
         self,
@@ -514,21 +560,109 @@ class CapacityReclaimAuditStore:
             error=error,
         )
 
-    def mark_restored_aborted_paused(
+    def mark_cancelled(
         self,
         reclaim_id: int,
         generation: int,
         reason: str,
         error: str | None = None,
+        *,
+        allowed_states: tuple[str, ...] = (
+            "stopping",
+            "aborted_paused",
+            "stop_unknown",
+            "deleting",
+            "quarantined",
+        ),
     ) -> bool:
-        return self._mark_warning_state(
-            reclaim_id,
-            generation,
-            target_state="aborted_paused",
-            allowed_states=("deleting", "quarantined"),
-            reason=reason,
-            error=error,
-        )
+        """End a safe, pre-delete reclaim attempt without human approval."""
+
+        now = int(self.now())
+        safe_error = self._safe_error(error)
+
+        def txn(con) -> bool:
+            row = con.execute(
+                "select * from capacity_reclaims where id=? and capacity_generation=?",
+                (int(reclaim_id), int(generation)),
+            ).fetchone()
+            if row is None:
+                return False
+            current_state = str(row["state"])
+            if current_state == "cancelled":
+                return True
+            if current_state not in set(allowed_states):
+                return False
+            placeholders = ",".join("?" for _ in allowed_states)
+            changed = con.execute(
+                "update capacity_reclaims set state='cancelled',"
+                "recheck_state='not_requested',recheck_error=?,updated_at=? "
+                f"where id=? and capacity_generation=? and state in ({placeholders})",
+                (
+                    safe_error or str(reason)[:2000],
+                    now,
+                    int(reclaim_id),
+                    int(generation),
+                    *allowed_states,
+                ),
+            )
+            if int(changed.rowcount or 0) != 1:
+                return False
+            row = con.execute(
+                "select * from capacity_reclaims where id=?", (int(reclaim_id),)
+            ).fetchone()
+            assert row is not None
+            self._enqueue_notification(
+                con,
+                row,
+                kind="automatic_cancelled",
+                level="warning",
+                message=(
+                    "qBT 容量回收本次未删除文件；已自动结束本次尝试，"
+                    "后续容量评估仍满足时会自动重试。\n"
+                    f"种子名：{row['name']}\nHash：{row['hash']}\n原因：{reason}"
+                ),
+                payload={
+                    "hash": canonical_torrent_hash(row["hash"]),
+                    "name": str(row["name"]),
+                    "reason": str(reason),
+                    "error": safe_error,
+                    "reclaim_id": int(row["id"]),
+                    "automatic": True,
+                    "outcome": "retryable",
+                },
+                now=now,
+            )
+            return True
+
+        return bool(write_transaction(self.state_db, txn))
+
+    def retire_legacy_confirmation_rows(self) -> list[dict[str, Any]]:
+        """Make old ``aborted_paused`` rows terminal after the policy upgrade."""
+
+        now = int(self.now())
+
+        def txn(con) -> list[dict[str, Any]]:
+            rows = con.execute(
+                "select * from capacity_reclaims where state='aborted_paused' "
+                "order by id"
+            ).fetchall()
+            retired: list[dict[str, Any]] = []
+            for raw in rows:
+                row = dict(raw)
+                changed = con.execute(
+                    "update capacity_reclaims set state='cancelled',"
+                    "recheck_state='not_requested',"
+                    "recheck_error=coalesce(recheck_error,'legacy_confirmation_removed'),"
+                    "updated_at=? where id=? and state='aborted_paused'",
+                    (now, int(row["id"])),
+                )
+                if int(changed.rowcount or 0) != 1:
+                    continue
+                row["state"] = "cancelled"
+                retired.append(row)
+            return retired
+
+        return list(write_transaction(self.state_db, txn))
 
     def mark_deleting(
         self,
@@ -616,6 +750,21 @@ class CapacityReclaimAuditStore:
         )
         return int(changed or 0) == 1
 
+    def mark_partial_deleted(self, reclaim_id: int, generation: int) -> bool:
+        """Record an already-absent payload discovered during reconciliation."""
+
+        now = int(self.now())
+        changed = write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update capacity_reclaims set state='deleted',recheck_state='pending',"
+                "recheck_error=null,updated_at=? where id=? and capacity_generation=? "
+                "and state='partial_or_unknown'",
+                (now, int(reclaim_id), int(generation)),
+            ).rowcount,
+        )
+        return int(changed or 0) == 1
+
     def authorize_delete(
         self,
         reclaim_id: int,
@@ -680,7 +829,8 @@ class CapacityReclaimAuditStore:
         try:
             rows = con.execute(
                 "select * from capacity_reclaims where "
-                "state in ('stopping','deleting','quarantined','deleted','recheck_pending','partial_or_unknown') "
+                "state in ('stopping','deleting','quarantined','deleted','recheck_pending',"
+                "'partial_or_unknown','stop_unknown') "
                 "order by capacity_generation,id",
             ).fetchall()
             return [dict(row) for row in rows]
@@ -692,7 +842,8 @@ class CapacityReclaimAuditStore:
         try:
             rows = con.execute(
                 "select id,hash,capacity_generation,state from capacity_reclaims "
-                "where state not in ('released','cancelled') order by id"
+                "where state in ('stopping','deleting','quarantined','deleted',"
+                "'recheck_pending','partial_or_unknown','stop_unknown') order by id"
             ).fetchall()
             return [dict(row) for row in rows]
         finally:
@@ -1007,6 +1158,39 @@ class DeadPartialReclaimer:
             return "qbt_mutation_lease_failed"
         return None if acquired else "qbt_mutation_lease_conflict"
 
+    def _release_reclaim_mutation_lease(
+        self,
+        torrent_hash: str,
+        lease_token: str,
+    ) -> str | None:
+        if not self._executor_supports_reclaim_mutation_leases():
+            return "qbt_mutation_lease_unsupported"
+        try:
+            # False only means this process did not currently hold the durable
+            # lease (for example immediately after an upgrade restart).
+            self.executor.release_hash_mutation_lease(torrent_hash, lease_token)
+        except Exception:
+            return "qbt_mutation_lease_release_failed"
+        return None
+
+    def _retire_legacy_confirmation_rows(self) -> list[str]:
+        try:
+            rows = self.audit.retire_legacy_confirmation_rows()
+        except Exception as exc:
+            return [f"legacy capacity reclaim retirement failed: {exc}"]
+        errors: list[str] = []
+        for row in rows:
+            torrent_hash = canonical_torrent_hash(row.get("hash"))
+            if not torrent_hash:
+                continue
+            token = self._reclaim_mutation_lease_token(
+                int(row["id"]), int(row.get("capacity_generation") or 0)
+            )
+            error = self._release_reclaim_mutation_lease(torrent_hash, token)
+            if error is not None:
+                errors.append(f"{torrent_hash}: {error}")
+        return errors
+
     @staticmethod
     def _combined_restore_error(
         original_error: Exception | str | None,
@@ -1027,15 +1211,22 @@ class DeadPartialReclaimer:
         target_free_bytes: int,
     ) -> CapacityReclaimResult:
         generation = 0 if assessment is None else int(assessment.generation)
-        recovery_errors = self._hydrate_reclaim_mutation_leases()
-        if not self.dry_run and not recovery_errors:
+        recovery_errors: list[str] = []
+        startup_errors: list[str] = []
+        if not self.dry_run:
+            startup_errors = self._retire_legacy_confirmation_rows()
+        if not startup_errors:
+            startup_errors = self._hydrate_reclaim_mutation_leases()
+        if not self.dry_run and not startup_errors:
+            # Per-hash recovery failures stay fenced and are reported, but do
+            # not prevent independent safe candidates from being reclaimed.
             recovery_errors = self._reconcile_reclaims(assessment)
         if generation <= 0:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
                 assessment_generation=generation,
                 rejection_counts={"uncommitted_assessment": 1},
-                errors=recovery_errors,
+                errors=startup_errors + recovery_errors,
             )
         assert assessment is not None
         if self._current_assessment_generation() != generation:
@@ -1043,14 +1234,14 @@ class DeadPartialReclaimer:
                 dry_run=self.dry_run,
                 assessment_generation=generation,
                 rejection_counts={"stale_assessment": 1},
-                errors=recovery_errors,
+                errors=startup_errors + recovery_errors,
             )
-        if recovery_errors:
+        if startup_errors:
             return CapacityReclaimResult(
                 dry_run=self.dry_run,
                 assessment_generation=generation,
                 rejection_counts={"reconciliation_failed": 1},
-                errors=recovery_errors,
+                errors=startup_errors + recovery_errors,
             )
         if (
             str(capacity_state) != "capacity_deadlock"
@@ -1246,11 +1437,12 @@ class DeadPartialReclaimer:
         selection_limit = self.max_per_tick if self.dry_run else min(
             self.max_per_tick, 1
         )
-        for candidate in candidates:
-            if len(selected) >= selection_limit or planned_bytes >= needed:
-                break
-            selected.append(candidate)
-            planned_bytes += int(candidate["allocated_bytes"])
+        if self.dry_run:
+            for candidate in candidates:
+                if len(selected) >= selection_limit or planned_bytes >= needed:
+                    break
+                selected.append(candidate)
+                planned_bytes += int(candidate["allocated_bytes"])
 
         if self.dry_run:
             return CapacityReclaimResult(
@@ -1267,7 +1459,9 @@ class DeadPartialReclaimer:
         reclaimed_bytes = 0
         errors: list[str] = list(recovery_errors)
         completed: list[dict[str, Any]] = []
-        for candidate in selected:
+        for candidate in candidates:
+            if len(selected) >= selection_limit or planned_bytes >= needed:
+                break
             torrent_hash = canonical_torrent_hash(candidate["hash"])
             reason = self._revalidate_candidate(candidate, assessment)
             if reason is not None:
@@ -1293,6 +1487,8 @@ class DeadPartialReclaimer:
             if not reservation["reserved"]:
                 reject(str(reservation.get("reason") or "reservation_failed"))
                 continue
+            selected.append(candidate)
+            planned_bytes += int(candidate["allocated_bytes"])
             reclaim_id = int(reservation["reclaim_id"])
             lease_token = self._reclaim_mutation_lease_token(
                 reclaim_id,
@@ -1302,15 +1498,21 @@ class DeadPartialReclaimer:
             def abort_paused(reason: str, error: str | None = None) -> None:
                 reject(reason)
                 try:
-                    if not self.audit.mark_aborted_paused(
+                    if not self.audit.mark_cancelled(
                         int(reclaim_id), generation, reason, error
                     ):
                         errors.append(
-                            f"{torrent_hash}: failed to fence paused abort state"
+                            f"{torrent_hash}: failed to finish automatic reclaim abort"
                         )
+                        return
+                    lease_error = self._release_reclaim_mutation_lease(
+                        torrent_hash, lease_token
+                    )
+                    if lease_error is not None:
+                        errors.append(f"{torrent_hash}: {lease_error}")
                 except Exception as exc:
                     errors.append(
-                        f"{torrent_hash}: failed to persist paused abort: {exc}"
+                        f"{torrent_hash}: failed to persist automatic abort: {exc}"
                     )
 
             lease_reason = self._acquire_reclaim_mutation_lease(
@@ -1521,11 +1723,19 @@ class DeadPartialReclaimer:
                         quarantine_path, host_path
                     ):
                         raise RuntimeError("quarantine restore failed")
-                    if not self.audit.mark_restored_aborted_paused(
-                        int(reclaim_id), generation, reason,
+                    if not self.audit.mark_cancelled(
+                        int(reclaim_id),
+                        generation,
+                        reason,
                         None if error is None else str(error),
+                        allowed_states=("deleting", "quarantined"),
                     ):
-                        raise RuntimeError("restored reclaim state changed")
+                        raise RuntimeError("restored reclaim cancellation changed")
+                    lease_error = self._release_reclaim_mutation_lease(
+                        torrent_hash, lease_token
+                    )
+                    if lease_error is not None:
+                        errors.append(f"{torrent_hash}: {lease_error}")
                 except Exception as restore_exc:
                     combined_error = self._combined_restore_error(
                         error,
@@ -1597,6 +1807,11 @@ class DeadPartialReclaimer:
                 completed.append({**candidate, **audit})
                 if recheck_error is None:
                     reclaimed += 1
+                    lease_error = self._release_reclaim_mutation_lease(
+                        torrent_hash, lease_token
+                    )
+                    if lease_error is not None:
+                        errors.append(f"{torrent_hash}: {lease_error}")
             except Exception as exc:
                 errors.append(f"{torrent_hash}: failed to persist completed reclaim: {exc}")
                 completed.append({**candidate, "state": "deleted"})
@@ -1653,22 +1868,25 @@ class DeadPartialReclaimer:
                         torrent_hash,
                         timeout=self.inventory_timeout_sec,
                     )
-                    if _is_stopped_download_state(current.get("state")):
-                        changed = self.audit.mark_aborted_paused(
-                            reclaim_id,
-                            row_generation,
-                            "restart_after_stopping",
-                        )
-                    else:
-                        changed = self.audit.mark_stop_unknown(
-                            reclaim_id,
-                            row_generation,
-                            "restart_stop_state_unknown",
-                        )
+                    changed = self.audit.mark_cancelled(
+                        reclaim_id,
+                        row_generation,
+                        (
+                            "restart_after_stopping"
+                            if _is_stopped_download_state(current.get("state"))
+                            else "restart_stop_not_confirmed"
+                        ),
+                    )
                     if not changed:
                         errors.append(
                             f"{torrent_hash}: stopping reconciliation fence changed"
                         )
+                    else:
+                        lease_error = self._release_reclaim_mutation_lease(
+                            torrent_hash, lease_token
+                        )
+                        if lease_error is not None:
+                            errors.append(f"{torrent_hash}: {lease_error}")
                 except Exception as exc:
                     try:
                         changed = self.audit.mark_stop_unknown(
@@ -1685,6 +1903,35 @@ class DeadPartialReclaimer:
                         errors.append(
                             f"{torrent_hash}: failed to reconcile stopping state: {audit_exc}"
                         )
+                continue
+
+            if state == "stop_unknown":
+                try:
+                    self._qbt_call_with_timeout(
+                        "torrent_info",
+                        torrent_hash,
+                        timeout=self.inventory_timeout_sec,
+                    )
+                    changed = self.audit.mark_cancelled(
+                        reclaim_id,
+                        row_generation,
+                        "stop_state_reconciled",
+                        allowed_states=("stop_unknown",),
+                    )
+                    if not changed:
+                        errors.append(
+                            f"{torrent_hash}: stop reconciliation fence changed"
+                        )
+                    else:
+                        lease_error = self._release_reclaim_mutation_lease(
+                            torrent_hash, lease_token
+                        )
+                        if lease_error is not None:
+                            errors.append(f"{torrent_hash}: {lease_error}")
+                except Exception as exc:
+                    errors.append(
+                        f"{torrent_hash}: stop state reconciliation unavailable: {exc}"
+                    )
                 continue
 
             host_path = self._recovery_path(row)
@@ -1817,14 +2064,20 @@ class DeadPartialReclaimer:
                             expected_dev,
                             expected_identity=identity,
                         )
-                        if not self.audit.mark_restored_aborted_paused(
+                        if not self.audit.mark_cancelled(
                             reclaim_id,
                             row_generation,
                             restore_reason,
+                            allowed_states=("deleting", "quarantined"),
                         ):
                             raise RuntimeError(
                                 "restored reclaim recovery state changed"
                             )
+                        lease_error = self._release_reclaim_mutation_lease(
+                            torrent_hash, lease_token
+                        )
+                        if lease_error is not None:
+                            errors.append(f"{torrent_hash}: {lease_error}")
                         continue
                     self._delete_quarantine_path(quarantine_path, identity)
                     if not self.audit.mark_deleted(reclaim_id, row_generation):
@@ -1881,11 +2134,17 @@ class DeadPartialReclaimer:
                     recheck_error = str(exc)
                     errors.append(f"{torrent_hash}: {exc}")
                 try:
-                    self.audit.complete(
+                    completed = self.audit.complete(
                         reclaim_id,
                         row,
                         recheck_error=recheck_error,
                     )
+                    if str(completed.get("state")) == "reclaimed":
+                        lease_error = self._release_reclaim_mutation_lease(
+                            torrent_hash, lease_token
+                        )
+                        if lease_error is not None:
+                            errors.append(f"{torrent_hash}: {lease_error}")
                 except Exception as exc:
                     errors.append(
                         f"{torrent_hash}: failed to reconcile recheck state: {exc}"
@@ -1894,18 +2153,67 @@ class DeadPartialReclaimer:
 
             if state == "partial_or_unknown":
                 try:
-                    changed = self.audit.mark_partial_or_unknown(
-                        reclaim_id,
-                        row_generation,
-                        "partial_or_unknown_requires_confirmation",
-                    )
-                    if not changed:
-                        errors.append(
-                            f"{torrent_hash}: partial reconciliation fence changed"
+                    if host_path is None:
+                        raise UnsafeFilesystemObject("recorded original path is unsafe")
+                    self._ensure_quarantine_root()
+                    quarantine_path = self._quarantine_destination(reclaim_id)
+                    if not self._quarantine_record_matches(row, quarantine_path):
+                        raise UnsafeFilesystemObject(
+                            "recorded quarantine path is not controlled"
                         )
+                    original_exists = self._path_exists_no_follow(host_path)
+                    quarantine_exists = self._path_exists_no_follow(quarantine_path)
+                    if original_exists and quarantine_exists:
+                        raise UnsafeFilesystemObject(
+                            "original and quarantine paths both exist"
+                        )
+                    if quarantine_exists:
+                        expected_dev = _filesystem_id(row.get("filesystem_dev"))
+                        expected_ino = _filesystem_id(row.get("filesystem_ino"))
+                        if expected_dev is None or expected_ino is None:
+                            raise UnsafeFilesystemObject(
+                                "quarantine filesystem identity is missing"
+                            )
+                        metadata = self._validate_payload_node(
+                            quarantine_path, expected_dev
+                        )
+                        identity = FilesystemIdentity(
+                            int(metadata.st_dev),
+                            int(metadata.st_ino),
+                            int(metadata.st_mode),
+                        )
+                        if int(identity.ino) != int(expected_ino):
+                            raise FilesystemIdentityChanged(
+                                "quarantine filesystem identity changed"
+                            )
+                        if not self._restore_from_quarantine(
+                            quarantine_path, host_path
+                        ):
+                            raise RuntimeError("automatic quarantine restore failed")
+                        original_exists = True
+                    if original_exists:
+                        changed = self.audit.mark_cancelled(
+                            reclaim_id,
+                            row_generation,
+                            "partial_state_restored",
+                            allowed_states=("partial_or_unknown",),
+                        )
+                        if not changed:
+                            raise RuntimeError(
+                                "partial reconciliation fence changed"
+                            )
+                        lease_error = self._release_reclaim_mutation_lease(
+                            torrent_hash, lease_token
+                        )
+                        if lease_error is not None:
+                            errors.append(f"{torrent_hash}: {lease_error}")
+                    elif not self.audit.mark_partial_deleted(
+                        reclaim_id, row_generation
+                    ):
+                        raise RuntimeError("partial deletion fence changed")
                 except Exception as exc:
                     errors.append(
-                        f"{torrent_hash}: failed to ensure partial deletion warning: {exc}"
+                        f"{torrent_hash}: automatic partial reconciliation failed: {exc}"
                     )
         return errors
 
@@ -2472,48 +2780,74 @@ class DeadPartialReclaimer:
 
         expected_hash = canonical_torrent_hash(torrent_hash)
         paths: dict[str, Path] = {}
-        identities: set[str] = set()
         candidate_row: dict[str, Any] | None = None
-        for fallback_hash, raw in torrents.items():
+        for index, (fallback_hash, raw) in enumerate(torrents.items()):
             if not isinstance(raw, Mapping):
-                return {}, None, "path_inventory_failed"
+                continue
             item = dict(raw)
             fallback_identity = canonical_torrent_hash(fallback_hash)
             row_identity = canonical_torrent_hash(item.get("hash"))
-            if row_identity and fallback_identity and row_identity != fallback_identity:
-                return {}, None, "path_inventory_failed"
             identity = row_identity or fallback_identity
-            if not identity or identity in identities:
-                return {}, None, "path_inventory_failed"
-            identities.add(identity)
+            candidate_identity = expected_hash in {
+                fallback_identity,
+                row_identity,
+            }
             raw_path = str(item.get("content_path") or "").strip()
-            if not raw_path:
-                return {}, None, "path_inventory_failed"
-            path = self._inventory_host_path(raw_path)
-            if path is None and identity == expected_hash:
-                authorized_path = self._host_path(raw_path)
-                try:
-                    candidate_path_missing = (
-                        authorized_path is not None
-                        and not self._path_exists_no_follow(authorized_path)
-                    )
-                except OSError:
-                    candidate_path_missing = False
+            if candidate_identity:
+                if candidate_row is not None:
+                    return {}, None, "path_inventory_failed"
                 if (
-                    allow_missing_candidate_path is not None
-                    and authorized_path == allow_missing_candidate_path
-                    and candidate_path_missing
+                    not identity
+                    or identity != expected_hash
+                    or (
+                        row_identity
+                        and fallback_identity
+                        and row_identity != fallback_identity
+                    )
+                    or not raw_path
                 ):
-                    path = authorized_path
-            if path is None:
-                return {}, None, "path_inventory_failed"
-            if identity == expected_hash:
+                    return {}, None, "path_inventory_failed"
+                path = self._inventory_host_path(raw_path)
                 authorized_path = self._host_path(raw_path)
+                if path is None:
+                    try:
+                        candidate_path_missing = (
+                            authorized_path is not None
+                            and not self._path_exists_no_follow(authorized_path)
+                        )
+                    except OSError:
+                        candidate_path_missing = False
+                    if (
+                        allow_missing_candidate_path is not None
+                        and authorized_path == allow_missing_candidate_path
+                        and candidate_path_missing
+                    ):
+                        path = authorized_path
                 if authorized_path is None or authorized_path != path:
                     return {}, None, "path_inventory_failed"
                 item["hash"] = identity
                 candidate_row = item
-            paths[identity] = path
+                paths[identity] = path
+                continue
+
+            # Unrelated torrents only contribute overlap evidence.  Empty
+            # metadata/precheck rows and stale missing paths cannot invalidate
+            # an otherwise fully verified candidate.
+            if not raw_path:
+                continue
+            posix_path = PurePosixPath(raw_path)
+            if not posix_path.is_absolute():
+                continue
+            normalized_raw_path = posixpath.normpath(raw_path)
+            path = self._inventory_host_path(normalized_raw_path)
+            if path is None:
+                path = self._host_path(normalized_raw_path)
+            if path is None:
+                continue
+            other_key = identity or f"inventory-{index}"
+            if other_key in paths or other_key == expected_hash:
+                other_key = f"inventory-{index}-{other_key}"
+            paths[other_key] = path
         if candidate_row is None:
             return {}, None, "path_inventory_failed"
         return paths, candidate_row, None

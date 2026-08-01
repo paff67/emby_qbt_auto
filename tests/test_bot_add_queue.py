@@ -523,7 +523,7 @@ def test_migration_16_repairs_legacy_item_lease_schema_without_losing_rows(tmp_p
     try:
         assert "metadata_lease_until" in _columns(con, "bot_add_items")
         assert con.execute("select id from bot_add_items where id=?", (item_id,)).fetchone()
-        assert con.execute("select max(version) from schema_migrations").fetchone()[0] == 17
+        assert con.execute("select max(version) from schema_migrations").fetchone()[0] == 18
     finally:
         con.close()
 
