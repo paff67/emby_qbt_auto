@@ -378,6 +378,99 @@ def test_planner_availability_probe_uses_capped_reserve_budget(tmp_path):
     state = _rows(db, "select state,probe_started_at from carousel_state where hash='h'")[0]
     assert state["state"] == "probing"
     assert state["probe_started_at"] == 30_000
+    intent = _rows(db, "select expires_at,data_json from scheduler_intents where hash='h'")[0]
+    assert intent["expires_at"] == 30_000 + 600
+    assert json.loads(intent["data_json"])["phase"] == "probing"
+
+
+def test_planner_confirms_already_running_availability_probe(tmp_path):
+    from qbt_orchestrator.capacity_assessment import CapacityAssessmentBuilder
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.planner import DownloadPlanner
+    from qbt_orchestrator.scheduler_intents import (
+        SchedulerIntent,
+        SchedulerIntentRepository,
+    )
+    from tests.fakes import FakeExecutor
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_level,updated_at) "
+        "values('h','pending',null,null,0,29500)"
+    )
+    con.commit()
+    con.close()
+    SchedulerIntentRepository(db).upsert(
+        SchedulerIntent(
+            "carousel",
+            "h",
+            "availability_probe",
+            40,
+            30_100,
+            {"phase": "pending"},
+        )
+    )
+    assessment = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 250,
+                "availability": 0.5,
+                "num_seeds": 0,
+                "num_complete": 0,
+            }
+        },
+        {"h": {"no_progress_since": 1_000}},
+        observed_at=30_000,
+        scheduler_mode="drain",
+        free_bytes=10_000,
+        target_free_bytes=1,
+        available_growth_bytes=10_000,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    ).with_generation(3)
+    executor = FakeExecutor()
+    planner = DownloadPlanner(
+        state_db=db,
+        executor=executor,
+        dry_run=False,
+        active_slots=1,
+        disk_floor_bytes=0,
+        now=lambda: 30_000,
+    )
+
+    result = planner.plan_and_apply(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "state": "stalledDL",
+                "amount_left": 900,
+                "size": 1_000,
+                "progress": 0.1,
+                "completed": 250,
+                "num_seeds": 0,
+                "num_peers": 1,
+            }
+        },
+        free_bytes=10_000,
+        sync_healthy=True,
+        capacity_assessment=assessment,
+    )
+
+    assert result.selected_hashes == ["h"]
+    assert executor.posts == []
+    state = _rows(db, "select state,probe_started_at from carousel_state where hash='h'")[0]
+    assert state == {"state": "probing", "probe_started_at": 30_000}
+    intent = _rows(db, "select expires_at,data_json from scheduler_intents where hash='h'")[0]
+    assert intent["expires_at"] == 30_000 + 600
+    data = json.loads(intent["data_json"])
+    assert data["phase"] == "probing"
+    assert data["probe_started_completed_bytes"] == 250
 
 
 def test_planner_consumes_active_intents_and_owns_one_plan_generation():

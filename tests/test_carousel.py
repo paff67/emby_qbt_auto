@@ -373,6 +373,52 @@ def test_carousel_disk_guard_cancels_active_probes_and_intents():
         assert state["backoff_until"] == 1000 + 30 * 60
 
 
+def test_carousel_probe_success_uses_max_complete_sources_not_or():
+    from qbt_orchestrator.carousel import CarouselService
+
+    assert CarouselService._probe_succeeded(
+        {"num_seeds": -1, "num_complete": 5, "dlspeed": 0, "completed": 0},
+        started_completed_bytes=0,
+    )
+    assert not CarouselService._probe_succeeded(
+        {"num_seeds": -1, "num_complete": 0, "dlspeed": 0, "completed": 0},
+        started_completed_bytes=0,
+    )
+
+
+def test_confirm_availability_probe_resets_expiry_from_confirmation_time(tmp_path):
+    from qbt_orchestrator.carousel import confirm_availability_probes_started
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.scheduler_intents import SchedulerIntent, SchedulerIntentRepository
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into carousel_state(hash,state,probe_started_at,updated_at) "
+        "values('h','pending',null,1000)"
+    )
+    con.commit()
+    con.close()
+    SchedulerIntentRepository(db).upsert(
+        SchedulerIntent("carousel", "h", "availability_probe", 40, 1100, {"phase": "pending"})
+    )
+
+    confirmed = confirm_availability_probes_started(
+        db,
+        {"h": 42},
+        now=1050,
+        probe_duration_sec=600,
+    )
+
+    assert confirmed == ["h"]
+    state = _rows(db, "select state,probe_started_at from carousel_state where hash='h'")[0]
+    assert state == {"state": "probing", "probe_started_at": 1050}
+    intent = _rows(db, "select expires_at,data_json from scheduler_intents where hash='h'")[0]
+    assert intent["expires_at"] == 1050 + 600
+    assert json.loads(intent["data_json"])["probe_started_completed_bytes"] == 42
+
+
 def test_carousel_missing_completed_baseline_does_not_count_as_progress():
     from qbt_orchestrator.carousel import CarouselService
     from qbt_orchestrator.db import migrate

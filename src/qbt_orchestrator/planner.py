@@ -472,30 +472,39 @@ class DownloadPlanner:
             )
         generation = self._flush_persistence_batch()
         self._apply_seq_desired(seq_desired_actions, plan_generation=generation)
-        started_ok = self._qbt_post(
-            "/api/v2/torrents/start",
-            start_hashes,
-            plan_generation=generation,
-        )
-        if started_ok and not self.dry_run:
-            selected_completed = {
-                (canonical_torrent_hash(t.get("hash")) or str(t.get("hash"))): max(
+        started_ok = False
+        if start_hashes:
+            started_ok = self._qbt_post(
+                "/api/v2/torrents/start",
+                start_hashes,
+                plan_generation=generation,
+            )
+        if not self.dry_run:
+            start_hash_set = {
+                canonical_torrent_hash(h) or str(h) for h in start_hashes
+            }
+            confirm_map: dict[str, int] = {}
+            for torrent in selected:
+                torrent_hash = canonical_torrent_hash(torrent.get("hash")) or str(
+                    torrent.get("hash") or ""
+                )
+                if not torrent_hash or torrent_hash not in capacity_probe_hashes:
+                    continue
+                if torrent_hash in start_hash_set:
+                    if not started_ok:
+                        continue
+                elif not _is_running_download(torrent):
+                    # Selected but neither freshly started nor already running.
+                    continue
+                confirm_map[torrent_hash] = max(
                     0,
                     int(
-                        t.get("completed_bytes")
-                        or t.get("completed")
-                        or t.get("downloaded")
+                        torrent.get("completed_bytes")
+                        or torrent.get("completed")
+                        or torrent.get("downloaded")
                         or 0
                     ),
                 )
-                for t in selected
-                if canonical_torrent_hash(t.get("hash")) or t.get("hash")
-            }
-            confirm_map = {
-                h: selected_completed.get(canonical_torrent_hash(h) or h, 0)
-                for h in start_hashes
-                if (canonical_torrent_hash(h) or h) in capacity_probe_hashes
-            }
             if confirm_map:
                 confirm_availability_probes_started(
                     self.state_db,

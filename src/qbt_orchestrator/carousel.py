@@ -214,11 +214,8 @@ def confirm_availability_probes_started(
             ).fetchone()
             if state is not None and str(state["state"]) == "probing":
                 continue
-            expires_at = (
-                int(intent["expires_at"])
-                if intent["expires_at"] is not None
-                else int(now) + int(probe_duration_sec)
-            )
+            # Restart the probe timer from real confirmation, not request time.
+            expires_at = int(now) + int(probe_duration_sec)
             con.execute(
                 "insert into carousel_state(hash,state,probe_started_at,last_probe_at,backoff_until,backoff_level,updated_at) "
                 "values(?,?,?,?,?,?,?) "
@@ -593,8 +590,12 @@ class CarouselService:
 
         if not snapshot:
             return False
-        num_seeds = int(snapshot.get("num_seeds") or snapshot.get("num_complete") or 0)
-        if num_seeds > 0:
+        complete_sources = max(
+            0,
+            int(snapshot.get("num_seeds") or 0),
+            int(snapshot.get("num_complete") or 0),
+        )
+        if complete_sources > 0:
             return True
         try:
             availability = snapshot.get("availability")
