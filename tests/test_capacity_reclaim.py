@@ -3230,6 +3230,155 @@ def test_apply_archive_tags_returns_torrent_absent_for_adapter_placeholder(
     )
 
 
+def test_successful_reclaim_finalizes_only_after_archive_tags(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import (
+        DeadPartialReclaimer,
+        RECLAIM_ARCHIVE_TAGS_CSV,
+    )
+    from qbt_orchestrator.db import migrate
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 4096)
+    allocated = 4096
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = {
+        **_snapshot("h", content_path="/downloads/incomplete/h")["h"],
+        "state": "stoppedDL",
+        "name": "Archive Me",
+        "magnet_uri": "magnet:?xt=urn:btih:h&dn=Archive%20Me",
+    }
+    executor = RecordingExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        disk_free_bytes=lambda _path: 0,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        notification_chat_ids=["100"],
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    post_paths = [path for path, _payload in executor.posts]
+    assert post_paths[-3:] == [
+        "/api/v2/torrents/stop",
+        "/api/v2/torrents/recheck",
+        "/api/v2/torrents/addTags",
+    ]
+    assert executor.posts[-1] == (
+        "/api/v2/torrents/addTags",
+        {"hashes": "h", "tags": RECLAIM_ARCHIVE_TAGS_CSV},
+    )
+    tags = {
+        part.strip()
+        for part in str(executor.torrent_info("h")["tags"]).split(",")
+        if part.strip()
+    }
+    assert {"capacity-reclaimed", "hold"} <= tags
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["state"] == "reclaimed"
+    assert row["recheck_error"] is None
+    assert "h" not in executor.hash_mutation_leases
+    assert result.reclaimed == 1
+    assert result.reclaimed_bytes >= allocated
+    assert not payload.exists()
+    notices = [
+        notice
+        for notice in _capacity_reclaim_notifications(db)
+        if notice["level"] == "info"
+    ]
+    assert len(notices) == 1
+    assert "标签：capacity-reclaimed, hold" in notices[0]["message"]
+    assert "Archive Me" in notices[0]["message"]
+
+
+def test_tag_pending_keeps_lease_when_add_tags_fails_after_delete(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+
+    class AddTagsFailExecutor(RecordingExecutor):
+        def qbt_post(self, path, payload, *, lease_token=None):
+            if path.endswith("/addTags"):
+                self.posts.append((path, payload))
+                self.post_lease_tokens.append(lease_token)
+                raise RuntimeError("addTags unavailable")
+            return super().qbt_post(path, payload, lease_token=lease_token)
+
+    managed = tmp_path / "incomplete"
+    payload = managed / "h"
+    payload.mkdir(parents=True)
+    (payload / "part").write_bytes(b"x" * 8192)
+    allocated = 8192
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    _capacity_health(db, "h")
+    candidate = {
+        **_snapshot("h", content_path="/downloads/incomplete/h")["h"],
+        "state": "stoppedDL",
+    }
+    executor = AddTagsFailExecutor({"h": candidate})
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        disk_free_bytes=lambda _path: 0,
+        min_reclaimable_age_sec=3_600,
+        min_reclaim_bytes=1,
+        notification_chat_ids=["100"],
+        now=lambda: 5_000,
+    )
+
+    result = reclaimer.run(
+        {"h": candidate},
+        assessment=_assessment(),
+        capacity_state="capacity_deadlock",
+        free_bytes=0,
+        target_free_bytes=10_000,
+    )
+
+    row = _capacity_reclaim_rows(db)[0]
+    assert row["state"] == "tag_pending"
+    assert str(row["recheck_error"]).startswith("post_reclaim_tag_failed:")
+    assert result.reclaimed == 0
+    assert result.reclaimed_bytes >= allocated
+    assert "h" in executor.hash_mutation_leases
+    assert not any(
+        "addTags unavailable" in str(error) for error in result.errors
+    )
+    assert not payload.exists()
+    assert not any(
+        notice["level"] == "info"
+        for notice in _capacity_reclaim_notifications(db)
+    )
+    warnings = [
+        notice
+        for notice in _capacity_reclaim_notifications(db)
+        if notice["level"] == "warning"
+    ]
+    assert len(warnings) == 1
+    assert json.loads(warnings[0]["payload_json"])["reason"] == (
+        "post_reclaim_tag_failed"
+    )
+
+
 CAPACITY_RECLAIM_TRIGGER_NAMES = (
     "trg_capacity_reclaim_lock_job_insert",
     "trg_capacity_reclaim_lock_job_update",
