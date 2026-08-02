@@ -1021,6 +1021,24 @@ def migration_sql() -> list[str]:
         "and not exists (select 1 from schema_migrations where version=22)",
         "insert or ignore into schema_migrations(version,name,applied_at) "
         "values(22,'torrent_name_and_batch_summary_v1',strftime('%s','now'))",
+        # Migration 23: persistent Telegram panel + suppress all-stopped storm leftovers.
+        "create table if not exists telegram_panel_session("
+        "id integer primary key check(id=1),"
+        "chat_id text not null,"
+        "message_id integer,"
+        "current_route text not null default 'n:h',"
+        "last_render_hash text,"
+        "last_refreshed_at integer,"
+        "updated_at integer not null)",
+        "delete from bot_warning_inbox "
+        "where warning_key='daemon_task:scheduler:all_stopped' "
+        "or topic='scheduler_all_stopped'",
+        "update bot_notifications set state='suppressed', next_run_at=null, "
+        "updated_at=strftime('%s','now') "
+        "where topic='scheduler_all_stopped' "
+        "and state in ('queued','retry_wait','running')",
+        "insert or ignore into schema_migrations(version,name,applied_at) "
+        "values(23,'telegram_persistent_panel_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

@@ -9,7 +9,6 @@ from .observability import redact
 from .runtime import BotNotificationRepository
 
 
-STOPPED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "stopped"}
 GIB = 1024**3
 MIB = 1024**2
 
@@ -36,23 +35,6 @@ class CapacityReclaimAlertContext:
     assessment_generation: int
     capacity_pressure_remaining: bool
     post_reclaim_free_bytes: int | None
-
-
-def _tags(torrent: Mapping[str, Any]) -> set[str]:
-    return {p.strip() for p in str(torrent.get("tags") or "").split(",") if p.strip()}
-
-
-def _is_managed(torrent: Mapping[str, Any]) -> bool:
-    tags = _tags(torrent)
-    return (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
-
-
-def _is_running_download(torrent: Mapping[str, Any]) -> bool:
-    return (
-        str(torrent.get("state") or "").lower() not in STOPPED_STATES
-        and int(torrent.get("amount_left") or 0) > 0
-        and float(torrent.get("progress") or 0) < 1.0
-    )
 
 
 def _fmt_gib(value: int) -> str:
@@ -99,24 +81,8 @@ class SchedulerAlertService:
         now = int(self.now())
         bucket = now // max(1, int(self.config.interval_sec))
         enqueued: list[int] = []
-        managed_incomplete = [dict(t, hash=str(t.get("hash") or h)) for h, t in snapshots.items() if _is_managed(t) and int(t.get("amount_left") or 0) > 0]
-        running = [t for t in managed_incomplete if _is_running_download(t)]
-        selected = list(getattr(planner_result, "selected_hashes", []) or [])
-        if sync_healthy and managed_incomplete and not running and not selected:
-            enqueued.extend(
-                self._broadcast(
-                    topic="scheduler_all_stopped",
-                    level="warning",
-                    message=(
-                        "qBT Orchestrator: all managed downloads are stopped; "
-                        f"managed={len(managed_incomplete)} free={_fmt_gib(int(free_bytes))} "
-                        f"mode={getattr(planner_result, 'mode', 'unknown')} budget={_fmt_gib(int(getattr(planner_result, 'budget_bytes', 0) or 0))}"
-                    ),
-                    payload={"managed_incomplete": len(managed_incomplete), "free_bytes": int(free_bytes), "mode": getattr(planner_result, "mode", "unknown")},
-                    dedupe_topic="all_stopped",
-                    bucket=bucket,
-                )
-            )
+        # scheduler_all_stopped is intentionally not projected to Telegram or
+        # WarningInbox; the home panel surfaces it as natural-language condition.
 
         disk_margin = max(0, int(self.config.disk_alert_margin_bytes))
         level: str | None = None
@@ -269,9 +235,7 @@ class SchedulerAlertService:
     def _broadcast(self, *, topic: str, level: str, message: str, payload: dict[str, Any], dedupe_topic: str, bucket: int) -> list[int]:
         safe_message = str(redact(message))
         if self.warning_service is not None and level in {"warning", "error", "critical"}:
-            if topic == "scheduler_all_stopped":
-                warning_key = "daemon_task:scheduler:all_stopped"
-            elif topic == "disk_threshold":
+            if topic == "disk_threshold":
                 state = str(payload.get("state") or dedupe_topic)
                 warning_key = (
                     "capacity:no_safe_reclaim"

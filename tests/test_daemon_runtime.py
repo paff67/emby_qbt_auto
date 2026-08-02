@@ -2060,13 +2060,27 @@ def test_daemon_runtime_enqueues_proactive_telegram_alerts_for_all_stopped_and_n
 
         con = sqlite3.connect(db)
         con.row_factory = sqlite3.Row
-        rows = [dict(r) for r in con.execute("select chat_id,topic,level,message,state from bot_notifications order by id")]
+        rows = [
+            dict(r)
+            for r in con.execute(
+                "select chat_id,topic,level,message,state from bot_notifications order by id"
+            )
+        ]
+        warn_rows = [
+            dict(r)
+            for r in con.execute(
+                "select warning_key,topic from bot_warning_inbox "
+                "where warning_key='daemon_task:scheduler:all_stopped' "
+                "or topic='scheduler_all_stopped'"
+            )
+        ]
         con.close()
         assert [(r["chat_id"], r["topic"], r["level"], r["state"]) for r in rows] == [
-            ("12345", "scheduler_all_stopped", "warning", "queued"),
             ("12345", "disk_threshold", "warning", "queued"),
         ]
-        assert "free=" in rows[1]["message"]
+        assert "free=" in rows[0]["message"]
+        assert not any(r["topic"] == "scheduler_all_stopped" for r in rows)
+        assert warn_rows == []
 
 
 class FakeTelegramService:

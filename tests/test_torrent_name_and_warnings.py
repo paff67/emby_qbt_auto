@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from qbt_orchestrator.alerts import SchedulerAlertConfig, SchedulerAlertService
 from qbt_orchestrator.db import migrate, readonly_connect, write_execute
-from qbt_orchestrator.planner import DownloadPlanner
+from qbt_orchestrator.planner import DownloadPlanner, PlannerResult
+from qbt_orchestrator.runtime import BotNotificationRepository
 from qbt_orchestrator.telegram_ui import DashboardRepository, TelegramPanelRenderer
-from qbt_orchestrator.warning_inbox import WarningInboxRepository
+from qbt_orchestrator.warning_inbox import WarningInboxRepository, WarningService
 from tests.fakes import FakeExecutor
 
 
@@ -159,3 +161,57 @@ def test_warning_detail_opens_beyond_recent_page(tmp_path):
 
     missing = router._warning_detail(999999, 1, 42)
     assert "该警告已不存在或无法读取" in missing.text
+
+
+def test_scheduler_all_stopped_does_not_write_inbox_or_notifications(tmp_path):
+    db = tmp_path / "stopped.sqlite"
+    migrate(db)
+    warnings = WarningService(db, admin_chat_id="7", now=lambda: 100)
+    repo = BotNotificationRepository(db, now=lambda: 100)
+    alerts = SchedulerAlertService(
+        repo,
+        SchedulerAlertConfig(enabled=True, chat_ids=["7"], interval_sec=60),
+        now=lambda: 100,
+        warning_service=warnings,
+    )
+    snapshots = {
+        f"h{i}": {
+            "hash": f"h{i}",
+            "category": "auto",
+            "tags": "auto",
+            "state": "stoppedDL",
+            "amount_left": 10,
+            "progress": 0.1,
+        }
+        for i in range(25)
+    }
+    result = PlannerResult(
+        selected_hashes=[],
+        paused_hashes=[],
+        conservative=False,
+        budget_bytes=0,
+        mode="normal",
+    )
+    alerts.evaluate_and_enqueue(
+        snapshots=snapshots,
+        free_bytes=20 * 1024**3,
+        disk_floor_bytes=3 * 1024**3,
+        recovery_enter_bytes=4 * 1024**3,
+        emergency_floor_bytes=2 * 1024**3,
+        planner_result=result,
+        sync_healthy=True,
+    )
+    con = readonly_connect(db)
+    try:
+        notes = con.execute(
+            "select count(*) from bot_notifications where topic='scheduler_all_stopped'"
+        ).fetchone()[0]
+        inbox = con.execute(
+            "select count(*) from bot_warning_inbox "
+            "where warning_key='daemon_task:scheduler:all_stopped' "
+            "or topic='scheduler_all_stopped'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert int(notes) == 0
+    assert int(inbox) == 0
