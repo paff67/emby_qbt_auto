@@ -119,6 +119,101 @@ def test_telegram_router_submit_and_cancel_callbacks(tmp_path):
     assert submitted["state"] in {"queued", "processing", "complete", "awaiting_confirmation"}
 
 
+def test_stale_draft_cancel_after_submit_is_rejected(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(db)
+    draft = queue.open_draft("7", "42")
+    magnet = "magnet:?" + "xt=urn:btih:" + ("d" * 40)
+    queue.append_message(int(draft["id"]), 11, [magnet])
+    draft = queue.get_batch(int(draft["id"]))
+    stale_gen = int(draft["updated_at"])
+    submitted = queue.submit_draft(int(draft["id"]), stale_gen)
+    assert submitted["state"] == "queued"
+
+    # Replaying the old cancel button must not cancel a submitted batch.
+    import pytest
+
+    with pytest.raises(ValueError, match="^draft_generation_conflict$"):
+        queue.cancel_draft(int(draft["id"]), stale_gen, actor="42")
+    assert queue.get_batch(int(draft["id"]))["state"] == "queued"
+
+    api = FakeApi()
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        add_queue=queue,
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    router.handle_update(
+        {
+            "update_id": 3,
+            "callback_query": {
+                "id": "cb-stale",
+                "from": {"id": 42},
+                "message": {"message_id": 6, "chat": {"id": 7}},
+                "data": f"a:c:{draft['id']}:{stale_gen}",
+            },
+        }
+    )
+    assert queue.get_batch(int(draft["id"]))["state"] == "queued"
+    assert any("草稿已变化" in text for _, text, _ in api.messages)
+
+
+def test_item_cancel_qbt_write_fenced_keeps_needs_confirmation(tmp_path):
+    from qbt_orchestrator.db import write_execute
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(db)
+    draft = queue.open_draft("7", "42")
+    magnet = "magnet:?" + "xt=urn:btih:" + ("e" * 40)
+    queue.append_message(int(draft["id"]), 1, [magnet])
+    batch = queue.submit(int(draft["id"]))
+    item = queue.list_items(int(batch["id"]))[0]
+    write_execute(
+        db,
+        "update bot_add_items set state='needs_confirmation',qbt_hash=?,"
+        "qbt_precheck_tag='tag-e',approval_generation=1,updated_at=updated_at+1 "
+        "where id=?",
+        ("a" * 40, int(item["id"])),
+    )
+    item = queue.get_item(int(item["id"]))
+
+    class FencedCheckedAdd:
+        def cancel(self, item_id, actor, approval_generation):
+            raise ValueError("qbt_write_fenced")
+
+        def approve_hold(self, *args, **kwargs):
+            raise AssertionError("unused")
+
+    api = FakeApi()
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        add_queue=queue,
+        checked_add=FencedCheckedAdd(),
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    router.handle_update(
+        {
+            "update_id": 4,
+            "callback_query": {
+                "id": "cb-x",
+                "from": {"id": 42},
+                "message": {"message_id": 7, "chat": {"id": 7}},
+                "data": f"i:x:{item['id']}:{item['approval_generation']}",
+            },
+        }
+    )
+    assert queue.get_item(int(item["id"]))["state"] == "needs_confirmation"
+    assert any("写入被保护" in text for _, text, _ in api.messages)
+
+
 def test_telegram_router_rejects_torrent_documents(tmp_path):
     db = tmp_path / "state.sqlite"
     migrate(db)

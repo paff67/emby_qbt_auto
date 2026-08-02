@@ -422,6 +422,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         metadata_probe_coordinator = MetadataProbeCoordinator(
             BotAddQueueRepository(state_db),
             QbtPrecheckGateway(qbt, executor),
+            notifications=BotNotificationRepository(state_db),
         )
     checked_add_enabled = (
         _truthy(os.environ.get("QBT_ORCH_CHECKED_ADD_ENABLED")) is True
@@ -1011,6 +1012,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             p.add_argument("--now", type=int, default=None)
     md = sub.add_parser("manual-media-delete")
     md.add_argument("--state-db", default="/var/lib/qbt-orchestrator/state.sqlite")
+    md.add_argument("--config", default=None)
     md.add_argument("--id", required=True)
     md.add_argument("--actor", required=True)
     md.add_argument("--reason", default="manual_media_delete")
@@ -1061,11 +1063,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not ns.remote_path:
             raise SystemExit("--remote-path is required and must be an exact ID directory or file under it")
         migrate(db, False)
-        cfg = load_config(ns.config) if ns.config else None
+        cfg = load_config(ns.config) if getattr(ns, "config", None) else None
         rclone_cfg = cfg.rclone if cfg else None
         emby_cfg = cfg.emby if cfg else None
         trash_remote = os.environ.get("QBT_ORCH_MANUAL_DELETE_TRASH_REMOTE", "gcrypt-trash:")
-        mount_root = os.environ.get("QBT_ORCH_MANUAL_DELETE_MOUNT_ROOT", "/media/gcrypt")
+        mount_root = os.environ.get(
+            "QBT_ORCH_MANUAL_DELETE_MOUNT_ROOT",
+            (emby_cfg.container_media_prefix if emby_cfg else "/media/gcrypt"),
+        )
         rclone = RcloneClient(
             config_path=rclone_cfg.config if rclone_cfg else "/root/.config/rclone/rclone.conf",
             transfers=1,
@@ -1073,10 +1078,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         from .integrations.emby import EmbyClient
 
-        emby = EmbyClient(
-            base_url=(emby_cfg.base_url if emby_cfg else os.environ.get("QBT_ORCH_EMBY_URL", "")),
-            api_key=(emby_cfg.api_key if emby_cfg else os.environ.get("QBT_ORCH_EMBY_API_KEY", "")),
+        # Prefer daemon env names; keep legacy QBT_ORCH_* as fallback.
+        emby_base = (
+            os.environ.get("EMBY_BASE_URL")
+            or os.environ.get("QBT_ORCH_EMBY_URL")
+            or ""
         )
+        emby_key = (
+            os.environ.get("EMBY_API_KEY")
+            or os.environ.get("QBT_ORCH_EMBY_API_KEY")
+            or ""
+        )
+        emby = EmbyClient(base_url=emby_base, api_key=emby_key)
         admin_chat = os.environ.get("QBT_ORCH_TG_ADMIN_CHAT") or os.environ.get("QBT_ORCH_TG_ADMIN_ID")
         service = ManualMediaDeleteService(
             db,

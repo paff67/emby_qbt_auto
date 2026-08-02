@@ -4,7 +4,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol
-from urllib.parse import urlsplit
 
 from .db import readonly_connect, write_transaction
 from .observability import redact
@@ -12,6 +11,9 @@ from .processed_media import ProcessedMediaRepository
 
 
 class DriveTrashAdapter(Protocol):
+    def planned_trash_path(self, remote_dir: str) -> str:
+        """Return the deterministic trash destination for remote_dir."""
+
     def trash_exact_directory(self, remote_dir: str) -> str:
         """Move an exact remote directory into the trash remote; return trash path."""
 
@@ -79,13 +81,25 @@ class RcloneDriveTrashAdapter:
         self.rclone = rclone
         self.trash_remote = str(trash_remote).rstrip(":") + ":"
 
-    def trash_exact_directory(self, remote_dir: str) -> str:
+    def planned_trash_path(self, remote_dir: str) -> str:
         source = str(remote_dir).rstrip("/")
         basename = PurePosixPath(source.split(":", 1)[-1]).name
         if not basename:
             raise ValueError("remote_path_invalid")
-        target = f"{self.trash_remote}{basename}"
-        self.rclone.moveto(source, target)
+        return f"{self.trash_remote}{basename}"
+
+    def trash_exact_directory(self, remote_dir: str) -> str:
+        source = str(remote_dir).rstrip("/")
+        target = self.planned_trash_path(source)
+        source_exists = self.rclone.stat(source) is not None
+        target_exists = self.rclone.stat(target) is not None
+        if source_exists and not target_exists:
+            self.rclone.moveto(source, target)
+        elif (not source_exists) and target_exists:
+            # Crash window after a successful move: treat as already completed.
+            pass
+        else:
+            raise RuntimeError("remote_trash_conflict")
         return target
 
 
@@ -161,10 +175,19 @@ class ManualMediaDeleteService:
                 deletion_manifest=deletion_manifest,
                 create_if_missing=create_if_missing,
             )
-            self._save_stage(nid, "pending", {"remote_dir": exact_dir})
+            saved = self._load_payload(nid)
+            remote_dir = str(saved.get("remote_dir") or exact_dir)
+            trash_path = str(saved.get("trash_path") or "")
+            if not trash_path:
+                trash_path = self.drive_trasher.planned_trash_path(remote_dir)
+            # Persist the exact move intent before any external side effect.
+            saved = self._save_stage(
+                nid, "pending", {"remote_dir": remote_dir, "trash_path": trash_path}
+            )
             stage = "pending"
+        else:
+            saved = self._load_payload(nid)
 
-        saved = self._load_payload(nid)
         # Resume must reuse the persisted exact directory; never re-guess.
         remote_dir = str(saved.get("remote_dir") or exact_dir)
         if PurePosixPath(remote_dir.split(":", 1)[-1]).name.casefold() != nid.casefold():
@@ -172,16 +195,31 @@ class ManualMediaDeleteService:
 
         try:
             if stage == "pending":
-                trash_path = self.drive_trasher.trash_exact_directory(remote_dir)
-                self._save_stage(
-                    nid, "remote_trashed", {"remote_dir": remote_dir, "trash_path": trash_path}
+                trash_path = str(
+                    saved.get("trash_path")
+                    or self.drive_trasher.planned_trash_path(remote_dir)
+                )
+                if not saved.get("trash_path"):
+                    saved = self._save_stage(
+                        nid,
+                        "pending",
+                        {"remote_dir": remote_dir, "trash_path": trash_path},
+                    )
+                moved_to = self.drive_trasher.trash_exact_directory(remote_dir)
+                saved = self._save_stage(
+                    nid,
+                    "remote_trashed",
+                    {
+                        "remote_dir": remote_dir,
+                        "trash_path": str(moved_to or trash_path),
+                    },
                 )
                 stage = "remote_trashed"
             if stage == "remote_trashed":
                 mount_path = self.mount_path_for_id(nid)
                 if self.mount_checker.path_exists(mount_path):
                     raise RuntimeError("mount_path_still_present")
-                self._save_stage(
+                saved = self._save_stage(
                     nid,
                     "mount_absent",
                     {
@@ -194,11 +232,19 @@ class ManualMediaDeleteService:
             if stage == "mount_absent":
                 mount_path = str(saved.get("mount_path") or self.mount_path_for_id(nid))
                 self.emby_cleaner.refresh_normalized_id(nid, mount_path)
-                self._save_stage(nid, "emby_refreshed", saved)
+                saved = self._save_stage(
+                    nid,
+                    "emby_refreshed",
+                    {
+                        "remote_dir": remote_dir,
+                        "trash_path": saved.get("trash_path"),
+                        "mount_path": mount_path,
+                    },
+                )
                 stage = "emby_refreshed"
             if stage == "emby_refreshed":
                 final = self.processed_media.finalize_manual_delete(nid, actor_id=actor_id)
-                self._save_stage(nid, "manual_deleted", saved)
+                saved = self._save_stage(nid, "manual_deleted", saved)
                 return ManualDeleteResult(
                     normalized_id=nid,
                     ok=True,
@@ -238,23 +284,9 @@ class ManualMediaDeleteService:
             )
 
     def _load_stage(self, normalized_id: str) -> str | None:
-        con = readonly_connect(self.state_db)
-        try:
-            row = con.execute(
-                "select payload_json from processed_media_events "
-                "where processed_media_id=(select id from processed_media where normalized_id=? collate nocase) "
-                "and event_type='manual_delete_stage' order by id desc limit 1",
-                (normalized_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            import json
-
-            payload = json.loads(row["payload_json"] or "{}")
-            stage = str(payload.get("stage") or "")
-            return stage if stage in _STAGE_ORDER else None
-        finally:
-            con.close()
+        payload = self._load_payload(normalized_id)
+        stage = str(payload.get("stage") or "")
+        return stage if stage in _STAGE_ORDER else None
 
     def _load_payload(self, normalized_id: str) -> dict[str, Any]:
         con = readonly_connect(self.state_db)
@@ -274,7 +306,9 @@ class ManualMediaDeleteService:
         finally:
             con.close()
 
-    def _save_stage(self, normalized_id: str, stage: str, payload: dict[str, Any]) -> None:
+    def _save_stage(
+        self, normalized_id: str, stage: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         import json
 
         now = int(self.now())
@@ -303,3 +337,4 @@ class ManualMediaDeleteService:
             )
 
         write_transaction(self.state_db, txn)
+        return body

@@ -71,6 +71,47 @@ def test_telegram_ui_pagination_and_limits(state_db, count):
         assert "下一页" not in page0.text
 
 
+def test_queue_detail_renders_item_action_buttons(state_db):
+    write_execute(
+        state_db,
+        "insert into bot_add_batches("
+        "batch_key,chat_id,user_id,state,received_count,confirmation_count,"
+        "created_at,updated_at) values(?,?,?,?,?,?,?,?)",
+        ("b-detail", "1", "1", "awaiting_confirmation", 2, 1, 1, 1),
+    )
+    write_execute(
+        state_db,
+        "insert into bot_add_items("
+        "batch_id,source_message_id,source_index,input_kind,redacted_input,input_sha256,"
+        "canonical_identity,state,approval_generation,normalized_media_id,created_at,updated_at) "
+        "values(1,1,0,'magnet','redacted-1','sha-1','id-1','needs_confirmation',1,'SONE-1',1,1)",
+    )
+    write_execute(
+        state_db,
+        "insert into bot_add_items("
+        "batch_id,source_message_id,source_index,input_kind,redacted_input,input_sha256,"
+        "canonical_identity,state,approval_generation,created_at,updated_at) "
+        "values(1,1,1,'magnet','redacted-2','sha-2','id-2','metadata_unavailable',2,1,1)",
+    )
+    view = TelegramPanelRenderer(DashboardRepository(state_db)).render_queue_detail(1)
+    callbacks = {
+        btn["callback_data"]
+        for row in view.reply_markup["inline_keyboard"]
+        for btn in row
+        if "callback_data" in btn
+    }
+    assert "i:y:1:1" in callbacks
+    assert "i:x:1:1" in callbacks
+    assert "i:r:2:2" in callbacks
+    assert "i:x:2:2" in callbacks
+    queue = TelegramPanelRenderer(DashboardRepository(state_db)).render_queue(0)
+    assert any(
+        btn.get("text", "").startswith("查看批次")
+        for row in queue.reply_markup["inline_keyboard"]
+        for btn in row
+    )
+
+
 def test_copy_summary_button_limit(state_db):
     write_execute(
         state_db,

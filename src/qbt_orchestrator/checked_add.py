@@ -1231,18 +1231,33 @@ class CheckedAddService:
             return
         batch = self.repository.get_batch(int(item["batch_id"]))
         generation = int(item["approval_generation"])
+        item_id = int(item["id"])
         self.notifications.enqueue_with_status(
             batch["chat_id"],
             "download_confirmation",
             "检查完成，需要你确认；当前任务保持暂停。",
             level="warning",
             payload={
-                "item_id": int(item["id"]),
+                "item_id": item_id,
                 "approval_generation": generation,
                 "normalized_media_id": item.get("normalized_media_id"),
                 "primary_video_size": item.get("primary_video_size"),
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "确认并暂缓",
+                                "callback_data": f"i:y:{item_id}:{generation}",
+                            },
+                            {
+                                "text": "取消",
+                                "callback_data": f"i:x:{item_id}:{generation}",
+                            },
+                        ]
+                    ]
+                },
             },
-            dedupe_key=f"checked-add-confirm:{int(item['id'])}:{generation}",
+            dedupe_key=f"checked-add-confirm:{item_id}:{generation}",
         )
 
     def _items_in_states(self, states: set[str], limit: int) -> list[dict[str, Any]]:

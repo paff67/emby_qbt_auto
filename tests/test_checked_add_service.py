@@ -505,6 +505,8 @@ def test_expired_raw_input_does_not_block_owned_precheck_validation(tmp_path):
 
 
 def test_confirmation_notification_is_deduplicated_by_item_generation(tmp_path):
+    import json
+
     from qbt_orchestrator.runtime import BotNotificationRepository
 
     queue, _gateway, service, item_id = _fixture(
@@ -520,6 +522,14 @@ def test_confirmation_notification_is_deduplicated_by_item_generation(tmp_path):
     rows = notifications.list_all()
     assert len(rows) == 1
     assert rows[0]["dedupe_key"] == "checked-add-confirm:1:1"
+    payload = json.loads(rows[0]["payload_json"])
+    buttons = [
+        btn["callback_data"]
+        for row in payload["reply_markup"]["inline_keyboard"]
+        for btn in row
+    ]
+    assert f"i:y:{item_id}:1" in buttons
+    assert f"i:x:{item_id}:1" in buttons
 
 
 def test_daemon_checked_add_hook_uses_current_sync_health(tmp_path):

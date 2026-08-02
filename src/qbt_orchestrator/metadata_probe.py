@@ -45,12 +45,14 @@ class MetadataProbeCoordinator:
         config: MetadataProbeConfig | None = None,
         owner: str | None = None,
         now: Callable[[], int] | None = None,
+        notifications=None,
     ) -> None:
         self.repository = repository
         self.gateway = gateway
         self.config = config or MetadataProbeConfig()
         self.owner = str(owner or f"metadata-probe-{uuid.uuid4().hex}")
         self.now = now or (lambda: int(time.time()))
+        self.notifications = notifications
 
     def tick(
         self,
@@ -119,7 +121,7 @@ class MetadataProbeCoordinator:
         raw_expires_at = int(raw.get("raw_input_expires_at") or 0)
         if raw_expires_at < deadline:
             try:
-                self.repository.transition_item(
+                unavailable = self.repository.transition_item(
                     item_id,
                     {"waiting_probe_slot", "metadata_retry_wait"},
                     "metadata_unavailable",
@@ -128,6 +130,7 @@ class MetadataProbeCoordinator:
                     metadata_lease_owner=self.owner,
                     metadata_lease_generation=generation,
                 )
+                self._notify_metadata_unavailable(unavailable)
                 result["errors"] = int(result["errors"]) + 1
             except Exception:
                 self._safe_release(item_id, token)
@@ -412,7 +415,7 @@ class MetadataProbeCoordinator:
                         "next_run_at": None,
                     }
                 )
-                self.repository.transition_item(
+                unavailable = self.repository.transition_item(
                     item_id,
                     {"metadata_wait"},
                     "metadata_unavailable",
@@ -421,9 +424,45 @@ class MetadataProbeCoordinator:
                     metadata_lease_owner=token[0],
                     metadata_lease_generation=token[1],
                 )
+                self._notify_metadata_unavailable(unavailable)
             result["timed_out"].append(item_id)
         except Exception:
             self._record_failure(item_id, token, now, result)
+
+    def _notify_metadata_unavailable(self, item: Mapping[str, Any]) -> None:
+        if self.notifications is None:
+            return
+        try:
+            batch = self.repository.get_batch(int(item["batch_id"]))
+            generation = int(item["approval_generation"])
+            item_id = int(item["id"])
+            self.notifications.enqueue_with_status(
+                batch["chat_id"],
+                "metadata_unavailable",
+                "暂时无法获取元数据。可立即重试，或取消该条目。",
+                level="warning",
+                payload={
+                    "item_id": item_id,
+                    "approval_generation": generation,
+                    "reply_markup": {
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "立即重试",
+                                    "callback_data": f"i:r:{item_id}:{generation}",
+                                },
+                                {
+                                    "text": "取消",
+                                    "callback_data": f"i:x:{item_id}:{generation}",
+                                },
+                            ]
+                        ]
+                    },
+                },
+                dedupe_key=f"metadata-unavailable:{item_id}:{generation}",
+            )
+        except Exception:
+            return
 
     def _schedule_poll(
         self,

@@ -23,6 +23,24 @@ _BATCH_STATE_ZH = {
     "draft_expired": "草稿已过期",
 }
 
+_ITEM_STATE_ZH = {
+    "received": "已接收",
+    "resolving": "解析中",
+    "waiting_probe_slot": "等待元数据槽位",
+    "metadata_wait": "获取元数据中",
+    "metadata_retry_wait": "等待元数据重试",
+    "metadata_unavailable": "元数据不可用",
+    "prechecking": "预检查中",
+    "needs_confirmation": "等待确认",
+    "enrolling": "入库中",
+    "enrolled": "已入库",
+    "enrolled_hold": "已确认暂缓",
+    "duplicate_local": "本地重复",
+    "failed": "失败",
+    "cancelled": "已取消",
+    "invalid": "无效",
+}
+
 
 @dataclass(frozen=True)
 class PanelView:
@@ -174,6 +192,28 @@ class DashboardRepository:
             con.close()
         return [dict(row) for row in rows], int(total or 0)
 
+    def queue_detail(self, batch_id: int) -> dict[str, Any] | None:
+        con = readonly_connect(self.state_db)
+        try:
+            batch = con.execute(
+                "select id,state,received_count,enrolled_count,duplicate_count,"
+                "confirmation_count,failed_count,blocked_history_count,updated_at "
+                "from bot_add_batches where id=?",
+                (int(batch_id),),
+            ).fetchone()
+            if batch is None:
+                return None
+            items = list(
+                con.execute(
+                    "select id,state,approval_generation,normalized_media_id,last_error "
+                    "from bot_add_items where batch_id=? order by id",
+                    (int(batch_id),),
+                )
+            )
+        finally:
+            con.close()
+        return {"batch": dict(batch), "items": [dict(row) for row in items]}
+
     def warning_pages(self, *, page: int = 0) -> tuple[list[dict[str, Any]], int]:
         offset = max(0, int(page)) * PAGE_SIZE
         con = readonly_connect(self.state_db)
@@ -245,6 +285,7 @@ class TelegramPanelRenderer:
     def render_queue(self, page: int = 0) -> PanelView:
         rows, total = self.dashboard.queue_pages(page=page)
         lines = ["添加队列", f"第 {page + 1} 页"]
+        buttons: list[list[dict[str, Any]]] = []
         if not rows:
             lines.append("当前没有批次。")
         for row in rows:
@@ -255,13 +296,94 @@ class TelegramPanelRenderer:
                 f"确认{row['confirmation_count']} 失败{row['failed_count']} "
                 f"历史拦截{row.get('blocked_history_count') or 0}"
             )
+            buttons.append(
+                [
+                    _btn(
+                        f"查看批次 {row['id']}",
+                        encode_callback(["n", "b", str(row["id"])]),
+                    )
+                ]
+            )
         text = _clip_body("\n".join(lines))
         nav = [_btn("首页", encode_callback(["n", "h"]))]
         if page > 0:
             nav.append(_btn("上一页", encode_callback(["n", "q", str(page - 1)])))
         if (page + 1) * PAGE_SIZE < total:
             nav.append(_btn("下一页", encode_callback(["n", "q", str(page + 1)])))
-        return PanelView(text=text, reply_markup={"inline_keyboard": [nav]})
+        buttons.append(nav)
+        return PanelView(text=text, reply_markup={"inline_keyboard": buttons})
+
+    def render_queue_detail(self, batch_id: int) -> PanelView:
+        detail = self.dashboard.queue_detail(batch_id)
+        if detail is None:
+            return PanelView(
+                text="未找到该批次。",
+                reply_markup={
+                    "inline_keyboard": [
+                        [_btn("返回队列", encode_callback(["n", "q", "0"]))]
+                    ]
+                },
+            )
+        batch = detail["batch"]
+        state_zh = _BATCH_STATE_ZH.get(str(batch["state"]), "处理中")
+        lines = [
+            f"批次 {batch['id']}（{state_zh}）",
+            (
+                f"收到{batch['received_count']} 入库{batch['enrolled_count']} "
+                f"重复{batch['duplicate_count']} 确认{batch['confirmation_count']} "
+                f"失败{batch['failed_count']} 历史拦截{batch.get('blocked_history_count') or 0}"
+            ),
+            "",
+            "条目：",
+        ]
+        buttons: list[list[dict[str, Any]]] = []
+        items = detail["items"]
+        if not items:
+            lines.append("暂无条目。")
+        for item in items[:12]:
+            item_id = int(item["id"])
+            generation = int(item.get("approval_generation") or 0)
+            item_state = str(item.get("state") or "")
+            item_zh = _ITEM_STATE_ZH.get(item_state, item_state or "未知")
+            media = str(item.get("normalized_media_id") or "").strip()
+            label = f"#{item_id} {item_zh}"
+            if media:
+                label += f" {media}"
+            lines.append(label)
+            if item_state == "needs_confirmation":
+                buttons.append(
+                    [
+                        _btn(
+                            f"确认并暂缓 #{item_id}",
+                            encode_callback(["i", "y", str(item_id), str(generation)]),
+                        ),
+                        _btn(
+                            f"取消 #{item_id}",
+                            encode_callback(["i", "x", str(item_id), str(generation)]),
+                        ),
+                    ]
+                )
+            elif item_state == "metadata_unavailable":
+                buttons.append(
+                    [
+                        _btn(
+                            f"立即重试 #{item_id}",
+                            encode_callback(["i", "r", str(item_id), str(generation)]),
+                        ),
+                        _btn(
+                            f"取消 #{item_id}",
+                            encode_callback(["i", "x", str(item_id), str(generation)]),
+                        ),
+                    ]
+                )
+        text = _clip_body("\n".join(lines))
+        buttons.append(
+            [
+                _btn("返回队列", encode_callback(["n", "q", "0"])),
+                _btn("首页", encode_callback(["n", "h"])),
+            ]
+        )
+        return PanelView(text=text, reply_markup={"inline_keyboard": buttons})
 
     def render_warnings(self, page: int = 0) -> PanelView:
         rows, total = self.dashboard.warning_pages(page=page)

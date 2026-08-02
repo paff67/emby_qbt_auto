@@ -212,6 +212,12 @@ class TelegramUpdateRouter:
             "source_message_conflict": "该消息内容与已记录内容不一致",
             "global_backlog_limit": "全局待处理队列已满",
             "empty_batch": "草稿为空，无法提交",
+            "draft_generation_conflict": "草稿已变化或已提交，请刷新后重试",
+            "item_not_cancellable": "当前条目状态不允许取消",
+            "qbt_write_fenced": "下载服务写入被保护，条目状态未改变",
+            "approval_generation_conflict": "确认信息已过期，请从队列详情重新操作",
+            "checked_add_unavailable": "确认服务未启用",
+            "add_queue_unavailable": "添加队列未配置",
         }
         return mapping.get(code, str(redact(code))[:180])
 
@@ -258,6 +264,8 @@ class TelegramUpdateRouter:
                 view = self.renderer.render_status(int(parts[2]))
             elif parts[0] == "n" and parts[1] == "q":
                 view = self.renderer.render_queue(int(parts[2]))
+            elif parts[0] == "n" and parts[1] == "b":
+                view = self.renderer.render_queue_detail(int(parts[2]))
             elif parts[0] == "n" and parts[1] == "w":
                 view = self.renderer.render_warnings(int(parts[2]))
             elif parts[0] == "a" and parts[1] == "o":
@@ -313,18 +321,17 @@ class TelegramUpdateRouter:
         ):
             self.api.send_message(chat_id, "无权操作该草稿")
             return
-        if int(batch.get("updated_at") or 0) != expected_gen and str(batch.get("state")) == "draft":
-            self.api.send_message(chat_id, "草稿已变化，请重新打开后再操作")
-            return
         try:
             if parts[1] == "s":
-                result = self.add_queue.submit(batch_id)
+                result = self.add_queue.submit_draft(batch_id, expected_gen)
                 text = (
                     f"已提交批次 {batch_id}。\n"
                     f"共 {int(result.get('received_count') or 0)} 个链接进入检查队列。"
                 )
             else:
-                result = self.add_queue.cancel_batch(batch_id, actor=str(user_id))
+                self.add_queue.cancel_draft(
+                    batch_id, expected_gen, actor=str(user_id)
+                )
                 text = f"已取消草稿 {batch_id}。"
         except ValueError as exc:
             self.api.send_message(chat_id, self._humanize_ingress_error(exc))
@@ -350,17 +357,16 @@ class TelegramUpdateRouter:
                 self.checked_add.approve_hold(item_id, str(user_id), generation)
                 self.api.send_message(chat_id, f"已确认条目 {item_id}，将保持手动暂缓。")
             elif action == "x":
-                if self.checked_add is not None:
-                    try:
-                        self.checked_add.cancel(item_id, str(user_id), generation)
-                        self.api.send_message(chat_id, f"已取消条目 {item_id}。")
-                        return
-                    except ValueError:
-                        pass
                 if self.add_queue is None:
                     raise ValueError("add_queue_unavailable")
                 item = self.add_queue.get_item(item_id)
-                if str(item.get("state")) == "metadata_unavailable":
+                state = str(item.get("state") or "")
+                if state == "needs_confirmation":
+                    if self.checked_add is None:
+                        raise ValueError("checked_add_unavailable")
+                    # CheckedAdd owns qBT cleanup; never fall back to a bare DB cancel.
+                    self.checked_add.cancel(item_id, str(user_id), generation)
+                elif state == "metadata_unavailable":
                     self.add_queue.transition_item(
                         item_id,
                         {"metadata_unavailable"},
@@ -370,13 +376,7 @@ class TelegramUpdateRouter:
                         metadata_action="cancel",
                     )
                 else:
-                    self.add_queue.transition_item(
-                        item_id,
-                        {str(item.get("state"))},
-                        "cancelled",
-                        "cancelled_by_operator",
-                        approval_generation=generation,
-                    )
+                    raise ValueError("item_not_cancellable")
                 self.api.send_message(chat_id, f"已取消条目 {item_id}。")
             elif action == "r":
                 if self.add_queue is None:

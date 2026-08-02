@@ -418,6 +418,17 @@ class BotAddQueueRepository:
         return result
 
     def submit(self, batch_id: int) -> dict[str, Any]:
+        return self._submit_batch(batch_id, expected_updated_at=None)
+
+    def submit_draft(self, batch_id: int, expected_updated_at: int) -> dict[str, Any]:
+        """Submit only while the batch is still a draft with a matching updated_at."""
+        if isinstance(expected_updated_at, bool) or not isinstance(expected_updated_at, int):
+            raise ValueError("expected_updated_at")
+        return self._submit_batch(batch_id, expected_updated_at=int(expected_updated_at))
+
+    def _submit_batch(
+        self, batch_id: int, *, expected_updated_at: int | None
+    ) -> dict[str, Any]:
         batch_key = self._positive_id(batch_id, "batch_id")
         now = self._timestamp()
 
@@ -431,14 +442,21 @@ class BotAddQueueRepository:
                 raise ValueError("batch_not_found")
             row = self._expire_draft_row_in_transaction(con, row, now)
             state = str(row["state"])
-            if state in _IDEMPOTENT_SUBMIT_STATES:
+            if expected_updated_at is None and state in _IDEMPOTENT_SUBMIT_STATES:
                 result = self._row(row)
                 result["idempotent"] = True
                 return result
             if state == "draft_expired":
                 return {"__error__": "draft_expired"}
             if state != "draft":
+                if expected_updated_at is not None:
+                    raise ValueError("draft_generation_conflict")
                 raise ValueError("batch_not_draft")
+            if (
+                expected_updated_at is not None
+                and int(row["updated_at"] or 0) != expected_updated_at
+            ):
+                raise ValueError("draft_generation_conflict")
 
             item_ids = [
                 int(item["id"])
@@ -462,10 +480,20 @@ class BotAddQueueRepository:
                     ") values(?,?,?,?,?,?,?)",
                     (batch_key, shard_index, "queued", item_count, 0, now, now),
                 )
-            con.execute(
-                "update bot_add_batches set state='queued',submitted_at=?,updated_at=? where id=?",
-                (now, now, batch_key),
-            )
+            if expected_updated_at is None:
+                cursor = con.execute(
+                    "update bot_add_batches set state='queued',submitted_at=?,updated_at=? "
+                    "where id=? and state='draft'",
+                    (now, now, batch_key),
+                )
+            else:
+                cursor = con.execute(
+                    "update bot_add_batches set state='queued',submitted_at=?,updated_at=? "
+                    "where id=? and state='draft' and updated_at=?",
+                    (now, now, batch_key, expected_updated_at),
+                )
+            if cursor.rowcount != 1:
+                raise ValueError("draft_generation_conflict")
             self._event(
                 con,
                 batch_id=batch_key,
@@ -480,6 +508,99 @@ class BotAddQueueRepository:
                     "shard_count": (len(item_ids) + self.limits.shard_size - 1)
                     // self.limits.shard_size,
                 },
+            )
+            result = self._batch_in_transaction(con, batch_key)
+            result["idempotent"] = False
+            return result
+
+        result = dict(write_transaction(self.state_db, txn))
+        self._raise_result_error(result)
+        return result
+
+    def cancel_draft(
+        self, batch_id: int, expected_updated_at: int, actor: str
+    ) -> dict[str, Any]:
+        """Cancel only while the batch is still a draft with a matching updated_at."""
+        batch_key = self._positive_id(batch_id, "batch_id")
+        actor_id = self._identity(actor, "actor")
+        if isinstance(expected_updated_at, bool) or not isinstance(expected_updated_at, int):
+            raise ValueError("expected_updated_at")
+        expected = int(expected_updated_at)
+        now = self._timestamp()
+
+        def txn(con: sqlite3.Connection) -> dict[str, Any]:
+            self._begin_immediate(con)
+            self._expire_due_in_transaction(con, now)
+            batch = con.execute(
+                "select * from bot_add_batches where id=?", (batch_key,)
+            ).fetchone()
+            if batch is None:
+                raise ValueError("batch_not_found")
+            batch = self._expire_draft_row_in_transaction(con, batch, now)
+            state = str(batch["state"])
+            if state != "draft" or int(batch["updated_at"] or 0) != expected:
+                raise ValueError("draft_generation_conflict")
+
+            rows = list(
+                con.execute(
+                    "select id,state from bot_add_items where batch_id=? order by id",
+                    (batch_key,),
+                )
+            )
+            changed = 0
+            for item in rows:
+                old_state = str(item["state"])
+                item_id = int(item["id"])
+                if old_state not in _CANCELLABLE_ITEM_STATES:
+                    continue
+                cursor = con.execute(
+                    "update bot_add_items set state='cancelled',raw_input=null,"
+                    "raw_input_expires_at=null,metadata_probe_deadline=null,"
+                    "metadata_next_poll_at=null,metadata_retry_at=null,"
+                    "metadata_lease_owner=null,metadata_lease_until=null,"
+                    "metadata_lease_generation=metadata_lease_generation+1,"
+                    "approval_generation=approval_generation+?,next_run_at=null,"
+                    "qbt_precheck_tag=null,updated_at=? where id=? and state=?",
+                    (1 if old_state == "enrolling" else 0, now, item_id, old_state),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                changed += 1
+                self._event(
+                    con,
+                    batch_id=batch_key,
+                    item_id=item_id,
+                    event_type="state_transition",
+                    from_state=old_state,
+                    to_state="cancelled",
+                    reason="draft_cancelled",
+                    now=now,
+                    actor=actor_id,
+                )
+            con.execute(
+                "update bot_add_items set raw_input=null,raw_input_expires_at=null "
+                "where batch_id=? and raw_input is not null",
+                (batch_key,),
+            )
+            cursor = con.execute(
+                "update bot_add_batches set state='cancelled',completed_at=?,updated_at=? "
+                "where id=? and state='draft' and updated_at=?",
+                (now, now, batch_key, expected),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("draft_generation_conflict")
+            self._refresh_batch_counters(con, batch_key, now)
+            self._event(
+                con,
+                batch_id=batch_key,
+                item_id=None,
+                event_type="batch_cancelled",
+                from_state="draft",
+                to_state="cancelled",
+                reason="cancelled_by_operator",
+                now=now,
+                actor=actor_id,
+                evidence={"cancelled_item_count": changed},
             )
             result = self._batch_in_transaction(con, batch_key)
             result["idempotent"] = False
