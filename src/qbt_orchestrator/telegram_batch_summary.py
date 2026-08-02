@@ -21,18 +21,6 @@ _DELAYED_STATES = frozenset(
         "needs_confirmation",
     }
 )
-_TERMINAL_STATES = frozenset(
-    {
-        "invalid",
-        "duplicate_local",
-        "metadata_unavailable",
-        "duplicate_remote",
-        "enrolled",
-        "enrolled_hold",
-        "failed",
-        "cancelled",
-    }
-)
 
 
 def _fmt_shanghai(ts: int) -> str:
@@ -178,14 +166,13 @@ class BatchSummaryProjector:
                 return False
             if str(batch["state"]) != "complete":
                 return False
+            # Trust persisted batch.state='complete'; item states are only for counts.
             states = [
                 str(row["state"])
                 for row in con.execute(
                     "select state from bot_add_items where batch_id=?", (batch_id,)
                 )
             ]
-            if states and any(state not in _TERMINAL_STATES for state in states):
-                return False
             completed_at = int(batch["completed_at"] or now)
             failed_like = sum(
                 1 for state in states if state in {"failed", "invalid", "metadata_unavailable"}

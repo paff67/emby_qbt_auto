@@ -132,6 +132,26 @@ def test_repeat_tick_does_not_duplicate_notifications(tmp_path):
     assert int(count) == 1
 
 
+def test_final_summary_trusts_complete_even_if_item_state_looks_open(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    write_execute(db, "delete from bot_add_batches")
+    _seed_batch(db, state="complete", submitted_at=1, completed_at=2)
+    # Queue already marked the batch complete; projector must not re-gate on item state.
+    _seed_item(db, item_id=1, batch_id=1, state="ready", source_index=0)
+    projector = BatchSummaryProjector(db, now=lambda: 50)
+    assert projector.tick()["final"] == 1
+    con = readonly_connect(db)
+    try:
+        keys = [
+            row[0]
+            for row in con.execute("select dedupe_key from bot_notifications").fetchall()
+        ]
+    finally:
+        con.close()
+    assert keys == ["tg:add-batch:1:final"]
+
+
 def test_migrated_historical_batches_do_not_storm(tmp_path):
     db = tmp_path / "state.sqlite"
     migrate(db)

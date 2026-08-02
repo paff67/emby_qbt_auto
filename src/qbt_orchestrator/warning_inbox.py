@@ -12,6 +12,7 @@ from .observability import redact
 _SEVERITY_RANK = {"info": 1, "warning": 2, "error": 3, "critical": 4}
 _MAX_EXPORT_ROWS = 1000
 _MAX_EXPORT_BYTES = 512_000
+_EXPORT_TRUNCATION_MARKER = "--- 后续日志因导出限制已省略 ---"
 
 
 def _now_default() -> int:
@@ -300,19 +301,37 @@ class WarningInboxRepository:
                             )
                         )
                     )
-            truncated = False
             body_lines: list[str] = []
             size = 0
-            for line in lines[:max_rows]:
+            for index, line in enumerate(lines):
+                if index >= max_rows:
+                    break
                 encoded = (line + "\n").encode("utf-8")
                 if size + len(encoded) > max_bytes:
-                    truncated = True
                     break
                 body_lines.append(line)
                 size += len(encoded)
-            if truncated or len(lines) > len(body_lines):
-                body_lines.append("--- 后续日志因导出限制已省略 ---")
-            return ("\n".join(body_lines) + ("\n" if body_lines else "")).encode("utf-8")
+            needs_truncation = len(body_lines) < len(lines)
+            if needs_truncation:
+                marker = _EXPORT_TRUNCATION_MARKER
+                marker_bytes = len((marker + "\n").encode("utf-8"))
+                body_row_budget = max(0, max_rows - 1)
+                body_byte_budget = max(0, max_bytes - marker_bytes)
+                trimmed: list[str] = []
+                size = 0
+                for index, line in enumerate(lines):
+                    if index >= body_row_budget:
+                        break
+                    encoded = (line + "\n").encode("utf-8")
+                    if size + len(encoded) > body_byte_budget:
+                        break
+                    trimmed.append(line)
+                    size += len(encoded)
+                body_lines = trimmed
+                body_lines.append(marker)
+            return ("\n".join(body_lines) + ("\n" if body_lines else "")).encode(
+                "utf-8"
+            )
         finally:
             con.close()
 

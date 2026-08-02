@@ -110,9 +110,11 @@ def test_warning_export_dedupe_sort_and_byte_cap(tmp_path):
             "values(?, 'INFO', 'c', 't', ?, 'hh')",
             (i, big),
         )
-    capped = warnings.export_text(warning_id).decode("utf-8")
+    payload = warnings.export_text(warning_id)
+    capped = payload.decode("utf-8")
     assert "--- 后续日志因导出限制已省略 ---" in capped
-    assert len(capped.encode("utf-8")) <= 512_000 + 200
+    assert len(payload) <= 512_000
+    assert len(payload.splitlines()) <= 1_000
 
 
 def test_warning_export_has_no_mark_read_side_effect(tmp_path):
@@ -309,6 +311,44 @@ def test_status_home_and_legacy_callback(tmp_path):
     assert "手动删除" in str(home.reply_markup)
     legacy = renderer.render_status(0)
     assert legacy.text == home.text
+
+
+def test_home_snapshot_matches_history_page_totals_after_manual_delete(tmp_path):
+    db = tmp_path / "align.sqlite"
+    migrate(db)
+    now = 1_700_000_000
+    # Lifecycle is manual_deleted, but cumulative download/ingest timestamps remain.
+    write_execute(
+        db,
+        "insert into processed_media("
+        "normalized_id,display_title,origin,lifecycle_state,download_policy,"
+        "first_seen_at,first_downloaded_at,last_ingested_at,"
+        "manual_delete_requested_at,manually_deleted_at,created_at,updated_at) "
+        "values('BBAN-582','Title','test','manual_deleted','block_permanent',"
+        "1,?,?,?,?,1,1)",
+        (now - 100, now - 50, now - 10, now),
+    )
+    write_execute(
+        db,
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,allocated_bytes,"
+        "state,created_at,updated_at,reclaimed_at) "
+        "values('rk1','rh1','ABF-055CH','magnet:x','/host','/content',100,"
+        "'reclaimed',1,1,?)",
+        (now,),
+    )
+    dash = DashboardRepository(db)
+    snap = dash.home_snapshot()
+    assert snap["downloaded"] == dash.history_pages("d")[1]
+    assert snap["ingested"] == dash.history_pages("i")[1]
+    assert snap["abnormal"] == dash.history_pages("e")[1]
+    assert snap["manual_deleted"] == dash.history_pages("m")[1]
+    assert snap["reclaimed"] == dash.history_pages("r")[1]
+    assert snap["downloaded"] == 1
+    assert snap["ingested"] == 1
+    assert snap["manual_deleted"] == 1
+    assert snap["abnormal"] == 0
+    assert snap["reclaimed"] == 1
 
 
 def test_migration_22_idempotent_stamps_once(tmp_path):

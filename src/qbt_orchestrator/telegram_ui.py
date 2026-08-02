@@ -23,6 +23,59 @@ _HISTORY_KINDS = {
     "m": "手动删除",
 }
 
+# Shared count/list predicates so home_snapshot and history_pages stay aligned.
+_HISTORY_COUNT_SQL = {
+    "d": (
+        "select count(*) from processed_media "
+        "where first_downloaded_at is not null"
+    ),
+    "i": (
+        "select count(*) from processed_media "
+        "where last_ingested_at is not null"
+    ),
+    "e": (
+        "select count(*) from processed_media "
+        "where lifecycle_state in ('manual_delete_failed','missing_unknown')"
+    ),
+    "r": "select count(*) from capacity_reclaims where state='reclaimed'",
+    "m": (
+        "select count(*) from processed_media "
+        "where lifecycle_state='manual_deleted'"
+    ),
+}
+_HISTORY_SELECT_SQL = {
+    "d": (
+        "select normalized_id,display_title,last_qbt_hash,"
+        "first_downloaded_at as processed_at "
+        "from processed_media where first_downloaded_at is not null "
+        "order by first_downloaded_at desc,id desc limit ? offset ?"
+    ),
+    "i": (
+        "select normalized_id,display_title,last_qbt_hash,"
+        "last_ingested_at as processed_at "
+        "from processed_media where last_ingested_at is not null "
+        "order by last_ingested_at desc,id desc limit ? offset ?"
+    ),
+    "e": (
+        "select normalized_id,display_title,last_qbt_hash,"
+        "updated_at as processed_at "
+        "from processed_media "
+        "where lifecycle_state in ('manual_delete_failed','missing_unknown') "
+        "order by updated_at desc,id desc limit ? offset ?"
+    ),
+    "r": (
+        "select name,hash,reclaimed_at as processed_at,allocated_bytes "
+        "from capacity_reclaims where state='reclaimed' "
+        "order by reclaimed_at desc,id desc limit ? offset ?"
+    ),
+    "m": (
+        "select normalized_id,display_title,last_qbt_hash,"
+        "manually_deleted_at as processed_at "
+        "from processed_media where lifecycle_state='manual_deleted' "
+        "order by manually_deleted_at desc,id desc limit ? offset ?"
+    ),
+}
+
 _BATCH_STATE_ZH = {
     "draft": "草稿",
     "queued": "排队中",
@@ -149,14 +202,17 @@ class DashboardRepository:
                 "sum(case when state='awaiting_confirmation' then 1 else 0 end) "
                 "from bot_add_batches"
             ).fetchone()
-            processed = con.execute(
-                "select "
-                "sum(case when lifecycle_state in ('downloaded','uploaded','ingested_present') then 1 else 0 end),"
-                "sum(case when lifecycle_state='ingested_present' then 1 else 0 end),"
-                "sum(case when lifecycle_state in ('manual_delete_failed','missing_unknown') then 1 else 0 end),"
-                "sum(case when lifecycle_state='manual_deleted' then 1 else 0 end) "
-                "from processed_media"
-            ).fetchone()
+            # Same口径 as history_pages(): cumulative timestamps for download/ingest,
+            # current lifecycle for exceptions/manual delete, reclaim table for回收.
+            downloaded = int(
+                con.execute(_HISTORY_COUNT_SQL["d"]).fetchone()[0] or 0
+            )
+            ingested = int(con.execute(_HISTORY_COUNT_SQL["i"]).fetchone()[0] or 0)
+            abnormal = int(con.execute(_HISTORY_COUNT_SQL["e"]).fetchone()[0] or 0)
+            manual_deleted = int(
+                con.execute(_HISTORY_COUNT_SQL["m"]).fetchone()[0] or 0
+            )
+            reclaimed = int(con.execute(_HISTORY_COUNT_SQL["r"]).fetchone()[0] or 0)
             unread = con.execute(
                 "select count(*) from bot_warning_inbox where resolved=0"
             ).fetchone()[0]
@@ -204,10 +260,11 @@ class DashboardRepository:
             "queue_metadata": int(queue[1] or 0) if queue else 0,
             "queue_confirm": int(queue[2] or 0) if queue else 0,
             "queue_batches": int((batch_queue[0] or 0) + (batch_queue[1] or 0)) if batch_queue else 0,
-            "downloaded": int(processed[0] or 0) if processed else 0,
-            "ingested": int(processed[1] or 0) if processed else 0,
-            "abnormal": int(processed[2] or 0) if processed else 0,
-            "manual_deleted": int(processed[3] or 0) if processed else 0,
+            "downloaded": downloaded,
+            "ingested": ingested,
+            "abnormal": abnormal,
+            "manual_deleted": manual_deleted,
+            "reclaimed": reclaimed,
             "unread_warnings": int(unread or 0),
         }
 
@@ -286,80 +343,16 @@ class DashboardRepository:
     def history_pages(
         self, kind: str, *, page: int = 0
     ) -> tuple[list[dict[str, Any]], int]:
+        key = str(kind)
+        count_sql = _HISTORY_COUNT_SQL.get(key)
+        select_sql = _HISTORY_SELECT_SQL.get(key)
+        if count_sql is None or select_sql is None:
+            return [], 0
         offset = max(0, int(page)) * PAGE_SIZE
         con = readonly_connect(self.state_db)
         try:
-            if kind == "d":
-                total = con.execute(
-                    "select count(*) from processed_media "
-                    "where first_downloaded_at is not null"
-                ).fetchone()[0]
-                rows = list(
-                    con.execute(
-                        "select normalized_id,display_title,last_qbt_hash,"
-                        "first_downloaded_at as processed_at "
-                        "from processed_media where first_downloaded_at is not null "
-                        "order by first_downloaded_at desc,id desc limit ? offset ?",
-                        (PAGE_SIZE, offset),
-                    )
-                )
-            elif kind == "i":
-                total = con.execute(
-                    "select count(*) from processed_media "
-                    "where last_ingested_at is not null"
-                ).fetchone()[0]
-                rows = list(
-                    con.execute(
-                        "select normalized_id,display_title,last_qbt_hash,"
-                        "last_ingested_at as processed_at "
-                        "from processed_media where last_ingested_at is not null "
-                        "order by last_ingested_at desc,id desc limit ? offset ?",
-                        (PAGE_SIZE, offset),
-                    )
-                )
-            elif kind == "e":
-                total = con.execute(
-                    "select count(*) from processed_media "
-                    "where lifecycle_state in ('manual_delete_failed','missing_unknown')"
-                ).fetchone()[0]
-                rows = list(
-                    con.execute(
-                        "select normalized_id,display_title,last_qbt_hash,"
-                        "updated_at as processed_at "
-                        "from processed_media "
-                        "where lifecycle_state in ('manual_delete_failed','missing_unknown') "
-                        "order by updated_at desc,id desc limit ? offset ?",
-                        (PAGE_SIZE, offset),
-                    )
-                )
-            elif kind == "r":
-                total = con.execute(
-                    "select count(*) from capacity_reclaims where state='reclaimed'"
-                ).fetchone()[0]
-                rows = list(
-                    con.execute(
-                        "select name,hash,reclaimed_at as processed_at,allocated_bytes "
-                        "from capacity_reclaims where state='reclaimed' "
-                        "order by reclaimed_at desc,id desc limit ? offset ?",
-                        (PAGE_SIZE, offset),
-                    )
-                )
-            elif kind == "m":
-                total = con.execute(
-                    "select count(*) from processed_media "
-                    "where lifecycle_state='manual_deleted'"
-                ).fetchone()[0]
-                rows = list(
-                    con.execute(
-                        "select normalized_id,display_title,last_qbt_hash,"
-                        "manually_deleted_at as processed_at "
-                        "from processed_media where lifecycle_state='manual_deleted' "
-                        "order by manually_deleted_at desc,id desc limit ? offset ?",
-                        (PAGE_SIZE, offset),
-                    )
-                )
-            else:
-                return [], 0
+            total = con.execute(count_sql).fetchone()[0]
+            rows = list(con.execute(select_sql, (PAGE_SIZE, offset)))
         finally:
             con.close()
         return [dict(row) for row in rows], int(total or 0)
