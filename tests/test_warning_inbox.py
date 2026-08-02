@@ -165,9 +165,8 @@ def test_warning_inbox_upsert_and_read_fencing(tmp_path):
     assert len(exported) <= 512_000
 
 
-def test_warning_service_projects_after_inbox_commit(tmp_path):
+def test_warning_service_persists_without_telegram_projection(tmp_path):
     from qbt_orchestrator.warning_inbox import WarningService
-    from qbt_orchestrator.runtime import BotNotificationRepository
 
     db = tmp_path / "state.sqlite"
     migrate(db)
@@ -184,22 +183,15 @@ def test_warning_service_projects_after_inbox_commit(tmp_path):
             "select warning_key,resolved from bot_warning_inbox where id=?",
             (int(row["id"]),),
         ).fetchone()
-        note = con.execute(
-            "select dedupe_key,chat_id from bot_notifications where dedupe_key=?",
-            (f"warn:{int(row['id'])}:{int(row['occurrence_count'])}",),
-        ).fetchone()
+        notes = con.execute("select count(*) from bot_notifications").fetchone()[0]
     finally:
         con.close()
     assert inbox["warning_key"] == "qbt:authentication"
-    assert note["chat_id"] == "1001"
-    # Drop projection and reconcile.
-    write_execute(db, "delete from bot_notifications")
-    assert service.reconcile_projections() == 1
+    assert int(inbox["resolved"]) == 0
+    assert int(notes) == 0
 
 
-def test_warning_service_projection_payload_and_failed_projection_keeps_inbox(tmp_path):
-    import json
-
+def test_warning_service_keeps_relations_without_projection(tmp_path):
     from qbt_orchestrator.warning_inbox import WarningService
 
     db = tmp_path / "state.sqlite"
@@ -217,19 +209,7 @@ def test_warning_service_projection_payload_and_failed_projection_keeps_inbox(tm
         "input_sha256,state,created_at,updated_at) "
         "values(9,38,1,0,'magnet','r','s','metadata_unavailable',1,1)",
     )
-
-    class BoomNotifications:
-        def __init__(self):
-            self.calls = 0
-
-        def enqueue_with_status(self, *args, **kwargs):
-            self.calls += 1
-            raise RuntimeError("notify_failed")
-
-    boom = BoomNotifications()
-    service = WarningService(
-        db, admin_chat_id="1001", notifications=boom, now=lambda: 310
-    )
+    service = WarningService(db, admin_chat_id="1001", now=lambda: 310)
     row = service.report(
         warning_key="checked_add:metadata_unavailable:9",
         severity="warning",
@@ -245,7 +225,6 @@ def test_warning_service_projection_payload_and_failed_projection_keeps_inbox(tm
             },
         },
     )
-    assert boom.calls == 1
     con = readonly_connect(db)
     try:
         inbox = con.execute(
@@ -258,27 +237,6 @@ def test_warning_service_projection_payload_and_failed_projection_keeps_inbox(tm
     assert int(inbox["related_batch_id"]) == 38
     assert int(inbox["related_item_id"]) == 9
     assert int(notes) == 0
-
-    from qbt_orchestrator.runtime import BotNotificationRepository
-
-    recovered = WarningService(
-        db,
-        admin_chat_id="1001",
-        notifications=BotNotificationRepository(db, now=lambda: 311),
-        now=lambda: 311,
-    )
-    assert recovered.reconcile_projections() == 1
-    con = readonly_connect(db)
-    try:
-        note = con.execute(
-            "select payload_json from bot_notifications where dedupe_key=?",
-            (f"warn:{int(row['id'])}:{int(row['occurrence_count'])}",),
-        ).fetchone()
-    finally:
-        con.close()
-    payload = json.loads(note["payload_json"])
-    assert "reply_markup" not in payload
-    assert int(payload["warning_id"]) == int(row["id"])
 
 
 def test_required_warning_keys_via_service(tmp_path):

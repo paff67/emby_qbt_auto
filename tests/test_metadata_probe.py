@@ -607,27 +607,19 @@ def test_metadata_unavailable_reports_warning_inbox_with_action_buttons(tmp_path
             "from bot_warning_inbox where warning_key=?",
             (f"checked_add:metadata_unavailable:{item_id}",),
         ).fetchone()
-        note = con.execute(
-            "select payload_json,dedupe_key from bot_notifications "
-            "where dedupe_key=?",
-            (f"warn:{int(warning['id'])}:{int(warning['occurrence_count'])}",),
-        ).fetchone()
+        notes = con.execute(
+            "select count(*) from bot_notifications where dedupe_key like 'warn:%'"
+        ).fetchone()[0]
     finally:
         con.close()
     assert warning is not None
     assert int(warning["related_batch_id"]) == batch_id
     assert int(warning["related_item_id"]) == item_id
-    payload = json.loads(note["payload_json"])
-    callbacks = {
-        btn["callback_data"]
-        for row in payload["reply_markup"]["inline_keyboard"]
-        for btn in row
-    }
-    assert f"i:r:{item_id}:{generation}" in callbacks
-    assert f"i:x:{item_id}:{generation}" in callbacks
-    assert f"n:b:{batch_id}:0" in callbacks
+    # Warnings stay in the center; retry/cancel live on the queue detail panel.
+    assert int(notes) == 0
+    del generation  # retained for readability of the scenario above
 
-    # Same item/generation must not create a second projected notification.
+    # Same item/generation must not create a second inbox occurrence.
     second = coordinator.tick()
     assert int(second.get("warning_backfilled") or 0) == 0
     con = readonly_connect(db)
@@ -641,7 +633,7 @@ def test_metadata_unavailable_reports_warning_inbox_with_action_buttons(tmp_path
         ).fetchone()[0]
     finally:
         con.close()
-    assert int(notes) == 1
+    assert int(notes) == 0
     assert int(occurrences) == 1
 
 
@@ -685,8 +677,8 @@ def test_metadata_tick_backfills_missing_warning_inbox(tmp_path):
         con.close()
     assert warning is not None
     assert int(warning["related_item_id"]) == item_id
-    assert int(notes) == 1
-    # Already present: no second upsert/projection from backfill.
+    assert int(notes) == 0
+    # Already present: no second backfill.
     again = coordinator.tick(sync_healthy=False)
     assert int(again["warning_backfilled"]) == 0
 

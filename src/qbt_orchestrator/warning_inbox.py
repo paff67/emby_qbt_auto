@@ -435,25 +435,22 @@ class WarningInboxRepository:
 
 
 class WarningService:
-    """Commit inbox rows first, then project generic Telegram notifications."""
+    """Persist warnings into WarningInbox; Telegram surface is the panel center."""
 
     def __init__(
         self,
         state_db: str | Path,
         *,
-        admin_chat_id: str | int | None,
+        admin_chat_id: str | int | None = None,
         notifications=None,
         inbox: WarningInboxRepository | None = None,
         now: Callable[[], int] | None = None,
     ):
         self.state_db = Path(state_db)
         self.now = now or _now_default
+        # admin_chat_id / notifications retained for constructor compatibility.
         self.admin_chat_id = None if admin_chat_id in (None, "") else str(admin_chat_id)
         self.inbox = inbox or WarningInboxRepository(self.state_db, now=self.now)
-        if notifications is None:
-            from .runtime import BotNotificationRepository
-
-            notifications = BotNotificationRepository(self.state_db, now=self.now)
         self.notifications = notifications
 
     def report(
@@ -469,7 +466,8 @@ class WarningService:
         related_item_id: int | None = None,
         projection_payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        row = self.inbox.upsert(
+        del projection_payload  # No longer projected to Telegram notifications.
+        return self.inbox.upsert(
             warning_key=warning_key,
             severity=severity,
             topic=topic,
@@ -479,66 +477,3 @@ class WarningService:
             related_batch_id=related_batch_id,
             related_item_id=related_item_id,
         )
-        self._project(row, projection_payload=projection_payload)
-        return row
-
-    def reconcile_projections(self, *, limit: int = 50) -> int:
-        if self.admin_chat_id is None:
-            return 0
-        con = readonly_connect(self.state_db)
-        try:
-            missing = con.execute(
-                "select w.id,w.occurrence_count,w.severity,w.topic,w.safe_message "
-                "from bot_warning_inbox w "
-                "left join bot_notifications n "
-                "on n.dedupe_key=('warn:' || w.id || ':' || w.occurrence_count) "
-                "where w.resolved=0 and n.id is null "
-                "order by w.last_occurred_at desc,w.id desc limit ?",
-                (max(1, min(100, int(limit))),),
-            ).fetchall()
-        finally:
-            con.close()
-        projected = 0
-        for row in missing:
-            # Reconciliation projects a generic warning without stale action buttons.
-            self._project(_row_dict(row) or {})
-            projected += 1
-        return projected
-
-    def _project(
-        self,
-        row: Mapping[str, Any],
-        *,
-        projection_payload: Mapping[str, Any] | None = None,
-    ) -> None:
-        if self.admin_chat_id is None:
-            return
-        warning_id = int(row["id"])
-        occurrence = int(row["occurrence_count"])
-        dedupe = f"warn:{warning_id}:{occurrence}"
-        message = (
-            f"系统警告 [{row.get('severity')}] {row.get('topic')}: "
-            f"{row.get('safe_message')}"
-        )
-        payload: dict[str, Any] = {
-            "warning_id": warning_id,
-            "occurrence_count": occurrence,
-        }
-        if projection_payload:
-            for key, value in dict(projection_payload).items():
-                if key in {"warning_id", "occurrence_count"}:
-                    continue
-                payload[key] = value
-            payload["warning_id"] = warning_id
-        try:
-            self.notifications.enqueue_with_status(
-                chat_id=self.admin_chat_id,
-                topic=str(row.get("topic") or "warning"),
-                message=str(redact(message)),
-                level=str(row.get("severity") or "warning"),
-                payload=payload,
-                dedupe_key=dedupe,
-            )
-        except Exception:
-            # Durable inbox row remains; reconcile_projections retries later.
-            return
