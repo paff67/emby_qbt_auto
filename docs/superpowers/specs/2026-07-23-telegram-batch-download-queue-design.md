@@ -4,6 +4,23 @@ Date: 2026-07-23
 Status: Approved design
 Scope: qBT Orchestrator Telegram Bot, checked download enrollment, warning inbox, and user-facing status on `ssh.paff-67.top`
 
+## 0. 2026-08-02 P1 override
+
+This section supersedes the WarningInbox, Telegram transport, panel routing, and duplicate presentation portions of the 2026-07-23 plan where they conflict. The existing link parser, 500/50/1000 queue limits, metadata probe state machine, and qBT isolation remain in force.
+
+1. There is exactly one `getUpdates` consumer: `TelegramPollingService` under the existing `TelegramSupervisor`.
+2. `bot_warning_inbox` is reused. `bot_warning_reads` is dropped and never read or recreated by the new release.
+3. Warning read state is global for the configured administrator: `resolved=0` means unread and `resolved=1` means read.
+4. Every warning is committed to `bot_warning_inbox` before any `bot_notifications` projection is attempted.
+5. `remote_media_index` remains a current-presence cache. It is not history and cannot represent a manual deletion tombstone.
+6. A manual deletion creates `download_policy='block_permanent'`. No Telegram callback, ordinary CLI option, remote-index refresh, or file restoration may clear it.
+7. Checked-add returns `blocked_manual_deleted`, not `duplicate_remote`, for a tombstoned normalized ID.
+8. Telegram does not support user-uploaded `.torrent` documents. `sendDocument` is used only for generated warning exports.
+9. All user-facing pages are natural-language Chinese. Internal terms such as `DRAIN`, `capacity_deadlock`, PID, generation, lease, and raw reason codes are forbidden in normal pages.
+10. Page size is 8 rows, body limit is 3,500 characters, callback data is at most 64 UTF-8 bytes, copy text is at most 256 characters, and exports are at most 1,000 lines/512,000 UTF-8 bytes.
+
+Initial production tombstone seed IDs: `BBAN-574`, `BBAN-576`, `BBAN-580`, `BBAN-582`, `BBAN-586`.
+
 ## 1. Outcome
 
 `/start` opens a mobile-friendly Telegram control panel implemented with ordinary `InlineKeyboardMarkup`. The welcome message uses clear natural language, shows active downloads and their progress, disk space, scheduling condition, processed-task totals, add-queue status, and unread warnings. Buttons edit the same panel message instead of flooding the chat with command output.
@@ -290,13 +307,15 @@ Duplicate checks are layered and deterministic:
 
 1. **Canonical torrent identity** against active qBT and prior successful requests.
 2. **Normalized media ID** extracted from the main video name using the existing normalizer.
-3. **Remote media index** exact normalized ID match.
-4. **Primary video size** comparison using the existing 15% tolerance.
-5. Optional live remote probe only when the persisted index is stale or an indexed path requires confirmation.
+3. **Processed-media tombstone ledger** for `download_policy='block_permanent'` (checked immediately after confident normalization and before remote-index scan).
+4. **Remote media index** exact normalized ID match (current presence only; never a deletion tombstone).
+5. **Primary video size** comparison using the existing 15% tolerance.
+6. Optional live remote probe only when the persisted index is stale or an indexed path requires confirmation.
 
 Decisions are:
 
 - same torrent identity: `duplicate_local`, do not add;
+- tombstoned normalized ID: `blocked_manual_deleted` / `previously_ingested_then_manually_deleted`, terminal `cancelled`, do not add;
 - same normalized ID and size within tolerance: `duplicate_remote`, do not add;
 - same normalized ID but size differs or is unknown: `needs_confirmation`;
 - no identity match: `ready`;
@@ -382,7 +401,7 @@ Notification behavior is:
 
 All messages have durable deduplication keys. Delivery retries use the existing `bot_notifications` queue and do not rerun the underlying add action.
 
-Create a durable warning inbox separate from outbound delivery state. Warning records have severity, topic, safe message, related hash/job/batch/item IDs, occurrence/update timestamps, and resolved status. Per-chat read state determines the unread badge. Opening the warning page marks only displayed records as read; it does not resolve them.
+Create a durable warning inbox separate from outbound delivery state. Warning records have severity, topic, safe message, related hash/job/batch/item IDs, occurrence/update timestamps, and resolved status. Read state is global for the configured administrator (`resolved=0` unread, `resolved=1` read); the legacy `bot_warning_reads` per-chat table is removed. Opening a warning detail marks that one occurrence read; merely opening the list, copying a summary, or exporting text does not.
 
 The warning page supports pagination, acknowledgement where applicable, `复制摘要`, and `导出全部日志`. The export contains every related persisted warning/event selected by the current filter, is capped by a configured row/byte limit, and states explicitly when truncation occurred. Raw secrets, full private URLs, WebUI credentials, and Bot tokens never appear.
 
@@ -468,7 +487,7 @@ The Telegram change is complete only when all of the following are demonstrated:
 11. Waiting confirmations and metadata backoffs do not block other queue work.
 12. Confirmation and failure messages arrive immediately; deferred work gets an initial summary and all terminal results produce one final summary.
 13. The homepage and queue detail show correct live queue and metadata counts.
-14. Warnings are persisted with per-chat unread state and do not flood the chat with raw logs.
+14. Warnings are persisted with single-admin unread state (`resolved`) and do not flood the chat with raw logs.
 15. `复制摘要` copies a bounded native payload, while `导出全部日志` sends a complete redacted text export within configured safety limits.
 16. Unknown users and replayed/stale callbacks cannot inspect or mutate operational state.
 17. The orchestrator remains active with zero unexpected restarts, qBT authentication remains healthy, and live logs contain no unhandled Telegram, queue, or SQLite errors during the one-hour observation.

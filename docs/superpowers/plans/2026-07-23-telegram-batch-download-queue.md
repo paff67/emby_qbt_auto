@@ -1,5 +1,7 @@
 # Telegram Batch Download Queue Implementation Plan
 
+> **Superseded in part (2026-08-02):** WarningInbox read state, `bot_warning_reads`, Telegram panel transport/routing, and manual-deletion duplicate presentation are overridden by the design-spec “2026-08-02 P1 override” and the processed-media tombstone plan. Do not recreate `bot_warning_reads`; use single-admin `resolved` on `bot_warning_inbox` and `blocked_manual_deleted` for tombstones.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver the approved Telegram control panel and a restart-safe, fair, bounded queue for batches of magnet, HTTP/HTTPS metainfo, and `bc://bt/` links.
@@ -46,7 +48,8 @@ def test_bot_queue_schema_contains_all_durable_state(tmp_path):
     try:
         tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
         assert {"bot_add_batches", "bot_add_shards", "bot_add_items", "bot_add_events",
-                "remote_media_index", "bot_warning_inbox", "bot_warning_reads"} <= tables
+                "remote_media_index", "bot_warning_inbox"} <= tables
+        # superseded 2026-08-02: bot_warning_reads must be absent
         item_columns = {row[1] for row in con.execute("pragma table_info(bot_add_items)")}
         assert {"raw_input", "raw_input_expires_at", "metadata_probe_attempt",
                 "metadata_probe_deadline", "metadata_retry_at", "metadata_lease_generation"} <= item_columns
@@ -82,7 +85,7 @@ create table if not exists bot_add_shards(
   unique(batch_id,shard_index));
 ```
 
-Create `bot_add_items` with every field in the design, including unique `(batch_id,source_message_id,source_index)`, and indexes on `(state,metadata_retry_at,id)`, `(metadata_probe_deadline,state)`, `canonical_identity`, and `qbt_hash`. Create append-only `bot_add_events`; `remote_media_index(video_path primary key,normalized_id,size,raw_basename,status,source,updated_at)`; `bot_warning_inbox`; and `bot_warning_reads(warning_id,chat_id,user_id,read_at,primary key(warning_id,chat_id,user_id))`. Insert schema migration version 16.
+Create `bot_add_items` with every field in the design, including unique `(batch_id,source_message_id,source_index)`, and indexes on `(state,metadata_retry_at,id)`, `(metadata_probe_deadline,state)`, `canonical_identity`, and `qbt_hash`. Create append-only `bot_add_events`; `remote_media_index(video_path primary key,normalized_id,size,raw_basename,status,source,updated_at)`; and `bot_warning_inbox` (single-admin `resolved` read state; do not create `bot_warning_reads`). Insert schema migration version 16.
 
 - [ ] **Step 4: Run migration/idempotency tests**
 
