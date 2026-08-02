@@ -127,12 +127,15 @@ class SchedulerAlertService:
         mature_reclaim_candidates: int = 0,
         rejection_fingerprint: str = "",
     ) -> list[int]:
-        """Queue a compact, episode-scoped capacity notice."""
+        """Record one WarningInbox row per capacity-deadlock episode fingerprint."""
+
+        del required_minimum_growth_bytes, top_manual_candidates
+        del mature_reclaim_candidates, rejection_fingerprint
 
         if (
             not self.config.enabled
             or not self.config.capacity_deadlock_enabled
-            or not self.config.chat_ids
+            or self.warning_service is None
             or str(getattr(transition, "state", "")) != "capacity_deadlock"
         ):
             return []
@@ -145,8 +148,6 @@ class SchedulerAlertService:
         ):
             return []
 
-        minimum = max(0, int(required_minimum_growth_bytes))
-        planned = max(0, int(reclaim_context.planned))
         reclaimed = max(0, int(reclaim_context.reclaimed))
         message_state = "reclaiming" if reclaimed > 0 else "manual"
         rejection_counts = dict(
@@ -165,42 +166,6 @@ class SchedulerAlertService:
             )
             or reclaim_context.rejection_fingerprint
         )
-        errors_summary = [
-            str(error)[:200]
-            for error in tuple(reclaim_context.errors_summary)[:3]
-        ]
-        candidates = [
-            {
-                "hash": str(candidate.get("hash") or ""),
-                "required_growth_bytes": max(0, int(candidate.get("required_growth_bytes") or 0)),
-            }
-            for candidate in top_manual_candidates[:3]
-        ]
-        payload = {
-            "state": str(getattr(transition, "state", "")),
-            "reason": str(getattr(transition, "reason", "")),
-            "entered_at": int(getattr(transition, "entered_at", 0) or 0),
-            "assessment_generation": max(
-                0, int(reclaim_context.assessment_generation)
-            ),
-            "required_minimum_growth_bytes": minimum,
-            "top_manual_candidates": candidates,
-            "evaluation_status": "live_evaluated",
-            "message_state": message_state,
-            "dry_run": False,
-            "planned": planned,
-            "reclaimed": reclaimed,
-            "errors_count": max(0, int(reclaim_context.errors_count)),
-            "errors_summary": errors_summary,
-            "rejection_counts": rejection_counts,
-            "rejection_fingerprint": fingerprint,
-            "capacity_pressure_remaining": True,
-            "post_reclaim_free_bytes": (
-                None
-                if reclaim_context.post_reclaim_free_bytes is None
-                else max(0, int(reclaim_context.post_reclaim_free_bytes))
-            ),
-        }
         message = (
             "可用空间不足，已暂停启动新任务；系统正在安全释放无效文件。"
             if message_state == "reclaiming"
@@ -214,23 +179,21 @@ class SchedulerAlertService:
         fingerprint_digest = hashlib.sha256(
             dedupe_state.encode("utf-8")
         ).hexdigest()[:16]
-        ids: list[int] = []
-        for chat_id in self.config.chat_ids:
-            dedupe_key = (
-                f"scheduler-alert:capacity-deadlock:{chat_id}:"
-                f"{entered_at}:{fingerprint_digest}"
-            )
-            notification_id, inserted = self.repo.enqueue_with_status(
-                chat_id=chat_id,
+        warning_key = (
+            f"capacity:no_safe_reclaim:{entered_at}:{fingerprint_digest}"
+        )
+        try:
+            row = self.warning_service.report_once(
+                warning_key=warning_key[:200],
+                severity="critical",
                 topic="capacity_deadlock",
-                message=message,
-                level="critical",
-                payload=payload,
-                dedupe_key=dedupe_key,
+                safe_message=message,
             )
-            if inserted:
-                ids.append(notification_id)
-        return ids
+        except Exception:
+            return []
+        if row is None:
+            return []
+        return [int(row["id"])]
 
     def _broadcast(self, *, topic: str, level: str, message: str, payload: dict[str, Any], dedupe_topic: str, bucket: int) -> list[int]:
         safe_message = str(redact(message))

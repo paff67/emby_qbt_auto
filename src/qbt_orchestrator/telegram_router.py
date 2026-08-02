@@ -113,17 +113,15 @@ class TelegramUpdateRouter:
         parts = text[1:].split()
         command = parts[0].split("@", 1)[0].replace("-", "_") if parts else ""
         args = parts[1:]
+        # Unauthorized traffic must never touch the singleton panel or emit replies.
+        if self.authorizer.role_for(user_id) is None:
+            return
         if command in RETIRED_TELEGRAM_COMMANDS:
-            message = "该命令已停用；请使用控制台面板查看状态与警告。"
-            if self.panel is not None:
-                self._panel_error(chat_id, message)
-            else:
-                self.api.send_message(chat_id, message)
+            self._panel_error(
+                chat_id, "该命令已停用；请使用控制台面板查看状态与警告。"
+            )
             return
         if command in PANEL_COMMANDS and self.panel_enabled and self.panel is not None:
-            if not self.authorizer.role_for(user_id):
-                self._panel_error(chat_id, "无权访问")
-                return
             if command in MUTATING_COMMANDS and not self._can_mutate(user_id):
                 self._panel_error(chat_id, "只读账号不能执行此操作")
                 return
@@ -143,10 +141,7 @@ class TelegramUpdateRouter:
                 self._open_add_draft(chat_id, user_id)
                 return
         if not self.authorizer.allowed(user_id, command):
-            if self.panel is not None:
-                self._panel_error(chat_id, "无权访问")
-            else:
-                self.api.send_message(chat_id, "unauthorized")
+            self._panel_error(chat_id, "无权访问")
             return
         if self.command_store is not None:
             self.command_store.insert_command(
@@ -525,7 +520,17 @@ class TelegramUpdateRouter:
                 return
             return
         session = self.panel.sessions.get()
-        route = str((session or {}).get("current_route") or "n:h")
+        if session is not None and str(session.get("chat_id") or "") != str(chat_id):
+            # Never let foreign-chat errors edit or rebind the singleton console.
+            return
+        if session is None or session.get("message_id") is None:
+            # No bound console yet: reply without creating a panel binding.
+            try:
+                self.api.send_message(chat_id, message)
+            except Exception:
+                return
+            return
+        route = str(session.get("current_route") or "n:h")
         base = self.panel.render_route(route)
         text = _clip_error(base.text, message)
         self.panel.show_view(

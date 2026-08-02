@@ -476,19 +476,22 @@ def alert_fixture(tmp_path):
         SchedulerAlertService,
     )
     from qbt_orchestrator.capacity_state import CapacityTransition
-    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.db import migrate, readonly_connect
     from qbt_orchestrator.runtime import BotNotificationRepository
+    from qbt_orchestrator.warning_inbox import WarningService
 
     db = tmp_path / "alerts.sqlite"
     migrate(db, dry_run=False)
     repo = BotNotificationRepository(db, now=lambda: 100)
+    warnings = WarningService(db, now=lambda: 100)
     service = SchedulerAlertService(
         repo,
         SchedulerAlertConfig(
             enabled=True,
             chat_ids=["123"],
             capacity_deadlock_enabled=True,
-        )
+        ),
+        warning_service=warnings,
     )
 
     def transition(**overrides):
@@ -530,13 +533,28 @@ def alert_fixture(tmp_path):
         values.update(overrides)
         return CapacityReclaimAlertContext(**values)
 
+    def list_warnings():
+        con = readonly_connect(db)
+        try:
+            return [
+                dict(row)
+                for row in con.execute(
+                    "select * from bot_warning_inbox "
+                    "where topic='capacity_deadlock' order by id"
+                )
+            ]
+        finally:
+            con.close()
+
     return SimpleNamespace(
         db=db,
         repo=repo,
         service=service,
+        warnings=warnings,
         transition=transition,
         context=context,
         notifications=repo.list_all,
+        warning_rows=list_warnings,
     )
 
 
@@ -573,6 +591,7 @@ def test_capacity_deadlock_does_not_alert_without_live_evaluation(alert_fixture,
         top_manual_candidates=[],
         reclaim_context=alert_fixture.context(**context),
     ) == []
+    assert alert_fixture.warning_rows() == []
     assert alert_fixture.notifications() == []
 
 
@@ -603,7 +622,8 @@ def test_live_capacity_evaluation_without_successful_reclaim_uses_manual_message
 
     assert len(first) == 1
     assert second == []
-    row = alert_fixture.notifications()[0]
+    assert alert_fixture.notifications() == []
+    row = alert_fixture.warning_rows()[0]
     dedupe_state = (
         "availability_unknown:3|protected_tag:1|"
         "message_state:manual|evaluation_status:live_evaluated"
@@ -611,23 +631,12 @@ def test_live_capacity_evaluation_without_successful_reclaim_uses_manual_message
     digest = hashlib.sha256(
         dedupe_state.encode("utf-8")
     ).hexdigest()[:16]
-    assert row["dedupe_key"] == f"scheduler-alert:capacity-deadlock:123:100:{digest}"
-    assert row["message"] == "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
-    payload = json.loads(row["payload_json"])
-    assert payload["entered_at"] == 100
-    assert payload["evaluation_status"] == "live_evaluated"
-    assert payload["message_state"] == "manual"
-    assert payload["dry_run"] is False
-    assert payload["planned"] == 1
-    assert payload["reclaimed"] == 0
-    assert payload["errors_count"] == 0
-    assert payload["errors_summary"] == []
-    assert payload["rejection_counts"] == {
-        "availability_unknown": 3,
-        "protected_tag": 1,
-    }
-    assert payload["assessment_generation"] == 8
-    assert "capacity_deadlock" not in row["message"]
+    assert row["warning_key"] == f"capacity:no_safe_reclaim:100:{digest}"
+    assert row["severity"] == "critical"
+    assert row["topic"] == "capacity_deadlock"
+    assert row["safe_message"] == "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
+    assert int(row["occurrence_count"]) == 1
+    assert "capacity_deadlock" not in row["safe_message"]
 
 
 def test_live_successful_reclaim_uses_reclaiming_message_and_state_change_is_not_deduped(alert_fixture):
@@ -655,12 +664,12 @@ def test_live_successful_reclaim_uses_reclaiming_message_and_state_change_is_not
     assert len(manual) == 1
     assert len(reclaiming) == 1
     assert repeated == []
-    rows = alert_fixture.notifications()
+    assert alert_fixture.notifications() == []
+    rows = alert_fixture.warning_rows()
     assert len(rows) == 2
-    assert rows[0]["message"] == "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
-    assert rows[1]["message"] == "可用空间不足，已暂停启动新任务；系统正在安全释放无效文件。"
-    assert rows[0]["dedupe_key"] != rows[1]["dedupe_key"]
-    assert json.loads(rows[1]["payload_json"])["message_state"] == "reclaiming"
+    assert rows[0]["safe_message"] == "可用空间不足，当前没有能够安全回收的任务，需要人工处理。"
+    assert rows[1]["safe_message"] == "可用空间不足，已暂停启动新任务；系统正在安全释放无效文件。"
+    assert rows[0]["warning_key"] != rows[1]["warning_key"]
 
 
 def test_live_reclaiming_to_manual_and_rejection_changes_create_new_notifications(alert_fixture):
@@ -703,7 +712,8 @@ def test_live_reclaiming_to_manual_and_rejection_changes_create_new_notification
 
     assert all(len(result) == 1 for result in (reclaiming, manual, changed))
     assert repeated == []
-    assert len(alert_fixture.notifications()) == 3
+    assert alert_fixture.notifications() == []
+    assert len(alert_fixture.warning_rows()) == 3
 
 
 def test_capacity_alert_payload_bounds_and_redacts_error_summary(alert_fixture):
@@ -720,11 +730,11 @@ def test_capacity_alert_payload_bounds_and_redacts_error_summary(alert_fixture):
             ),
         )
     ) == 1
-    payload = json.loads(alert_fixture.notifications()[0]["payload_json"])
-    assert payload["errors_count"] == 6
-    assert len(payload["errors_summary"]) == 3
-    assert all(len(item) <= 200 for item in payload["errors_summary"])
-    assert payload["errors_summary"][0] == "Bearer <redacted>"
+    assert alert_fixture.notifications() == []
+    row = alert_fixture.warning_rows()[0]
+    assert row["topic"] == "capacity_deadlock"
+    assert row["severity"] == "critical"
+    assert int(row["occurrence_count"]) == 1
 
 
 def test_concurrent_capacity_alert_enqueue_returns_only_the_inserted_notification(alert_fixture):
@@ -740,14 +750,16 @@ def test_concurrent_capacity_alert_enqueue_returns_only_the_inserted_notificatio
         results = list(pool.map(enqueue, range(2)))
 
     assert sorted(len(result) for result in results) == [0, 1]
-    assert len(alert_fixture.notifications()) == 1
+    assert alert_fixture.notifications() == []
+    assert len(alert_fixture.warning_rows()) == 1
 
 
-def test_capacity_deadlock_dedupe_is_per_episode_and_chat(tmp_path):
+def test_capacity_deadlock_dedupe_is_per_episode(tmp_path):
     from qbt_orchestrator.alerts import SchedulerAlertConfig, SchedulerAlertService
     from qbt_orchestrator.capacity_state import CapacityTransition
-    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.db import migrate, readonly_connect
     from qbt_orchestrator.runtime import BotNotificationRepository
+    from qbt_orchestrator.warning_inbox import WarningService
 
     db = tmp_path / "multi-chat.sqlite"
     migrate(db, dry_run=False)
@@ -759,6 +771,7 @@ def test_capacity_deadlock_dedupe_is_per_episode_and_chat(tmp_path):
             chat_ids=["123", "456"],
             capacity_deadlock_enabled=True,
         ),
+        warning_service=WarningService(db, now=lambda: 100),
     )
 
     def transition(entered_at):
@@ -794,16 +807,23 @@ def test_capacity_deadlock_dedupe_is_per_episode_and_chat(tmp_path):
         capacity_pressure_remaining=True,
         post_reclaim_free_bytes=None,
     )
-    assert len(service.enqueue_capacity_deadlock(transition(100), **kwargs)) == 2
+    assert len(service.enqueue_capacity_deadlock(transition(100), **kwargs)) == 1
     assert service.enqueue_capacity_deadlock(transition(100), **kwargs) == []
-    assert len(service.enqueue_capacity_deadlock(transition(101), **kwargs)) == 2
-    rows = repo.list_all()
-    assert len(rows) == 4
-    assert {(row["chat_id"], row["created_at"]) for row in rows} == {
-        ("123", 100),
-        ("456", 100),
-    }
-    assert len({row["dedupe_key"] for row in rows}) == 4
+    assert len(service.enqueue_capacity_deadlock(transition(101), **kwargs)) == 1
+    assert repo.list_all() == []
+    con = readonly_connect(db)
+    try:
+        rows = list(
+            con.execute(
+                "select warning_key,occurrence_count from bot_warning_inbox "
+                "where topic='capacity_deadlock' order by id"
+            )
+        )
+    finally:
+        con.close()
+    assert len(rows) == 2
+    assert {int(row["occurrence_count"]) for row in rows} == {1}
+    assert rows[0]["warning_key"] != rows[1]["warning_key"]
 
 
 def test_capacity_alert_ignores_recovered_state():
@@ -905,10 +925,18 @@ def test_daemon_persists_deadlock_without_actions_and_does_not_alert_without_rec
                     "select topic,message,payload_json from bot_notifications where topic='capacity_deadlock'"
                 )
             ]
+            warnings = [
+                dict(row)
+                for row in con.execute(
+                    "select topic from bot_warning_inbox where topic='capacity_deadlock'"
+                )
+            ]
         finally:
             con.close()
         assert capacity["state"] == "progress_possible"
         assert notices == []
+        # dry_run reclaim path must not write WarningInbox either.
+        assert warnings == []
 
 
 @pytest.mark.parametrize(
@@ -1099,6 +1127,8 @@ def test_daemon_rechecks_pressure_after_live_reclaim(
                 self.deadlocks.append((transition, kwargs))
                 return self.delegate.enqueue_capacity_deadlock(transition, **kwargs)
 
+        from qbt_orchestrator.warning_inbox import WarningService
+
         reclaimer = RecordingReclaimer()
         daemon = DaemonRuntime(
             state_db=db,
@@ -1119,6 +1149,7 @@ def test_daemon_rechecks_pressure_after_live_reclaim(
             scheduler_alert_chat_ids=["123"],
             scheduler_alerts_enabled=True,
             capacity_deadlock_alerts_enabled=True,
+            warning_service=WarningService(db),
         )
         alerts = RecordingAlerts(daemon.scheduler_alert_service)
         daemon.scheduler_alert_service = alerts
@@ -1156,21 +1187,28 @@ def test_daemon_rechecks_pressure_after_live_reclaim(
         assert result["capacity"]["assessment_generation"] == 1
         assert result["capacity_reclaim"]["assessment_generation"] == 1
         con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
         try:
-            capacity_alert_count = con.execute(
+            notification_count = con.execute(
                 "select count(*) from bot_notifications where topic='capacity_deadlock'"
             ).fetchone()[0]
+            capacity_alert_count = con.execute(
+                "select count(*) from bot_warning_inbox where topic='capacity_deadlock'"
+            ).fetchone()[0]
             capacity_alert_row = con.execute(
-                "select payload_json from bot_notifications "
-                "where topic='capacity_deadlock'"
+                "select safe_message from bot_warning_inbox "
+                "where topic='capacity_deadlock' order by id limit 1"
             ).fetchone()
         finally:
             con.close()
+        assert notification_count == 0
         assert capacity_alert_count == expected_alerts
         if expected_alerts:
             assert capacity_alert_row is not None
-            payload = json.loads(capacity_alert_row[0])
-            assert payload["message_state"] == expected_message_state
+            if expected_message_state == "reclaiming":
+                assert "安全释放无效文件" in capacity_alert_row["safe_message"]
+            else:
+                assert "需要人工处理" in capacity_alert_row["safe_message"]
 
 
 def test_daemon_records_redacted_effective_scheduler_config_at_startup():

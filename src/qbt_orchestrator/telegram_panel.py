@@ -20,6 +20,22 @@ def _view_digest(view: PanelView) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _is_panel_message_unavailable(exc: BaseException) -> bool:
+    """True only for explicit Telegram 400s that mean the panel message is gone."""
+    from .integrations.telegram import TelegramApiError
+
+    if not isinstance(exc, TelegramApiError):
+        return False
+    status = exc.http_status if exc.http_status is not None else exc.error_code
+    if status != 400:
+        return False
+    text = str(exc.description or "").lower()
+    return (
+        "message to edit not found" in text
+        or "message can't be edited" in text
+    )
+
+
 def _extract_message_id(response: Any) -> int | None:
     if not isinstance(response, dict):
         return None
@@ -146,19 +162,45 @@ class PersistentPanelController:
         self.sessions = sessions or PanelSessionRepository(self.state_db, now=self.now)
 
     def open_home(self, chat_id: int) -> None:
-        self.navigate(chat_id, "n:h")
+        # /start is the only path allowed to rebind the singleton to a new chat.
+        self.navigate(chat_id, "n:h", allow_rebind=True)
 
-    def navigate(self, chat_id: int, route: str) -> None:
+    def navigate(
+        self, chat_id: int, route: str, *, allow_rebind: bool = False
+    ) -> None:
+        if not self._may_publish_to_chat(chat_id, allow_rebind=allow_rebind):
+            return
         route_text = str(route or "n:h")
         self.sessions.set_route(route_text)
         view = self.render_route(route_text)
-        self._publish(chat_id, view, route=route_text)
+        self._publish(
+            chat_id, view, route=route_text, allow_rebind=allow_rebind
+        )
 
-    def show_view(self, chat_id: int, route: str, view: PanelView) -> None:
+    def show_view(
+        self,
+        chat_id: int,
+        route: str,
+        view: PanelView,
+        *,
+        allow_rebind: bool = False,
+    ) -> None:
         """Publish a pre-built view and persist the route."""
+        if not self._may_publish_to_chat(chat_id, allow_rebind=allow_rebind):
+            return
         route_text = str(route or "n:h")
         self.sessions.set_route(route_text)
-        self._publish(chat_id, view, route=route_text)
+        self._publish(
+            chat_id, view, route=route_text, allow_rebind=allow_rebind
+        )
+
+    def _may_publish_to_chat(self, chat_id: int, *, allow_rebind: bool) -> bool:
+        session = self.sessions.get()
+        if session is None or session.get("message_id") is None:
+            return True
+        if str(session.get("chat_id") or "") == str(chat_id):
+            return True
+        return bool(allow_rebind)
 
     def refresh_now(self) -> None:
         session = self.sessions.get()
@@ -243,12 +285,17 @@ class PersistentPanelController:
         *,
         route: str,
         force: bool = False,
+        allow_rebind: bool = False,
     ) -> None:
         digest = _view_digest(view)
         session = self.sessions.get()
+        same_chat = (
+            session is not None
+            and str(session.get("chat_id") or "") == str(chat_id)
+        )
         if (
             not force
-            and session is not None
+            and same_chat
             and session.get("message_id") is not None
             and str(session.get("last_render_hash") or "") == digest
             and str(session.get("current_route") or "") == str(route)
@@ -256,11 +303,13 @@ class PersistentPanelController:
             return
         message_id = (
             int(session["message_id"])
-            if session is not None and session.get("message_id") is not None
+            if same_chat and session.get("message_id") is not None
             else None
         )
         now = int(self.now())
         if message_id is not None:
+            from .integrations.telegram import TelegramApiError
+
             try:
                 self.api.edit_message_text(
                     chat_id,
@@ -268,17 +317,28 @@ class PersistentPanelController:
                     view.text,
                     reply_markup=view.reply_markup,
                 )
+            except TelegramApiError as exc:
+                if not _is_panel_message_unavailable(exc):
+                    raise
+            else:
+                # Keep persistence outside the edit except-block so a DB failure
+                # after a successful edit never falls through to sendMessage.
                 self.sessions.record_render(digest, now)
                 return
-            except Exception:
-                message_id = None
+        elif (
+            session is not None
+            and session.get("message_id") is not None
+            and not allow_rebind
+        ):
+            # Bound to another chat; refuse silent cross-chat create/rebind.
+            return
         response = self.api.send_message(
             chat_id, view.text, reply_markup=view.reply_markup
         )
         new_id = _extract_message_id(response)
         if new_id is None:
             # Tests/fakes may return {"ok": True} without message_id; keep prior.
-            if session is not None and session.get("message_id") is not None:
+            if same_chat and session is not None and session.get("message_id") is not None:
                 new_id = int(session["message_id"])
             else:
                 new_id = 1

@@ -139,6 +139,60 @@ class WarningInboxRepository:
 
         return write_transaction(self.state_db, txn)
 
+    def insert_once(
+        self,
+        *,
+        warning_key: str,
+        severity: str,
+        topic: str,
+        safe_message: str,
+        related_hash: str | None = None,
+        related_job_id: int | None = None,
+        related_batch_id: int | None = None,
+        related_item_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Insert a warning only if warning_key is new; never bump occurrence_count."""
+        key = str(warning_key or "").strip()
+        if not key:
+            raise ValueError("warning_key")
+        if severity not in _SEVERITY_RANK:
+            raise ValueError("severity")
+        topic_text = str(topic or "").strip() or "general"
+        message = str(redact(str(safe_message)))[:2000]
+        now = int(self.now())
+
+        def txn(con) -> dict[str, Any] | None:
+            cur = con.execute(
+                "insert or ignore into bot_warning_inbox("
+                "warning_key,severity,topic,safe_message,related_hash,related_job_id,"
+                "related_batch_id,related_item_id,occurrence_count,first_occurred_at,"
+                "last_occurred_at,updated_at,resolved) values(?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                (
+                    key,
+                    severity,
+                    topic_text,
+                    message,
+                    related_hash,
+                    related_job_id,
+                    related_batch_id,
+                    related_item_id,
+                    1,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            if int(cur.rowcount or 0) == 0:
+                return None
+            warning_id = int(cur.lastrowid)
+            return _row_dict(
+                con.execute(
+                    "select * from bot_warning_inbox where id=?", (warning_id,)
+                ).fetchone()
+            )
+
+        return write_transaction(self.state_db, txn)
+
     def unread_count(self) -> int:
         con = readonly_connect(self.state_db)
         try:
@@ -492,6 +546,30 @@ class WarningService:
     ) -> dict[str, Any]:
         del projection_payload  # No longer projected to Telegram notifications.
         return self.inbox.upsert(
+            warning_key=warning_key,
+            severity=severity,
+            topic=topic,
+            safe_message=safe_message,
+            related_hash=related_hash,
+            related_job_id=related_job_id,
+            related_batch_id=related_batch_id,
+            related_item_id=related_item_id,
+        )
+
+    def report_once(
+        self,
+        *,
+        warning_key: str,
+        severity: str,
+        topic: str,
+        safe_message: str,
+        related_hash: str | None = None,
+        related_job_id: int | None = None,
+        related_batch_id: int | None = None,
+        related_item_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Create at most one inbox row per warning_key (no occurrence bumps)."""
+        return self.inbox.insert_once(
             warning_key=warning_key,
             severity=severity,
             topic=topic,

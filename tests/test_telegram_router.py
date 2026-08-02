@@ -399,3 +399,115 @@ def test_static_guard_single_get_updates_path():
     db_sql = Path("src/qbt_orchestrator/db.py").read_text(encoding="utf-8")
     assert "create table if not exists bot_warning_reads" not in db_sql
     assert "drop table if exists bot_warning_reads" in db_sql
+
+
+def test_unauthorized_chat_cannot_touch_bound_panel(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    api = FakeApi()
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    router.handle_update(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 7},
+                "from": {"id": 42},
+                "text": "/start",
+            },
+        }
+    )
+    assert len(api.messages) == 1
+    bound = router.panel.sessions.get()
+    assert str(bound["chat_id"]) == "7"
+    message_id = int(bound["message_id"])
+
+    before_messages = list(api.messages)
+    before_edits = list(api.edits)
+    router.handle_update(
+        {
+            "update_id": 2,
+            "message": {
+                "message_id": 2,
+                "chat": {"id": 999},
+                "from": {"id": 999},
+                "text": "/status",
+            },
+        }
+    )
+    router.handle_update(
+        {
+            "update_id": 3,
+            "message": {
+                "message_id": 3,
+                "chat": {"id": 999},
+                "from": {"id": 999},
+                "text": "/cleanup h1",
+            },
+        }
+    )
+    assert api.messages == before_messages
+    assert api.edits == before_edits
+    still = router.panel.sessions.get()
+    assert str(still["chat_id"]) == "7"
+    assert int(still["message_id"]) == message_id
+
+
+def test_authorized_admin_can_rebind_panel_via_start_in_new_chat(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    api = FakeApi()
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    router.handle_update(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 7},
+                "from": {"id": 42},
+                "text": "/start",
+            },
+        }
+    )
+    old_id = int(router.panel.sessions.get()["message_id"])
+    router.handle_update(
+        {
+            "update_id": 2,
+            "message": {
+                "message_id": 2,
+                "chat": {"id": 7},
+                "from": {"id": 42},
+                "text": "/status",
+            },
+        }
+    )
+    assert api.edits
+    assert int(router.panel.sessions.get()["message_id"]) == old_id
+
+    router.handle_update(
+        {
+            "update_id": 3,
+            "message": {
+                "message_id": 3,
+                "chat": {"id": 8},
+                "from": {"id": 42},
+                "text": "/start",
+            },
+        }
+    )
+    session = router.panel.sessions.get()
+    assert str(session["chat_id"]) == "8"
+    assert int(session["message_id"]) != old_id
+    assert any(chat_id == 8 for chat_id, _text, _markup in api.messages)

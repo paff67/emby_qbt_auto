@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from qbt_orchestrator.db import migrate, write_execute
+from qbt_orchestrator.integrations.telegram import TelegramApiError
 from qbt_orchestrator.telegram_panel import (
     PanelSessionRepository,
     PersistentPanelController,
@@ -97,10 +100,12 @@ def test_refresh_if_due_backs_off_after_failed_attempt(tmp_path):
 
     class BoomApi(FakeApi):
         def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
-            raise RuntimeError("edit failed")
+            raise TelegramApiError(
+                "editMessageText", http_status=500, description="upstream boom"
+            )
 
         def send_message(self, chat_id, text, reply_markup=None):
-            raise RuntimeError("send failed")
+            raise AssertionError("sendMessage must not run on transient edit errors")
 
     clock = {"t": 1000}
     controller = PersistentPanelController(
@@ -116,26 +121,152 @@ def test_refresh_if_due_backs_off_after_failed_attempt(tmp_path):
     controller.sessions.set_route("n:h")
     controller.sessions.record_render("seed", 900)
 
-    raised = False
-    try:
+    with pytest.raises(TelegramApiError):
         controller.refresh_if_due(60)
-    except RuntimeError:
-        raised = True
-    assert raised is True
     session = controller.sessions.get()
     assert session is not None
     assert int(session["last_refresh_attempt_at"]) == 1000
+    assert int(session["message_id"]) == 55
 
     clock["t"] = 1059
     assert controller.refresh_if_due(60) is False
     clock["t"] = 1060
-    raised = False
-    try:
+    with pytest.raises(TelegramApiError):
         controller.refresh_if_due(60)
-    except RuntimeError:
-        raised = True
-    assert raised is True
     assert int(controller.sessions.get()["last_refresh_attempt_at"]) == 1060
+
+
+def test_publish_network_error_does_not_create_duplicate_console(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+
+    class NetworkApi(FakeApi):
+        def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+            raise TelegramApiError("editMessageText", description="timed out")
+
+        def send_message(self, chat_id, text, reply_markup=None):
+            raise AssertionError("sendMessage forbidden on network errors")
+
+    api = NetworkApi()
+    controller = PersistentPanelController(
+        db,
+        api=api,
+        renderer=TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000),
+        now=lambda: 1000,
+    )
+    controller.sessions.bind(7, 55)
+    controller.sessions.set_route("n:h")
+    controller.sessions.record_render("seed", 900)
+    with pytest.raises(TelegramApiError):
+        controller.refresh_now()
+    assert api.messages == []
+    session = controller.sessions.get()
+    assert str(session["chat_id"]) == "7"
+    assert int(session["message_id"]) == 55
+
+
+def test_publish_rate_limit_does_not_create_duplicate_console(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+
+    class RateLimitApi(FakeApi):
+        def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+            raise TelegramApiError(
+                "editMessageText",
+                http_status=429,
+                error_code=429,
+                description="Too Many Requests",
+                retry_after=3,
+            )
+
+        def send_message(self, chat_id, text, reply_markup=None):
+            raise AssertionError("sendMessage forbidden on 429")
+
+    api = RateLimitApi()
+    controller = PersistentPanelController(
+        db,
+        api=api,
+        renderer=TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000),
+        now=lambda: 1000,
+    )
+    controller.sessions.bind(7, 55)
+    controller.sessions.set_route("n:h")
+    controller.sessions.record_render("seed", 900)
+    with pytest.raises(TelegramApiError):
+        controller.refresh_now()
+    assert api.messages == []
+    session = controller.sessions.get()
+    assert str(session["chat_id"]) == "7"
+    assert int(session["message_id"]) == 55
+
+
+def test_publish_rebuilds_when_message_to_edit_not_found(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+
+    class MissingMessageApi(FakeApi):
+        def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+            self.edits.append((chat_id, message_id, text, reply_markup))
+            raise TelegramApiError(
+                "editMessageText",
+                http_status=400,
+                error_code=400,
+                description="Bad Request: message to edit not found",
+            )
+
+    api = MissingMessageApi()
+    controller = PersistentPanelController(
+        db,
+        api=api,
+        renderer=TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000),
+        now=lambda: 1000,
+    )
+    controller.sessions.bind(7, 55)
+    controller.sessions.set_route("n:h")
+    controller.sessions.record_render("seed", 900)
+    controller.refresh_now()
+    assert len(api.edits) == 1
+    assert len(api.messages) == 1
+    session = controller.sessions.get()
+    assert str(session["chat_id"]) == "7"
+    assert int(session["message_id"]) == api.messages[0][3]
+    assert int(session["message_id"]) != 55
+
+
+def test_publish_successful_edit_with_record_render_failure_does_not_send(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+
+    class FailingSessions(PanelSessionRepository):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.fail_record = False
+
+        def record_render(self, digest: str, refreshed_at: int) -> None:
+            if self.fail_record:
+                raise RuntimeError("persist render failed")
+            return super().record_render(digest, refreshed_at)
+
+    api = FakeApi()
+    sessions = FailingSessions(db, now=lambda: 1000)
+    controller = PersistentPanelController(
+        db,
+        api=api,
+        renderer=TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000),
+        sessions=sessions,
+        now=lambda: 1000,
+    )
+    sessions.bind(7, 55)
+    sessions.set_route("n:h")
+    sessions.record_render("seed", 900)
+    sessions.fail_record = True
+    with pytest.raises(RuntimeError, match="persist render failed"):
+        controller.refresh_now()
+    assert len(api.edits) == 1
+    assert api.messages == []
+    session = PanelSessionRepository(db).get()
+    assert str(session["chat_id"]) == "7"
+    assert int(session["message_id"]) == 55
 
 
 def test_home_active_total_counts_beyond_display_limit(tmp_path):
