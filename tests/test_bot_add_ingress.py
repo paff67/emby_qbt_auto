@@ -177,7 +177,7 @@ def test_ingress_marks_invalid_links_and_resolves_http(tmp_path):
         batch["id"],
         1,
         [
-            "magnet:?xt=urn:btih:not-a-hash",
+            "magnet:?" + "xt=urn:btih:not-a-hash",
             "https://example.test/file.torrent",
         ],
     )
