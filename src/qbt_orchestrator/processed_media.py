@@ -483,6 +483,21 @@ class ProcessedMediaRepository:
                             "ignored_error": safe_error,
                         },
                     )
+                    # Keep saga stage aligned; finalize early-return would otherwise
+                    # leave the latest stage stuck before manual_deleted forever.
+                    self._insert_event(
+                        con,
+                        media_id,
+                        event_type="manual_delete_stage",
+                        event_at=now,
+                        actor_type=actor_type,
+                        actor_id=actor_id,
+                        correlation_id=correlation_id,
+                        payload={
+                            "stage": "manual_deleted",
+                            "reason": "contradiction_repair",
+                        },
+                    )
                     return _row_to_dict(
                         con.execute(
                             "select * from processed_media where id=?", (media_id,)

@@ -121,11 +121,22 @@ def test_processed_media_migration_idempotent_and_readable(tmp_path):
     try:
         count = con.execute("select count(*) from processed_media").fetchone()[0]
         assert int(count) == 0
-        version = con.execute(
+        version21 = con.execute(
             "select name from schema_migrations where version=21"
         ).fetchone()
-        assert version is not None
-        assert version[0] == "processed_media_tombstone_ledger_v1"
+        version22 = con.execute(
+            "select name from schema_migrations where version=22"
+        ).fetchone()
+        assert version21 is not None
+        assert version21[0] == "processed_media_tombstone_ledger_v1"
+        assert version22 is not None
+        assert version22[0] == "torrent_name_and_batch_summary_v1"
+        assert "name" in {
+            row[1] for row in con.execute("pragma table_info(torrent_health)")
+        }
+        assert "final_summary_sent_at" in {
+            row[1] for row in con.execute("pragma table_info(bot_add_batches)")
+        }
     finally:
         con.close()
 
@@ -225,13 +236,31 @@ def test_finalize_manual_delete_writes_stage_atomically_and_resists_fail(tmp_pat
         "where normalized_id=?",
         ("BBAN-600",),
     )
-    repaired = repo.fail_manual_delete("BBAN-600", actor_id="ops", error="stale")
+    # Leave latest stage before final so repair must append manual_deleted stage.
+    write_execute(
+        db,
+        "insert into processed_media_events("
+        "processed_media_id,event_type,event_at,actor_type,actor_id,payload_json) "
+        "values((select id from processed_media where normalized_id=?),"
+        "'manual_delete_stage',78,'cli','ops',?)",
+        (
+            "BBAN-600",
+            json.dumps({"stage": "emby_refreshed"}, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+    # Repair clock must advance past the stale stage timestamp (78).
+    repair_repo = ProcessedMediaRepository(db, now=lambda: 80, enforce=True)
+    repaired = repair_repo.fail_manual_delete("BBAN-600", actor_id="ops", error="stale")
     assert repaired["lifecycle_state"] == "manual_deleted"
     assert int(repaired["manually_deleted_at"]) == 77
-    history = repo.history("BBAN-600", limit=30)
+    history = repair_repo.history("BBAN-600", limit=30)
     assert any(
         item["event_type"] == "manual_delete_state_normalized" for item in history
     )
+    latest_stage = next(
+        item for item in history if item["event_type"] == "manual_delete_stage"
+    )
+    assert json.loads(latest_stage["payload_json"])["stage"] == "manual_deleted"
 
 
 def test_processed_media_backfill_dry_run(tmp_path):
