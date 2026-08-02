@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Sequence
 from .config import load_config
 from .carousel import CarouselService
+from .bot_add_ingress import BotAddIngressCoordinator
 from .bot_add_queue import BotAddQueueRepository
 from .capacity_reclaim import (
     CAPACITY_BLOCKING_RECOVERY_STATES,
@@ -417,21 +418,29 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     metadata_probe_enabled = (
         _truthy(os.environ.get("QBT_ORCH_METADATA_PROBE_ENABLED")) is True
     )
-    metadata_probe_coordinator = None
-    if metadata_probe_enabled and not dry_run:
-        metadata_probe_coordinator = MetadataProbeCoordinator(
-            BotAddQueueRepository(state_db),
-            QbtPrecheckGateway(qbt, executor),
-            warning_service=warning_service,
-        )
     checked_add_enabled = (
         _truthy(os.environ.get("QBT_ORCH_CHECKED_ADD_ENABLED")) is True
     )
+    bot_add_queue = None
+    if (metadata_probe_enabled or checked_add_enabled) and not dry_run:
+        bot_add_queue = BotAddQueueRepository(state_db)
+    metadata_probe_coordinator = None
+    if metadata_probe_enabled and not dry_run and bot_add_queue is not None:
+        metadata_probe_coordinator = MetadataProbeCoordinator(
+            bot_add_queue,
+            QbtPrecheckGateway(qbt, executor),
+            warning_service=warning_service,
+        )
+    bot_add_ingress_coordinator = None
+    if bot_add_queue is not None:
+        bot_add_ingress_coordinator = BotAddIngressCoordinator(
+            bot_add_queue,
+            warning_service=warning_service,
+        )
     checked_add_service = None
-    if checked_add_enabled and not dry_run:
-        checked_queue = BotAddQueueRepository(state_db)
+    if checked_add_enabled and not dry_run and bot_add_queue is not None:
         checked_add_service = CheckedAddService(
-            checked_queue,
+            bot_add_queue,
             QbtPrecheckGateway(qbt, executor),
             DuplicateMatcher(
                 state_db,
@@ -881,6 +890,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         junk_janitor=junk_janitor,
         observe_promotion_service=observe_promotion_service,
         metadata_probe_coordinator=metadata_probe_coordinator,
+        bot_add_ingress_coordinator=bot_add_ingress_coordinator,
         checked_add_service=checked_add_service,
         junk_file_refresh_limit=int(os.environ.get("QBT_ORCH_JUNK_FILE_REFRESH_LIMIT", "3")),
         carousel_service=carousel_service,

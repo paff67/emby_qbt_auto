@@ -354,6 +354,7 @@ class DaemonRuntime:
         junk_janitor=None,
         observe_promotion_service: ObservePromotionService | None = None,
         metadata_probe_coordinator=None,
+        bot_add_ingress_coordinator=None,
         checked_add_service=None,
         junk_file_refresh_limit: int = 3,
         carousel_service=None,
@@ -495,6 +496,7 @@ class DaemonRuntime:
         self.junk_janitor = junk_janitor
         self.observe_promotion_service = observe_promotion_service
         self.metadata_probe_coordinator = metadata_probe_coordinator
+        self.bot_add_ingress_coordinator = bot_add_ingress_coordinator
         self.checked_add_service = checked_add_service
         self.path_reconciler = path_reconciler
         self.preemption_service = preemption_service
@@ -645,6 +647,15 @@ class DaemonRuntime:
             LoopTask("maintenance", 300, self.maintenance_tick, max_runtime_sec=5),
             LoopTask("carousel", 60, self.carousel_tick, max_runtime_sec=2),
         ]
+        if self.bot_add_ingress_coordinator is not None:
+            tasks.append(
+                LoopTask(
+                    "bot_add_ingress",
+                    5,
+                    self.bot_add_ingress_tick,
+                    max_runtime_sec=2,
+                )
+            )
         if self.metadata_probe_coordinator is not None:
             tasks.append(
                 LoopTask(
@@ -677,6 +688,11 @@ class DaemonRuntime:
         if self.batch_summary_projector is None:
             return {"status": "disabled"}
         return self.batch_summary_projector.tick()
+
+    def bot_add_ingress_tick(self) -> dict:
+        if self.bot_add_ingress_coordinator is None:
+            return {"status": "disabled"}
+        return self.bot_add_ingress_coordinator.tick()
 
     def metadata_probe_tick(self) -> dict:
         if self.metadata_probe_coordinator is None:
@@ -1706,6 +1722,7 @@ class DaemonRuntime:
                 "batch_live_verify": bool(self.batch_live_verify),
                 "background_event_workers": bool(self.background_event_workers),
                 "background_periodic_workers": bool(self.background_periodic_workers),
+                "bot_add_ingress": self.bot_add_ingress_coordinator is not None,
                 "metadata_probe": self.metadata_probe_coordinator is not None,
                 "checked_add": self.checked_add_service is not None,
                 "scheduler_alerts": bool(self.scheduler_alert_service.config.enabled)
