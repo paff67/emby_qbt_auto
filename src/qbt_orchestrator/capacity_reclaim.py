@@ -158,6 +158,7 @@ class CapacityReclaimAuditStore:
         *,
         notification_chat_ids: list[str] | tuple[str, ...] | None = None,
         now: Callable[[], int] | None = None,
+        warning_service=None,
     ):
         self.state_db = Path(state_db)
         self.notification_chat_ids = tuple(
@@ -168,6 +169,7 @@ class CapacityReclaimAuditStore:
             )
         )
         self.now = now or (lambda: int(__import__("time").time()))
+        self.warning_service = warning_service
 
     @staticmethod
     def _identity(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -238,6 +240,22 @@ class CapacityReclaimAuditStore:
         payload: Mapping[str, Any],
         now: int,
     ) -> list[int]:
+        if self.warning_service is not None and level in {"warning", "error", "critical"}:
+            torrent_hash = str(row.get("hash") or payload.get("hash") or "").strip()
+            if kind in {"no_safe_reclaim", "no_candidate", "deadlock"}:
+                warning_key = "capacity:no_safe_reclaim"
+            else:
+                warning_key = f"capacity:reclaim_failed:{torrent_hash or 'unknown'}"
+            try:
+                self.warning_service.report(
+                    warning_key=warning_key[:200],
+                    severity=level if level in {"info", "warning", "error", "critical"} else "warning",
+                    topic="capacity_reclaim",
+                    safe_message=str(redact(message)),
+                    related_hash=torrent_hash or None,
+                )
+            except Exception:
+                pass
         notification_ids = self._notification_ids(row)
         reason_token = str(payload.get("reason") or kind).strip() or kind
         hour_bucket = int(now) // 3600

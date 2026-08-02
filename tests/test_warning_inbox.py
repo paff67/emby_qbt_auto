@@ -120,3 +120,101 @@ def test_runtime_writer_cannot_insert_legacy_warning_reads(tmp_path):
             "values(?,?,?,?)",
             (1, "chat", "user", 100),
         )
+
+
+def test_warning_inbox_upsert_and_read_fencing(tmp_path):
+    from qbt_orchestrator.warning_inbox import WarningInboxRepository
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    repo = WarningInboxRepository(db, now=lambda: 200)
+    first = repo.upsert(
+        warning_key="capacity:no_safe_reclaim",
+        severity="warning",
+        topic="capacity",
+        safe_message="no safe reclaim",
+    )
+    assert first["occurrence_count"] == 1
+    assert first["resolved"] == 0
+    second = repo.upsert(
+        warning_key="capacity:no_safe_reclaim",
+        severity="error",
+        topic="capacity",
+        safe_message="still no reclaim",
+    )
+    assert second["occurrence_count"] == 2
+    assert second["severity"] == "error"
+    assert repo.unread_count() == 1
+    assert not repo.mark_read(int(second["id"]), expected_occurrence=1, admin_id="admin")
+    assert repo.mark_read(int(second["id"]), expected_occurrence=2, admin_id="admin")
+    assert repo.unread_count() == 0
+    reopened = repo.upsert(
+        warning_key="capacity:no_safe_reclaim",
+        severity="warning",
+        topic="capacity",
+        safe_message="again",
+    )
+    assert reopened["resolved"] == 0
+    assert reopened["occurrence_count"] == 3
+    summary = repo.copy_summary(int(reopened["id"]))
+    assert len(summary.encode("utf-8")) <= 256
+    exported = repo.export_text(int(reopened["id"]))
+    assert b"capacity" in exported
+    assert len(exported) <= 512_000
+
+
+def test_warning_service_projects_after_inbox_commit(tmp_path):
+    from qbt_orchestrator.warning_inbox import WarningService
+    from qbt_orchestrator.runtime import BotNotificationRepository
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    service = WarningService(db, admin_chat_id="1001", now=lambda: 300)
+    row = service.report(
+        warning_key="qbt:authentication",
+        severity="error",
+        topic="qbt",
+        safe_message="auth failed",
+    )
+    con = readonly_connect(db)
+    try:
+        inbox = con.execute(
+            "select warning_key,resolved from bot_warning_inbox where id=?",
+            (int(row["id"]),),
+        ).fetchone()
+        note = con.execute(
+            "select dedupe_key,chat_id from bot_notifications where dedupe_key=?",
+            (f"warn:{int(row['id'])}:{int(row['occurrence_count'])}",),
+        ).fetchone()
+    finally:
+        con.close()
+    assert inbox["warning_key"] == "qbt:authentication"
+    assert note["chat_id"] == "1001"
+    # Drop projection and reconcile.
+    write_execute(db, "delete from bot_notifications")
+    assert service.reconcile_projections() == 1
+
+
+def test_required_warning_keys_via_service(tmp_path):
+    from qbt_orchestrator.warning_inbox import WarningService
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    service = WarningService(db, admin_chat_id="9", now=lambda: 400)
+    keys = [
+        "capacity:no_safe_reclaim",
+        "capacity:reclaim_failed:abc",
+        "qbt:authentication",
+        "checked_add:blocked_manual_deleted:1",
+        "upload:verify:2",
+        "path_drift:abc",
+        "daemon_task:planner:RuntimeError",
+    ]
+    for key in keys:
+        service.report(
+            warning_key=key,
+            severity="warning",
+            topic=key.split(":", 1)[0],
+            safe_message=f"safe {key}",
+        )
+    assert WarningService(db, admin_chat_id="9").inbox.unread_count() == len(keys)

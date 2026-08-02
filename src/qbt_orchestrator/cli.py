@@ -421,6 +421,10 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
                     "QBT_ORCH_TELEGRAM_BACKFILL_DB",
                     "/opt/qbt/gdrive-backfill/state/backfill.sqlite",
                 ),
+                enforce_processed_media=_truthy(
+                    os.environ.get("QBT_ORCH_PROCESSED_MEDIA_ENFORCE")
+                )
+                is True,
             ),
             notifications=BotNotificationRepository(state_db),
         )
@@ -666,10 +670,21 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     if path_reconcile_enabled is None:
         path_reconcile_enabled = True
     if path_reconcile_enabled:
+        from .warning_inbox import WarningService
+
+        warning_service = WarningService(
+            state_db,
+            admin_chat_id=(
+                (_csv_list(os.environ.get("QBT_ORCH_TG_ALERT_CHAT_IDS")) or [None])[0]
+                or os.environ.get("QBT_ORCH_TG_ADMIN_CHAT")
+                or os.environ.get("QBT_ORCH_TG_ADMIN_ID")
+            ),
+        )
         path_reconciler = QbtPathReconciler(
             state_db,
             expected_save_path=qbt_cfg.save_path if qbt_cfg else "/downloads/active",
             allowed_temp_path=qbt_cfg.temp_path if qbt_cfg else "/downloads/incomplete",
+            warning_service=warning_service,
         )
     orphan_janitor = None
     orphan_enabled = _truthy(os.environ.get("QBT_ORCH_ORPHAN_JANITOR"))
@@ -972,6 +987,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             p.add_argument("--safety-interval", type=float, default=2.0)
         if name == "reconcile":
             p.add_argument("--now", type=int, default=None)
+    md = sub.add_parser("manual-media-delete")
+    md.add_argument("--state-db", default="/var/lib/qbt-orchestrator/state.sqlite")
+    md.add_argument("--id", required=True)
+    md.add_argument("--actor", required=True)
+    md.add_argument("--reason", default="manual_media_delete")
+    md.add_argument("--remote-path", default=None)
+    md.add_argument("--create-if-missing", action="store_true")
+    md.add_argument("--json", action="store_true")
     pm = sub.add_parser("processed-media")
     pm.add_argument("--state-db", default="/var/lib/qbt-orchestrator/state.sqlite")
     pm.add_argument("--json", action="store_true")
@@ -996,6 +1019,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     ns = parser.parse_args(list(argv) if argv is not None else None); db = Path(getattr(ns, "state_db", "/var/lib/qbt-orchestrator/state.sqlite"))
     if ns.cmd == "processed-media":
         return _cmd_processed_media(ns, db)
+    if ns.cmd == "manual-media-delete":
+        from .manual_media_delete import ManualMediaDeleteService
+        from .processed_media import ProcessedMediaRepository
+        from .warning_inbox import WarningService
+
+        migrate(db, False)
+        admin_chat = os.environ.get("QBT_ORCH_TG_ADMIN_CHAT") or os.environ.get("QBT_ORCH_TG_ADMIN_ID")
+        service = ManualMediaDeleteService(
+            db,
+            processed_media=ProcessedMediaRepository(db, enforce=True),
+            warning_service=WarningService(db, admin_chat_id=admin_chat),
+        )
+        result = service.delete(
+            ns.id,
+            actor_id=str(ns.actor),
+            reason=str(ns.reason or "manual_media_delete"),
+            remote_path=ns.remote_path,
+            create_if_missing=bool(ns.create_if_missing),
+        )
+        payload = {
+            "normalized_id": result.normalized_id,
+            "ok": result.ok,
+            "lifecycle_state": result.lifecycle_state,
+            "download_policy": result.download_policy,
+            "error": result.error,
+        }
+        _print_json(payload) if ns.json else print(payload)
+        return 0 if result.ok else 2
     if ns.cmd == "migrate":
         sql = migrate(db, dry_run=not ns.apply); print((json.dumps({"dry_run": not ns.apply, "statements": len(sql)}) if ns.json else f"migration {'dry-run' if not ns.apply else 'applied'}: {len(sql)} statements")); return 0
     if not db.exists(): migrate(db, False)

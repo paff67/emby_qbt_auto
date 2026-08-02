@@ -62,10 +62,12 @@ class QbtPathReconciler:
         state_db: str | Path,
         expected_save_path: str = "/downloads/active",
         allowed_temp_path: str = "/downloads/incomplete",
+        warning_service=None,
     ):
         self.state_db = Path(state_db)
         self.expected_save_path = _norm_posix(expected_save_path)
         self.allowed_temp_path = _norm_posix(allowed_temp_path)
+        self.warning_service = warning_service
 
     def reconcile(self, snapshots: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         scanned = 0
@@ -138,5 +140,16 @@ class QbtPathReconciler:
                     ),
                 ),
             )
+            if self.warning_service is not None:
+                try:
+                    self.warning_service.report(
+                        warning_key=f"path_drift:{drift.get('hash')}",
+                        severity="warning",
+                        topic="path_drift",
+                        safe_message=f"qBT path drift: {drift.get('reason')}",
+                        related_hash=str(drift.get("hash") or "") or None,
+                    )
+                except Exception:
+                    pass
         finally:
             con.close()

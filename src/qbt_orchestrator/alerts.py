@@ -71,10 +71,17 @@ def _normalize_rejection_fingerprint(value: str) -> str:
 class SchedulerAlertService:
     """Queue proactive Telegram alerts for scheduler and disk-pressure anomalies."""
 
-    def __init__(self, repo: BotNotificationRepository, config: SchedulerAlertConfig | None = None, now=None):
+    def __init__(
+        self,
+        repo: BotNotificationRepository,
+        config: SchedulerAlertConfig | None = None,
+        now=None,
+        warning_service=None,
+    ):
         self.repo = repo
         self.config = config or SchedulerAlertConfig()
         self.now = now or (lambda: int(time.time()))
+        self.warning_service = warning_service
 
     def evaluate_and_enqueue(
         self,
@@ -260,6 +267,29 @@ class SchedulerAlertService:
         return ids
 
     def _broadcast(self, *, topic: str, level: str, message: str, payload: dict[str, Any], dedupe_topic: str, bucket: int) -> list[int]:
+        safe_message = str(redact(message))
+        if self.warning_service is not None and level in {"warning", "error", "critical"}:
+            warning_key = {
+                "scheduler_all_stopped": "qbt:authentication" if "auth" in dedupe_topic else f"daemon_task:scheduler:{dedupe_topic}",
+                "disk_threshold": "capacity:no_safe_reclaim" if "no_safe" in dedupe_topic else f"capacity:disk:{dedupe_topic}",
+                "capacity_deadlock": "capacity:no_safe_reclaim",
+            }.get(topic, f"daemon_task:alert:{dedupe_topic}")
+            if topic == "scheduler_all_stopped":
+                warning_key = "daemon_task:scheduler:all_stopped"
+            elif topic == "disk_threshold":
+                warning_key = "capacity:no_safe_reclaim" if "emergency" in str(payload.get("state") or "") else f"capacity:disk:{payload.get('state') or dedupe_topic}"
+            elif topic == "capacity_deadlock":
+                warning_key = "capacity:no_safe_reclaim"
+            try:
+                self.warning_service.report(
+                    warning_key=str(warning_key)[:200],
+                    severity=level if level in {"info", "warning", "error", "critical"} else "warning",
+                    topic=topic,
+                    safe_message=safe_message,
+                    related_hash=str(payload.get("hash") or "") or None,
+                )
+            except Exception:
+                pass
         ids: list[int] = []
         for chat_id in self.config.chat_ids:
             dedupe_key = f"scheduler-alert:{dedupe_topic}:{chat_id}:{bucket}"
@@ -267,7 +297,7 @@ class SchedulerAlertService:
                 self.repo.enqueue(
                     chat_id=chat_id,
                     topic=topic,
-                    message=str(redact(message)),
+                    message=safe_message,
                     level=level,
                     payload=payload,
                     dedupe_key=dedupe_key,

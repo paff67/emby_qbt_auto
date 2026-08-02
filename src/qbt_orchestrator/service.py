@@ -208,17 +208,49 @@ def build_telegram_supervisor_from_env(
     token = env.get("QBT_ORCH_TELEGRAM_TOKEN") or env.get("TELEGRAM_BOT_TOKEN")
     if not token:
         return None
+    admins = _parse_id_set(env.get("QBT_ORCH_TG_ADMINS"))
+    single_admin_raw = (env.get("QBT_ORCH_TG_ADMIN_ID") or "").strip()
+    single_admin_id = int(single_admin_raw) if single_admin_raw else (next(iter(admins), None))
     authorizer = TelegramAuthorizer(
         viewers=_parse_id_set(env.get("QBT_ORCH_TG_VIEWERS")),
         operators=_parse_id_set(env.get("QBT_ORCH_TG_OPERATORS")),
-        admins=_parse_id_set(env.get("QBT_ORCH_TG_ADMINS")),
+        admins=admins,
+        single_admin_id=single_admin_id,
     )
     command_store = BotCommandRepository(state_db)
     api = api_factory(token)
     poll_timeout = int(env.get("QBT_ORCH_TG_POLL_TIMEOUT", "30"))
     interval = float(env.get("QBT_ORCH_TG_SUPERVISOR_INTERVAL", "1"))
     max_backoff = float(env.get("QBT_ORCH_TG_MAX_BACKOFF", "60"))
-    return TelegramSupervisor(TelegramPollingService(api, authorizer, command_store, poll_timeout=poll_timeout), interval=interval, max_backoff=max_backoff)
+    panel_enabled = str(env.get("QBT_ORCH_TG_PANEL_ENABLED", "0")).strip() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    router = None
+    if panel_enabled:
+        from .bot_add_queue import BotAddQueueRepository
+        from .telegram_router import TelegramUpdateRouter
+        from .warning_inbox import WarningInboxRepository
+
+        router = TelegramUpdateRouter(
+            api=api,
+            authorizer=authorizer,
+            command_store=command_store,
+            state_db=state_db,
+            add_queue=BotAddQueueRepository(state_db),
+            warnings=WarningInboxRepository(state_db),
+            panel_enabled=True,
+            admin_user_id=str(single_admin_id) if single_admin_id is not None else None,
+        )
+    return TelegramSupervisor(
+        TelegramPollingService(
+            api, authorizer, command_store, poll_timeout=poll_timeout, router=router
+        ),
+        interval=interval,
+        max_backoff=max_backoff,
+    )
 
 
 class DaemonRuntime:

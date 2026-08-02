@@ -9,19 +9,45 @@ from typing import Callable, Dict, Set
 from .db import write_transaction
 from .hash_identity import canonical_torrent_hash
 
-VIEWER = {"status", "trace", "perf"}
-OPERATOR = VIEWER | {"pause", "resume", "queue"}
+VIEWER = {"start", "help", "status", "trace", "perf", "queue", "warnings"}
+OPERATOR = VIEWER | {"pause", "resume", "add"}
 ADMIN = OPERATOR | {"force_upload", "cleanup", "preempt", "config", "approve", "deny"}
+
+
 class TelegramAuthorizer:
-    def __init__(self, viewers: Set[int] | None = None, operators: Set[int] | None = None, admins: Set[int] | None = None): self.viewers = viewers or set(); self.operators = operators or set(); self.admins = admins or set()
+    def __init__(
+        self,
+        viewers: Set[int] | None = None,
+        operators: Set[int] | None = None,
+        admins: Set[int] | None = None,
+        *,
+        single_admin_id: int | None = None,
+    ):
+        self.viewers = viewers or set()
+        self.operators = operators or set()
+        self.admins = admins or set()
+        if single_admin_id is not None:
+            self.admins.add(int(single_admin_id))
+
     def role_for(self, user_id: int) -> str | None:
-        if user_id in self.admins: return "admin"
-        if user_id in self.operators: return "operator"
-        if user_id in self.viewers: return "viewer"
+        if user_id in self.admins:
+            return "admin"
+        if user_id in self.operators:
+            return "operator"
+        if user_id in self.viewers:
+            return "viewer"
         return None
+
     def allowed(self, user_id: int, command: str) -> bool:
         role = self.role_for(user_id)
-        return (role == "admin" and command in ADMIN) or (role == "operator" and command in OPERATOR) or (role == "viewer" and command in VIEWER)
+        return (
+            (role == "admin" and command in ADMIN)
+            or (role == "operator" and command in OPERATOR)
+            or (role == "viewer" and command in VIEWER)
+        )
+
+    def can_mutate(self, user_id: int) -> bool:
+        return self.role_for(user_id) in {"admin", "operator"}
 @dataclass
 class Approval:
     action: str; payload: dict; expires_at: int; approved: bool = False
