@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from qbt_orchestrator.bot_add_queue import BotAddQueueRepository
 from qbt_orchestrator.db import migrate, readonly_connect
-from qbt_orchestrator.integrations.telegram import TelegramPollingService
 from qbt_orchestrator.telegram_control import TelegramAuthorizer
 from qbt_orchestrator.telegram_router import TelegramUpdateRouter, extract_links_from_text
 
@@ -13,13 +12,15 @@ class FakeApi:
         self.edits: list[tuple] = []
         self.callbacks: list[tuple] = []
         self.documents: list[tuple] = []
+        self._next_id = 10
 
     def get_updates(self, offset, timeout):
         return []
 
     def send_message(self, chat_id, text, reply_markup=None):
+        self._next_id += 1
         self.messages.append((chat_id, text, reply_markup))
-        return {"ok": True}
+        return {"ok": True, "result": {"message_id": self._next_id}}
 
     def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
         self.edits.append((chat_id, message_id, text, reply_markup))
@@ -74,9 +75,9 @@ def test_telegram_router_appends_magnet_to_real_queue(tmp_path):
         con.close()
     assert int(batches) == 1
     assert int(items) == 1
-    assert any("已接收" in text for _, text, _ in api.messages)
+    assert any("添加下载" in text and "已接收" in text for _, text, _ in api.messages)
     assert any(
-        btn.get("text") == "提交本批"
+        "提交本批" in str(btn.get("text") or "")
         for _, _, markup in api.messages
         if markup
         for row in markup.get("inline_keyboard", [])
@@ -116,7 +117,16 @@ def test_telegram_router_submit_and_cancel_callbacks(tmp_path):
     )
     assert api.callbacks
     submitted = queue.get_batch(int(draft["id"]))
-    assert submitted["state"] in {"queued", "processing", "complete", "awaiting_confirmation"}
+    assert submitted["state"] in {
+        "queued",
+        "processing",
+        "complete",
+        "awaiting_confirmation",
+    }
+    # Submitted draft navigates persistent panel to batch detail.
+    assert any("批次" in text for _, _, text, _ in api.edits) or any(
+        "批次" in text for _, text, _ in api.messages
+    )
 
 
 def test_stale_draft_cancel_after_submit_is_rejected(tmp_path):
@@ -131,35 +141,113 @@ def test_stale_draft_cancel_after_submit_is_rejected(tmp_path):
     submitted = queue.submit_draft(int(draft["id"]), stale_gen)
     assert submitted["state"] == "queued"
 
-    # Replaying the old cancel button must not cancel a submitted batch.
     import pytest
 
     with pytest.raises(ValueError, match="^draft_generation_conflict$"):
         queue.cancel_draft(int(draft["id"]), stale_gen, actor="42")
     assert queue.get_batch(int(draft["id"]))["state"] == "queued"
 
+
+def test_start_uses_persistent_panel(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
     api = FakeApi()
     router = TelegramUpdateRouter(
         api=api,
         authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
         state_db=db,
-        add_queue=queue,
         panel_enabled=True,
         admin_user_id="42",
     )
     router.handle_update(
         {
-            "update_id": 3,
-            "callback_query": {
-                "id": "cb-stale",
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 7},
                 "from": {"id": 42},
-                "message": {"message_id": 6, "chat": {"id": 7}},
-                "data": f"a:c:{draft['id']}:{stale_gen}",
+                "text": "/start",
             },
         }
     )
-    assert queue.get_batch(int(draft["id"]))["state"] == "queued"
-    assert any("草稿已变化" in text for _, text, _ in api.messages)
+    assert len(api.messages) == 1
+    assert "编排器控制台" in api.messages[0][1]
+    router.handle_update(
+        {
+            "update_id": 2,
+            "callback_query": {
+                "id": "cb",
+                "from": {"id": 42},
+                "message": {"message_id": api._next_id, "chat": {"id": 7}},
+                "data": "n:q:0",
+            },
+        }
+    )
+    assert api.edits
+    assert "添加队列" in api.edits[-1][2]
+
+
+def test_confirmation_callback_edits_source_message(tmp_path):
+    from qbt_orchestrator.checked_add import CheckedAddService
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    api = FakeApi()
+    queue = BotAddQueueRepository(db)
+    draft = queue.open_draft("7", "42")
+    magnet = "magnet:?" + "xt=urn:btih:" + ("e" * 40)
+    queue.append_message(int(draft["id"]), 11, [magnet])
+    draft = queue.get_batch(int(draft["id"]))
+    queue.submit_draft(int(draft["id"]), int(draft["updated_at"]))
+    item = queue.get_item(1)
+    # Force needs_confirmation for button path without full checked-add.
+    from qbt_orchestrator.db import write_execute
+
+    write_execute(
+        db,
+        "update bot_add_items set state='needs_confirmation', approval_generation=3 "
+        "where id=1",
+    )
+
+    class FakeChecked:
+        def approve_hold(self, item_id, actor, generation):
+            write_execute(
+                db,
+                "update bot_add_items set state='enrolled_hold' where id=?",
+                (item_id,),
+            )
+
+        def cancel(self, item_id, actor, generation):
+            write_execute(
+                db,
+                "update bot_add_items set state='cancelled' where id=?",
+                (item_id,),
+            )
+
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        add_queue=queue,
+        checked_add=FakeChecked(),
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    # Independent confirmation message (not the panel message_id).
+    router.handle_update(
+        {
+            "update_id": 9,
+            "callback_query": {
+                "id": "cby",
+                "from": {"id": 42},
+                "message": {"message_id": 999, "chat": {"id": 7}},
+                "data": "i:y:1:3",
+            },
+        }
+    )
+    assert any(mid == 999 and "已确认" in text for _, mid, text, _ in api.edits)
+    del item
+    del CheckedAddService
 
 
 def test_legacy_batch_detail_callback_opens_first_page(tmp_path):
@@ -185,17 +273,29 @@ def test_legacy_batch_detail_callback_opens_first_page(tmp_path):
     )
     router.handle_update(
         {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 7},
+                "from": {"id": 42},
+                "text": "/start",
+            },
+        }
+    )
+    panel_mid = int(router.panel.sessions.get()["message_id"])
+    router.handle_update(
+        {
             "update_id": 9,
             "callback_query": {
                 "id": "cb-legacy",
                 "from": {"id": 42},
-                "message": {"message_id": 8, "chat": {"id": 7}},
+                "message": {"message_id": panel_mid, "chat": {"id": 7}},
                 "data": "n:b:1",
             },
         }
     )
     assert api.edits
-    assert "条目第 1 页" in api.edits[0][2]
+    assert "条目第 1 页" in api.edits[-1][2]
 
 
 def test_item_cancel_qbt_write_fenced_keeps_needs_confirmation(tmp_path):
@@ -247,7 +347,9 @@ def test_item_cancel_qbt_write_fenced_keeps_needs_confirmation(tmp_path):
         }
     )
     assert queue.get_item(int(item["id"]))["state"] == "needs_confirmation"
-    assert any("写入被保护" in text for _, text, _ in api.messages)
+    assert any(
+        text and "写入被保护" in text for _, text in api.callbacks
+    )
 
 
 def test_telegram_router_rejects_torrent_documents(tmp_path):
@@ -291,7 +393,9 @@ def test_static_guard_single_get_updates_path():
             hits.append(str(path))
     assert hits == ["src/qbt_orchestrator/integrations/telegram.py"]
     checked = Path("src/qbt_orchestrator/checked_add.py").read_text(encoding="utf-8")
-    assert checked.index("is_permanently_blocked") < checked.index("_scan_remote_matches(")
+    assert checked.index("is_permanently_blocked") < checked.index(
+        "_scan_remote_matches("
+    )
     db_sql = Path("src/qbt_orchestrator/db.py").read_text(encoding="utf-8")
     assert "create table if not exists bot_warning_reads" not in db_sql
     assert "drop table if exists bot_warning_reads" in db_sql

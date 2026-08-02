@@ -162,6 +162,12 @@ class TelegramSupervisor:
         try:
             count = int(self.service.poll_once())
             self.consecutive_failures = 0
+            router = getattr(self.service, "router", None)
+            if router is not None and hasattr(router, "refresh_panel_if_due"):
+                try:
+                    router.refresh_panel_if_due(interval_sec=60)
+                except Exception:
+                    pass
             return count
         except Exception:
             self.consecutive_failures += 1
@@ -647,15 +653,6 @@ class DaemonRuntime:
                     max_runtime_sec=2,
                 )
             )
-        if self.warning_service is not None:
-            tasks.append(
-                LoopTask(
-                    "warning_projection_reconcile",
-                    60,
-                    self.warning_projection_reconcile_tick,
-                    max_runtime_sec=2,
-                )
-            )
         tasks.append(
             LoopTask(
                 "batch_summary",
@@ -665,11 +662,6 @@ class DaemonRuntime:
             )
         )
         return tasks
-
-    def warning_projection_reconcile_tick(self) -> dict:
-        if self.warning_service is None:
-            return {"status": "disabled", "projected": 0}
-        return {"projected": int(self.warning_service.reconcile_projections())}
 
     def batch_summary_tick(self) -> dict:
         if self.batch_summary_projector is None:

@@ -153,6 +153,19 @@ def _fmt_shanghai(ts: int | None) -> str:
     return datetime.fromtimestamp(int(ts), tz=_SHANGHAI).strftime("%Y-%m-%d %H:%M")
 
 
+def _fmt_shanghai_clock(ts: int | None) -> str:
+    if ts is None:
+        return "--:--"
+    return datetime.fromtimestamp(int(ts), tz=_SHANGHAI).strftime("%H:%M")
+
+
+def _fmt_speed(dlspeed_bps: int) -> str:
+    speed = max(0, int(dlspeed_bps or 0))
+    if speed <= 0:
+        return "等待数据源"
+    return f"{speed / (1024 * 1024):.1f} MiB/s"
+
+
 def _display_name(
     *,
     normalized_id: str | None = None,
@@ -359,53 +372,124 @@ class DashboardRepository:
 
 
 class TelegramPanelRenderer:
-    def __init__(self, dashboard: DashboardRepository):
+    def __init__(
+        self,
+        dashboard: DashboardRepository,
+        *,
+        now: Callable[[], int] | None = None,
+    ):
         self.dashboard = dashboard
+        self.now = now or (lambda: int(time.time()))
 
     def render_home(self) -> PanelView:
         snap = self.dashboard.home_snapshot()
-        lines = ["qBT Orchestrator", "", "当前任务"]
-        if not snap["active"]:
+        active = list(snap["active"][:3])
+        lines = [
+            "📱 qBT 编排器控制台",
+            f"系统在线 · 最后更新 {_fmt_shanghai_clock(int(self.now()))}",
+            "",
+            f"📥 当前任务（{len(active)}）",
+        ]
+        if not active:
             lines.append("暂无进行中的下载任务。")
         else:
-            for item in snap["active"][:3]:
+            for index, item in enumerate(active, start=1):
                 bar = _progress_bar(item["progress"])
+                lines.append(f"{index}. {item['name']}")
                 lines.append(
-                    f"{bar} {item['progress']*100:.1f}%  {item['name']}"
+                    f"{bar} {item['progress'] * 100:.1f}% · {_fmt_speed(item['dlspeed'])}"
                 )
         free_gib = snap["free_bytes"] / (1024**3)
+        unread = int(snap["unread_warnings"] or 0)
         lines.extend(
             [
                 "",
-                f"磁盘可用空间：{free_gib:.1f} GiB",
-                f"当前调度说明：{humanize_scheduler_condition(snap['condition'])}",
+                f"💽 磁盘剩余：{free_gib:.1f} GiB",
+                f"🧠 {humanize_scheduler_condition(snap['condition'])}",
+                "",
+                "📋 添加队列",
                 (
-                    "添加队列：待检查 "
-                    f"{snap['queue_pending']}/获取元数据 {snap['queue_metadata']}/"
-                    f"等待确认 {snap['queue_confirm']}/等待调度 {snap['queue_batches']}"
+                    f"待检查 {snap['queue_pending']} · 获取元数据 {snap['queue_metadata']} · "
+                    f"等待确认 {snap['queue_confirm']}"
                 ),
+                "",
+                "📈 累计处理",
                 (
-                    "累计处理：完成下载 "
-                    f"{snap['downloaded']}/完成入库 {snap['ingested']}/"
-                    f"异常 {snap['abnormal']}/手动删除 {snap['manual_deleted']}"
+                    f"✅ 下载 {snap['downloaded']}  🗂 入库 {snap['ingested']}\n"
+                    f"❌ 异常 {snap['abnormal']}  ♻️ 回收 {snap.get('reclaimed', 0)}"
                 ),
-                f"未读警告：{snap['unread_warnings']}",
+                f"⚠️ {unread} 条警告未读",
             ]
         )
         text = _clip_body("\n".join(lines))
+        warn_label = f"⚠️ 警告 · {unread}" if unread else "⚠️ 警告"
         markup = {
             "inline_keyboard": [
                 [
-                    _btn("状态/历史", encode_callback(["n", "s", "0"])),
-                    _btn("添加队列", encode_callback(["n", "q", "0"])),
+                    _btn("📊 运行状态", encode_callback(["n", "s", "0"])),
+                    _btn("📥 处理队列", encode_callback(["n", "q", "0"])),
                 ],
                 [
-                    _btn("警告", encode_callback(["n", "w", "0"])),
-                    _btn("打开添加", encode_callback(["a", "o"])),
+                    _btn("➕ 添加下载", encode_callback(["a", "o"])),
+                    _btn(warn_label, encode_callback(["n", "w", "0"])),
                 ],
+                [_btn("🔄 刷新面板", encode_callback(["n", "rf"]))],
             ]
         }
         return PanelView(text=text, reply_markup=markup)
+
+    def render_add_draft(
+        self, batch_id: int, *, error: str | None = None
+    ) -> PanelView:
+        con = readonly_connect(self.dashboard.state_db)
+        try:
+            batch = con.execute(
+                "select id,state,received_count,updated_at from bot_add_batches where id=?",
+                (int(batch_id),),
+            ).fetchone()
+        finally:
+            con.close()
+        if batch is None:
+            return PanelView(
+                text="未找到添加草稿。",
+                reply_markup={
+                    "inline_keyboard": [
+                        [_btn("🏠 返回首页", encode_callback(["n", "h"]))]
+                    ]
+                },
+            )
+        lines = [
+            "➕ 添加下载",
+            f"草稿 #{batch['id']}",
+            f"已接收：{int(batch['received_count'] or 0)} 条链接",
+            "请继续发送链接，或者提交当前批次。",
+        ]
+        if error:
+            lines.extend(["", f"⚠️ {error}"])
+        text = _clip_body("\n".join(lines))
+        gen = int(batch["updated_at"] or 0)
+        bid = int(batch["id"])
+        return PanelView(
+            text=text,
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        _btn(
+                            "✅ 提交本批",
+                            encode_callback(["a", "s", str(bid), str(gen)]),
+                        ),
+                        _btn(
+                            "🗑 取消草稿",
+                            encode_callback(["a", "c", str(bid), str(gen)]),
+                        ),
+                    ],
+                    [
+                        _btn("📥 查看队列", encode_callback(["n", "q", "0"])),
+                        _btn("🏠 返回首页", encode_callback(["n", "h"])),
+                    ],
+                ]
+            },
+        )
 
     def render_queue(self, page: int = 0) -> PanelView:
         rows, total = self.dashboard.queue_pages(page=page)
@@ -535,41 +619,79 @@ class TelegramPanelRenderer:
 
     def render_warnings(self, page: int = 0) -> PanelView:
         rows, total = self.dashboard.warning_pages(page=page)
-        lines = ["警告列表", f"第 {page + 1} 页"]
+        lines = ["⚠️ 警告中心", f"第 {page + 1} 页"]
         buttons: list[list[dict[str, Any]]] = []
         if not rows:
             lines.append("当前没有警告。")
+        view_row: list[dict[str, Any]] = []
         for row in rows:
             marker = "未读" if int(row["resolved"] or 0) == 0 else "已读"
             lines.append(
                 f"#{row['id']} [{row['severity']}] {marker} {row['topic']} "
                 f"x{row['occurrence_count']}: {str(row['safe_message'])[:80]}"
             )
-            buttons.append(
-                [
-                    _btn(
-                        f"查看 #{row['id']}",
-                        encode_callback(["w", "d", str(row["id"]), str(row["occurrence_count"])]),
-                    )
-                ]
+            view_row.append(
+                _btn(
+                    f"查看 #{row['id']}",
+                    encode_callback(
+                        ["w", "d", str(row["id"]), str(row["occurrence_count"])]
+                    ),
+                )
             )
+            if len(view_row) == 2:
+                buttons.append(view_row)
+                view_row = []
+        if view_row:
+            buttons.append(view_row)
         text = _clip_body("\n".join(lines))
-        nav = [_btn("首页", encode_callback(["n", "h"]))]
+        buttons.append(
+            [_btn("全部标为已读", encode_callback(["w", "ra", "0"]))]
+        )
+        buttons.append(
+            [_btn("导出全部日志", encode_callback(["w", "xa"]))]
+        )
+        nav = [
+            _btn("🔄 刷新", encode_callback(["n", "w", str(page)])),
+            _btn("🏠 首页", encode_callback(["n", "h"])),
+        ]
         if page > 0:
-            nav.append(_btn("上一页", encode_callback(["n", "w", str(page - 1)])))
+            nav.insert(
+                0, _btn("上一页", encode_callback(["n", "w", str(page - 1)]))
+            )
         if (page + 1) * PAGE_SIZE < total:
             nav.append(_btn("下一页", encode_callback(["n", "w", str(page + 1)])))
         buttons.append(nav)
         return PanelView(text=text, reply_markup={"inline_keyboard": buttons})
 
+    def render_warning_detail_by_id(self, warning_id: int) -> PanelView:
+        from .warning_inbox import WarningInboxRepository
+
+        repo = WarningInboxRepository(self.dashboard.state_db)
+        warning = repo.get(int(warning_id))
+        if warning is None:
+            return PanelView(
+                text="该警告已不存在或无法读取。",
+                reply_markup={
+                    "inline_keyboard": [
+                        [_btn("⬅️ 返回警告中心", encode_callback(["n", "w", "0"]))]
+                    ]
+                },
+            )
+        return self.render_warning_detail(
+            warning, copy_text=repo.copy_summary(int(warning_id))
+        )
+
     def render_warning_detail(
         self, warning: Mapping[str, Any], *, copy_text: str
     ) -> PanelView:
         lines = [
-            f"警告 #{warning['id']}",
+            f"⚠️ 警告 #{warning['id']}",
             f"级别：{warning['severity']}",
             f"主题：{warning['topic']}",
-            f"次数：{warning['occurrence_count']}",
+            f"首次时间：{_fmt_shanghai(warning.get('first_occurred_at'))}",
+            f"最后时间：{_fmt_shanghai(warning.get('last_occurred_at'))}",
+            f"累计次数：{warning['occurrence_count']}",
+            "",
             str(warning["safe_message"]),
         ]
         text = _clip_body("\n".join(lines))
@@ -577,14 +699,22 @@ class TelegramPanelRenderer:
         wid = int(warning["id"])
         markup = {
             "inline_keyboard": [
-                [_copy_btn("复制摘要", copy_text[:COPY_TEXT_LIMIT])],
                 [
-                    _btn("导出相关日志", encode_callback(["w", "x", str(wid), str(occ)])),
-                    _btn("标为已读", encode_callback(["w", "r", str(wid), str(occ)])),
+                    _btn(
+                        "✅ 标为已读",
+                        encode_callback(["w", "r", str(wid), str(occ)]),
+                    )
                 ],
-                [_btn("返回警告列表", encode_callback(["n", "w", "0"]))],
+                [
+                    _btn(
+                        "📄 导出相关日志",
+                        encode_callback(["w", "x", str(wid), str(occ)]),
+                    )
+                ],
+                [_btn("⬅️ 返回警告中心", encode_callback(["n", "w", "0"]))],
             ]
         }
+        del copy_text  # kept for API compatibility with callers
         return PanelView(text=text, reply_markup=markup)
 
     def render_status(self, page: int = 0) -> PanelView:

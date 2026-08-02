@@ -91,9 +91,12 @@ def test_telegram_home_shows_name_or_hash_fallback(tmp_path):
     names = [item["name"] for item in snap["active"]]
     assert "BBAN-582" in names
     assert "abcdef012345" in names
-    home = TelegramPanelRenderer(DashboardRepository(db)).render_home()
+    home = TelegramPanelRenderer(
+        DashboardRepository(db), now=lambda: 1000
+    ).render_home()
     assert "BBAN-582" in home.text
     assert "abcdef012345" in home.text
+    assert "编排器控制台" in home.text
 
 
 def test_warning_detail_opens_beyond_recent_page(tmp_path):
@@ -120,6 +123,7 @@ def test_warning_detail_opens_beyond_recent_page(tmp_path):
         def __init__(self):
             self.edits: list[tuple] = []
             self.messages: list[tuple] = []
+            self._next_id = 20
 
         def answer_callback_query(self, *a, **k):
             return {"ok": True}
@@ -129,8 +133,9 @@ def test_warning_detail_opens_beyond_recent_page(tmp_path):
             return {"ok": True}
 
         def send_message(self, chat_id, text, reply_markup=None):
+            self._next_id += 1
             self.messages.append((chat_id, text, reply_markup))
-            return {"ok": True}
+            return {"ok": True, "result": {"message_id": self._next_id}}
 
     api = FakeApi()
     router = TelegramUpdateRouter(
@@ -143,12 +148,24 @@ def test_warning_detail_opens_beyond_recent_page(tmp_path):
     )
     router.handle_update(
         {
-            "update_id": 1,
+            "update_id": 0,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 7},
+                "from": {"id": 42},
+                "text": "/start",
+            },
+        }
+    )
+    panel_mid = int(router.panel.sessions.get()["message_id"])
+    router.handle_update(
+        {
+            "update_id": 2,
             "callback_query": {
-                "id": "cb1",
+                "id": "cb2",
                 "data": "w:d:1:1",
                 "from": {"id": 42},
-                "message": {"message_id": 9, "chat": {"id": 7}},
+                "message": {"message_id": panel_mid, "chat": {"id": 7}},
             },
         }
     )
@@ -156,10 +173,22 @@ def test_warning_detail_opens_beyond_recent_page(tmp_path):
     detail_text = api.edits[-1][2]
     assert "该警告已不存在或无法读取" not in detail_text
     assert "msg-0" in detail_text
+    assert int(warnings.get(1)["resolved"]) == 0
+    router.handle_update(
+        {
+            "update_id": 3,
+            "callback_query": {
+                "id": "cb3",
+                "data": "w:r:1:1",
+                "from": {"id": 42},
+                "message": {"message_id": panel_mid, "chat": {"id": 7}},
+            },
+        }
+    )
     assert int(warnings.get(1)["resolved"]) == 1
     assert warnings.unread_count() == 100
 
-    missing = router._warning_detail(999999, 1, 42)
+    missing = router.renderer.render_warning_detail_by_id(999999)
     assert "该警告已不存在或无法读取" in missing.text
 
 

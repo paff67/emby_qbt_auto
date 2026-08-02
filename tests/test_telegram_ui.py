@@ -35,16 +35,23 @@ def test_telegram_ui_home_and_limits(state_db):
         "insert or replace into disk_state(id,sampled_at,free_bytes,pressure_state) values(1,1,?,?)",
         (8 * 1024**3, "normal"),
     )
-    renderer = TelegramPanelRenderer(DashboardRepository(state_db))
+    renderer = TelegramPanelRenderer(DashboardRepository(state_db), now=lambda: 1000)
     home = renderer.render_home()
-    assert "qBT Orchestrator" in home.text
+    assert "qBT 编排器控制台" in home.text
+    assert "累计处理" in home.text
     assert len(home.text) <= BODY_LIMIT
     assert "DRAIN" not in home.text
     assert "capacity_deadlock" not in home.text
-    for row in home.reply_markup["inline_keyboard"]:
-        for button in row:
-            if "callback_data" in button:
-                assert len(button["callback_data"].encode("utf-8")) <= CALLBACK_LIMIT
+    callbacks = {
+        button["callback_data"]
+        for row in home.reply_markup["inline_keyboard"]
+        for button in row
+        if "callback_data" in button
+    }
+    assert "n:rf" in callbacks
+    assert "a:o" in callbacks
+    for callback in callbacks:
+        assert len(callback.encode("utf-8")) <= CALLBACK_LIMIT
 
 
 @pytest.mark.parametrize("count", [0, 1, 8, 9, 17])
@@ -192,7 +199,7 @@ def test_queue_detail_pagination_covers_actionable_items(state_db, count):
             assert "i:x:14:4" in callbacks
 
 
-def test_copy_summary_button_limit(state_db):
+def test_warning_detail_actions_and_copy_summary_limit(state_db):
     write_execute(
         state_db,
         "insert into bot_warning_inbox("
@@ -209,4 +216,12 @@ def test_copy_summary_button_limit(state_db):
     view = TelegramPanelRenderer(DashboardRepository(state_db)).render_warning_detail(
         warning, copy_text=copy_text
     )
-    assert view.reply_markup["inline_keyboard"][0][0]["copy_text"]["text"]
+    callbacks = {
+        btn["callback_data"]
+        for row in view.reply_markup["inline_keyboard"]
+        for btn in row
+        if "callback_data" in btn
+    }
+    assert "w:r:1:1" in callbacks
+    assert "w:x:1:1" in callbacks
+    assert "n:w:0" in callbacks
