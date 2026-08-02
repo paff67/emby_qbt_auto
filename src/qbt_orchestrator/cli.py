@@ -422,7 +422,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         metadata_probe_coordinator = MetadataProbeCoordinator(
             BotAddQueueRepository(state_db),
             QbtPrecheckGateway(qbt, executor),
-            notifications=BotNotificationRepository(state_db),
+            warning_service=warning_service,
         )
     checked_add_enabled = (
         _truthy(os.environ.get("QBT_ORCH_CHECKED_ADD_ENABLED")) is True

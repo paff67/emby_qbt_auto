@@ -265,7 +265,9 @@ class TelegramUpdateRouter:
             elif parts[0] == "n" and parts[1] == "q":
                 view = self.renderer.render_queue(int(parts[2]))
             elif parts[0] == "n" and parts[1] == "b":
-                view = self.renderer.render_queue_detail(int(parts[2]))
+                # n:b:<batch_id>[:page] — omit page for legacy callbacks (page 0).
+                detail_page = int(parts[3]) if len(parts) > 3 else 0
+                view = self.renderer.render_queue_detail(int(parts[2]), detail_page)
             elif parts[0] == "n" and parts[1] == "w":
                 view = self.renderer.render_warnings(int(parts[2]))
             elif parts[0] == "a" and parts[1] == "o":

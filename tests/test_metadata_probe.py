@@ -5,7 +5,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from qbt_orchestrator.db import migrate
+from qbt_orchestrator.db import migrate, readonly_connect
 
 
 class Clock:
@@ -562,6 +562,86 @@ def test_probe_windows_and_backoffs_end_in_metadata_unavailable(tmp_path):
     assert item["state"] == "metadata_unavailable"
     assert item["approval_generation"] == 1
     assert item["metadata_lease_owner"] is None
+
+
+def test_metadata_unavailable_reports_warning_inbox_with_action_buttons(tmp_path):
+    import json
+
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.runtime import BotNotificationRepository
+    from qbt_orchestrator.warning_inbox import WarningService
+
+    queue, gateway, _coordinator, clock, item_ids, db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    warnings = WarningService(
+        db,
+        admin_chat_id="1001",
+        notifications=BotNotificationRepository(db, now=clock),
+        now=clock,
+    )
+    coordinator = MetadataProbeCoordinator(
+        queue, gateway, owner="worker-a", now=clock, warning_service=warnings
+    )
+    coordinator.tick()
+    clock.advance(300)
+    coordinator.tick()
+    clock.advance(1800)
+    coordinator.tick()
+    clock.advance(600)
+    coordinator.tick()
+    clock.advance(21600)
+    coordinator.tick()
+    clock.advance(900)
+    coordinator.tick()
+    item = queue.get_item(item_ids[0])
+    assert item["state"] == "metadata_unavailable"
+    batch_id = int(item["batch_id"])
+    item_id = int(item["id"])
+    generation = int(item["approval_generation"])
+
+    con = readonly_connect(db)
+    try:
+        warning = con.execute(
+            "select id,warning_key,related_batch_id,related_item_id,occurrence_count "
+            "from bot_warning_inbox where warning_key=?",
+            (f"checked_add:metadata_unavailable:{item_id}",),
+        ).fetchone()
+        note = con.execute(
+            "select payload_json,dedupe_key from bot_notifications "
+            "where dedupe_key=?",
+            (f"warn:{int(warning['id'])}:{int(warning['occurrence_count'])}",),
+        ).fetchone()
+    finally:
+        con.close()
+    assert warning is not None
+    assert int(warning["related_batch_id"]) == batch_id
+    assert int(warning["related_item_id"]) == item_id
+    payload = json.loads(note["payload_json"])
+    callbacks = {
+        btn["callback_data"]
+        for row in payload["reply_markup"]["inline_keyboard"]
+        for btn in row
+    }
+    assert f"i:r:{item_id}:{generation}" in callbacks
+    assert f"i:x:{item_id}:{generation}" in callbacks
+    assert f"n:b:{batch_id}:0" in callbacks
+
+    # Same item/generation must not create a second projected notification.
+    coordinator.tick()
+    con = readonly_connect(db)
+    try:
+        notes = con.execute(
+            "select count(*) from bot_notifications where topic='metadata_probe'"
+        ).fetchone()[0]
+        occurrences = con.execute(
+            "select occurrence_count from bot_warning_inbox where id=?",
+            (int(warning["id"]),),
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert int(notes) == 1
+    assert int(occurrences) == 1
 
 
 def test_timeout_never_touches_same_hash_without_item_tag_and_marks_duplicate(tmp_path):

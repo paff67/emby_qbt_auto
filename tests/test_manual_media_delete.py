@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from qbt_orchestrator.db import migrate, readonly_connect
@@ -14,7 +16,7 @@ from qbt_orchestrator.processed_media import ProcessedMediaRepository
 class FakeDrive:
     def __init__(self, trash_remote: str = "trash:"):
         self.trash_remote = trash_remote.rstrip(":") + ":"
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, str]] = []
         self.sources: set[str] = set()
         self.targets: set[str] = set()
         self.fail_move = False
@@ -23,10 +25,10 @@ class FakeDrive:
         basename = remote_dir.rstrip("/").split(":")[-1].rstrip("/").split("/")[-1]
         return f"{self.trash_remote}{basename}"
 
-    def trash_exact_directory(self, remote_dir: str) -> str:
+    def trash_exact_directory(self, remote_dir: str, expected_trash_path: str) -> str:
         source = remote_dir.rstrip("/")
-        target = self.planned_trash_path(source)
-        self.calls.append(source)
+        target = str(expected_trash_path).strip()
+        self.calls.append((source, target))
         source_exists = source in self.sources
         target_exists = target in self.targets
         if self.fail_move:
@@ -88,9 +90,16 @@ def test_manual_delete_saga_keeps_permanent_block(tmp_path):
     assert result.ok
     assert result.stage == "manual_deleted"
     assert result.download_policy == "block_permanent"
-    assert drive.calls == ["gcrypt:/BBAN-574"]
+    assert drive.calls == [("gcrypt:/BBAN-574", "trash:BBAN-574")]
     assert emby.calls
     assert repo.is_permanently_blocked("BBAN-574") is not None
+    history = repo.history("BBAN-574", limit=20)
+    assert any(item["event_type"] == "manual_deleted" for item in history)
+    assert any(
+        item["event_type"] == "manual_delete_stage"
+        and json.loads(item["payload_json"] or "{}").get("stage") == "manual_deleted"
+        for item in history
+    )
 
 
 def test_manual_delete_requires_adapters():
@@ -162,8 +171,8 @@ def test_manual_delete_persists_trash_path_before_move_and_resumes(tmp_path):
         def planned_trash_path(self, remote_dir: str) -> str:
             return self.inner.planned_trash_path(remote_dir)
 
-        def trash_exact_directory(self, remote_dir: str) -> str:
-            target = self.inner.trash_exact_directory(remote_dir)
+        def trash_exact_directory(self, remote_dir: str, expected_trash_path: str) -> str:
+            target = self.inner.trash_exact_directory(remote_dir, expected_trash_path)
             raise RuntimeError("crash_after_move")
 
     crashing = CrashAfterMove(drive)
@@ -182,7 +191,6 @@ def test_manual_delete_persists_trash_path_before_move_and_resumes(tmp_path):
         remote_path="gcrypt:/BBAN-590",
     )
     assert not failed.ok
-    # Intent persisted before move; stage remains pending after crash in move path.
     con = readonly_connect(db)
     try:
         row = con.execute(
@@ -191,15 +199,12 @@ def test_manual_delete_persists_trash_path_before_move_and_resumes(tmp_path):
         ).fetchone()
     finally:
         con.close()
-    import json
-
     payload = json.loads(row["payload_json"])
     assert payload["stage"] == "pending"
     assert payload["trash_path"] == "trash:BBAN-590"
     assert "trash:BBAN-590" in drive.targets
     assert "gcrypt:/BBAN-590" not in drive.sources
 
-    # Resume: source gone / target present should not conflict, and should finish.
     service2 = ManualMediaDeleteService(
         db,
         drive_trasher=drive,
@@ -227,13 +232,78 @@ def test_manual_delete_persists_trash_path_before_move_and_resumes(tmp_path):
     assert json.loads(final["payload_json"])["trash_path"] == "trash:BBAN-590"
 
 
-def test_rclone_adapter_idempotent_when_already_trashed():
+def test_resume_uses_persisted_trash_path_not_current_config(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    repo = ProcessedMediaRepository(db, now=lambda: 10, enforce=True)
+    repo.observe("ABCD-1", origin="test")
+    old = FakeDrive(trash_remote="old-trash:")
+    old.sources.add("gcrypt:/ABCD-1")
+
+    class CrashAfterMove(FakeDrive):
+        def __init__(self, inner: FakeDrive):
+            self.inner = inner
+            self.calls = inner.calls
+            self.sources = inner.sources
+            self.targets = inner.targets
+            self.trash_remote = inner.trash_remote
+
+        def planned_trash_path(self, remote_dir: str) -> str:
+            return self.inner.planned_trash_path(remote_dir)
+
+        def trash_exact_directory(self, remote_dir: str, expected_trash_path: str) -> str:
+            target = self.inner.trash_exact_directory(remote_dir, expected_trash_path)
+            raise RuntimeError("crash_after_move")
+
+    service = ManualMediaDeleteService(
+        db,
+        drive_trasher=CrashAfterMove(old),
+        mount_checker=FakeMount(present=False),
+        emby_cleaner=FakeEmby(),
+        processed_media=repo,
+        now=lambda: 20,
+    )
+    assert not service.delete(
+        "ABCD-1",
+        actor_id="ops",
+        reason="audit",
+        remote_path="gcrypt:/ABCD-1",
+    ).ok
+    assert old.calls == [("gcrypt:/ABCD-1", "old-trash:ABCD-1")]
+
+    # Restart with a different trash_remote config; resume must keep old target.
+    new_drive = FakeDrive(trash_remote="new-trash:")
+    new_drive.sources = old.sources
+    new_drive.targets = old.targets
+    resumed = ManualMediaDeleteService(
+        db,
+        drive_trasher=new_drive,
+        mount_checker=FakeMount(present=False),
+        emby_cleaner=FakeEmby(),
+        processed_media=repo,
+        now=lambda: 30,
+    )
+    result = resumed.delete(
+        "ABCD-1",
+        actor_id="ops",
+        reason="audit",
+        remote_path="gcrypt:/ABCD-1",
+    )
+    assert result.ok
+    assert new_drive.calls == [("gcrypt:/ABCD-1", "old-trash:ABCD-1")]
+    assert all(target != "new-trash:ABCD-1" for _, target in new_drive.calls)
+    assert "new-trash:ABCD-1" not in new_drive.targets
+
+
+def test_rclone_adapter_honors_expected_trash_path():
     class FakeRclone:
         def __init__(self):
-            self.paths = {"gcrypt-trash:BBAN-591": {"Name": "BBAN-591"}}
+            self.paths = {"old-trash:BBAN-591": {"Name": "BBAN-591"}}
             self.moves = []
+            self.stats = []
 
         def stat(self, remote: str):
+            self.stats.append(remote)
             return self.paths.get(remote)
 
         def moveto(self, source, target):
@@ -242,10 +312,50 @@ def test_rclone_adapter_idempotent_when_already_trashed():
             self.paths[target] = {"Name": "x"}
 
     rclone = FakeRclone()
-    adapter = RcloneDriveTrashAdapter(rclone, trash_remote="gcrypt-trash:")
-    assert adapter.planned_trash_path("gcrypt:/BBAN-591") == "gcrypt-trash:BBAN-591"
-    assert adapter.trash_exact_directory("gcrypt:/BBAN-591") == "gcrypt-trash:BBAN-591"
+    adapter = RcloneDriveTrashAdapter(rclone, trash_remote="new-trash:")
+    assert adapter.planned_trash_path("gcrypt:/BBAN-591") == "new-trash:BBAN-591"
+    assert (
+        adapter.trash_exact_directory("gcrypt:/BBAN-591", "old-trash:BBAN-591")
+        == "old-trash:BBAN-591"
+    )
     assert rclone.moves == []
+    assert "old-trash:BBAN-591" in rclone.stats
+    assert "new-trash:BBAN-591" not in rclone.stats
+
+
+def test_post_finalize_exception_does_not_downgrade_summary(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    repo = ProcessedMediaRepository(db, now=lambda: 10, enforce=True)
+    repo.observe("BBAN-601", origin="test")
+    drive = FakeDrive()
+    drive.sources.add("gcrypt:/BBAN-601")
+
+    class FinalizeThenBoom(ProcessedMediaRepository):
+        def finalize_manual_delete(self, *args, **kwargs):
+            result = super().finalize_manual_delete(*args, **kwargs)
+            raise RuntimeError("after_finalize_side_effect")
+
+    boom_repo = FinalizeThenBoom(db, now=lambda: 20, enforce=True)
+    service = ManualMediaDeleteService(
+        db,
+        drive_trasher=drive,
+        mount_checker=FakeMount(present=False),
+        emby_cleaner=FakeEmby(),
+        processed_media=boom_repo,
+        now=lambda: 20,
+    )
+    result = service.delete(
+        "BBAN-601",
+        actor_id="ops",
+        reason="audit",
+        remote_path="gcrypt:/BBAN-601",
+    )
+    assert result.ok
+    assert result.lifecycle_state == "manual_deleted"
+    row = repo.get_by_normalized_id("BBAN-601")
+    assert row["lifecycle_state"] == "manual_deleted"
+    assert row["manually_deleted_at"] is not None
 
 
 def test_manual_media_delete_cli_accepts_config(monkeypatch, tmp_path):

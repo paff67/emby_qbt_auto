@@ -14,8 +14,10 @@ class DriveTrashAdapter(Protocol):
     def planned_trash_path(self, remote_dir: str) -> str:
         """Return the deterministic trash destination for remote_dir."""
 
-    def trash_exact_directory(self, remote_dir: str) -> str:
-        """Move an exact remote directory into the trash remote; return trash path."""
+    def trash_exact_directory(
+        self, remote_dir: str, expected_trash_path: str
+    ) -> str:
+        """Move using the persisted trash target; never recompute from current config."""
 
 
 class MountPresenceAdapter(Protocol):
@@ -88,15 +90,19 @@ class RcloneDriveTrashAdapter:
             raise ValueError("remote_path_invalid")
         return f"{self.trash_remote}{basename}"
 
-    def trash_exact_directory(self, remote_dir: str) -> str:
+    def trash_exact_directory(
+        self, remote_dir: str, expected_trash_path: str
+    ) -> str:
         source = str(remote_dir).rstrip("/")
-        target = self.planned_trash_path(source)
+        target = str(expected_trash_path or "").strip()
+        if not target:
+            raise ValueError("expected_trash_path")
+        # Resume must honor the persisted target; never recompute from trash_remote.
         source_exists = self.rclone.stat(source) is not None
         target_exists = self.rclone.stat(target) is not None
         if source_exists and not target_exists:
             self.rclone.moveto(source, target)
         elif (not source_exists) and target_exists:
-            # Crash window after a successful move: treat as already completed.
             pass
         else:
             raise RuntimeError("remote_trash_conflict")
@@ -195,17 +201,18 @@ class ManualMediaDeleteService:
 
         try:
             if stage == "pending":
-                trash_path = str(
-                    saved.get("trash_path")
-                    or self.drive_trasher.planned_trash_path(remote_dir)
-                )
-                if not saved.get("trash_path"):
+                trash_path = str(saved.get("trash_path") or "")
+                if not trash_path:
+                    trash_path = self.drive_trasher.planned_trash_path(remote_dir)
                     saved = self._save_stage(
                         nid,
                         "pending",
                         {"remote_dir": remote_dir, "trash_path": trash_path},
                     )
-                moved_to = self.drive_trasher.trash_exact_directory(remote_dir)
+                    trash_path = str(saved.get("trash_path") or trash_path)
+                moved_to = self.drive_trasher.trash_exact_directory(
+                    remote_dir, trash_path
+                )
                 saved = self._save_stage(
                     nid,
                     "remote_trashed",
@@ -243,8 +250,14 @@ class ManualMediaDeleteService:
                 )
                 stage = "emby_refreshed"
             if stage == "emby_refreshed":
-                final = self.processed_media.finalize_manual_delete(nid, actor_id=actor_id)
-                saved = self._save_stage(nid, "manual_deleted", saved)
+                final = self.processed_media.finalize_manual_delete(
+                    nid,
+                    actor_id=actor_id,
+                    stage_payload={
+                        **saved,
+                        "stage": "manual_deleted",
+                    },
+                )
                 return ManualDeleteResult(
                     normalized_id=nid,
                     ok=True,
@@ -264,6 +277,18 @@ class ManualMediaDeleteService:
             failed = self.processed_media.fail_manual_delete(
                 nid, actor_id=actor_id, error=str(exc)
             )
+            if (
+                str(failed.get("lifecycle_state") or "") == "manual_deleted"
+                or failed.get("manually_deleted_at") is not None
+            ):
+                # finalize already committed; do not report a false failure.
+                return ManualDeleteResult(
+                    normalized_id=nid,
+                    ok=True,
+                    lifecycle_state=str(failed["lifecycle_state"]),
+                    download_policy=str(failed["download_policy"]),
+                    stage="manual_deleted",
+                )
             if self.warning_service is not None:
                 try:
                     self.warning_service.report(

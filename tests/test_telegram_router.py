@@ -162,6 +162,42 @@ def test_stale_draft_cancel_after_submit_is_rejected(tmp_path):
     assert any("草稿已变化" in text for _, text, _ in api.messages)
 
 
+def test_legacy_batch_detail_callback_opens_first_page(tmp_path):
+    from qbt_orchestrator.db import write_execute
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    write_execute(
+        db,
+        "insert into bot_add_batches("
+        "batch_key,chat_id,user_id,state,received_count,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        ("b-legacy", "7", "42", "queued", 0, 1, 1),
+    )
+    api = FakeApi()
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        add_queue=BotAddQueueRepository(db),
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    router.handle_update(
+        {
+            "update_id": 9,
+            "callback_query": {
+                "id": "cb-legacy",
+                "from": {"id": 42},
+                "message": {"message_id": 8, "chat": {"id": 7}},
+                "data": "n:b:1",
+            },
+        }
+    )
+    assert api.edits
+    assert "条目第 1 页" in api.edits[0][2]
+
+
 def test_item_cancel_qbt_write_fenced_keeps_needs_confirmation(tmp_path):
     from qbt_orchestrator.db import write_execute
 

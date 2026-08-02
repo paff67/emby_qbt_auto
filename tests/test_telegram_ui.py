@@ -106,10 +106,90 @@ def test_queue_detail_renders_item_action_buttons(state_db):
     assert "i:x:2:2" in callbacks
     queue = TelegramPanelRenderer(DashboardRepository(state_db)).render_queue(0)
     assert any(
-        btn.get("text", "").startswith("查看批次")
+        btn.get("callback_data") == "n:b:1:0"
         for row in queue.reply_markup["inline_keyboard"]
         for btn in row
+        if "callback_data" in btn
     )
+
+
+@pytest.mark.parametrize("count", [0, 8, 9, 17])
+def test_queue_detail_pagination_covers_actionable_items(state_db, count):
+    from qbt_orchestrator.bot_add_queue import _ITEM_STATES
+    from qbt_orchestrator.telegram_ui import _ITEM_STATE_ZH
+
+    assert not (_ITEM_STATES - _ITEM_STATE_ZH.keys())
+    write_execute(
+        state_db,
+        "insert into bot_add_batches("
+        "batch_key,chat_id,user_id,state,received_count,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        ("b-page", "1", "1", "processing", count, 1, 1),
+    )
+    for index in range(count):
+        state = "received"
+        generation = 0
+        if index == 12:
+            state = "needs_confirmation"
+            generation = 3
+        elif index == 13:
+            state = "metadata_unavailable"
+            generation = 4
+        write_execute(
+            state_db,
+            "insert into bot_add_items("
+            "batch_id,source_message_id,source_index,input_kind,redacted_input,input_sha256,"
+            "canonical_identity,state,approval_generation,created_at,updated_at) "
+            "values(1,1,?,?,?,?,?,?,?,1,1)",
+            (
+                index,
+                "magnet",
+                f"redacted-{index}",
+                f"sha-{index}",
+                f"id-{index}",
+                state,
+                generation,
+            ),
+        )
+    renderer = TelegramPanelRenderer(DashboardRepository(state_db))
+    page0 = renderer.render_queue_detail(1, 0)
+    assert "条目第 1 页" in page0.text
+    for row in page0.reply_markup["inline_keyboard"]:
+        for btn in row:
+            if "callback_data" in btn:
+                assert len(btn["callback_data"].encode("utf-8")) <= CALLBACK_LIMIT
+    if count == 0:
+        assert "暂无条目" in page0.text
+        assert "下一页" not in {
+            btn.get("text")
+            for row in page0.reply_markup["inline_keyboard"]
+            for btn in row
+        }
+    elif count <= PAGE_SIZE:
+        assert "下一页" not in {
+            btn.get("text")
+            for row in page0.reply_markup["inline_keyboard"]
+            for btn in row
+        }
+    else:
+        assert any(
+            btn.get("callback_data") == "n:b:1:1"
+            for row in page0.reply_markup["inline_keyboard"]
+            for btn in row
+            if "callback_data" in btn
+        )
+        page1 = renderer.render_queue_detail(1, 1)
+        callbacks = {
+            btn["callback_data"]
+            for row in page1.reply_markup["inline_keyboard"]
+            for btn in row
+            if "callback_data" in btn
+        }
+        if count >= 13:
+            assert "i:y:13:3" in callbacks
+        if count >= 14:
+            assert "i:r:14:4" in callbacks
+            assert "i:x:14:4" in callbacks
 
 
 def test_copy_summary_button_limit(state_db):

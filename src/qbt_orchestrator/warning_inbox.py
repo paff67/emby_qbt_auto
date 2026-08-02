@@ -346,6 +346,7 @@ class WarningService:
         related_job_id: int | None = None,
         related_batch_id: int | None = None,
         related_item_id: int | None = None,
+        projection_payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         row = self.inbox.upsert(
             warning_key=warning_key,
@@ -357,7 +358,7 @@ class WarningService:
             related_batch_id=related_batch_id,
             related_item_id=related_item_id,
         )
-        self._project(row)
+        self._project(row, projection_payload=projection_payload)
         return row
 
     def reconcile_projections(self, *, limit: int = 50) -> int:
@@ -378,11 +379,17 @@ class WarningService:
             con.close()
         projected = 0
         for row in missing:
+            # Reconciliation projects a generic warning without stale action buttons.
             self._project(_row_dict(row) or {})
             projected += 1
         return projected
 
-    def _project(self, row: Mapping[str, Any]) -> None:
+    def _project(
+        self,
+        row: Mapping[str, Any],
+        *,
+        projection_payload: Mapping[str, Any] | None = None,
+    ) -> None:
         if self.admin_chat_id is None:
             return
         warning_id = int(row["id"])
@@ -392,13 +399,23 @@ class WarningService:
             f"系统警告 [{row.get('severity')}] {row.get('topic')}: "
             f"{row.get('safe_message')}"
         )
+        payload: dict[str, Any] = {
+            "warning_id": warning_id,
+            "occurrence_count": occurrence,
+        }
+        if projection_payload:
+            for key, value in dict(projection_payload).items():
+                if key in {"warning_id", "occurrence_count"}:
+                    continue
+                payload[key] = value
+            payload["warning_id"] = warning_id
         try:
             self.notifications.enqueue_with_status(
                 chat_id=self.admin_chat_id,
                 topic=str(row.get("topic") or "warning"),
                 message=str(redact(message)),
                 level=str(row.get("severity") or "warning"),
-                payload={"warning_id": warning_id, "occurrence_count": occurrence},
+                payload=payload,
                 dedupe_key=dedupe,
             )
         except Exception:

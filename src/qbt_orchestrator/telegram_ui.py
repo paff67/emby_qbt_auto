@@ -36,6 +36,8 @@ _ITEM_STATE_ZH = {
     "enrolled": "已入库",
     "enrolled_hold": "已确认暂缓",
     "duplicate_local": "本地重复",
+    "duplicate_remote": "远端已存在",
+    "ready": "等待加入下载",
     "failed": "失败",
     "cancelled": "已取消",
     "invalid": "无效",
@@ -192,7 +194,10 @@ class DashboardRepository:
             con.close()
         return [dict(row) for row in rows], int(total or 0)
 
-    def queue_detail(self, batch_id: int) -> dict[str, Any] | None:
+    def queue_detail(
+        self, batch_id: int, *, page: int = 0
+    ) -> dict[str, Any] | None:
+        offset = max(0, int(page)) * PAGE_SIZE
         con = readonly_connect(self.state_db)
         try:
             batch = con.execute(
@@ -203,16 +208,27 @@ class DashboardRepository:
             ).fetchone()
             if batch is None:
                 return None
+            total = con.execute(
+                "select count(*) from bot_add_items where batch_id=?",
+                (int(batch_id),),
+            ).fetchone()[0]
             items = list(
                 con.execute(
-                    "select id,state,approval_generation,normalized_media_id,last_error "
-                    "from bot_add_items where batch_id=? order by id",
-                    (int(batch_id),),
+                    "select id,state,approval_generation,normalized_media_id,"
+                    "display_name,last_error "
+                    "from bot_add_items where batch_id=? order by id "
+                    "limit ? offset ?",
+                    (int(batch_id), PAGE_SIZE, offset),
                 )
             )
         finally:
             con.close()
-        return {"batch": dict(batch), "items": [dict(row) for row in items]}
+        return {
+            "batch": dict(batch),
+            "items": [dict(row) for row in items],
+            "total": int(total or 0),
+            "page": max(0, int(page)),
+        }
 
     def warning_pages(self, *, page: int = 0) -> tuple[list[dict[str, Any]], int]:
         offset = max(0, int(page)) * PAGE_SIZE
@@ -300,7 +316,7 @@ class TelegramPanelRenderer:
                 [
                     _btn(
                         f"查看批次 {row['id']}",
-                        encode_callback(["n", "b", str(row["id"])]),
+                        encode_callback(["n", "b", str(row["id"]), "0"]),
                     )
                 ]
             )
@@ -313,8 +329,8 @@ class TelegramPanelRenderer:
         buttons.append(nav)
         return PanelView(text=text, reply_markup={"inline_keyboard": buttons})
 
-    def render_queue_detail(self, batch_id: int) -> PanelView:
-        detail = self.dashboard.queue_detail(batch_id)
+    def render_queue_detail(self, batch_id: int, page: int = 0) -> PanelView:
+        detail = self.dashboard.queue_detail(batch_id, page=page)
         if detail is None:
             return PanelView(
                 text="未找到该批次。",
@@ -325,9 +341,12 @@ class TelegramPanelRenderer:
                 },
             )
         batch = detail["batch"]
+        page = int(detail.get("page") or 0)
+        total = int(detail.get("total") or 0)
         state_zh = _BATCH_STATE_ZH.get(str(batch["state"]), "处理中")
         lines = [
             f"批次 {batch['id']}（{state_zh}）",
+            f"条目第 {page + 1} 页",
             (
                 f"收到{batch['received_count']} 入库{batch['enrolled_count']} "
                 f"重复{batch['duplicate_count']} 确认{batch['confirmation_count']} "
@@ -340,15 +359,18 @@ class TelegramPanelRenderer:
         items = detail["items"]
         if not items:
             lines.append("暂无条目。")
-        for item in items[:12]:
+        for item in items:
             item_id = int(item["id"])
             generation = int(item.get("approval_generation") or 0)
             item_state = str(item.get("state") or "")
-            item_zh = _ITEM_STATE_ZH.get(item_state, item_state or "未知")
+            item_zh = _ITEM_STATE_ZH.get(item_state, "处理中")
             media = str(item.get("normalized_media_id") or "").strip()
+            display = str(item.get("display_name") or "").strip()
             label = f"#{item_id} {item_zh}"
             if media:
                 label += f" {media}"
+            elif display:
+                label += f" {display[:40]}"
             lines.append(label)
             if item_state == "needs_confirmation":
                 buttons.append(
@@ -377,6 +399,23 @@ class TelegramPanelRenderer:
                     ]
                 )
         text = _clip_body("\n".join(lines))
+        page_nav: list[dict[str, Any]] = []
+        if page > 0:
+            page_nav.append(
+                _btn(
+                    "上一页",
+                    encode_callback(["n", "b", str(batch["id"]), str(page - 1)]),
+                )
+            )
+        if (page + 1) * PAGE_SIZE < total:
+            page_nav.append(
+                _btn(
+                    "下一页",
+                    encode_callback(["n", "b", str(batch["id"]), str(page + 1)]),
+                )
+            )
+        if page_nav:
+            buttons.append(page_nav)
         buttons.append(
             [
                 _btn("返回队列", encode_callback(["n", "q", "0"])),

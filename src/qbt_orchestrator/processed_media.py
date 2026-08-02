@@ -376,6 +376,7 @@ class ProcessedMediaRepository:
         actor_type: str = "cli",
         correlation_id: str | None = None,
         payload: Mapping[str, Any] | None = None,
+        stage_payload: Mapping[str, Any] | None = None,
         effective_at: int | None = None,
     ) -> dict[str, Any]:
         now = int(self.now())
@@ -409,6 +410,20 @@ class ProcessedMediaRepository:
                 correlation_id=correlation_id,
                 payload=event_payload,
             )
+            # Persist final saga stage in the same write transaction so a later
+            # crash cannot leave manual_deleted summary with a failed stage write.
+            stage_body = dict(stage_payload or {})
+            stage_body["stage"] = "manual_deleted"
+            self._insert_event(
+                con,
+                int(row["id"]),
+                event_type="manual_delete_stage",
+                event_at=now,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                correlation_id=correlation_id,
+                payload=stage_body,
+            )
             return _row_to_dict(
                 con.execute(
                     "select * from processed_media where id=?", (int(row["id"]),)
@@ -436,6 +451,12 @@ class ProcessedMediaRepository:
             ).fetchone()
             if row is None:
                 raise ValueError("processed_media_missing")
+            current = _row_to_dict(row) or {}
+            # Never downgrade a completed deletion into manual_delete_failed.
+            if current.get("manually_deleted_at") is not None:
+                return current
+            if str(current.get("lifecycle_state") or "") == "manual_deleted":
+                return current
             requested_at = row["manual_delete_requested_at"] or now
             con.execute(
                 "update processed_media set lifecycle_state='manual_delete_failed',"

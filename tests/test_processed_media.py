@@ -167,6 +167,51 @@ def test_processed_media_repository_lifecycle_and_no_untombstone(tmp_path):
         con.close()
 
 
+def test_finalize_manual_delete_writes_stage_atomically_and_resists_fail(tmp_path):
+    import json
+
+    from qbt_orchestrator.db import readonly_connect
+    from qbt_orchestrator.processed_media import ProcessedMediaRepository
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    repo = ProcessedMediaRepository(db, now=lambda: 77, enforce=True)
+    repo.observe("BBAN-600", origin="test")
+    repo.begin_manual_delete("BBAN-600", actor_id="ops", reason="cleanup")
+    final = repo.finalize_manual_delete(
+        "BBAN-600",
+        actor_id="ops",
+        stage_payload={"remote_dir": "gcrypt:/BBAN-600", "trash_path": "trash:BBAN-600"},
+    )
+    assert final["lifecycle_state"] == "manual_deleted"
+    assert int(final["manually_deleted_at"]) == 77
+    history = repo.history("BBAN-600", limit=20)
+    assert any(item["event_type"] == "manual_deleted" for item in history)
+    stage_events = [
+        item for item in history if item["event_type"] == "manual_delete_stage"
+    ]
+    assert stage_events
+    assert json.loads(stage_events[0]["payload_json"])["stage"] == "manual_deleted"
+
+    kept = repo.fail_manual_delete("BBAN-600", actor_id="ops", error="should_not_downgrade")
+    assert kept["lifecycle_state"] == "manual_deleted"
+    assert int(kept["manually_deleted_at"]) == 77
+    con = readonly_connect(db)
+    try:
+        failed_events = con.execute(
+            "select count(*) from processed_media_events where event_type='manual_delete_failed'"
+        ).fetchone()[0]
+        bad = con.execute(
+            "select count(*) from processed_media "
+            "where manually_deleted_at is not null "
+            "and lifecycle_state='manual_delete_failed'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert int(failed_events) == 0
+    assert int(bad) == 0
+
+
 def test_processed_media_backfill_dry_run(tmp_path):
     from qbt_orchestrator.db import write_execute
     from qbt_orchestrator.processed_media import ProcessedMediaRepository

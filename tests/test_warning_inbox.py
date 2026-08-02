@@ -195,6 +195,90 @@ def test_warning_service_projects_after_inbox_commit(tmp_path):
     assert service.reconcile_projections() == 1
 
 
+def test_warning_service_projection_payload_and_failed_projection_keeps_inbox(tmp_path):
+    import json
+
+    from qbt_orchestrator.warning_inbox import WarningService
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    write_execute(
+        db,
+        "insert into bot_add_batches("
+        "id,batch_key,chat_id,user_id,state,created_at,updated_at) "
+        "values(38,'b-38','1','1','queued',1,1)",
+    )
+    write_execute(
+        db,
+        "insert into bot_add_items("
+        "id,batch_id,source_message_id,source_index,input_kind,redacted_input,"
+        "input_sha256,state,created_at,updated_at) "
+        "values(9,38,1,0,'magnet','r','s','metadata_unavailable',1,1)",
+    )
+
+    class BoomNotifications:
+        def __init__(self):
+            self.calls = 0
+
+        def enqueue_with_status(self, *args, **kwargs):
+            self.calls += 1
+            raise RuntimeError("notify_failed")
+
+    boom = BoomNotifications()
+    service = WarningService(
+        db, admin_chat_id="1001", notifications=boom, now=lambda: 310
+    )
+    row = service.report(
+        warning_key="checked_add:metadata_unavailable:9",
+        severity="warning",
+        topic="metadata_probe",
+        safe_message="暂时无法获取元数据",
+        related_batch_id=38,
+        related_item_id=9,
+        projection_payload={
+            "item_id": 9,
+            "batch_id": 38,
+            "reply_markup": {
+                "inline_keyboard": [[{"text": "x", "callback_data": "i:r:9:1"}]]
+            },
+        },
+    )
+    assert boom.calls == 1
+    con = readonly_connect(db)
+    try:
+        inbox = con.execute(
+            "select related_batch_id,related_item_id from bot_warning_inbox where id=?",
+            (int(row["id"]),),
+        ).fetchone()
+        notes = con.execute("select count(*) from bot_notifications").fetchone()[0]
+    finally:
+        con.close()
+    assert int(inbox["related_batch_id"]) == 38
+    assert int(inbox["related_item_id"]) == 9
+    assert int(notes) == 0
+
+    from qbt_orchestrator.runtime import BotNotificationRepository
+
+    recovered = WarningService(
+        db,
+        admin_chat_id="1001",
+        notifications=BotNotificationRepository(db, now=lambda: 311),
+        now=lambda: 311,
+    )
+    assert recovered.reconcile_projections() == 1
+    con = readonly_connect(db)
+    try:
+        note = con.execute(
+            "select payload_json from bot_notifications where dedupe_key=?",
+            (f"warn:{int(row['id'])}:{int(row['occurrence_count'])}",),
+        ).fetchone()
+    finally:
+        con.close()
+    payload = json.loads(note["payload_json"])
+    assert "reply_markup" not in payload
+    assert int(payload["warning_id"]) == int(row["id"])
+
+
 def test_required_warning_keys_via_service(tmp_path):
     from qbt_orchestrator.warning_inbox import WarningService
 

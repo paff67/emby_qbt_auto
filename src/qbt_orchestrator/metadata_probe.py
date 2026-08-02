@@ -45,6 +45,7 @@ class MetadataProbeCoordinator:
         config: MetadataProbeConfig | None = None,
         owner: str | None = None,
         now: Callable[[], int] | None = None,
+        warning_service=None,
         notifications=None,
     ) -> None:
         self.repository = repository
@@ -52,7 +53,9 @@ class MetadataProbeCoordinator:
         self.config = config or MetadataProbeConfig()
         self.owner = str(owner or f"metadata-probe-{uuid.uuid4().hex}")
         self.now = now or (lambda: int(time.time()))
-        self.notifications = notifications
+        # Prefer WarningService (inbox-first). Legacy notifications= is ignored.
+        _ = notifications
+        self.warning_service = warning_service
 
     def tick(
         self,
@@ -430,20 +433,22 @@ class MetadataProbeCoordinator:
             self._record_failure(item_id, token, now, result)
 
     def _notify_metadata_unavailable(self, item: Mapping[str, Any]) -> None:
-        if self.notifications is None:
+        if self.warning_service is None:
             return
         try:
-            batch = self.repository.get_batch(int(item["batch_id"]))
             generation = int(item["approval_generation"])
             item_id = int(item["id"])
-            self.notifications.enqueue_with_status(
-                batch["chat_id"],
-                "metadata_unavailable",
-                "暂时无法获取元数据。可立即重试，或取消该条目。",
-                level="warning",
-                payload={
+            batch_id = int(item["batch_id"])
+            self.warning_service.report(
+                warning_key=f"checked_add:metadata_unavailable:{item_id}",
+                severity="warning",
+                topic="metadata_probe",
+                safe_message="暂时无法获取元数据，请从批次详情选择重试或取消。",
+                related_batch_id=batch_id,
+                related_item_id=item_id,
+                projection_payload={
                     "item_id": item_id,
-                    "approval_generation": generation,
+                    "batch_id": batch_id,
                     "reply_markup": {
                         "inline_keyboard": [
                             [
@@ -455,11 +460,16 @@ class MetadataProbeCoordinator:
                                     "text": "取消",
                                     "callback_data": f"i:x:{item_id}:{generation}",
                                 },
-                            ]
+                            ],
+                            [
+                                {
+                                    "text": "查看批次",
+                                    "callback_data": f"n:b:{batch_id}:0",
+                                }
+                            ],
                         ]
                     },
                 },
-                dedupe_key=f"metadata-unavailable:{item_id}:{generation}",
             )
         except Exception:
             return
