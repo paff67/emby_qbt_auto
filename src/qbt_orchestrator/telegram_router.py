@@ -261,7 +261,13 @@ class TelegramUpdateRouter:
             if parts[0] == "n" and parts[1] == "h":
                 view = self.renderer.render_home()
             elif parts[0] == "n" and parts[1] == "s":
-                view = self.renderer.render_status(int(parts[2]))
+                # Legacy n:s:<n> opens status home; n:s:<kind>:<page> opens history.
+                if len(parts) >= 4 and parts[2] in {"d", "i", "e", "r", "m"}:
+                    view = self.renderer.render_status_history(
+                        parts[2], int(parts[3])
+                    )
+                else:
+                    view = self.renderer.render_status_home()
             elif parts[0] == "n" and parts[1] == "q":
                 view = self.renderer.render_queue(int(parts[2]))
             elif parts[0] == "n" and parts[1] == "b":
@@ -396,20 +402,26 @@ class TelegramUpdateRouter:
             self.api.send_message(chat_id, self._humanize_ingress_error(exc))
 
     def _warning_detail(self, warning_id: int, occurrence: int, user_id: int):
+        from .telegram_ui import PanelView
+
         assert self.warnings is not None and self.renderer is not None
-        rows = [
-            row
-            for row in self.warnings.list_recent(limit=100)
-            if int(row["id"]) == warning_id
-        ]
-        if not rows:
-            return self.renderer.render_warnings(0)
-        warning = rows[0]
+        warning = self.warnings.get(warning_id)
+        if warning is None:
+            return PanelView(
+                text="该警告已不存在或无法读取。",
+                reply_markup={
+                    "inline_keyboard": [
+                        [_btn("返回警告列表", encode_callback(["n", "w", "0"]))]
+                    ]
+                },
+            )
         self.warnings.mark_read(
             warning_id, expected_occurrence=occurrence, admin_id=str(user_id)
         )
+        # Re-read after fencing so the detail shows current occurrence/resolved state.
+        current = self.warnings.get(warning_id) or warning
         copy_text = self.warnings.copy_summary(warning_id)
-        return self.renderer.render_warning_detail(warning, copy_text=copy_text)
+        return self.renderer.render_warning_detail(current, copy_text=copy_text)
 
     def _export_warning(self, chat_id: int, warning_id: int) -> None:
         assert self.warnings is not None

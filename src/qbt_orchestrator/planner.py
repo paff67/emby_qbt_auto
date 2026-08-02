@@ -33,9 +33,21 @@ ALLOCATION_UPSERT_SQL = (
 )
 
 HEALTH_UPSERT_SQL = (
-    "insert into torrent_health(hash,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,progress,num_seeds,num_peers,last_swarm_seen_at,no_swarm_since,low_speed_since,no_progress_since,active_since,soak_since,dead_since,updated_at) "
-    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-    "on conflict(hash) do update set sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,last_swarm_seen_at=excluded.last_swarm_seen_at,no_swarm_since=excluded.no_swarm_since,low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,active_since=excluded.active_since,soak_since=excluded.soak_since,dead_since=excluded.dead_since,updated_at=excluded.updated_at"
+    "insert into torrent_health("
+    "hash,name,sampled_at,dlspeed_bps,upspeed_bps,completed_bytes,last_completed_bytes,"
+    "progress,num_seeds,num_peers,last_swarm_seen_at,no_swarm_since,low_speed_since,"
+    "no_progress_since,active_since,soak_since,dead_since,updated_at) "
+    "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+    "on conflict(hash) do update set "
+    "name=coalesce(excluded.name,torrent_health.name),"
+    "sampled_at=excluded.sampled_at,dlspeed_bps=excluded.dlspeed_bps,"
+    "upspeed_bps=excluded.upspeed_bps,completed_bytes=excluded.completed_bytes,"
+    "last_completed_bytes=excluded.last_completed_bytes,progress=excluded.progress,"
+    "num_seeds=excluded.num_seeds,num_peers=excluded.num_peers,"
+    "last_swarm_seen_at=excluded.last_swarm_seen_at,no_swarm_since=excluded.no_swarm_since,"
+    "low_speed_since=excluded.low_speed_since,no_progress_since=excluded.no_progress_since,"
+    "active_since=excluded.active_since,soak_since=excluded.soak_since,"
+    "dead_since=excluded.dead_since,updated_at=excluded.updated_at"
 )
 
 @dataclass(frozen=True)
@@ -860,9 +872,11 @@ class DownloadPlanner:
                 active_since = None
                 soak_since = old.get("soak_since") or now
                 dead_since = old.get("dead_since")
+            torrent_name = " ".join(str(torrent.get("name") or "").split())[:512] or None
             rows.append(
                 {
                     "hash": h,
+                    "name": torrent_name,
                     "now": int(now),
                     "dlspeed": dlspeed,
                     "upspeed": upspeed,
@@ -973,6 +987,7 @@ class DownloadPlanner:
     def _health_params(row: Mapping[str, Any]) -> tuple[Any, ...]:
         return (
             canonical_torrent_hash(row["hash"]),
+            row.get("name"),
             int(row["now"]),
             int(row["dlspeed"]),
             int(row["upspeed"]),

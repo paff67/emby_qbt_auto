@@ -70,9 +70,11 @@ def test_warning_reads_table_absent_after_migration(tmp_path):
         assert "idx_bot_warning_reads_actor" not in indexes
         versions = {
             int(row[0])
-            for row in con.execute("select version from schema_migrations where version in (20,21)")
+            for row in con.execute(
+                "select version from schema_migrations where version in (20,21,22)"
+            )
         }
-        assert versions == {20, 21}
+        assert versions == {20, 21, 22}
     finally:
         con.close()
 

@@ -51,6 +51,7 @@ from .runtime import (
 )
 from .scheduler_engine import SchedulerEngine
 from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
+from .telegram_batch_summary import BatchSummaryProjector
 from .telegram_control import TelegramAuthorizer
 from .work_items import build_full_finish_work_items
 
@@ -366,6 +367,7 @@ class DaemonRuntime:
         scheduler_alert_service=None,
         warning_service=None,
         processed_media=None,
+        batch_summary_projector=None,
         sync_repeated_full_limit: int = 3,
         sync_degraded_interval_sec: float = 10.0,
         safety_event_sample_interval_sec: float = 60.0,
@@ -529,6 +531,9 @@ class DaemonRuntime:
         # Must be set before _default_loop_tasks() reads these attributes.
         self.warning_service = warning_service
         self.processed_media = processed_media
+        self.batch_summary_projector = (
+            batch_summary_projector or BatchSummaryProjector(self.state_db)
+        )
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -651,12 +656,25 @@ class DaemonRuntime:
                     max_runtime_sec=2,
                 )
             )
+        tasks.append(
+            LoopTask(
+                "batch_summary",
+                15,
+                self.batch_summary_tick,
+                max_runtime_sec=2,
+            )
+        )
         return tasks
 
     def warning_projection_reconcile_tick(self) -> dict:
         if self.warning_service is None:
             return {"status": "disabled", "projected": 0}
         return {"projected": int(self.warning_service.reconcile_projections())}
+
+    def batch_summary_tick(self) -> dict:
+        if self.batch_summary_projector is None:
+            return {"status": "disabled"}
+        return self.batch_summary_projector.tick()
 
     def metadata_probe_tick(self) -> dict:
         if self.metadata_probe_coordinator is None:

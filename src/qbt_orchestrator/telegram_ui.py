@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -12,6 +13,15 @@ PAGE_SIZE = 8
 BODY_LIMIT = 3500
 CALLBACK_LIMIT = 64
 COPY_TEXT_LIMIT = 256
+_SHANGHAI = timezone(timedelta(hours=8))
+
+_HISTORY_KINDS = {
+    "d": "完成下载",
+    "i": "完成入库",
+    "e": "异常任务",
+    "r": "自动回收",
+    "m": "手动删除",
+}
 
 _BATCH_STATE_ZH = {
     "draft": "草稿",
@@ -84,6 +94,27 @@ def _btn(text: str, callback_data: str) -> dict[str, str]:
     return {"text": text, "callback_data": callback_data}
 
 
+def _fmt_shanghai(ts: int | None) -> str:
+    if ts is None:
+        return "-"
+    return datetime.fromtimestamp(int(ts), tz=_SHANGHAI).strftime("%Y-%m-%d %H:%M")
+
+
+def _display_name(
+    *,
+    normalized_id: str | None = None,
+    display_title: str | None = None,
+    torrent_name: str | None = None,
+    torrent_hash: str | None = None,
+) -> str:
+    for candidate in (normalized_id, display_title, torrent_name):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    digest = str(torrent_hash or "").strip()
+    return digest[:12] if digest else "-"
+
+
 def _copy_btn(text: str, copy_text: str) -> dict[str, Any]:
     return {"text": text, "copy_text": {"text": copy_text[:COPY_TEXT_LIMIT]}}
 
@@ -97,7 +128,7 @@ class DashboardRepository:
         try:
             active = list(
                 con.execute(
-                    "select hash,progress,dlspeed_bps from torrent_health "
+                    "select hash,name,progress,dlspeed_bps from torrent_health "
                     "where coalesce(dlspeed_bps,0)>0 or coalesce(active_since,0)>0 "
                     "order by dlspeed_bps desc, progress desc limit 3"
                 )
@@ -157,7 +188,11 @@ class DashboardRepository:
         return {
             "active": [
                 {
-                    "name": str(row["hash"])[:40],
+                    "name": (
+                        str(row["name"]).strip()
+                        if row["name"] is not None and str(row["name"]).strip()
+                        else str(row["hash"])[:12]
+                    ),
                     "progress": float(row["progress"] or 0.0),
                     "dlspeed": int(row["dlspeed_bps"] or 0),
                 }
@@ -244,6 +279,87 @@ class DashboardRepository:
                     (PAGE_SIZE, offset),
                 )
             )
+        finally:
+            con.close()
+        return [dict(row) for row in rows], int(total or 0)
+
+    def history_pages(
+        self, kind: str, *, page: int = 0
+    ) -> tuple[list[dict[str, Any]], int]:
+        offset = max(0, int(page)) * PAGE_SIZE
+        con = readonly_connect(self.state_db)
+        try:
+            if kind == "d":
+                total = con.execute(
+                    "select count(*) from processed_media "
+                    "where first_downloaded_at is not null"
+                ).fetchone()[0]
+                rows = list(
+                    con.execute(
+                        "select normalized_id,display_title,last_qbt_hash,"
+                        "first_downloaded_at as processed_at "
+                        "from processed_media where first_downloaded_at is not null "
+                        "order by first_downloaded_at desc,id desc limit ? offset ?",
+                        (PAGE_SIZE, offset),
+                    )
+                )
+            elif kind == "i":
+                total = con.execute(
+                    "select count(*) from processed_media "
+                    "where last_ingested_at is not null"
+                ).fetchone()[0]
+                rows = list(
+                    con.execute(
+                        "select normalized_id,display_title,last_qbt_hash,"
+                        "last_ingested_at as processed_at "
+                        "from processed_media where last_ingested_at is not null "
+                        "order by last_ingested_at desc,id desc limit ? offset ?",
+                        (PAGE_SIZE, offset),
+                    )
+                )
+            elif kind == "e":
+                total = con.execute(
+                    "select count(*) from processed_media "
+                    "where lifecycle_state in ('manual_delete_failed','missing_unknown')"
+                ).fetchone()[0]
+                rows = list(
+                    con.execute(
+                        "select normalized_id,display_title,last_qbt_hash,"
+                        "updated_at as processed_at "
+                        "from processed_media "
+                        "where lifecycle_state in ('manual_delete_failed','missing_unknown') "
+                        "order by updated_at desc,id desc limit ? offset ?",
+                        (PAGE_SIZE, offset),
+                    )
+                )
+            elif kind == "r":
+                total = con.execute(
+                    "select count(*) from capacity_reclaims where state='reclaimed'"
+                ).fetchone()[0]
+                rows = list(
+                    con.execute(
+                        "select name,hash,reclaimed_at as processed_at,allocated_bytes "
+                        "from capacity_reclaims where state='reclaimed' "
+                        "order by reclaimed_at desc,id desc limit ? offset ?",
+                        (PAGE_SIZE, offset),
+                    )
+                )
+            elif kind == "m":
+                total = con.execute(
+                    "select count(*) from processed_media "
+                    "where lifecycle_state='manual_deleted'"
+                ).fetchone()[0]
+                rows = list(
+                    con.execute(
+                        "select normalized_id,display_title,last_qbt_hash,"
+                        "manually_deleted_at as processed_at "
+                        "from processed_media where lifecycle_state='manual_deleted' "
+                        "order by manually_deleted_at desc,id desc limit ? offset ?",
+                        (PAGE_SIZE, offset),
+                    )
+                )
+            else:
+                return [], 0
         finally:
             con.close()
         return [dict(row) for row in rows], int(total or 0)
@@ -479,6 +595,10 @@ class TelegramPanelRenderer:
         return PanelView(text=text, reply_markup=markup)
 
     def render_status(self, page: int = 0) -> PanelView:
+        del page  # Legacy n:s:<n> opens the status home.
+        return self.render_status_home()
+
+    def render_status_home(self) -> PanelView:
         snap = self.dashboard.home_snapshot()
         text = _clip_body(
             "\n".join(
@@ -487,13 +607,69 @@ class TelegramPanelRenderer:
                     f"磁盘可用：{snap['free_bytes'] / (1024**3):.1f} GiB",
                     humanize_scheduler_condition(snap["condition"]),
                     f"已入库 {snap['ingested']}，手动删除 {snap['manual_deleted']}",
-                    f"第 {page + 1} 页",
+                    "请选择要查看的历史分类。",
                 ]
             )
         )
         return PanelView(
             text=text,
             reply_markup={
-                "inline_keyboard": [[_btn("首页", encode_callback(["n", "h"]))]]
+                "inline_keyboard": [
+                    [
+                        _btn("完成下载", encode_callback(["n", "s", "d", "0"])),
+                        _btn("完成入库", encode_callback(["n", "s", "i", "0"])),
+                    ],
+                    [
+                        _btn("异常任务", encode_callback(["n", "s", "e", "0"])),
+                        _btn("自动回收", encode_callback(["n", "s", "r", "0"])),
+                    ],
+                    [_btn("手动删除", encode_callback(["n", "s", "m", "0"]))],
+                    [_btn("返回首页", encode_callback(["n", "h"]))],
+                ]
             },
         )
+
+    def render_status_history(self, kind: str, page: int = 0) -> PanelView:
+        title = _HISTORY_KINDS.get(str(kind))
+        if title is None:
+            return PanelView(
+                text="未知的历史分类。",
+                reply_markup={
+                    "inline_keyboard": [
+                        [_btn("返回状态页", encode_callback(["n", "s", "0"]))]
+                    ]
+                },
+            )
+        rows, total = self.dashboard.history_pages(str(kind), page=page)
+        lines = [f"{title}记录 · 第 {page + 1} 页"]
+        if not rows:
+            lines.append("当前没有记录。")
+        for row in rows:
+            when = _fmt_shanghai(row.get("processed_at"))
+            if kind == "r":
+                name = _display_name(
+                    torrent_name=row.get("name"),
+                    torrent_hash=row.get("hash"),
+                )
+                gib = int(row.get("allocated_bytes") or 0) / (1024**3)
+                lines.append(f"{when}  {name} · {gib:.1f} GiB")
+            else:
+                name = _display_name(
+                    normalized_id=row.get("normalized_id"),
+                    display_title=row.get("display_title"),
+                    torrent_hash=row.get("last_qbt_hash"),
+                )
+                lines.append(f"{when}  {name}")
+        text = _clip_body("\n".join(lines))
+        nav: list[dict[str, Any]] = [
+            _btn("返回状态页", encode_callback(["n", "s", "0"]))
+        ]
+        if page > 0:
+            nav.append(
+                _btn("上一页", encode_callback(["n", "s", str(kind), str(page - 1)]))
+            )
+        if (page + 1) * PAGE_SIZE < total:
+            nav.append(
+                _btn("下一页", encode_callback(["n", "s", str(kind), str(page + 1)]))
+            )
+        return PanelView(text=text, reply_markup={"inline_keyboard": [nav]})

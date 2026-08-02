@@ -1007,6 +1007,20 @@ def migration_sql() -> list[str]:
         "insert or ignore into schema_migrations(version,name,applied_at) values(12,'torrent_job_leases_v2',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(13,'successful_job_diagnostics_cleanup_v1',strftime('%s','now'))",
         "insert or ignore into schema_migrations(version,name,applied_at) values(14,'capacity_reclaim_audit_v1',strftime('%s','now'))",
+        # Migration 22: torrent display names + batch summary projection markers.
+        "alter table torrent_health add column name text",
+        "alter table bot_add_batches add column final_summary_sent_at integer",
+        # One-time stamp only on first apply of version 22. Remigrates must not
+        # stamp newer batches that are still waiting for summary projection.
+        "update bot_add_batches set initial_summary_sent_at=strftime('%s','now') "
+        "where initial_summary_sent_at is null "
+        "and not exists (select 1 from schema_migrations where version=22)",
+        "update bot_add_batches set final_summary_sent_at=strftime('%s','now') "
+        "where final_summary_sent_at is null "
+        "and state in ('complete','cancelled','draft_expired') "
+        "and not exists (select 1 from schema_migrations where version=22)",
+        "insert or ignore into schema_migrations(version,name,applied_at) "
+        "values(22,'torrent_name_and_batch_summary_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

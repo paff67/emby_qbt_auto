@@ -148,6 +148,17 @@ class WarningInboxRepository:
         finally:
             con.close()
 
+    def get(self, warning_id: int) -> dict[str, Any] | None:
+        con = readonly_connect(self.state_db)
+        try:
+            row = con.execute(
+                "select * from bot_warning_inbox where id=?",
+                (int(warning_id),),
+            ).fetchone()
+            return _row_dict(row)
+        finally:
+            con.close()
+
     def list_recent(self, *, limit: int = 8, offset: int = 0) -> list[dict[str, Any]]:
         return self._list(resolved=None, limit=limit, offset=offset)
 
@@ -262,21 +273,14 @@ class WarningInboxRepository:
                         )
                     )
                 )
-                related_hash = warning["related_hash"]
-                events = []
-                if related_hash:
-                    events = list(
-                        con.execute(
-                            "select ts,level,component,event_type,message from events_v2 "
-                            "where hash=? order by ts asc,id asc limit ?",
-                            (str(related_hash), max_rows),
-                        )
-                    )
-                for event in events:
+                related = self._collect_related_events(con, warning, limit=max_rows)
+                for event in related:
                     lines.append(
                         str(
                             redact(
-                                f"{event['ts']} {event['level']} {event['component']} "
+                                f"{event['timestamp']} [{event['source']}] "
+                                f"{event.get('level') or '-'} "
+                                f"{event.get('component') or '-'} "
                                 f"{event['event_type']} {event['message']}"
                             )
                         )
@@ -307,10 +311,108 @@ class WarningInboxRepository:
                 body_lines.append(line)
                 size += len(encoded)
             if truncated or len(lines) > len(body_lines):
-                body_lines.append("--- truncated ---")
+                body_lines.append("--- 后续日志因导出限制已省略 ---")
             return ("\n".join(body_lines) + ("\n" if body_lines else "")).encode("utf-8")
         finally:
             con.close()
+
+    @staticmethod
+    def _collect_related_events(
+        con, warning, *, limit: int
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        related_hash = warning["related_hash"]
+        related_job_id = warning["related_job_id"]
+        related_batch_id = warning["related_batch_id"]
+        related_item_id = warning["related_item_id"]
+        if related_hash:
+            for row in con.execute(
+                "select id,ts,level,component,event_type,message from events_v2 "
+                "where hash=? order by ts asc,id asc limit ?",
+                (str(related_hash), limit),
+            ):
+                events.append(
+                    {
+                        "source": "events_v2",
+                        "source_id": int(row["id"]),
+                        "timestamp": int(row["ts"]),
+                        "level": str(row["level"] or ""),
+                        "component": str(row["component"] or ""),
+                        "event_type": str(row["event_type"] or ""),
+                        "message": str(row["message"] or ""),
+                    }
+                )
+        if related_job_id is not None:
+            for row in con.execute(
+                "select id,ts,level,component,event_type,message from events_v2 "
+                "where job_id=? order by ts asc,id asc limit ?",
+                (int(related_job_id), limit),
+            ):
+                events.append(
+                    {
+                        "source": "events_v2",
+                        "source_id": int(row["id"]),
+                        "timestamp": int(row["ts"]),
+                        "level": str(row["level"] or ""),
+                        "component": str(row["component"] or ""),
+                        "event_type": str(row["event_type"] or ""),
+                        "message": str(row["message"] or ""),
+                    }
+                )
+        if related_batch_id is not None:
+            for row in con.execute(
+                "select id,created_at,event_type,from_state,to_state,reason_code,"
+                "safe_evidence_json from bot_add_events where batch_id=? "
+                "order by created_at asc,id asc limit ?",
+                (int(related_batch_id), limit),
+            ):
+                events.append(
+                    {
+                        "source": "bot_add_events",
+                        "source_id": int(row["id"]),
+                        "timestamp": int(row["created_at"]),
+                        "level": "info",
+                        "component": "bot_add",
+                        "event_type": str(row["event_type"] or ""),
+                        "message": (
+                            f"{row['from_state']}->{row['to_state']} "
+                            f"{row['reason_code']} {row['safe_evidence_json'] or ''}"
+                        ).strip(),
+                    }
+                )
+        if related_item_id is not None:
+            for row in con.execute(
+                "select id,created_at,event_type,from_state,to_state,reason_code,"
+                "safe_evidence_json from bot_add_events where item_id=? "
+                "order by created_at asc,id asc limit ?",
+                (int(related_item_id), limit),
+            ):
+                events.append(
+                    {
+                        "source": "bot_add_events",
+                        "source_id": int(row["id"]),
+                        "timestamp": int(row["created_at"]),
+                        "level": "info",
+                        "component": "bot_add",
+                        "event_type": str(row["event_type"] or ""),
+                        "message": (
+                            f"{row['from_state']}->{row['to_state']} "
+                            f"{row['reason_code']} {row['safe_evidence_json'] or ''}"
+                        ).strip(),
+                    }
+                )
+        deduped: dict[tuple[str, int], dict[str, Any]] = {}
+        for event in events:
+            deduped[(str(event["source"]), int(event["source_id"]))] = event
+        ordered = sorted(
+            deduped.values(),
+            key=lambda item: (
+                int(item["timestamp"]),
+                str(item["source"]),
+                int(item["source_id"]),
+            ),
+        )
+        return ordered[:limit]
 
 
 class WarningService:
