@@ -292,8 +292,9 @@ def test_telegram_notification_sender_sends_queued_messages_and_retries_failures
         db = Path(td) / "state.sqlite"
         migrate(db, dry_run=False)
         repo = BotNotificationRepository(db, now=lambda: 100)
-        first = repo.enqueue(100, "status", "hello")
-        second = repo.enqueue(100, "status", "will retry")
+        first = repo.enqueue(100, "download_confirmation", "hello")
+        second = repo.enqueue(100, "download_confirmation", "will retry")
+        blocked = repo.enqueue(100, "status", "panel only")
 
         sent = []
 
@@ -315,6 +316,7 @@ def test_telegram_notification_sender_sends_queued_messages_and_retries_failures
 
         assert sender.send_next() == first
         assert sender.send_next() == second
+        assert sender.send_next() == blocked
 
         assert sent == [(100, "hello", None)]
         assert repo.get(first)["state"] == "sent"
@@ -322,6 +324,8 @@ def test_telegram_notification_sender_sends_queued_messages_and_retries_failures
         assert failed["state"] == "retry_wait"
         assert failed["next_run_at"] == 160
         assert "secret-token" not in failed["last_error"]
+        assert repo.get(blocked)["state"] == "suppressed"
+        assert repo.get(blocked)["last_error"] == "panel_only_policy"
 
 
 def test_telegram_notification_sender_passes_inline_reply_markup_from_payload():
@@ -340,7 +344,12 @@ def test_telegram_notification_sender_passes_inline_reply_markup_from_payload():
                 {"text": "Deny", "callback_data": "deny:approval-c1"},
             ]]
         }
-        notice_id = repo.enqueue(100, "approval", "approval required", payload={"reply_markup": markup})
+        notice_id = repo.enqueue(
+            100,
+            "download_confirmation",
+            "approval required",
+            payload={"reply_markup": markup},
+        )
         sent = []
 
         class Api:

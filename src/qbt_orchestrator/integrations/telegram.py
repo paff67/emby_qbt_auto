@@ -335,11 +335,11 @@ class TelegramPollingService:
 
 
 class TelegramNotificationSender:
-    """Drain persistent bot_notifications to Telegram sendMessage.
+    """Drain allowlisted bot_notifications to Telegram sendMessage.
 
-    Polling only records commands/approvals in SQLite.  This sender is the
-    opposite direction and is intentionally queue-backed so daemon restarts do
-    not lose status/trace/perf replies.
+    Only confirmation prompts and final batch summaries are sent as standalone
+    messages. Everything else is suppressed so the persistent panel remains the
+    primary console surface.
     """
 
     def __init__(self, repo: BotNotificationRepository, api: TelegramApiProtocol, retry_delay: int = 60):
@@ -355,18 +355,41 @@ class TelegramNotificationSender:
         if row is None:
             return None
         notification_id = int(row["id"])
+        if not self._allowed(row):
+            self.repo.mark_suppressed(notification_id, reason="panel_only_policy")
+            return notification_id
         try:
-            self.api.send_message(int(row["chat_id"]), str(row["message"]), reply_markup=self._reply_markup(row))
+            self.api.send_message(
+                int(row["chat_id"]),
+                str(row["message"]),
+                reply_markup=self._reply_markup(row),
+            )
         except Exception as exc:
-            self.repo.schedule_retry(notification_id, error=str(redact(str(exc))), delay_sec=self.retry_delay)
+            self.repo.schedule_retry(
+                notification_id,
+                error=str(redact(str(exc))),
+                delay_sec=self.retry_delay,
+            )
             return notification_id
         self.repo.mark_sent(notification_id)
         return notification_id
 
-    def _reply_markup(self, row: dict[str, Any]) -> dict[str, Any] | None:
+    def _allowed(self, row: dict[str, Any]) -> bool:
+        topic = str(row.get("topic") or "")
+        if topic == "download_confirmation":
+            return True
+        if topic == "add_batch_summary":
+            payload = self._payload(row)
+            return str(payload.get("summary") or "") == "final"
+        return False
+
+    def _payload(self, row: dict[str, Any]) -> dict[str, Any]:
         try:
             payload = json.loads(row.get("payload_json") or "{}")
         except Exception:
-            return None
-        reply_markup = payload.get("reply_markup")
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _reply_markup(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        reply_markup = self._payload(row).get("reply_markup")
         return reply_markup if isinstance(reply_markup, dict) else None

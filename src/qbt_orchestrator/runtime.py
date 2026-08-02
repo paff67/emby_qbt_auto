@@ -1728,6 +1728,17 @@ class BotNotificationRepository:
             ),
         )
 
+    def mark_suppressed(self, notification_id: int, *, reason: str) -> None:
+        now = int(self.now())
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update bot_notifications set state='suppressed', next_run_at=null, "
+                "last_error=?, updated_at=? where id=?",
+                (str(redact(reason))[:1000], now, int(notification_id)),
+            ),
+        )
+
     def schedule_retry(self, notification_id: int, error: str, delay_sec: int = 60) -> None:
         now = int(self.now())
         write_transaction(

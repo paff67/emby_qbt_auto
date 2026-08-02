@@ -53,37 +53,26 @@ def _seed_item(db, *, item_id, batch_id, state, source_index):
     )
 
 
-def test_initial_summary_once_when_delayed_items_present(tmp_path):
+def test_delayed_batch_does_not_emit_initial_summary(tmp_path):
     db = tmp_path / "state.sqlite"
     migrate(db)
-    # Clear migration stamp so this new logical batch can notify.
     write_execute(db, "delete from bot_add_batches")
     _seed_batch(db, submitted_at=1000)
     _seed_item(db, item_id=1, batch_id=1, state="enrolled", source_index=0)
     _seed_item(db, item_id=2, batch_id=1, state="needs_confirmation", source_index=1)
-    _seed_item(db, item_id=3, batch_id=1, state="metadata_wait", source_index=2)
-    projector = BatchSummaryProjector(db, now=lambda: 1200, initial_delay_sec=120)
-    first = projector.tick()
-    second = projector.tick()
-    assert first["initial"] == 1
-    assert second["initial"] == 0
+    projector = BatchSummaryProjector(db, now=lambda: 1200)
+    result = projector.tick()
+    assert result["initial"] == 0
+    assert result["final"] == 0
     con = readonly_connect(db)
     try:
-        notes = con.execute(
-            "select dedupe_key,message from bot_notifications "
-            "where dedupe_key='tg:add-batch:1:initial'"
-        ).fetchall()
-        sent = con.execute(
-            "select initial_summary_sent_at from bot_add_batches where id=1"
-        ).fetchone()[0]
+        count = con.execute("select count(*) from bot_notifications").fetchone()[0]
     finally:
         con.close()
-    assert len(notes) == 1
-    assert "等待确认：1 条" in notes[0]["message"]
-    assert int(sent) == 1200
+    assert int(count) == 0
 
 
-def test_fast_complete_skips_initial_and_emits_final(tmp_path):
+def test_fast_complete_emits_final_only(tmp_path):
     db = tmp_path / "state.sqlite"
     migrate(db)
     write_execute(db, "delete from bot_add_batches")
@@ -100,7 +89,7 @@ def test_fast_complete_skips_initial_and_emits_final(tmp_path):
         ["enrolled", "duplicate_local", "failed", "enrolled_hold"]
     ):
         _seed_item(db, item_id=index + 1, batch_id=1, state=state, source_index=index)
-    projector = BatchSummaryProjector(db, now=lambda: 1100, initial_delay_sec=120)
+    projector = BatchSummaryProjector(db, now=lambda: 1100)
     result = projector.tick()
     assert result["initial"] == 0
     assert result["final"] == 1
@@ -137,25 +126,14 @@ def test_final_summary_trusts_complete_even_if_item_state_looks_open(tmp_path):
     migrate(db)
     write_execute(db, "delete from bot_add_batches")
     _seed_batch(db, state="complete", submitted_at=1, completed_at=2)
-    # Queue already marked the batch complete; projector must not re-gate on item state.
     _seed_item(db, item_id=1, batch_id=1, state="ready", source_index=0)
     projector = BatchSummaryProjector(db, now=lambda: 50)
     assert projector.tick()["final"] == 1
-    con = readonly_connect(db)
-    try:
-        keys = [
-            row[0]
-            for row in con.execute("select dedupe_key from bot_notifications").fetchall()
-        ]
-    finally:
-        con.close()
-    assert keys == ["tg:add-batch:1:final"]
 
 
 def test_migrated_historical_batches_do_not_storm(tmp_path):
     db = tmp_path / "state.sqlite"
     migrate(db)
-    # Simulate upgrade: historical terminal batch exists before version 22 applies.
     write_execute(db, "delete from schema_migrations where version=22")
     write_execute(
         db,
@@ -168,17 +146,15 @@ def test_migrated_historical_batches_do_not_storm(tmp_path):
     migrate(db)
     projector = BatchSummaryProjector(db, now=lambda: 999999)
     result = projector.tick()
-    assert result["initial"] == 0
     assert result["final"] == 0
     con = readonly_connect(db)
     try:
         notes = con.execute("select count(*) from bot_notifications").fetchone()[0]
         stamped = con.execute(
-            "select initial_summary_sent_at is not null, final_summary_sent_at is not null "
+            "select final_summary_sent_at is not null "
             "from bot_add_batches where batch_key='old'"
         ).fetchone()
     finally:
         con.close()
     assert int(notes) == 0
     assert stamped[0] == 1
-    assert stamped[1] == 1

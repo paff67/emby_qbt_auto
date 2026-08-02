@@ -1232,10 +1232,11 @@ class CheckedAddService:
         batch = self.repository.get_batch(int(item["batch_id"]))
         generation = int(item["approval_generation"])
         item_id = int(item["id"])
+        media = str(item.get("normalized_media_id") or item.get("display_name") or item_id)
         self.notifications.enqueue_with_status(
             batch["chat_id"],
             "download_confirmation",
-            "检查完成，需要你确认；当前任务保持暂停。",
+            f"任务 {media} 需要确认，当前保持暂停。",
             level="warning",
             payload={
                 "item_id": item_id,
