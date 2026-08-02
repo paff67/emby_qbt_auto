@@ -35,7 +35,7 @@ def test_telegram_ui_home_and_limits(state_db):
         "insert or replace into disk_state(id,sampled_at,free_bytes,pressure_state) values(1,1,?,?)",
         (8 * 1024**3, "normal"),
     )
-    renderer = TelegramPanelRenderer(DashboardRepository(state_db, now=lambda: 1))
+    renderer = TelegramPanelRenderer(DashboardRepository(state_db))
     home = renderer.render_home()
     assert "qBT Orchestrator" in home.text
     assert len(home.text) <= BODY_LIMIT
@@ -56,7 +56,7 @@ def test_telegram_ui_pagination_and_limits(state_db, count):
             "batch_key,chat_id,user_id,state,created_at,updated_at) values(?,?,?,?,?,?)",
             (f"b-{index}", "1", "1", "complete", index + 1, index + 1),
         )
-    renderer = TelegramPanelRenderer(DashboardRepository(state_db, now=lambda: 1))
+    renderer = TelegramPanelRenderer(DashboardRepository(state_db))
     page0 = renderer.render_queue(0)
     assert len(page0.text) <= BODY_LIMIT
     if count > PAGE_SIZE:

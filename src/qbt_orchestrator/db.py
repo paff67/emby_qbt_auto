@@ -853,16 +853,7 @@ def migration_sql() -> list[str]:
         "on bot_warning_inbox(topic,last_occurred_at,id)",
         "create index if not exists idx_bot_warning_related_hash "
         "on bot_warning_inbox(related_hash,last_occurred_at,id)",
-        # Legacy per-chat warning reads are created only so migration 20 can drop
-        # them on upgrades that already applied migration 16 before the P1 cut.
-        "create table if not exists bot_warning_reads("
-        "warning_id integer not null references bot_warning_inbox(id) on delete cascade,"
-        "chat_id text not null,"
-        "user_id text not null,"
-        "read_at integer not null,"
-        "primary key(warning_id,chat_id,user_id))",
-        "create index if not exists idx_bot_warning_reads_actor "
-        "on bot_warning_reads(chat_id,user_id,warning_id)",
+        # Migration 20: drop legacy per-chat warning reads if present. Do not recreate.
         "drop index if exists idx_bot_warning_reads_actor",
         "drop table if exists bot_warning_reads",
         "insert or ignore into schema_migrations(version,name,applied_at) "

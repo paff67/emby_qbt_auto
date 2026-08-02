@@ -26,21 +26,6 @@ _LIFECYCLE_RANK = {
 }
 
 
-@dataclass(frozen=True)
-class ProcessedMediaRow:
-    id: int
-    normalized_id: str
-    display_title: str | None
-    origin: str
-    lifecycle_state: str
-    download_policy: str
-    ingestion_count: int
-    manual_delete_requested_at: int | None
-    manually_deleted_at: int | None
-    deletion_reason: str | None
-    deletion_manifest: str | None
-
-
 def _now_default() -> int:
     return int(time.time())
 
@@ -391,8 +376,10 @@ class ProcessedMediaRepository:
         actor_type: str = "cli",
         correlation_id: str | None = None,
         payload: Mapping[str, Any] | None = None,
+        effective_at: int | None = None,
     ) -> dict[str, Any]:
         now = int(self.now())
+        event_at = int(effective_at) if effective_at is not None else now
 
         def txn(con) -> dict[str, Any]:
             row = con.execute(
@@ -407,17 +394,20 @@ class ProcessedMediaRepository:
                 "update processed_media set lifecycle_state='manual_deleted',"
                 "manually_deleted_at=?,manually_deleted_by=?,updated_at=?,"
                 "row_version=row_version+1 where id=?",
-                (now, str(actor_id)[:128], now, int(row["id"])),
+                (event_at, str(actor_id)[:128], now, int(row["id"])),
             )
+            event_payload = dict(payload or {})
+            if effective_at is not None:
+                event_payload.setdefault("deleted_at", int(effective_at))
             self._insert_event(
                 con,
                 int(row["id"]),
                 event_type="manual_deleted",
-                event_at=now,
+                event_at=event_at,
                 actor_type=actor_type,
                 actor_id=actor_id,
                 correlation_id=correlation_id,
-                payload=payload,
+                payload=event_payload,
             )
             return _row_to_dict(
                 con.execute(
@@ -497,6 +487,7 @@ class ProcessedMediaRepository:
             normalized_id,
             actor_id=actor_id,
             payload={"deleted_at": int(deleted_at), "source": "audit_manifest"},
+            effective_at=int(deleted_at),
         )
 
     def backfill_from_sources(self, *, dry_run: bool = True) -> dict[str, int]:

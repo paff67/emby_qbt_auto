@@ -12,14 +12,16 @@ PAGE_SIZE = 8
 BODY_LIMIT = 3500
 CALLBACK_LIMIT = 64
 COPY_TEXT_LIMIT = 256
-FORBIDDEN_INTERNAL = (
-    "DRAIN",
-    "capacity_deadlock",
-    "plan_generation",
-    "lease",
-    "PID",
-    "generation",
-)
+
+_BATCH_STATE_ZH = {
+    "draft": "草稿",
+    "queued": "排队中",
+    "processing": "检查中",
+    "awaiting_confirmation": "等待确认",
+    "complete": "已完成",
+    "cancelled": "已取消",
+    "draft_expired": "草稿已过期",
+}
 
 
 @dataclass(frozen=True)
@@ -67,9 +69,8 @@ def _copy_btn(text: str, copy_text: str) -> dict[str, Any]:
 
 
 class DashboardRepository:
-    def __init__(self, state_db: str | Path, *, now: Callable[[], int] | None = None):
+    def __init__(self, state_db: str | Path):
         self.state_db = Path(state_db)
-        self.now = now or (lambda: int(time.time()))
 
     def home_snapshot(self) -> dict[str, Any]:
         con = readonly_connect(self.state_db)
@@ -114,12 +115,23 @@ class DashboardRepository:
         finally:
             con.close()
         free_bytes = int(free_row[0]) if free_row and free_row[0] is not None else 0
-        mode = str(capacity["scheduler_mode"] if capacity and "scheduler_mode" in capacity.keys() else (capacity[0] if capacity else "normal"))
-        state = str(capacity["state"] if capacity and "state" in capacity.keys() else (capacity[1] if capacity and len(capacity) > 1 else ""))
+        mode = str(
+            capacity["scheduler_mode"]
+            if capacity and "scheduler_mode" in capacity.keys()
+            else (capacity[0] if capacity else "normal")
+        )
+        state = str(
+            capacity["state"]
+            if capacity and "state" in capacity.keys()
+            else (capacity[1] if capacity and len(capacity) > 1 else "")
+        )
+        # Map only to approved natural-language condition keys for the renderer.
         if mode in {"recovery", "emergency"} or state in {"recovery", "emergency"}:
             condition = "limited_with_candidate"
         elif mode in {"watch", "guard"} or state in {"watch", "guard"}:
             condition = "limited_without_candidate"
+        elif mode in {"qbt_down", "unavailable"} or state in {"qbt_down", "unavailable"}:
+            condition = "qbt_unavailable"
         else:
             condition = "progress_possible"
         return {
@@ -216,9 +228,6 @@ class TelegramPanelRenderer:
             ]
         )
         text = _clip_body("\n".join(lines))
-        for word in FORBIDDEN_INTERNAL:
-            if word in text and word != "lease":
-                text = text.replace(word, "内部状态")
         markup = {
             "inline_keyboard": [
                 [
@@ -239,8 +248,9 @@ class TelegramPanelRenderer:
         if not rows:
             lines.append("当前没有批次。")
         for row in rows:
+            state_zh = _BATCH_STATE_ZH.get(str(row["state"]), "处理中")
             lines.append(
-                f"#{row['id']} {row['state']} 收到{row['received_count']} "
+                f"批次 {row['id']}（{state_zh}）收到{row['received_count']} "
                 f"入库{row['enrolled_count']} 重复{row['duplicate_count']} "
                 f"确认{row['confirmation_count']} 失败{row['failed_count']} "
                 f"历史拦截{row.get('blocked_history_count') or 0}"

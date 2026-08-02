@@ -10,8 +10,9 @@ from .db import write_transaction
 from .hash_identity import canonical_torrent_hash
 
 VIEWER = {"start", "help", "status", "trace", "perf", "queue", "warnings"}
-OPERATOR = VIEWER | {"pause", "resume", "add"}
-ADMIN = OPERATOR | {"force_upload", "cleanup", "preempt", "config", "approve", "deny"}
+# Legacy operator set retained for non-panel commands only; P1 panel mutations are admin-only.
+OPERATOR = VIEWER | {"pause", "resume"}
+ADMIN = OPERATOR | {"add", "force_upload", "cleanup", "preempt", "config", "approve", "deny"}
 
 
 class TelegramAuthorizer:
@@ -27,7 +28,8 @@ class TelegramAuthorizer:
         self.operators = operators or set()
         self.admins = admins or set()
         if single_admin_id is not None:
-            self.admins.add(int(single_admin_id))
+            # P1 personal deploy uses exactly one administrator for mutations.
+            self.admins = {int(single_admin_id)}
 
     def role_for(self, user_id: int) -> str | None:
         if user_id in self.admins:
@@ -47,7 +49,7 @@ class TelegramAuthorizer:
         )
 
     def can_mutate(self, user_id: int) -> bool:
-        return self.role_for(user_id) in {"admin", "operator"}
+        return self.role_for(user_id) == "admin"
 @dataclass
 class Approval:
     action: str; payload: dict; expires_at: int; approved: bool = False

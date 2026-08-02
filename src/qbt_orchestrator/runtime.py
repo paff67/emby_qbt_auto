@@ -600,6 +600,8 @@ class UploadJobRunner:
         backoff_schedule=(60, 180, 600, 1800, 7200, 21600),
         job_types=("upload", "sidecar_upload"),
         lease_heartbeat_interval_sec: float = 60.0,
+        warning_service=None,
+        processed_media=None,
     ):
         self.repo = repo
         self.worker = RcloneUploadWorker(rclone, executor)
@@ -608,6 +610,8 @@ class UploadJobRunner:
         self.lease_heartbeat_interval_sec = max(
             0.01, float(lease_heartbeat_interval_sec)
         )
+        self.warning_service = warning_service
+        self.processed_media = processed_media
 
     @staticmethod
     def _lease_kwargs(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -766,8 +770,53 @@ class UploadJobRunner:
         if row["job_type"] == "upload" and row.get("batch_id") is not None:
             self._update_batch_upload_state(row, payload, result)
         if row["job_type"] == "upload" and result.remote_verified:
+            self._record_processed_uploaded(row, payload)
             self._enqueue_media_pipeline_if_present(row, payload)
         return int(row["id"])
+
+    def _record_processed_uploaded(self, row: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+        if self.processed_media is None:
+            return
+        normalized_id = str(payload.get("normalized_id") or "").strip()
+        if not normalized_id:
+            return
+        try:
+            self.processed_media.mark_uploaded(
+                normalized_id,
+                origin="upload",
+                remote_path=str(payload.get("remote") or "") or None,
+                remote_size=int(payload["size"]) if payload.get("size") is not None else None,
+                correlation_id=f"upload:{int(row['id'])}",
+                payload={"hash": str(row.get("hash") or "")[:128]},
+            )
+        except Exception as exc:
+            if self.warning_service is not None:
+                try:
+                    self.warning_service.report(
+                        warning_key=f"upload:ledger:{int(row['id'])}",
+                        severity="warning",
+                        topic="upload",
+                        safe_message=str(redact(f"upload ledger update failed: {exc}"))[:500],
+                        related_job_id=int(row["id"]),
+                        related_hash=str(row.get("hash") or "") or None,
+                    )
+                except Exception:
+                    pass
+
+    def _report_upload_warning(self, row: Mapping[str, Any], phase: str, message: str) -> None:
+        if self.warning_service is None:
+            return
+        try:
+            self.warning_service.report(
+                warning_key=f"upload:{phase}:{int(row['id'])}",
+                severity="error",
+                topic="upload",
+                safe_message=str(redact(message))[:500],
+                related_job_id=int(row["id"]),
+                related_hash=str(row.get("hash") or "") or None,
+            )
+        except Exception:
+            pass
 
     def _handle_upload_exception(
         self,
@@ -789,7 +838,10 @@ class UploadJobRunner:
                 self._mark_sidecar_upload_failed(
                     row, payload, "sidecar_upload_failed"
                 )
+                self._report_upload_warning(row, "sidecar", error)
             return
+        if (not is_sidecar) and self._attempts_exhausted(row):
+            self._report_upload_warning(row, "copy", error)
         delay = self._delay_for_attempt(int(row.get("attempts") or 1))
         self.repo.schedule_retry(
             row["id"],

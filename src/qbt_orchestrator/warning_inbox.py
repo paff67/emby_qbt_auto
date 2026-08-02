@@ -365,25 +365,19 @@ class WarningService:
             return 0
         con = readonly_connect(self.state_db)
         try:
-            open_rows = con.execute(
-                "select id,occurrence_count,severity,topic,safe_message from bot_warning_inbox "
-                "where resolved=0 order by last_occurred_at desc,id desc limit ?",
+            missing = con.execute(
+                "select w.id,w.occurrence_count,w.severity,w.topic,w.safe_message "
+                "from bot_warning_inbox w "
+                "left join bot_notifications n "
+                "on n.dedupe_key=('warn:' || w.id || ':' || w.occurrence_count) "
+                "where w.resolved=0 and n.id is null "
+                "order by w.last_occurred_at desc,w.id desc limit ?",
                 (max(1, min(100, int(limit))),),
             ).fetchall()
         finally:
             con.close()
         projected = 0
-        for row in open_rows:
-            key = f"warn:{int(row['id'])}:{int(row['occurrence_count'])}"
-            con = readonly_connect(self.state_db)
-            try:
-                exists = con.execute(
-                    "select id from bot_notifications where dedupe_key=?", (key,)
-                ).fetchone()
-            finally:
-                con.close()
-            if exists is not None:
-                continue
+        for row in missing:
             self._project(_row_dict(row) or {})
             projected += 1
         return projected

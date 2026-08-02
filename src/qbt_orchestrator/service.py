@@ -203,6 +203,8 @@ def build_telegram_supervisor_from_env(
     state_db: str | Path,
     env: Mapping[str, str] | None = None,
     api_factory=TelegramHttpApi,
+    *,
+    checked_add=None,
 ) -> TelegramSupervisor | None:
     env = env or {}
     token = env.get("QBT_ORCH_TELEGRAM_TOKEN") or env.get("TELEGRAM_BOT_TOKEN")
@@ -211,23 +213,25 @@ def build_telegram_supervisor_from_env(
     admins = _parse_id_set(env.get("QBT_ORCH_TG_ADMINS"))
     single_admin_raw = (env.get("QBT_ORCH_TG_ADMIN_ID") or "").strip()
     single_admin_id = int(single_admin_raw) if single_admin_raw else (next(iter(admins), None))
-    authorizer = TelegramAuthorizer(
-        viewers=_parse_id_set(env.get("QBT_ORCH_TG_VIEWERS")),
-        operators=_parse_id_set(env.get("QBT_ORCH_TG_OPERATORS")),
-        admins=admins,
-        single_admin_id=single_admin_id,
-    )
-    command_store = BotCommandRepository(state_db)
-    api = api_factory(token)
-    poll_timeout = int(env.get("QBT_ORCH_TG_POLL_TIMEOUT", "30"))
-    interval = float(env.get("QBT_ORCH_TG_SUPERVISOR_INTERVAL", "1"))
-    max_backoff = float(env.get("QBT_ORCH_TG_MAX_BACKOFF", "60"))
     panel_enabled = str(env.get("QBT_ORCH_TG_PANEL_ENABLED", "0")).strip() in {
         "1",
         "true",
         "yes",
         "on",
     }
+    if panel_enabled and len(admins) > 1 and not single_admin_raw:
+        raise ValueError("QBT_ORCH_TG_ADMIN_ID required when multiple TG admins are configured")
+    authorizer = TelegramAuthorizer(
+        viewers=_parse_id_set(env.get("QBT_ORCH_TG_VIEWERS")),
+        operators=_parse_id_set(env.get("QBT_ORCH_TG_OPERATORS")),
+        admins=admins,
+        single_admin_id=single_admin_id if panel_enabled else None,
+    )
+    command_store = BotCommandRepository(state_db)
+    api = api_factory(token)
+    poll_timeout = int(env.get("QBT_ORCH_TG_POLL_TIMEOUT", "30"))
+    interval = float(env.get("QBT_ORCH_TG_SUPERVISOR_INTERVAL", "1"))
+    max_backoff = float(env.get("QBT_ORCH_TG_MAX_BACKOFF", "60"))
     router = None
     if panel_enabled:
         from .bot_add_queue import BotAddQueueRepository
@@ -240,6 +244,7 @@ def build_telegram_supervisor_from_env(
             command_store=command_store,
             state_db=state_db,
             add_queue=BotAddQueueRepository(state_db),
+            checked_add=checked_add,
             warnings=WarningInboxRepository(state_db),
             panel_enabled=True,
             admin_user_id=str(single_admin_id) if single_admin_id is not None else None,
@@ -359,6 +364,8 @@ class DaemonRuntime:
         disk_alert_margin_bytes: int = 512 * 1024**2,
         capacity_deadlock_alerts_enabled: bool = True,
         scheduler_alert_service=None,
+        warning_service=None,
+        processed_media=None,
         sync_repeated_full_limit: int = 3,
         sync_degraded_interval_sec: float = 10.0,
         safety_event_sample_interval_sec: float = 60.0,
@@ -519,6 +526,9 @@ class DaemonRuntime:
             )
         else:
             self.carousel_service = None
+        # Must be set before _default_loop_tasks() reads these attributes.
+        self.warning_service = warning_service
+        self.processed_media = processed_media
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -596,6 +606,7 @@ class DaemonRuntime:
                     disk_alert_margin_bytes=int(disk_alert_margin_bytes),
                     capacity_deadlock_enabled=self.capacity_deadlock_alerts_enabled,
                 ),
+                warning_service=warning_service,
             )
         self._stopping = False
 
@@ -631,7 +642,21 @@ class DaemonRuntime:
                     max_runtime_sec=2,
                 )
             )
+        if self.warning_service is not None:
+            tasks.append(
+                LoopTask(
+                    "warning_projection_reconcile",
+                    60,
+                    self.warning_projection_reconcile_tick,
+                    max_runtime_sec=2,
+                )
+            )
         return tasks
+
+    def warning_projection_reconcile_tick(self) -> dict:
+        if self.warning_service is None:
+            return {"status": "disabled", "projected": 0}
+        return {"projected": int(self.warning_service.reconcile_projections())}
 
     def metadata_probe_tick(self) -> dict:
         if self.metadata_probe_coordinator is None:
@@ -1290,6 +1315,7 @@ class DaemonRuntime:
             batch_inventory_limit=self.batch_inventory_limit,
             scheduler_engine=self.scheduler_engine,
             disk_floor_bytes=self.disk_floor_bytes,
+            processed_media=self.processed_media,
         )
         result = service.sync_completed(
             snapshots,
@@ -2154,7 +2180,18 @@ class DaemonRuntime:
             if callback_error is None:
                 self.obs.event("info", task.name, "loop_tick", f"{task.name} loop completed", {"result": result, "dry_run": self.dry_run})
             else:
-                self.obs.event("error", task.name, "loop_failed", str(redact(str(callback_error))), {"dry_run": self.dry_run})
+                safe = str(redact(str(callback_error)))
+                self.obs.event("error", task.name, "loop_failed", safe, {"dry_run": self.dry_run})
+                if self.warning_service is not None:
+                    try:
+                        self.warning_service.report(
+                            warning_key=f"daemon_task:{task.name}:{type(callback_error).__name__}",
+                            severity="error",
+                            topic="daemon",
+                            safe_message=f"后台任务异常：{task.name}",
+                        )
+                    except Exception:
+                        pass
         finally:
             self._loop_metric(task, duration, succeeded=callback_error is None)
 

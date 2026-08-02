@@ -240,6 +240,7 @@ class CapacityReclaimAuditStore:
         payload: Mapping[str, Any],
         now: int,
     ) -> list[int]:
+        notification_ids = self._notification_ids(row)
         if self.warning_service is not None and level in {"warning", "error", "critical"}:
             torrent_hash = str(row.get("hash") or payload.get("hash") or "").strip()
             if kind in {"no_safe_reclaim", "no_candidate", "deadlock"}:
@@ -247,16 +248,23 @@ class CapacityReclaimAuditStore:
             else:
                 warning_key = f"capacity:reclaim_failed:{torrent_hash or 'unknown'}"
             try:
-                self.warning_service.report(
+                reported = self.warning_service.report(
                     warning_key=warning_key[:200],
                     severity=level if level in {"info", "warning", "error", "critical"} else "warning",
                     topic="capacity_reclaim",
                     safe_message=str(redact(message)),
                     related_hash=torrent_hash or None,
                 )
+                notice_id = int(reported["id"])
+                if notice_id not in notification_ids:
+                    notification_ids.append(notice_id)
+                con.execute(
+                    "update capacity_reclaims set notification_ids_json=?,updated_at=? where id=?",
+                    (json.dumps(notification_ids), now, int(row["id"])),
+                )
+                return notification_ids
             except Exception:
                 pass
-        notification_ids = self._notification_ids(row)
         reason_token = str(payload.get("reason") or kind).strip() or kind
         hour_bucket = int(now) // 3600
         for chat_id in self.notification_chat_ids:
@@ -1324,6 +1332,7 @@ class DeadPartialReclaimer:
         stop_max_polls: int = 8,
         inventory_timeout_sec: float = 5.0,
         disk_free_bytes: Callable[[Path], int] | None = None,
+        warning_service=None,
     ):
         self.state_db = Path(state_db)
         self.executor = executor
@@ -1331,6 +1340,7 @@ class DeadPartialReclaimer:
         self.container_downloads = PurePosixPath(str(container_downloads))
         self.managed_root = Path(managed_root).resolve()
         self.dry_run = bool(dry_run)
+        self.warning_service = warning_service
         if min_dead_age_sec is not None:
             if (
                 int(min_reclaimable_age_sec) != 3_600
@@ -1355,6 +1365,7 @@ class DeadPartialReclaimer:
             self.state_db,
             notification_chat_ids=notification_chat_ids,
             now=self.now,
+            warning_service=warning_service,
         )
         if not self.managed_root.is_relative_to(self.host_downloads):
             raise ValueError("capacity reclaim managed_root must be inside host_downloads")

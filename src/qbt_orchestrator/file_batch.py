@@ -21,6 +21,8 @@ from .scheduler_engine import SchedulerEngine
 from .scheduler_intents import SchedulerIntent, SchedulerIntentRepository
 from .work_items import WorkItem, build_batch_delivery_work_item
 
+_MEDIA_ID = re.compile(r"(?:[A-Z0-9]{1,16}-){1,2}\d{2,9}", re.I)
+
 
 @dataclass(frozen=True)
 class FileBatchResult:
@@ -120,6 +122,7 @@ class FileBatchService:
         scheduler_engine: SchedulerEngine | None = None,
         now=None,
         allow_unguarded_qbt_mutations: bool = False,
+        processed_media=None,
     ):
         self.state_db = state_db
         self.dry_run = dry_run
@@ -154,6 +157,7 @@ class FileBatchService:
         self.jobs = TorrentJobRepository(state_db)
         self.obs = ObservabilityStore(state_db, now=self.now)
         self.decision_recorder = DecisionRecorder(state_db, now=self.now)
+        self.processed_media = processed_media
         self.intent_repository = SchedulerIntentRepository(state_db)
         self._pending_decisions: list[DecisionEntry] | None = None
         self._decision_reason_counts: dict[str, int] = {}
@@ -281,6 +285,7 @@ class FileBatchService:
                 priority=int(JobPriority.FULL_TORRENT_RELEASE_UPLOAD),
             )
             enqueued += 1
+            self._record_download_complete(torrent_hash, torrent, payload)
             self.obs.event("info", "file_batch", "upload_queued", f"upload job {job_id} queued", {"job_id": job_id, **payload}, hash=torrent_hash, job_id=job_id)
 
         if batch_candidates:
@@ -1583,6 +1588,33 @@ class FileBatchService:
             "file_batch",
             {**dict(base_metrics), **reason_counts, "sample_hashes": sample_hashes},
         )
+
+
+    def _record_download_complete(self, torrent_hash: str, torrent: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+        if self.processed_media is None:
+            return
+        name = str(torrent.get("name") or payload.get("name") or "")
+        match = _MEDIA_ID.search(name.upper())
+        normalized_id = match.group(0).upper() if match else str(payload.get("normalized_id") or "").strip()
+        if not normalized_id:
+            return
+        try:
+            self.processed_media.mark_downloaded(
+                normalized_id,
+                origin="file_batch",
+                qbt_hash=torrent_hash,
+                correlation_id=f"download:{torrent_hash[:16]}",
+                payload={"source": "completed_full_torrent"},
+            )
+        except Exception as exc:
+            self.obs.event(
+                "warning",
+                "file_batch",
+                "processed_media_ledger_failed",
+                str(redact(str(exc)))[:500],
+                {"hash": torrent_hash, "normalized_id": normalized_id},
+                hash=torrent_hash,
+            )
 
     def _existing_upload_job(self, torrent_hash: str) -> bool:
         torrent_hash = canonical_torrent_hash(torrent_hash)

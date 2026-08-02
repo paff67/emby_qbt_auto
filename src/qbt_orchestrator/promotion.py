@@ -170,8 +170,28 @@ class MediaPromotionRepository:
                     correlation_id=f"promotion:{int(promotion_id)}",
                     payload={"method": str(method), "verified": True},
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                try:
+                    write_transaction(
+                        self.state_db,
+                        lambda con: con.execute(
+                            "insert into events_v2(ts,level,component,event_type,message,data_json) "
+                            "values(?,?,?,?,?,?)",
+                            (
+                                now,
+                                "warning",
+                                "promotion",
+                                "processed_media_ledger_failed",
+                                str(redact(str(exc)))[:500],
+                                json.dumps(
+                                    {"promotion_id": int(promotion_id)},
+                                    ensure_ascii=False,
+                                ),
+                            ),
+                        ),
+                    )
+                except Exception:
+                    pass
 
     def record_failed(self, promotion_id: int, error: str, *, state: str = "failed") -> None:
         now = int(self.now())

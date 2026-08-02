@@ -393,6 +393,24 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     #    locked reclaim states (aborted_paused is already terminal, so it never
     #    receives a lease and needs no extra release).
     migrate(state_db, dry_run=False)
+    from .processed_media import ProcessedMediaRepository
+    from .warning_inbox import WarningService
+
+    alert_chat_ids_early = (
+        _csv_list(os.environ.get("QBT_ORCH_TG_ALERT_CHAT_IDS"))
+        or _csv_list(os.environ.get("QBT_ORCH_TG_ADMINS"))
+    )
+    admin_chat_id = (
+        alert_chat_ids_early[0]
+        if alert_chat_ids_early
+        else os.environ.get("QBT_ORCH_TG_ADMIN_CHAT")
+        or os.environ.get("QBT_ORCH_TG_ADMIN_ID")
+    )
+    warning_service = WarningService(state_db, admin_chat_id=admin_chat_id)
+    processed_media_repo = ProcessedMediaRepository(
+        state_db,
+        enforce=_truthy(os.environ.get("QBT_ORCH_PROCESSED_MEDIA_ENFORCE")) is True,
+    )
     qbt_cfg = cfg.qbt if cfg else None
     qbt = _build_qbt_client_from_env(qbt_cfg, os.environ)
     executor = Executor(qbt, dry_run=dry_run, state_db=state_db)
@@ -421,12 +439,11 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
                     "QBT_ORCH_TELEGRAM_BACKFILL_DB",
                     "/opt/qbt/gdrive-backfill/state/backfill.sqlite",
                 ),
-                enforce_processed_media=_truthy(
-                    os.environ.get("QBT_ORCH_PROCESSED_MEDIA_ENFORCE")
-                )
-                is True,
+                processed_media=processed_media_repo,
+                enforce_processed_media=processed_media_repo.enforce,
             ),
             notifications=BotNotificationRepository(state_db),
+            warning_service=warning_service,
         )
     capacity_assessment_builder = CapacityAssessmentBuilder(
         viability_stale_sec=viability_stale_sec
@@ -480,6 +497,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
                 os.environ.get("QBT_ORCH_CAPACITY_RECLAIM_MAX_PER_TICK", "1")
             ),
             notification_chat_ids=capacity_reclaim_chat_ids,
+            warning_service=warning_service,
         )
     con = readonly_connect(state_db)
     try:
@@ -554,9 +572,14 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
                 ),
                 max_per_tick=0,
                 notification_chat_ids=capacity_reclaim_chat_ids,
+                warning_service=warning_service,
             )
     disk_path = os.environ.get("QBT_ORCH_DISK_PATH", "/data/downloads")
-    telegram_supervisor = build_telegram_supervisor_from_env(state_db, os.environ)
+    telegram_supervisor = build_telegram_supervisor_from_env(
+        state_db,
+        os.environ,
+        checked_add=checked_add_service,
+    )
     notification_repo = BotNotificationRepository(state_db)
     preemption_service = _build_preemption_from_env(state_db, executor, os.environ, global_dry_run=dry_run)
     command_processor = CommandProcessor(BotCommandRepository(state_db), executor, notifications=notification_repo, preemption_service=preemption_service)
@@ -585,9 +608,16 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     cleanup_env = _truthy(os.environ.get("QBT_ORCH_CLEANUP_DRY_RUN"))
     cleanup_dry_run = True if dry_run else (cleanup_env if cleanup_env is not None else False)
     cleanup_repo = TorrentJobRepository(state_db)
-    upload_runner = UploadJobRunner(TorrentJobRepository(state_db), rclone, executor)
+    upload_runner = UploadJobRunner(
+        TorrentJobRepository(state_db),
+        rclone,
+        executor,
+        warning_service=warning_service,
+        processed_media=processed_media_repo,
+    )
     media_promotion_runner = MediaPromotionRunner(
-        MediaPromotionRepository(state_db), rclone
+        MediaPromotionRepository(state_db, processed_media=processed_media_repo),
+        rclone,
     )
     promotion_env = _truthy(os.environ.get("QBT_ORCH_MEDIA_PROMOTION_DRY_RUN"))
     media_promotion_dry_run = True if dry_run else (
@@ -670,16 +700,6 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     if path_reconcile_enabled is None:
         path_reconcile_enabled = True
     if path_reconcile_enabled:
-        from .warning_inbox import WarningService
-
-        warning_service = WarningService(
-            state_db,
-            admin_chat_id=(
-                (_csv_list(os.environ.get("QBT_ORCH_TG_ALERT_CHAT_IDS")) or [None])[0]
-                or os.environ.get("QBT_ORCH_TG_ADMIN_CHAT")
-                or os.environ.get("QBT_ORCH_TG_ADMIN_ID")
-            ),
-        )
         path_reconciler = QbtPathReconciler(
             state_db,
             expected_save_path=qbt_cfg.save_path if qbt_cfg else "/downloads/active",
@@ -887,6 +907,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         capacity_deadlock_alerts_enabled=(
             _truthy(os.environ.get("QBT_ORCH_CAPACITY_DEADLOCK_ALERTS")) is not False
         ),
+        warning_service=warning_service,
+        processed_media=processed_media_repo,
         sync_repeated_full_limit=int(os.environ.get("QBT_ORCH_SYNC_REPEATED_FULL_LIMIT", "3")),
         sync_degraded_interval_sec=float(os.environ.get("QBT_ORCH_SYNC_DEGRADED_INTERVAL_SEC", "10")),
         safety_event_sample_interval_sec=float(
@@ -1020,16 +1042,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ns.cmd == "processed-media":
         return _cmd_processed_media(ns, db)
     if ns.cmd == "manual-media-delete":
-        from .manual_media_delete import ManualMediaDeleteService
+        from .manual_media_delete import (
+            EmbyPathRefreshAdapter,
+            LocalMountPresenceAdapter,
+            ManualMediaDeleteService,
+            RcloneDriveTrashAdapter,
+        )
         from .processed_media import ProcessedMediaRepository
         from .warning_inbox import WarningService
 
+        if _truthy(os.environ.get("QBT_ORCH_MANUAL_DELETE_ENABLED")) is not True:
+            payload = {
+                "error": "manual_delete_disabled",
+                "hint": "Set QBT_ORCH_MANUAL_DELETE_ENABLED=1 and provide rclone/emby/mount adapters",
+            }
+            _print_json(payload) if ns.json else print(payload)
+            return 2
+        if not ns.remote_path:
+            raise SystemExit("--remote-path is required and must be an exact ID directory or file under it")
         migrate(db, False)
+        cfg = load_config(ns.config) if ns.config else None
+        rclone_cfg = cfg.rclone if cfg else None
+        emby_cfg = cfg.emby if cfg else None
+        trash_remote = os.environ.get("QBT_ORCH_MANUAL_DELETE_TRASH_REMOTE", "gcrypt-trash:")
+        mount_root = os.environ.get("QBT_ORCH_MANUAL_DELETE_MOUNT_ROOT", "/media/gcrypt")
+        rclone = RcloneClient(
+            config_path=rclone_cfg.config if rclone_cfg else "/root/.config/rclone/rclone.conf",
+            transfers=1,
+            checkers=1,
+        )
+        from .integrations.emby import EmbyClient
+
+        emby = EmbyClient(
+            base_url=(emby_cfg.base_url if emby_cfg else os.environ.get("QBT_ORCH_EMBY_URL", "")),
+            api_key=(emby_cfg.api_key if emby_cfg else os.environ.get("QBT_ORCH_EMBY_API_KEY", "")),
+        )
         admin_chat = os.environ.get("QBT_ORCH_TG_ADMIN_CHAT") or os.environ.get("QBT_ORCH_TG_ADMIN_ID")
         service = ManualMediaDeleteService(
             db,
+            drive_trasher=RcloneDriveTrashAdapter(rclone, trash_remote=trash_remote),
+            mount_checker=LocalMountPresenceAdapter(mount_root),
+            emby_cleaner=EmbyPathRefreshAdapter(emby, media_prefix=mount_root),
             processed_media=ProcessedMediaRepository(db, enforce=True),
             warning_service=WarningService(db, admin_chat_id=admin_chat),
+            mount_path_for_id=lambda nid: str(Path(mount_root) / nid),
         )
         result = service.delete(
             ns.id,
@@ -1043,6 +1099,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ok": result.ok,
             "lifecycle_state": result.lifecycle_state,
             "download_policy": result.download_policy,
+            "stage": result.stage,
             "error": result.error,
         }
         _print_json(payload) if ns.json else print(payload)

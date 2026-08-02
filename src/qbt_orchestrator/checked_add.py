@@ -873,6 +873,7 @@ class CheckedAddService:
         matcher: DuplicateMatcher,
         *,
         notifications=None,
+        warning_service=None,
         owner: str = "checked-add",
         now=None,
         lease_sec: int = 30,
@@ -883,6 +884,7 @@ class CheckedAddService:
         self.gateway = gateway
         self.matcher = matcher
         self.notifications = notifications
+        self.warning_service = warning_service
         self.owner = str(owner or "checked-add")
         self.now = now or (lambda: int(time.time()))
         self.lease_sec = lease_sec
@@ -1109,6 +1111,18 @@ class CheckedAddService:
                 guard=guard,
             ):
                 raise ValueError("qbt_write_fenced")
+            if self.warning_service is not None:
+                try:
+                    self.warning_service.report(
+                        warning_key=f"checked_add:blocked_manual_deleted:{item_id}",
+                        severity="warning",
+                        topic="checked_add",
+                        safe_message="之前入库但后续被手动删除，已永久禁止重新下载",
+                        related_item_id=item_id,
+                        related_batch_id=int(current.get("batch_id") or 0) or None,
+                    )
+                except Exception:
+                    pass
             return self.repository.transition_item(
                 item_id,
                 {"prechecking"},

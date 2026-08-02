@@ -269,25 +269,28 @@ class SchedulerAlertService:
     def _broadcast(self, *, topic: str, level: str, message: str, payload: dict[str, Any], dedupe_topic: str, bucket: int) -> list[int]:
         safe_message = str(redact(message))
         if self.warning_service is not None and level in {"warning", "error", "critical"}:
-            warning_key = {
-                "scheduler_all_stopped": "qbt:authentication" if "auth" in dedupe_topic else f"daemon_task:scheduler:{dedupe_topic}",
-                "disk_threshold": "capacity:no_safe_reclaim" if "no_safe" in dedupe_topic else f"capacity:disk:{dedupe_topic}",
-                "capacity_deadlock": "capacity:no_safe_reclaim",
-            }.get(topic, f"daemon_task:alert:{dedupe_topic}")
             if topic == "scheduler_all_stopped":
                 warning_key = "daemon_task:scheduler:all_stopped"
             elif topic == "disk_threshold":
-                warning_key = "capacity:no_safe_reclaim" if "emergency" in str(payload.get("state") or "") else f"capacity:disk:{payload.get('state') or dedupe_topic}"
+                state = str(payload.get("state") or dedupe_topic)
+                warning_key = (
+                    "capacity:no_safe_reclaim"
+                    if state in {"emergency_near", "emergency"}
+                    else f"capacity:disk:{state}"
+                )
             elif topic == "capacity_deadlock":
                 warning_key = "capacity:no_safe_reclaim"
+            else:
+                warning_key = f"daemon_task:alert:{dedupe_topic}"
             try:
-                self.warning_service.report(
+                row = self.warning_service.report(
                     warning_key=str(warning_key)[:200],
                     severity=level if level in {"info", "warning", "error", "critical"} else "warning",
                     topic=topic,
                     safe_message=safe_message,
                     related_hash=str(payload.get("hash") or "") or None,
                 )
+                return [int(row["id"])]
             except Exception:
                 pass
         ids: list[int] = []

@@ -218,3 +218,37 @@ def test_required_warning_keys_via_service(tmp_path):
             safe_message=f"safe {key}",
         )
     assert WarningService(db, admin_chat_id="9").inbox.unread_count() == len(keys)
+
+
+def test_path_reconcile_reports_through_warning_service(tmp_path):
+    from qbt_orchestrator.path_reconcile import QbtPathReconciler
+    from qbt_orchestrator.warning_inbox import WarningService
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    service = WarningService(db, admin_chat_id="9", now=lambda: 500)
+    reconciler = QbtPathReconciler(
+        db,
+        expected_save_path="/downloads/active",
+        allowed_temp_path="/downloads/incomplete",
+        warning_service=service,
+    )
+    reconciler.reconcile(
+        {
+            "abc": {
+                "hash": "abc",
+                "name": "x",
+                "category": "auto",
+                "tags": "auto",
+                "save_path": "/downloads/active",
+                "content_path": "/downloads/BBAN-582",
+                "progress": 0.5,
+            }
+        }
+    )
+    assert service.inbox.unread_count() >= 1
+    keys = {
+        row["warning_key"]
+        for row in service.inbox.list_recent(limit=10)
+    }
+    assert any(key.startswith("path_drift:") for key in keys)

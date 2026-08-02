@@ -450,18 +450,28 @@ class MediaPipelineService:
                     origin="media_pipeline",
                     display_title=ledger_id,
                     correlation_id=f"media_group:{key}",
-                    payload={"emby_media_dir_sha256": None},
                 )
-                uploaded_path = str(emby_dir or "").strip()
-                if uploaded_path:
-                    self.processed_media.mark_uploaded(
-                        ledger_id,
-                        origin="media_pipeline",
-                        remote_path=uploaded_path,
-                        correlation_id=f"media_group:{key}",
+            except Exception as exc:
+                from .observability import redact
+
+                try:
+                    write_transaction(
+                        self.state_db,
+                        lambda con: con.execute(
+                            "insert into events_v2(ts,level,component,event_type,message,data_json) "
+                            "values(?,?,?,?,?,?)",
+                            (
+                                now,
+                                "warning",
+                                "media",
+                                "processed_media_ledger_failed",
+                                str(redact(str(exc)))[:500],
+                                "{}",
+                            ),
+                        ),
                     )
-            except Exception:
-                pass
+                except Exception:
+                    pass
         return group_id
 
     def _ensure_pipeline_run(self, manifest_id: str, group_id: int) -> int:
