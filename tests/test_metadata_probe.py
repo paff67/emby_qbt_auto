@@ -628,7 +628,8 @@ def test_metadata_unavailable_reports_warning_inbox_with_action_buttons(tmp_path
     assert f"n:b:{batch_id}:0" in callbacks
 
     # Same item/generation must not create a second projected notification.
-    coordinator.tick()
+    second = coordinator.tick()
+    assert int(second.get("warning_backfilled") or 0) == 0
     con = readonly_connect(db)
     try:
         notes = con.execute(
@@ -642,6 +643,52 @@ def test_metadata_unavailable_reports_warning_inbox_with_action_buttons(tmp_path
         con.close()
     assert int(notes) == 1
     assert int(occurrences) == 1
+
+
+def test_metadata_tick_backfills_missing_warning_inbox(tmp_path):
+    from qbt_orchestrator.db import write_execute
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.runtime import BotNotificationRepository
+    from qbt_orchestrator.warning_inbox import WarningService
+
+    queue, gateway, _coordinator, clock, item_ids, db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    item_id = int(item_ids[0])
+    write_execute(
+        db,
+        "update bot_add_items set state='metadata_unavailable',approval_generation=1 "
+        "where id=?",
+        (item_id,),
+    )
+    warnings = WarningService(
+        db,
+        admin_chat_id="1001",
+        notifications=BotNotificationRepository(db, now=clock),
+        now=clock,
+    )
+    coordinator = MetadataProbeCoordinator(
+        queue, gateway, owner="worker-a", now=clock, warning_service=warnings
+    )
+    result = coordinator.tick(sync_healthy=False)
+    assert int(result["warning_backfilled"]) == 1
+    con = readonly_connect(db)
+    try:
+        warning = con.execute(
+            "select related_item_id from bot_warning_inbox where warning_key=?",
+            (f"checked_add:metadata_unavailable:{item_id}",),
+        ).fetchone()
+        notes = con.execute(
+            "select count(*) from bot_notifications where topic='metadata_probe'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert warning is not None
+    assert int(warning["related_item_id"]) == item_id
+    assert int(notes) == 1
+    # Already present: no second upsert/projection from backfill.
+    again = coordinator.tick(sync_healthy=False)
+    assert int(again["warning_backfilled"]) == 0
 
 
 def test_timeout_never_touches_same_hash_without_item_tag_and_marks_duplicate(tmp_path):

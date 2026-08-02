@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 import hashlib
+import logging
 import time
 import uuid
 from typing import Any, Callable, Mapping
 
 from .db import readonly_connect
+
+LOGGER = logging.getLogger(__name__)
+_WARNING_BACKFILL_LIMIT = 20
 
 
 @dataclass(frozen=True)
@@ -46,15 +50,12 @@ class MetadataProbeCoordinator:
         owner: str | None = None,
         now: Callable[[], int] | None = None,
         warning_service=None,
-        notifications=None,
     ) -> None:
         self.repository = repository
         self.gateway = gateway
         self.config = config or MetadataProbeConfig()
         self.owner = str(owner or f"metadata-probe-{uuid.uuid4().hex}")
         self.now = now or (lambda: int(time.time()))
-        # Prefer WarningService (inbox-first). Legacy notifications= is ignored.
-        _ = notifications
         self.warning_service = warning_service
 
     def tick(
@@ -71,7 +72,10 @@ class MetadataProbeCoordinator:
             "requeued": [],
             "duplicates": [],
             "errors": 0,
+            "warning_backfilled": 0,
         }
+        # Repair missing WarningInbox rows even when qBT sync is unhealthy.
+        result["warning_backfilled"] = self._backfill_missing_metadata_warnings()
         if not sync_healthy:
             return result
         if snapshots is not None:
@@ -432,12 +436,44 @@ class MetadataProbeCoordinator:
         except Exception:
             self._record_failure(item_id, token, now, result)
 
-    def _notify_metadata_unavailable(self, item: Mapping[str, Any]) -> None:
+    def _backfill_missing_metadata_warnings(
+        self, *, limit: int = _WARNING_BACKFILL_LIMIT
+    ) -> int:
+        """Recreate WarningInbox rows lost after metadata_unavailable persistence."""
         if self.warning_service is None:
-            return
+            return 0
+        bound = max(1, min(int(_WARNING_BACKFILL_LIMIT), int(limit)))
+        con = readonly_connect(self.repository.state_db)
+        try:
+            rows = list(
+                con.execute(
+                    "select i.id,i.batch_id,i.approval_generation,i.state "
+                    "from bot_add_items i "
+                    "where i.state='metadata_unavailable' "
+                    "and not exists ("
+                    "  select 1 from bot_warning_inbox w "
+                    "  where w.warning_key=("
+                    "    'checked_add:metadata_unavailable:' || i.id"
+                    "  )"
+                    ") "
+                    "order by i.updated_at,i.id limit ?",
+                    (bound,),
+                )
+            )
+        finally:
+            con.close()
+        created = 0
+        for row in rows:
+            if self._notify_metadata_unavailable(dict(row)):
+                created += 1
+        return created
+
+    def _notify_metadata_unavailable(self, item: Mapping[str, Any]) -> bool:
+        if self.warning_service is None:
+            return False
+        item_id = int(item["id"])
         try:
             generation = int(item["approval_generation"])
-            item_id = int(item["id"])
             batch_id = int(item["batch_id"])
             self.warning_service.report(
                 warning_key=f"checked_add:metadata_unavailable:{item_id}",
@@ -471,8 +507,14 @@ class MetadataProbeCoordinator:
                     },
                 },
             )
-        except Exception:
-            return
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "metadata_unavailable warning report failed item_id=%s: %s",
+                item_id,
+                exc,
+            )
+            return False
 
     def _schedule_poll(
         self,

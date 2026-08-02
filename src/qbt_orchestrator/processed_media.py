@@ -391,6 +391,12 @@ class ProcessedMediaRepository:
                 raise ValueError("processed_media_missing")
             if str(row["download_policy"]) != "block_permanent":
                 raise ValueError("download_policy")
+            # Idempotent for already-completed deletions (normal saga resume).
+            if (
+                str(row["lifecycle_state"] or "") == "manual_deleted"
+                and row["manually_deleted_at"] is not None
+            ):
+                return _row_to_dict(row) or {}
             con.execute(
                 "update processed_media set lifecycle_state='manual_deleted',"
                 "manually_deleted_at=?,manually_deleted_by=?,updated_at=?,"
@@ -452,8 +458,36 @@ class ProcessedMediaRepository:
             if row is None:
                 raise ValueError("processed_media_missing")
             current = _row_to_dict(row) or {}
-            # Never downgrade a completed deletion into manual_delete_failed.
+            media_id = int(row["id"])
+            # Completed deletions must never become (or remain) manual_delete_failed.
             if current.get("manually_deleted_at") is not None:
+                if str(current.get("lifecycle_state") or "") != "manual_deleted":
+                    con.execute(
+                        "update processed_media set lifecycle_state='manual_deleted',"
+                        "download_policy='block_permanent',updated_at=?,"
+                        "row_version=row_version+1 where id=?",
+                        (now, media_id),
+                    )
+                    self._insert_event(
+                        con,
+                        media_id,
+                        event_type="manual_delete_state_normalized",
+                        event_at=now,
+                        actor_type=actor_type,
+                        actor_id=actor_id,
+                        correlation_id=correlation_id,
+                        payload={
+                            "from_state": str(current.get("lifecycle_state") or ""),
+                            "to_state": "manual_deleted",
+                            "reason": "contradiction_repair",
+                            "ignored_error": safe_error,
+                        },
+                    )
+                    return _row_to_dict(
+                        con.execute(
+                            "select * from processed_media where id=?", (media_id,)
+                        ).fetchone()
+                    ) or {}
                 return current
             if str(current.get("lifecycle_state") or "") == "manual_deleted":
                 return current
@@ -463,11 +497,11 @@ class ProcessedMediaRepository:
                 "download_policy='block_permanent',manual_delete_requested_at=?,"
                 "deletion_reason=coalesce(deletion_reason,?),"
                 "updated_at=?,row_version=row_version+1 where id=?",
-                (requested_at, safe_error, now, int(row["id"])),
+                (requested_at, safe_error, now, media_id),
             )
             self._insert_event(
                 con,
-                int(row["id"]),
+                media_id,
                 event_type="manual_delete_failed",
                 event_at=now,
                 actor_type=actor_type,
@@ -477,7 +511,7 @@ class ProcessedMediaRepository:
             )
             return _row_to_dict(
                 con.execute(
-                    "select * from processed_media where id=?", (int(row["id"]),)
+                    "select * from processed_media where id=?", (media_id,)
                 ).fetchone()
             ) or {}
 

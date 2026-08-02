@@ -170,7 +170,7 @@ def test_processed_media_repository_lifecycle_and_no_untombstone(tmp_path):
 def test_finalize_manual_delete_writes_stage_atomically_and_resists_fail(tmp_path):
     import json
 
-    from qbt_orchestrator.db import readonly_connect
+    from qbt_orchestrator.db import readonly_connect, write_execute
     from qbt_orchestrator.processed_media import ProcessedMediaRepository
 
     db = tmp_path / "state.sqlite"
@@ -196,10 +196,16 @@ def test_finalize_manual_delete_writes_stage_atomically_and_resists_fail(tmp_pat
     kept = repo.fail_manual_delete("BBAN-600", actor_id="ops", error="should_not_downgrade")
     assert kept["lifecycle_state"] == "manual_deleted"
     assert int(kept["manually_deleted_at"]) == 77
+    # Idempotent finalize must not rewrite deletion time or duplicate events.
+    again = repo.finalize_manual_delete("BBAN-600", actor_id="ops", effective_at=999)
+    assert int(again["manually_deleted_at"]) == 77
     con = readonly_connect(db)
     try:
         failed_events = con.execute(
             "select count(*) from processed_media_events where event_type='manual_delete_failed'"
+        ).fetchone()[0]
+        deleted_events = con.execute(
+            "select count(*) from processed_media_events where event_type='manual_deleted'"
         ).fetchone()[0]
         bad = con.execute(
             "select count(*) from processed_media "
@@ -209,7 +215,23 @@ def test_finalize_manual_delete_writes_stage_atomically_and_resists_fail(tmp_pat
     finally:
         con.close()
     assert int(failed_events) == 0
+    assert int(deleted_events) == 1
     assert int(bad) == 0
+
+    # Historical contradiction is normalized in-transaction.
+    write_execute(
+        db,
+        "update processed_media set lifecycle_state='manual_delete_failed' "
+        "where normalized_id=?",
+        ("BBAN-600",),
+    )
+    repaired = repo.fail_manual_delete("BBAN-600", actor_id="ops", error="stale")
+    assert repaired["lifecycle_state"] == "manual_deleted"
+    assert int(repaired["manually_deleted_at"]) == 77
+    history = repo.history("BBAN-600", limit=30)
+    assert any(
+        item["event_type"] == "manual_delete_state_normalized" for item in history
+    )
 
 
 def test_processed_media_backfill_dry_run(tmp_path):
