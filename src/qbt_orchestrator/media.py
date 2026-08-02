@@ -108,6 +108,7 @@ class MediaPipelineService:
         allow_unrecognized_passthrough: bool = True,
         required_sidecar_outputs: tuple[str, ...] = ("nfo", "poster", "fanart"),
         now=None,
+        processed_media=None,
     ):
         self.state_db = state_db
         self.backfill = backfill
@@ -121,6 +122,11 @@ class MediaPipelineService:
         self.now = now or (lambda: int(time.time()))
         self.jobs = TorrentJobRepository(state_db, now=self.now)
         self.promotions = MediaPromotionRepository(state_db, now=self.now)
+        if processed_media is None:
+            from .processed_media import ProcessedMediaRepository
+
+            processed_media = ProcessedMediaRepository(state_db, now=self.now)
+        self.processed_media = processed_media
 
     def handle_upload_verified(
         self,
@@ -435,7 +441,28 @@ class MediaPipelineService:
             row = con.execute("select id from media_groups where media_group_key=?", (key,)).fetchone()
             return int(row["id"])
 
-        return int(write_transaction(self.state_db, txn))
+        group_id = int(write_transaction(self.state_db, txn))
+        ledger_id = str(normalized_id or key or "").strip()
+        if ledger_id and ledger_id.lower() not in {"unknown", "normalize_failed", "missing_remote"}:
+            try:
+                self.processed_media.observe(
+                    ledger_id,
+                    origin="media_pipeline",
+                    display_title=ledger_id,
+                    correlation_id=f"media_group:{key}",
+                    payload={"emby_media_dir_sha256": None},
+                )
+                uploaded_path = str(emby_dir or "").strip()
+                if uploaded_path:
+                    self.processed_media.mark_uploaded(
+                        ledger_id,
+                        origin="media_pipeline",
+                        remote_path=uploaded_path,
+                        correlation_id=f"media_group:{key}",
+                    )
+            except Exception:
+                pass
+        return group_id
 
     def _ensure_pipeline_run(self, manifest_id: str, group_id: int) -> int:
         now = int(self.now())

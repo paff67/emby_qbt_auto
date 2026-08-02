@@ -128,3 +128,99 @@ def test_processed_media_migration_idempotent_and_readable(tmp_path):
         assert version[0] == "processed_media_tombstone_ledger_v1"
     finally:
         con.close()
+
+
+def test_processed_media_repository_lifecycle_and_no_untombstone(tmp_path):
+    from qbt_orchestrator.processed_media import ProcessedMediaRepository
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    repo = ProcessedMediaRepository(db, now=lambda: 1000, enforce=True)
+    observed = repo.observe("BBAN-574", origin="test", display_title="BBAN-574")
+    assert observed["lifecycle_state"] == "observed"
+    downloaded = repo.mark_downloaded("BBAN-574", qbt_hash="abc")
+    assert downloaded["lifecycle_state"] == "downloaded"
+    uploaded = repo.mark_uploaded("BBAN-574", remote_path="gcrypt:/BBAN-574/a.mp4", remote_size=10)
+    assert uploaded["lifecycle_state"] == "uploaded"
+    ingested = repo.mark_ingested("BBAN-574", remote_path="gcrypt:/BBAN-574/a.mp4", remote_size=10)
+    assert ingested["lifecycle_state"] == "ingested_present"
+    assert int(ingested["ingestion_count"]) == 1
+    again = repo.mark_ingested("BBAN-574", remote_path="gcrypt:/BBAN-574/a.mp4", remote_size=10)
+    assert int(again["ingestion_count"]) == 2
+    assert len(repo.history("BBAN-574", limit=10)) >= 5
+    assert repo.upsert_alias("BBAN-574", alias_type="video_basename", alias_value="a.mp4")
+    pending = repo.begin_manual_delete("BBAN-574", actor_id="ops", reason="cleanup")
+    assert pending["download_policy"] == "block_permanent"
+    assert pending["lifecycle_state"] == "manual_delete_pending"
+    final = repo.finalize_manual_delete("BBAN-574", actor_id="ops")
+    assert final["lifecycle_state"] == "manual_deleted"
+    blocked = repo.is_permanently_blocked("BBAN-574")
+    assert blocked is not None
+    con = sqlite3.connect(db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "update processed_media set download_policy='normal' where normalized_id=?",
+                ("BBAN-574",),
+            )
+    finally:
+        con.close()
+
+
+def test_processed_media_backfill_dry_run(tmp_path):
+    from qbt_orchestrator.db import write_execute
+    from qbt_orchestrator.processed_media import ProcessedMediaRepository
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    write_execute(
+        db,
+        "insert into media_groups(media_group_key,normalized_id,emby_media_dir,created_at,updated_at) "
+        "values(?,?,?,?,?)",
+        ("BBAN-580", "BBAN-580", "/media/gcrypt/BBAN-580", 1, 1),
+    )
+    write_execute(
+        db,
+        "insert into media_groups(media_group_key,normalized_id,emby_media_dir,created_at,updated_at) "
+        "values(?,?,?,?,?)",
+        ("normalize_failed", "normalize_failed", "/media/gcrypt/x", 1, 1),
+    )
+    repo = ProcessedMediaRepository(db, now=lambda: 50)
+    counts = repo.backfill_from_sources(dry_run=True)
+    assert counts["inserted"] >= 1
+    assert counts["skipped"] >= 1
+    assert repo.get_by_normalized_id("BBAN-580") is None
+
+
+def test_processed_media_tombstone_cli(tmp_path):
+    from qbt_orchestrator.cli import main
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"ids":["BBAN-586"]}', encoding="utf-8")
+    code = main(
+        [
+            "processed-media",
+            "tombstone",
+            "--state-db",
+            str(db),
+            "--id",
+            "BBAN-586",
+            "--deleted-at",
+            "1754116704",
+            "--actor",
+            "ops",
+            "--manifest",
+            str(manifest),
+            "--create-from-audit",
+            "--apply",
+            "--json",
+        ]
+    )
+    assert code == 0
+    from qbt_orchestrator.processed_media import ProcessedMediaRepository
+
+    row = ProcessedMediaRepository(db, enforce=True).is_permanently_blocked("BBAN-586")
+    assert row is not None
+    assert row["lifecycle_state"] == "manual_deleted"

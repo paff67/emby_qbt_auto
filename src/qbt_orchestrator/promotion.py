@@ -11,9 +11,14 @@ from .observability import redact
 
 
 class MediaPromotionRepository:
-    def __init__(self, state_db: str | Path, now=None):
+    def __init__(self, state_db: str | Path, now=None, processed_media=None):
         self.state_db = Path(state_db)
         self.now = now or (lambda: int(time.time()))
+        if processed_media is None:
+            from .processed_media import ProcessedMediaRepository
+
+            processed_media = ProcessedMediaRepository(self.state_db, now=self.now)
+        self.processed_media = processed_media
 
     def enqueue(
         self,
@@ -130,9 +135,9 @@ class MediaPromotionRepository:
         details: dict[str, Any],
     ) -> None:
         now = int(self.now())
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
+
+        def txn(con):
+            con.execute(
                 "update media_promotions set state='verified',verification_method=?,"
                 "verification_result_json=?,verified_at=?,next_run_at=null,last_error=null,"
                 "lease_owner=null,lease_until=null,updated_at=? where id=?",
@@ -143,8 +148,30 @@ class MediaPromotionRepository:
                     now,
                     int(promotion_id),
                 ),
-            ),
-        )
+            )
+            row = con.execute(
+                "select normalized_id,target_remote,expected_size from media_promotions where id=?",
+                (int(promotion_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+        row = write_transaction(self.state_db, txn)
+        if row and str(row.get("normalized_id") or "").strip():
+            try:
+                self.processed_media.mark_ingested(
+                    str(row["normalized_id"]).strip(),
+                    origin="promotion",
+                    remote_path=str(row.get("target_remote") or "") or None,
+                    remote_size=(
+                        int(row["expected_size"])
+                        if row.get("expected_size") is not None
+                        else None
+                    ),
+                    correlation_id=f"promotion:{int(promotion_id)}",
+                    payload={"method": str(method), "verified": True},
+                )
+            except Exception:
+                pass
 
     def record_failed(self, promotion_id: int, error: str, *, state: str = "failed") -> None:
         now = int(self.now())

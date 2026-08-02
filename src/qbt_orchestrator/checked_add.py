@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping, Protocol
 
 from .db import readonly_connect, write_transaction
 from .media import FallbackFilenameNormalizer, _MEDIA_EXTS
+from .processed_media import ProcessedMediaRepository
 
 
 _REMOTE_SOURCE = "backfill"
@@ -613,6 +614,8 @@ class DuplicateMatcher:
         now=None,
         size_tolerance_ratio: float = 0.15,
         min_normalizer_confidence: float = 0.8,
+        processed_media: ProcessedMediaRepository | None = None,
+        enforce_processed_media: bool | None = None,
     ):
         if isinstance(size_tolerance_ratio, bool) or not isinstance(
             size_tolerance_ratio, (int, float)
@@ -637,6 +640,15 @@ class DuplicateMatcher:
         self.size_tolerance_ratio = tolerance
         self._tolerance_decimal = Decimal(str(tolerance))
         self.min_normalizer_confidence = confidence_threshold
+        if processed_media is not None:
+            self.processed_media = processed_media
+        else:
+            enforce = bool(enforce_processed_media) if enforce_processed_media is not None else False
+            self.processed_media = ProcessedMediaRepository(
+                self.state_db, now=now or (lambda: int(time.time())), enforce=enforce
+            )
+        if enforce_processed_media is not None:
+            self.processed_media.enforce = bool(enforce_processed_media)
         self.remote_index = RemoteMediaIndex(
             self.state_db,
             backfill_db=backfill_db,
@@ -682,6 +694,20 @@ class DuplicateMatcher:
             return DuplicateDecision(
                 "ready",
                 "normalized_media_id_below_confidence_threshold",
+                normalized.normalized_id,
+                evidence=tuple(evidence[:_MAX_EVIDENCE]),
+                warnings=tuple(dict.fromkeys(warnings)),
+            )
+
+        tombstone = self.processed_media.is_permanently_blocked(normalized.normalized_id)
+        if tombstone is not None:
+            evidence.insert(
+                0,
+                f"tombstone:policy=block_permanent:lifecycle={tombstone.get('lifecycle_state')}",
+            )
+            return DuplicateDecision(
+                "blocked_manual_deleted",
+                "previously_ingested_then_manually_deleted",
                 normalized.normalized_id,
                 evidence=tuple(evidence[:_MAX_EVIDENCE]),
                 warnings=tuple(dict.fromkeys(warnings)),
@@ -1063,6 +1089,35 @@ class CheckedAddService:
                 {"prechecking"},
                 decision.decision,
                 decision.reason,
+                metadata_lease_owner=token[0],
+                metadata_lease_generation=token[1],
+            )
+        if decision.decision == "blocked_manual_deleted":
+            # Metadata-only recognition: stop precheck, zero priorities, remove
+            # temporary registration without deleting payload files.
+            guard = lambda: self._lease_owned_guard(item_id, token)
+            try:
+                self.gateway.zero_file_priorities(str(current["qbt_hash"]), guard=guard)
+            except Exception:
+                pass
+            try:
+                self.gateway.stop(str(current["qbt_hash"]), guard=guard)
+            except Exception:
+                pass
+            if not self.gateway.remove_registration(
+                str(current["qbt_hash"]),
+                guard=guard,
+            ):
+                raise ValueError("qbt_write_fenced")
+            return self.repository.transition_item(
+                item_id,
+                {"prechecking"},
+                "cancelled",
+                decision.reason,
+                {
+                    "decision": "blocked_manual_deleted",
+                    "decision_reason": decision.reason,
+                },
                 metadata_lease_owner=token[0],
                 metadata_lease_generation=token[1],
             )

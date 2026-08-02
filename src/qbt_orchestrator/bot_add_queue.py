@@ -1482,13 +1482,15 @@ class BotAddQueueRepository:
             "sum(case when state in ('enrolled','enrolled_hold') then 1 else 0 end) as enrolled_count,"
             "sum(case when state in ('duplicate_local','duplicate_remote') then 1 else 0 end) as duplicate_count,"
             "sum(case when state='needs_confirmation' then 1 else 0 end) as confirmation_count,"
-            "sum(case when state in ('invalid','metadata_unavailable','failed') then 1 else 0 end) as failed_count "
+            "sum(case when state in ('invalid','metadata_unavailable','failed') then 1 else 0 end) as failed_count,"
+            "sum(case when decision='blocked_manual_deleted' then 1 else 0 end) as blocked_history_count "
             "from bot_add_items where batch_id=?",
             (batch_id,),
         ).fetchone()
         con.execute(
             "update bot_add_batches set received_count=?,valid_count=?,enrolled_count=?,"
-            "duplicate_count=?,confirmation_count=?,failed_count=?,updated_at=? where id=?",
+            "duplicate_count=?,confirmation_count=?,failed_count=?,blocked_history_count=?,"
+            "updated_at=? where id=?",
             (
                 int(counts["received_count"] or 0),
                 int(counts["valid_count"] or 0),
@@ -1496,6 +1498,7 @@ class BotAddQueueRepository:
                 int(counts["duplicate_count"] or 0),
                 int(counts["confirmation_count"] or 0),
                 int(counts["failed_count"] or 0),
+                int(counts["blocked_history_count"] or 0),
                 now,
                 batch_id,
             ),

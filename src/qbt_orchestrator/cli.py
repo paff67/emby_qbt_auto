@@ -882,6 +882,87 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     )
     return runtime, dry_run
 
+def _cmd_processed_media(ns, db: Path) -> int:
+    from .processed_media import ProcessedMediaRepository, manifest_sha256
+
+    migrate(db, False)
+    repo = ProcessedMediaRepository(db)
+    if ns.processed_media_cmd == "backfill":
+        dry_run = not ns.apply
+        counts = repo.backfill_from_sources(dry_run=dry_run)
+        payload = {"command": "backfill", "dry_run": dry_run, **counts}
+        _print_json(payload) if ns.json else print(payload)
+        return 0
+    if ns.processed_media_cmd == "tombstone":
+        if not ns.id:
+            raise SystemExit("--id is required")
+        if ns.deleted_at is None:
+            raise SystemExit("--deleted-at is required")
+        if not ns.actor:
+            raise SystemExit("--actor is required")
+        manifest_path = Path(ns.manifest) if ns.manifest else None
+        manifest_text = None
+        digest = None
+        if manifest_path is not None:
+            manifest_text = manifest_path.read_text(encoding="utf-8")
+            digest = manifest_sha256(manifest_path)
+        if ns.dry_run and not ns.apply:
+            existing = repo.get_by_normalized_id(ns.id)
+            payload = {
+                "command": "tombstone",
+                "dry_run": True,
+                "normalized_id": ns.id,
+                "exists": existing is not None,
+                "create_from_audit": bool(ns.create_from_audit),
+                "manifest_sha256": digest,
+                "inserted": 0 if existing is not None else (1 if ns.create_from_audit else 0),
+                "updated": 1 if existing is not None else 0,
+                "skipped": 0,
+                "conflict": 0 if existing is not None or ns.create_from_audit else 1,
+            }
+            _print_json(payload) if ns.json else print(payload)
+            return 0
+        before = repo.get_by_normalized_id(ns.id)
+        try:
+            row = repo.register_tombstone(
+                ns.id,
+                deleted_at=int(ns.deleted_at),
+                actor_id=str(ns.actor),
+                reason=str(ns.reason or "manual_deletion_audit"),
+                deletion_manifest=manifest_text,
+                deletion_batch_key=ns.batch_key,
+                create_from_audit=bool(ns.create_from_audit),
+            )
+        except ValueError as exc:
+            payload = {
+                "command": "tombstone",
+                "dry_run": False,
+                "error": str(exc),
+                "manifest_sha256": digest,
+                "inserted": 0,
+                "updated": 0,
+                "skipped": 0,
+                "conflict": 1,
+            }
+            _print_json(payload) if ns.json else print(payload)
+            return 2
+        payload = {
+            "command": "tombstone",
+            "dry_run": False,
+            "normalized_id": row.get("normalized_id"),
+            "lifecycle_state": row.get("lifecycle_state"),
+            "download_policy": row.get("download_policy"),
+            "manifest_sha256": digest,
+            "inserted": 0 if before is not None else 1,
+            "updated": 1 if before is not None else 0,
+            "skipped": 0,
+            "conflict": 0,
+        }
+        _print_json(payload) if ns.json else print(payload)
+        return 0
+    return 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="qbt-orchestrator"); sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ["status", "events", "trace", "once", "daemon", "reconcile", "migrate", "qbt-api-check"]:
@@ -891,7 +972,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             p.add_argument("--safety-interval", type=float, default=2.0)
         if name == "reconcile":
             p.add_argument("--now", type=int, default=None)
-    ns = parser.parse_args(list(argv) if argv is not None else None); db = Path(ns.state_db)
+    pm = sub.add_parser("processed-media")
+    pm.add_argument("--state-db", default="/var/lib/qbt-orchestrator/state.sqlite")
+    pm.add_argument("--json", action="store_true")
+    pm_sub = pm.add_subparsers(dest="processed_media_cmd", required=True)
+    pm_backfill = pm_sub.add_parser("backfill")
+    pm_backfill.add_argument("--dry-run", action="store_true", default=True)
+    pm_backfill.add_argument("--apply", action="store_true")
+    pm_backfill.add_argument("--json", action="store_true")
+    pm_backfill.add_argument("--state-db", default="/var/lib/qbt-orchestrator/state.sqlite")
+    pm_tomb = pm_sub.add_parser("tombstone")
+    pm_tomb.add_argument("--id", required=True)
+    pm_tomb.add_argument("--deleted-at", type=int, required=True)
+    pm_tomb.add_argument("--actor", required=True)
+    pm_tomb.add_argument("--manifest", default=None)
+    pm_tomb.add_argument("--reason", default="manual_deletion_audit")
+    pm_tomb.add_argument("--batch-key", default=None)
+    pm_tomb.add_argument("--create-from-audit", action="store_true")
+    pm_tomb.add_argument("--dry-run", action="store_true")
+    pm_tomb.add_argument("--apply", action="store_true")
+    pm_tomb.add_argument("--json", action="store_true")
+    pm_tomb.add_argument("--state-db", default="/var/lib/qbt-orchestrator/state.sqlite")
+    ns = parser.parse_args(list(argv) if argv is not None else None); db = Path(getattr(ns, "state_db", "/var/lib/qbt-orchestrator/state.sqlite"))
+    if ns.cmd == "processed-media":
+        return _cmd_processed_media(ns, db)
     if ns.cmd == "migrate":
         sql = migrate(db, dry_run=not ns.apply); print((json.dumps({"dry_run": not ns.apply, "statements": len(sql)}) if ns.json else f"migration {'dry-run' if not ns.apply else 'applied'}: {len(sql)} statements")); return 0
     if not db.exists(): migrate(db, False)

@@ -826,3 +826,38 @@ def test_duplicate_queries_use_identity_and_remote_indexes(state_db):
     assert "idx_bot_add_items_canonical_identity" in local_plan
     assert "idx_remote_media_normalized_path" in remote_plan
     assert "TEMP B-TREE" not in remote_plan.upper()
+
+
+def test_tombstone_blocks_before_remote_duplicate(state_db):
+    from qbt_orchestrator.processed_media import ProcessedMediaRepository
+
+    RemoteMediaIndex(state_db, backfill_db=None, now=lambda: 100).replace_rows(
+        [{
+            "video_path": "gcrypt:/BBAN-582/a.mp4",
+            "normalized_id": "BBAN-582",
+            "size": 1000,
+            "raw_basename": "a.mp4",
+            "status": "done",
+        }]
+    )
+    repo = ProcessedMediaRepository(state_db, now=lambda: 100, enforce=True)
+    repo.register_tombstone(
+        "BBAN-582",
+        deleted_at=100,
+        actor_id="ops",
+        reason="manual",
+        create_from_audit=True,
+    )
+    matcher = DuplicateMatcher(
+        state_db,
+        normalizer=RecordingNormalizer(),
+        size_tolerance_ratio=0.15,
+        processed_media=repo,
+        enforce_processed_media=True,
+    )
+    decision = matcher.decide("BBAN-582.mp4", 1050)
+    assert decision.decision == "blocked_manual_deleted"
+    assert decision.reason == "previously_ingested_then_manually_deleted"
+    # Different size / restored remote / alias-style names remain blocked.
+    assert matcher.decide("BBAN-582-HD.mp4", 999999).decision == "blocked_manual_deleted"
+    assert matcher.decide("prefix-BBAN-582-suffix.mp4", 1000).decision == "blocked_manual_deleted"
