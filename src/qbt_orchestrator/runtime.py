@@ -21,6 +21,7 @@ from .cleanup_policy import cleanup_eligibility
 from .io_governor import JobPriority
 from .observability import redact
 from .promotion import finalize_canonical_upload
+from .telegram_control import RETIRED_TELEGRAM_COMMANDS
 from .upload import RcloneUploadWorker, UploadJob, UploadResult
 
 
@@ -1765,7 +1766,7 @@ class BotNotificationRepository:
 
 
 class CommandProcessor:
-    DANGEROUS = {"cleanup", "force_upload", "preempt", "config"}
+    DANGEROUS = {"config"}
 
     def __init__(self, commands: BotCommandRepository, executor, notifications: BotNotificationRepository | None = None, preemption_service=None):
         self.commands = commands
@@ -1826,20 +1827,15 @@ class CommandProcessor:
     def _execute_claimed(self, row: Mapping[str, Any]) -> str:
         command_id = str(row["command_id"])
         command = str(row["command"])
+        # Retired Telegram commands: never enqueue invisible approval/result
+        # notifications under the panel-only outbound policy.
+        if command in RETIRED_TELEGRAM_COMMANDS:
+            return "ignored"
         payload = json.loads(row["payload_json"] or "{}")
         args = payload.get("args") or []
-        if command in {
-            "pause",
-            "resume",
-            "queue",
-            "force_upload",
-            "cleanup",
-            "preempt",
-        }:
+        if command in {"pause", "resume", "queue"}:
             args = [
-                canonical_torrent_hash(value)
-                if index < (2 if command == "preempt" else 1)
-                else value
+                canonical_torrent_hash(value) if index < 1 else value
                 for index, value in enumerate(args)
             ]
             payload["args"] = args
@@ -1874,23 +1870,10 @@ class CommandProcessor:
         if command == "queue":
             self._enqueue_command_job(command, payload, args, default_job_type="upload", default_priority=50)
             return "done"
-        if command == "force_upload":
-            self._enqueue_command_job(command, payload, args, default_job_type="upload", default_priority=0, force_upload=True)
-            return "done"
-        if command == "cleanup":
-            self._enqueue_command_job(command, payload, args, default_job_type="cleanup_request", default_priority=10)
-            return "done"
         if command == "config":
             self._audit_config_command(payload, args)
             return "done"
-        if command == "preempt" and args:
-            if self.preemption_service is not None and hasattr(self.preemption_service, "force_preempt_hash"):
-                target_hash = canonical_torrent_hash(args[1]) if len(args) > 1 else None
-                self.preemption_service.force_preempt_hash(canonical_torrent_hash(args[0]), target_hash=target_hash, reason="telegram")
-            else:
-                self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": args[0]})
-            return "done"
-        if command in {"status", "trace", "perf"}:
+        if command == "status":
             if self.notifications is not None:
                 self.notifications.enqueue(
                     chat_id=row["chat_id"],

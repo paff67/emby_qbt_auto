@@ -2107,6 +2107,37 @@ def test_telegram_supervisor_polls_and_survives_crash():
     assert supervisor.consecutive_failures == 0
 
 
+def test_telegram_supervisor_rate_limits_panel_refresh_error_logs(caplog):
+    import logging
+
+    from qbt_orchestrator.service import TelegramSupervisor
+
+    class ServiceWithBrokenRefresh:
+        def __init__(self):
+            self.calls = 0
+            self.router = self
+
+        def poll_once(self):
+            self.calls += 1
+            return 1
+
+        def refresh_panel_if_due(self, interval_sec=60):
+            raise RuntimeError("panel refresh boom")
+
+    service = ServiceWithBrokenRefresh()
+    supervisor = TelegramSupervisor(service, interval=0, max_backoff=0)
+    with caplog.at_level(logging.WARNING, logger="qbt_orchestrator.service"):
+        assert supervisor.poll_once_supervised() == 1
+        assert supervisor.poll_once_supervised() == 1
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "panel auto-refresh failed" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "panel refresh boom" in messages[0]
+
+
 def test_daemon_runtime_starts_optional_telegram_supervisor():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.service import DaemonRuntime, TelegramSupervisor
@@ -2164,7 +2195,8 @@ def test_build_telegram_supervisor_from_env_requires_token_and_parses_roles():
         assert made["token"] == "123456:abc"
         assert supervisor.service.authorizer.allowed(10, "status")
         assert supervisor.service.authorizer.allowed(20, "pause")
-        assert supervisor.service.authorizer.allowed(30, "cleanup")
+        assert supervisor.service.authorizer.allowed(30, "config")
+        assert not supervisor.service.authorizer.allowed(30, "cleanup")
         assert not supervisor.service.authorizer.allowed(10, "cleanup")
 
 

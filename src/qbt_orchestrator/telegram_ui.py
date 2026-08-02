@@ -192,10 +192,19 @@ class DashboardRepository:
     def home_snapshot(self) -> dict[str, Any]:
         con = readonly_connect(self.state_db)
         try:
+            active_filter = (
+                "coalesce(dlspeed_bps,0)>0 or coalesce(active_since,0)>0"
+            )
+            active_total = int(
+                con.execute(
+                    f"select count(*) from torrent_health where {active_filter}"
+                ).fetchone()[0]
+                or 0
+            )
             active = list(
                 con.execute(
                     "select hash,name,progress,dlspeed_bps from torrent_health "
-                    "where coalesce(dlspeed_bps,0)>0 or coalesce(active_since,0)>0 "
+                    f"where {active_filter} "
                     "order by dlspeed_bps desc, progress desc limit 3"
                 )
             )
@@ -267,6 +276,7 @@ class DashboardRepository:
                 }
                 for row in active
             ],
+            "active_total": active_total,
             "free_bytes": free_bytes,
             "condition": condition,
             "queue_pending": int(queue[0] or 0) if queue else 0,
@@ -384,11 +394,12 @@ class TelegramPanelRenderer:
     def render_home(self) -> PanelView:
         snap = self.dashboard.home_snapshot()
         active = list(snap["active"][:3])
+        active_total = int(snap.get("active_total", len(active)) or 0)
         lines = [
             "📱 qBT 编排器控制台",
             f"系统在线 · 最后更新 {_fmt_shanghai_clock(int(self.now()))}",
             "",
-            f"📥 当前任务（{len(active)}）",
+            f"📥 当前任务（{active_total}）",
         ]
         if not active:
             lines.append("暂无进行中的下载任务。")

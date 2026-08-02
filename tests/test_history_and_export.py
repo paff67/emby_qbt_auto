@@ -134,6 +134,34 @@ def test_warning_export_has_no_mark_read_side_effect(tmp_path):
     assert int(current["resolved"]) == 0
 
 
+def test_warning_export_all_includes_related_events(tmp_path):
+    db = tmp_path / "all.sqlite"
+    migrate(db)
+    write_execute(
+        db,
+        "insert into events_v2(ts, level, component, event_type, message, hash) "
+        "values(10, 'WARN', 'c', 'boom', 'related-line', 'hh')",
+    )
+    warnings = WarningInboxRepository(db)
+    warnings.upsert(
+        warning_key="all-1",
+        severity="warning",
+        topic="t1",
+        safe_message="summary-one",
+        related_hash="hh",
+    )
+    warnings.upsert(
+        warning_key="all-2",
+        severity="error",
+        topic="t2",
+        safe_message="summary-two",
+    )
+    text = warnings.export_text(None).decode("utf-8")
+    assert "summary-one" in text
+    assert "related-line" in text
+    assert "summary-two" in text
+
+
 def test_warning_export_router_temp_cleanup(tmp_path):
     from qbt_orchestrator.telegram_control import TelegramAuthorizer
     from qbt_orchestrator.telegram_router import TelegramUpdateRouter

@@ -1029,6 +1029,7 @@ def migration_sql() -> list[str]:
         "current_route text not null default 'n:h',"
         "last_render_hash text,"
         "last_refreshed_at integer,"
+        "last_refresh_attempt_at integer,"
         "updated_at integer not null)",
         "delete from bot_warning_inbox "
         "where warning_key='daemon_task:scheduler:all_stopped' "
@@ -1039,6 +1040,10 @@ def migration_sql() -> list[str]:
         "and state in ('queued','retry_wait','running')",
         "insert or ignore into schema_migrations(version,name,applied_at) "
         "values(23,'telegram_persistent_panel_v1',strftime('%s','now'))",
+        # Migration 24: panel refresh attempt backoff after auto-refresh failures.
+        "alter table telegram_panel_session add column last_refresh_attempt_at integer",
+        "insert or ignore into schema_migrations(version,name,applied_at) "
+        "values(24,'telegram_panel_refresh_attempt_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

@@ -567,13 +567,15 @@ def test_telegram_auth_approval_and_duplicate_click_idempotency():
 
     auth = TelegramAuthorizer(viewers={1}, operators={2}, admins={3})
     assert auth.role_for(1) == "viewer"
-    assert auth.allowed(1, "trace") is True
+    assert auth.allowed(1, "status") is True
+    assert auth.allowed(1, "trace") is False
     assert auth.allowed(1, "cleanup") is False
-    assert auth.allowed(3, "cleanup") is True
+    assert auth.allowed(3, "cleanup") is False
+    assert auth.allowed(3, "config") is True
     assert auth.allowed(99, "status") is False
 
     store = ApprovalStore(now=lambda: 100)
-    approval_id = store.create("cleanup", {"hash": "h1"}, ttl=300)
+    approval_id = store.create("config", {"hash": "h1"}, ttl=300)
     assert store.approve_once(approval_id, user_id=3) is True
     assert store.approve_once(approval_id, user_id=3) is False
 

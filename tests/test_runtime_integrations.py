@@ -179,7 +179,8 @@ def test_telegram_polling_writes_commands_and_rejects_unauthorized_users():
 
     updates = [
         {"update_id": 10, "message": {"message_id": 1, "chat": {"id": 100}, "from": {"id": 1}, "text": "/status disk"}},
-        {"update_id": 11, "message": {"message_id": 2, "chat": {"id": 101}, "from": {"id": 99}, "text": "/cleanup h1"}},
+        {"update_id": 11, "message": {"message_id": 2, "chat": {"id": 101}, "from": {"id": 99}, "text": "/pause h1"}},
+        {"update_id": 12, "message": {"message_id": 3, "chat": {"id": 102}, "from": {"id": 1}, "text": "/cleanup h1"}},
     ]
     sent = []
     class Store:
@@ -193,10 +194,13 @@ def test_telegram_polling_writes_commands_and_rejects_unauthorized_users():
 
     store = Store()
     service = TelegramPollingService(api=Api(), authorizer=TelegramAuthorizer(viewers={1}), command_store=store)
-    assert service.poll_once() == 2
+    assert service.poll_once() == 3
     assert store.commands == [("tg-10", 100, 1, "status", {"args": ["disk"], "text": "/status disk"})]
-    assert sent == [(101, "unauthorized", None)]
-    assert service.next_offset == 12
+    assert sent == [
+        (101, "unauthorized", None),
+        (102, "该命令已停用；请使用控制台面板查看状态与警告。", None),
+    ]
+    assert service.next_offset == 13
 
 
 def test_telegram_polling_errors_are_counted_not_raised():

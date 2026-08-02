@@ -9,7 +9,7 @@ from urllib import error, parse, request
 
 from ..observability import redact
 from ..runtime import BotNotificationRepository
-from ..telegram_control import TelegramAuthorizer
+from ..telegram_control import RETIRED_TELEGRAM_COMMANDS, TelegramAuthorizer
 
 
 class TelegramApiError(RuntimeError):
@@ -296,6 +296,11 @@ class TelegramPollingService:
         parts = text[1:].split()
         command = parts[0].replace("-", "_") if parts else ""
         args = parts[1:]
+        if command in RETIRED_TELEGRAM_COMMANDS:
+            self.api.send_message(
+                chat_id, "该命令已停用；请使用控制台面板查看状态与警告。"
+            )
+            return
         if not self.authorizer.allowed(user_id, command):
             self.api.send_message(chat_id, "unauthorized")
             return

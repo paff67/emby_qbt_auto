@@ -9,10 +9,15 @@ from typing import Callable, Dict, Set
 from .db import write_transaction
 from .hash_identity import canonical_torrent_hash
 
-VIEWER = {"start", "help", "status", "trace", "perf", "queue", "warnings"}
+# Retired Telegram entries (results/approvals were outbound-suppressed): cleanup,
+# force_upload, preempt, trace, perf. Use the persistent panel / CLI instead.
+VIEWER = {"start", "help", "status", "queue", "warnings"}
 # Legacy operator set retained for non-panel commands only; P1 panel mutations are admin-only.
 OPERATOR = VIEWER | {"pause", "resume"}
-ADMIN = OPERATOR | {"add", "force_upload", "cleanup", "preempt", "config", "approve", "deny"}
+ADMIN = OPERATOR | {"add", "config", "approve", "deny"}
+RETIRED_TELEGRAM_COMMANDS = frozenset(
+    {"cleanup", "force_upload", "preempt", "trace", "perf"}
+)
 
 
 class TelegramAuthorizer:

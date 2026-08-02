@@ -107,8 +107,21 @@ class PanelSessionRepository:
         def txn(con) -> None:
             con.execute(
                 "update telegram_panel_session set last_render_hash=?, "
-                "last_refreshed_at=?, updated_at=? where id=1",
-                (str(digest)[:64], int(refreshed_at), now),
+                "last_refreshed_at=?, last_refresh_attempt_at=?, updated_at=? "
+                "where id=1",
+                (str(digest)[:64], int(refreshed_at), int(refreshed_at), now),
+            )
+
+        write_transaction(self.state_db, txn)
+
+    def record_refresh_attempt(self, attempted_at: int) -> None:
+        now = int(self.now())
+
+        def txn(con) -> None:
+            con.execute(
+                "update telegram_panel_session set last_refresh_attempt_at=?, "
+                "updated_at=? where id=1",
+                (int(attempted_at), now),
             )
 
         write_transaction(self.state_db, txn)
@@ -162,10 +175,20 @@ class PersistentPanelController:
         route = str(session.get("current_route") or "n:h")
         if route != "n:h":
             return False
-        last = session.get("last_refreshed_at")
         now = int(self.now())
-        if last is not None and now - int(last) < max(1, int(interval_sec)):
+        interval = max(1, int(interval_sec))
+        gate: int | None = None
+        last_refreshed = session.get("last_refreshed_at")
+        last_attempt = session.get("last_refresh_attempt_at")
+        if last_refreshed is not None:
+            gate = int(last_refreshed)
+        if last_attempt is not None:
+            attempt = int(last_attempt)
+            gate = attempt if gate is None else max(gate, attempt)
+        if gate is not None and now - gate < interval:
             return False
+        # Persist attempt before publish so failures still enforce backoff.
+        self.sessions.record_refresh_attempt(now)
         view = self.render_route("n:h")
         self._publish(int(session["chat_id"]), view, route="n:h")
         return True

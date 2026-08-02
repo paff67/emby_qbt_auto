@@ -130,12 +130,17 @@ def test_processed_media_migration_idempotent_and_readable(tmp_path):
         version23 = con.execute(
             "select name from schema_migrations where version=23"
         ).fetchone()
+        version24 = con.execute(
+            "select name from schema_migrations where version=24"
+        ).fetchone()
         assert version21 is not None
         assert version21[0] == "processed_media_tombstone_ledger_v1"
         assert version22 is not None
         assert version22[0] == "torrent_name_and_batch_summary_v1"
         assert version23 is not None
         assert version23[0] == "telegram_persistent_panel_v1"
+        assert version24 is not None
+        assert version24[0] == "telegram_panel_refresh_attempt_v1"
         assert "name" in {
             row[1] for row in con.execute("pragma table_info(torrent_health)")
         }

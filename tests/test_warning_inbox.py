@@ -71,10 +71,10 @@ def test_warning_reads_table_absent_after_migration(tmp_path):
         versions = {
             int(row[0])
             for row in con.execute(
-                "select version from schema_migrations where version in (20,21,22,23)"
+                "select version from schema_migrations where version in (20,21,22,23,24)"
             )
         }
-        assert versions == {20, 21, 22, 23}
+        assert versions == {20, 21, 22, 23, 24}
     finally:
         con.close()
 

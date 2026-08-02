@@ -287,12 +287,16 @@ class WarningInboxRepository:
                         )
                     )
             else:
+                # Export summaries plus related events under the shared row/byte budget.
                 warnings = con.execute(
                     "select * from bot_warning_inbox order by last_occurred_at desc,id desc "
                     "limit ?",
                     (max_rows,),
                 ).fetchall()
+                remaining = max_rows
                 for warning in warnings:
+                    if remaining <= 0:
+                        break
                     lines.append(
                         str(
                             redact(
@@ -301,6 +305,26 @@ class WarningInboxRepository:
                             )
                         )
                     )
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
+                    related = self._collect_related_events(
+                        con, warning, limit=remaining
+                    )
+                    for event in related:
+                        if remaining <= 0:
+                            break
+                        lines.append(
+                            str(
+                                redact(
+                                    f"{event['timestamp']} [{event['source']}] "
+                                    f"{event.get('level') or '-'} "
+                                    f"{event.get('component') or '-'} "
+                                    f"{event['event_type']} {event['message']}"
+                                )
+                            )
+                        )
+                        remaining -= 1
             body_lines: list[str] = []
             size = 0
             for index, line in enumerate(lines):

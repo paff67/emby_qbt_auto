@@ -89,3 +89,68 @@ def test_refresh_if_due_only_on_home(tmp_path):
     controller.navigate(7, "n:q:0")
     clock["t"] = 1200
     assert controller.refresh_if_due(60) is False
+
+
+def test_refresh_if_due_backs_off_after_failed_attempt(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+
+    class BoomApi(FakeApi):
+        def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+            raise RuntimeError("edit failed")
+
+        def send_message(self, chat_id, text, reply_markup=None):
+            raise RuntimeError("send failed")
+
+    clock = {"t": 1000}
+    controller = PersistentPanelController(
+        db,
+        api=BoomApi(),
+        renderer=TelegramPanelRenderer(
+            DashboardRepository(db), now=lambda: clock["t"]
+        ),
+        now=lambda: clock["t"],
+    )
+    # Seed a bound session without going through publish.
+    controller.sessions.bind(7, 55)
+    controller.sessions.set_route("n:h")
+    controller.sessions.record_render("seed", 900)
+
+    raised = False
+    try:
+        controller.refresh_if_due(60)
+    except RuntimeError:
+        raised = True
+    assert raised is True
+    session = controller.sessions.get()
+    assert session is not None
+    assert int(session["last_refresh_attempt_at"]) == 1000
+
+    clock["t"] = 1059
+    assert controller.refresh_if_due(60) is False
+    clock["t"] = 1060
+    raised = False
+    try:
+        controller.refresh_if_due(60)
+    except RuntimeError:
+        raised = True
+    assert raised is True
+    assert int(controller.sessions.get()["last_refresh_attempt_at"]) == 1060
+
+
+def test_home_active_total_counts_beyond_display_limit(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+    for index in range(4):
+        write_execute(
+            db,
+            "insert into torrent_health("
+            "hash,name,sampled_at,dlspeed_bps,progress,updated_at,active_since) "
+            "values(?,?,1,?,?,1,1)",
+            (f"h{index}", f"T-{index}", 100 - index, 0.1 * (index + 1)),
+        )
+    snap = DashboardRepository(db).home_snapshot()
+    assert snap["active_total"] == 4
+    assert len(snap["active"]) == 3
+    view = TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000).render_home()
+    assert "当前任务（4）" in view.text

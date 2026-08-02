@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import signal
 import sqlite3
 import threading
@@ -54,6 +55,8 @@ from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
 from .telegram_batch_summary import BatchSummaryProjector
 from .telegram_control import TelegramAuthorizer
 from .work_items import build_full_finish_work_items
+
+LOGGER = logging.getLogger(__name__)
 
 
 from .capacity_reclaim import (
@@ -157,6 +160,7 @@ class TelegramSupervisor:
         self.consecutive_failures = 0
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_panel_refresh_error_log_at = 0.0
 
     def poll_once_supervised(self) -> int:
         try:
@@ -166,8 +170,14 @@ class TelegramSupervisor:
             if router is not None and hasattr(router, "refresh_panel_if_due"):
                 try:
                     router.refresh_panel_if_due(interval_sec=60)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    now = time.time()
+                    if now - self._last_panel_refresh_error_log_at >= 60.0:
+                        self._last_panel_refresh_error_log_at = now
+                        LOGGER.warning(
+                            "telegram panel auto-refresh failed: %s",
+                            redact(str(exc)),
+                        )
             return count
         except Exception:
             self.consecutive_failures += 1

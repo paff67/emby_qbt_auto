@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from .bot_add_queue import BotAddQueueRepository
 from .observability import redact
-from .telegram_control import TelegramAuthorizer
+from .telegram_control import RETIRED_TELEGRAM_COMMANDS, TelegramAuthorizer
 from .telegram_panel import PersistentPanelController
 from .telegram_ui import (
     DashboardRepository,
@@ -113,6 +113,13 @@ class TelegramUpdateRouter:
         parts = text[1:].split()
         command = parts[0].split("@", 1)[0].replace("-", "_") if parts else ""
         args = parts[1:]
+        if command in RETIRED_TELEGRAM_COMMANDS:
+            message = "该命令已停用；请使用控制台面板查看状态与警告。"
+            if self.panel is not None:
+                self._panel_error(chat_id, message)
+            else:
+                self.api.send_message(chat_id, message)
+            return
         if command in PANEL_COMMANDS and self.panel_enabled and self.panel is not None:
             if not self.authorizer.role_for(user_id):
                 self._panel_error(chat_id, "无权访问")
