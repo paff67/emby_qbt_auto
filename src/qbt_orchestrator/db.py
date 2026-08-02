@@ -853,6 +853,8 @@ def migration_sql() -> list[str]:
         "on bot_warning_inbox(topic,last_occurred_at,id)",
         "create index if not exists idx_bot_warning_related_hash "
         "on bot_warning_inbox(related_hash,last_occurred_at,id)",
+        # Legacy per-chat warning reads are created only so migration 20 can drop
+        # them on upgrades that already applied migration 16 before the P1 cut.
         "create table if not exists bot_warning_reads("
         "warning_id integer not null references bot_warning_inbox(id) on delete cascade,"
         "chat_id text not null,"
@@ -861,6 +863,83 @@ def migration_sql() -> list[str]:
         "primary key(warning_id,chat_id,user_id))",
         "create index if not exists idx_bot_warning_reads_actor "
         "on bot_warning_reads(chat_id,user_id,warning_id)",
+        "drop index if exists idx_bot_warning_reads_actor",
+        "drop table if exists bot_warning_reads",
+        "insert or ignore into schema_migrations(version,name,applied_at) "
+        "values(20,'telegram_warning_inbox_single_admin_v2',strftime('%s','now'))",
+        "create table if not exists processed_media("
+        "id integer primary key autoincrement,"
+        "normalized_id text not null collate nocase unique,"
+        "display_title text,"
+        "origin text not null,"
+        "lifecycle_state text not null,"
+        "download_policy text not null default 'normal',"
+        "first_seen_at integer not null,"
+        "first_downloaded_at integer,"
+        "first_uploaded_at integer,"
+        "first_ingested_at integer,"
+        "last_ingested_at integer,"
+        "ingestion_count integer not null default 0 check(ingestion_count>=0),"
+        "last_qbt_hash text,"
+        "last_remote_path text,"
+        "last_remote_size integer check(last_remote_size is null or last_remote_size>=0),"
+        "last_remote_seen_at integer,"
+        "manual_delete_requested_at integer,"
+        "manually_deleted_at integer,"
+        "manually_deleted_by text,"
+        "deletion_reason text,"
+        "deletion_batch_key text,"
+        "deletion_manifest text,"
+        "created_at integer not null,"
+        "updated_at integer not null,"
+        "row_version integer not null default 1 check(row_version>=1),"
+        "check(lifecycle_state in ("
+        "'observed','downloaded','uploaded','ingested_present',"
+        "'manual_delete_pending','manual_deleted','manual_delete_failed','missing_unknown')),"
+        "check(download_policy in ('normal','manual_review','block_permanent')),"
+        "check(download_policy!='block_permanent' or manual_delete_requested_at is not null))",
+        "create index if not exists idx_processed_media_policy_time "
+        "on processed_media(download_policy,manually_deleted_at desc,id desc)",
+        "create index if not exists idx_processed_media_lifecycle_time "
+        "on processed_media(lifecycle_state,updated_at desc,id desc)",
+        "create table if not exists processed_media_aliases("
+        "id integer primary key autoincrement,"
+        "processed_media_id integer not null references processed_media(id) on delete restrict,"
+        "alias_type text not null check(alias_type in ("
+        "'normalized_id','infohash_v1','infohash_v2','torrent_name','video_basename')),"
+        "alias_value text not null,"
+        "alias_sha256 text not null,"
+        "created_at integer not null,"
+        "unique(alias_type,alias_sha256))",
+        "create table if not exists processed_media_events("
+        "id integer primary key autoincrement,"
+        "processed_media_id integer not null references processed_media(id) on delete restrict,"
+        "event_type text not null,"
+        "event_at integer not null,"
+        "actor_type text not null,"
+        "actor_id text,"
+        "correlation_id text,"
+        "payload_json text not null default '{}')",
+        "create index if not exists idx_processed_media_events_media_time "
+        "on processed_media_events(processed_media_id,event_at desc,id desc)",
+        "create trigger if not exists trg_processed_media_block_permanent_policy "
+        "before update of download_policy on processed_media for each row "
+        "when old.download_policy='block_permanent' and new.download_policy!='block_permanent' "
+        "begin select raise(abort,'processed_media_block_permanent'); end",
+        "create trigger if not exists trg_processed_media_block_permanent_delete "
+        "before delete on processed_media for each row "
+        "when old.download_policy='block_permanent' "
+        "begin select raise(abort,'processed_media_block_permanent'); end",
+        "create trigger if not exists trg_processed_media_events_append_only_update "
+        "before update on processed_media_events begin "
+        "select raise(abort,'processed_media_events_append_only'); end",
+        "create trigger if not exists trg_processed_media_events_append_only_delete "
+        "before delete on processed_media_events begin "
+        "select raise(abort,'processed_media_events_append_only'); end",
+        "alter table bot_add_batches add column blocked_history_count integer not null "
+        "default 0 check(blocked_history_count>=0)",
+        "insert or ignore into schema_migrations(version,name,applied_at) "
+        "values(21,'processed_media_tombstone_ledger_v1',strftime('%s','now'))",
         "create table if not exists capacity_reclaims(id integer primary key autoincrement, reclaim_key text not null unique, hash text not null, name text not null, magnet_uri text not null, host_path text not null, content_path text not null, allocated_bytes integer not null default 0, completed_bytes integer not null default 0, progress real not null default 0, dead_since integer, state text not null, recheck_state text not null default 'pending', recheck_error text, notification_ids_json text not null default '[]', created_at integer not null, reclaimed_at integer, updated_at integer not null)",
         "create index if not exists idx_capacity_reclaims_hash_time on capacity_reclaims(hash,reclaimed_at desc)",
         "create index if not exists idx_capacity_reclaims_state on capacity_reclaims(state,updated_at)",

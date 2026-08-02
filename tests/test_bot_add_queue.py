@@ -26,7 +26,9 @@ EXPECTED_TABLES = {
     "remote_media_index",
     "remote_media_index_refresh_state",
     "bot_warning_inbox",
-    "bot_warning_reads",
+    "processed_media",
+    "processed_media_aliases",
+    "processed_media_events",
 }
 
 ITEM_COLUMNS = {

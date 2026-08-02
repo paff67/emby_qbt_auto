@@ -53,61 +53,28 @@ def test_warning_schema_covers_identity_occurrence_relations_and_resolution(tmp_
         con.close()
 
 
-def test_warning_read_primary_key_is_per_chat_user_and_enforces_warning_fk(tmp_path):
+def test_warning_reads_table_absent_after_migration(tmp_path):
     db = tmp_path / "state.sqlite"
     migrate(db)
-    con = sqlite3.connect(db)
-    con.execute("pragma foreign_keys=ON")
+    migrate(db)
+    con = readonly_connect(db)
     try:
-        warning_id = _insert_warning(con)
-        con.execute(
-            "insert into bot_warning_reads(warning_id,chat_id,user_id,read_at) "
-            "values(?,?,?,?)",
-            (warning_id, "chat", "user-a", 100),
-        )
-        con.execute(
-            "insert into bot_warning_reads(warning_id,chat_id,user_id,read_at) "
-            "values(?,?,?,?)",
-            (warning_id, "chat", "user-b", 100),
-        )
-        with pytest.raises(sqlite3.IntegrityError):
-            con.execute(
-                "insert into bot_warning_reads(warning_id,chat_id,user_id,read_at) "
-                "values(?,?,?,?)",
-                (warning_id, "chat", "user-a", 101),
-            )
-        with pytest.raises(sqlite3.IntegrityError):
-            con.execute(
-                "insert into bot_warning_reads(warning_id,chat_id,user_id,read_at) "
-                "values(?,?,?,?)",
-                (warning_id + 999, "chat", "user-a", 100),
-            )
-
-        primary_key = {
-            str(row[1]): int(row[5])
-            for row in con.execute("pragma table_info(bot_warning_reads)")
-            if row[5]
+        tables = {
+            str(row[0]) for row in con.execute("select name from sqlite_master where type='table'")
         }
-        assert primary_key == {"warning_id": 1, "chat_id": 2, "user_id": 3}
-        assert {
-            (str(row[2]), str(row[3]), str(row[4]))
-            for row in con.execute("pragma foreign_key_list(bot_warning_reads)")
-        } == {("bot_warning_inbox", "warning_id", "id")}
+        assert "bot_warning_inbox" in tables
+        assert "bot_warning_reads" not in tables
+        indexes = {
+            str(row[0]) for row in con.execute("select name from sqlite_master where type='index'")
+        }
+        assert "idx_bot_warning_reads_actor" not in indexes
+        versions = {
+            int(row[0])
+            for row in con.execute("select version from schema_migrations where version in (20,21)")
+        }
+        assert versions == {20, 21}
     finally:
         con.close()
-
-
-def test_runtime_writer_enforces_warning_read_foreign_key(tmp_path):
-    db = tmp_path / "state.sqlite"
-    migrate(db)
-
-    with pytest.raises(sqlite3.IntegrityError):
-        write_execute(
-            db,
-            "insert into bot_warning_reads(warning_id,chat_id,user_id,read_at) "
-            "values(?,?,?,?)",
-            (999, "chat", "user", 100),
-        )
 
 
 def test_warning_severity_resolution_and_occurrence_integrity_checks(tmp_path):
@@ -140,3 +107,16 @@ def test_warning_severity_resolution_and_occurrence_integrity_checks(tmp_path):
             )
     finally:
         con.close()
+
+
+def test_runtime_writer_cannot_insert_legacy_warning_reads(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+
+    with pytest.raises(sqlite3.OperationalError):
+        write_execute(
+            db,
+            "insert into bot_warning_reads(warning_id,chat_id,user_id,read_at) "
+            "values(?,?,?,?)",
+            (1, "chat", "user", 100),
+        )
