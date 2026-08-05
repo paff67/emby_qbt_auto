@@ -1306,6 +1306,17 @@ class BotAddQueueRepository:
 
         return dict(write_transaction(self.state_db, txn))
 
+    def list_qbt_precheck_tag_refs(self) -> set[str]:
+        con = readonly_connect(self.state_db)
+        try:
+            rows = con.execute(
+                "select distinct qbt_precheck_tag from bot_add_items "
+                "where qbt_precheck_tag is not null and qbt_precheck_tag <> ''"
+            )
+            return {str(row[0]).strip() for row in rows if str(row[0] or "").strip()}
+        finally:
+            con.close()
+
     def get_batch(self, batch_id: int) -> dict[str, Any]:
         key = self._positive_id(batch_id, "batch_id")
         con = readonly_connect(self.state_db)
