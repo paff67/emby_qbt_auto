@@ -4118,3 +4118,83 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
+
+
+def test_qbt_tag_janitor_loop_defaults_and_shared_gateway(tmp_path, monkeypatch):
+    from qbt_orchestrator.cli import _build_runtime
+
+    for name, value in {
+        "QBT_ORCH_STATE_DB": str(tmp_path / "cli.sqlite"),
+        "QBT_ORCH_DRY_RUN": "0",
+        "QBT_ORCH_DISK_PATH": str(tmp_path),
+        "QBT_ORCH_ORPHAN_JANITOR": "0",
+        "QBT_ORCH_JUNK_JANITOR": "0",
+        "QBT_ORCH_CAROUSEL": "0",
+        "QBT_ORCH_QBT_PREFERENCES_GUARD": "0",
+        "QBT_ORCH_PATH_RECONCILE": "0",
+        "QBT_ORCH_SOAK_ENABLED": "0",
+        "QBT_ORCH_METADATA_PROBE_ENABLED": "1",
+        "QBT_ORCH_CHECKED_ADD_ENABLED": "1",
+        "QBT_ORCH_ADD_TAG_GC_ENABLED": "1",
+        "QBT_ORCH_ADD_TAG_GC_DRY_RUN": "1",
+        "QBT_ORCH_ADD_TAG_GC_INTERVAL_SEC": "300",
+        "QBT_ORCH_ADD_TAG_GC_BATCH_LIMIT": "25",
+        "QBT_ORCH_FILENAME_NORMALIZE": "0",
+        "QBT_ORCH_CAPACITY_RECLAIM": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    class Ns:
+        config = None
+        cmd = "daemon"
+        safety_interval = 0
+        max_safety_ticks = 1
+        dry_run = False
+
+    runtime, _ = _build_runtime(Ns(), tmp_path / "fallback.sqlite")
+    assert runtime.checked_add_service is not None
+    assert runtime.metadata_probe_coordinator is not None
+    assert runtime.qbt_tag_janitor is not None
+    assert runtime.qbt_tag_janitor.dry_run is True
+    assert runtime.qbt_tag_janitor.batch_limit == 25
+    assert runtime.checked_add_service.gateway is runtime.metadata_probe_coordinator.gateway
+    assert runtime.qbt_tag_janitor.gateway is runtime.checked_add_service.gateway
+    tasks = {task.name: task for task in runtime.loop_tasks}
+    assert tasks["checked_add"].interval_sec == 5
+    assert tasks["qbt_tag_janitor"].interval_sec == 300
+
+
+def test_qbt_tag_janitor_tick_suspends_when_sync_unhealthy(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class Qbt:
+        def get_maindata(self, rid):
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+
+    class Executor:
+        def qbt_post(self, _path, _payload):
+            return True
+
+    class Janitor:
+        def __init__(self):
+            self.calls = []
+
+        def tick(self, snapshots=None, *, sync_healthy=True):
+            self.calls.append((sync_healthy, dict(snapshots or {})))
+            return {"status": "suspended" if not sync_healthy else "ok"}
+
+    janitor = Janitor()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "runtime.sqlite",
+        qbt=Qbt(),
+        executor=Executor(),
+        free_bytes_provider=lambda: 10 * 1024**3,
+        dry_run=False,
+        carousel_enabled=False,
+        qbt_tag_janitor=janitor,
+        qbt_tag_janitor_interval_sec=300,
+    )
+    daemon.monitor.sync.high_risk_actions_allowed = False
+    assert daemon.qbt_tag_janitor_tick()["status"] == "suspended"
+    assert janitor.calls[-1][0] is False
+    assert "qbt_tag_janitor" in {task.name for task in daemon.loop_tasks}

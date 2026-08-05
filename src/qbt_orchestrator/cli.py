@@ -32,6 +32,7 @@ from .orphan_janitor import OrphanJanitorService
 from .path_reconcile import QbtPathReconciler
 from .preferences import QbtPreferencesGuard
 from .qbt_precheck import QbtPrecheckGateway
+from .qbt_tag_janitor import QbtTagJanitor
 from .promotion import MediaPromotionRepository, MediaPromotionRunner
 from .runtime import BotCommandRepository, BotNotificationRepository, CleanupRequestRunner, CommandProcessor, TorrentJobRepository, UploadJobRunner, reconcile_jobs
 from .runtime import ObservabilityStore
@@ -421,14 +422,26 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     checked_add_enabled = (
         _truthy(os.environ.get("QBT_ORCH_CHECKED_ADD_ENABLED")) is True
     )
+    add_tag_gc_enabled = (
+        _truthy(os.environ.get("QBT_ORCH_ADD_TAG_GC_ENABLED")) is True
+    )
     bot_add_queue = None
-    if (metadata_probe_enabled or checked_add_enabled) and not dry_run:
+    precheck_gateway = None
+    if (
+        metadata_probe_enabled or checked_add_enabled or add_tag_gc_enabled
+    ) and not dry_run:
         bot_add_queue = BotAddQueueRepository(state_db)
+        precheck_gateway = QbtPrecheckGateway(qbt, executor)
     metadata_probe_coordinator = None
-    if metadata_probe_enabled and not dry_run and bot_add_queue is not None:
+    if (
+        metadata_probe_enabled
+        and not dry_run
+        and bot_add_queue is not None
+        and precheck_gateway is not None
+    ):
         metadata_probe_coordinator = MetadataProbeCoordinator(
             bot_add_queue,
-            QbtPrecheckGateway(qbt, executor),
+            precheck_gateway,
             warning_service=warning_service,
         )
     bot_add_ingress_coordinator = None
@@ -438,10 +451,15 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             warning_service=warning_service,
         )
     checked_add_service = None
-    if checked_add_enabled and not dry_run and bot_add_queue is not None:
+    if (
+        checked_add_enabled
+        and not dry_run
+        and bot_add_queue is not None
+        and precheck_gateway is not None
+    ):
         checked_add_service = CheckedAddService(
             bot_add_queue,
-            QbtPrecheckGateway(qbt, executor),
+            precheck_gateway,
             DuplicateMatcher(
                 state_db,
                 normalizer=_build_normalizer_from_env(os.environ),
@@ -454,6 +472,31 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
             ),
             notifications=BotNotificationRepository(state_db),
             warning_service=warning_service,
+        )
+    qbt_tag_janitor = None
+    add_tag_gc_interval_sec = 300
+    if (
+        add_tag_gc_enabled
+        and not dry_run
+        and bot_add_queue is not None
+        and precheck_gateway is not None
+    ):
+        tag_gc_dry_env = _truthy(os.environ.get("QBT_ORCH_ADD_TAG_GC_DRY_RUN"))
+        tag_gc_dry_run = (
+            True
+            if dry_run
+            else (tag_gc_dry_env if tag_gc_dry_env is not None else True)
+        )
+        add_tag_gc_interval_sec = max(
+            30, int(os.environ.get("QBT_ORCH_ADD_TAG_GC_INTERVAL_SEC", "300"))
+        )
+        qbt_tag_janitor = QbtTagJanitor(
+            bot_add_queue,
+            precheck_gateway,
+            dry_run=tag_gc_dry_run,
+            batch_limit=max(
+                1, int(os.environ.get("QBT_ORCH_ADD_TAG_GC_BATCH_LIMIT", "25"))
+            ),
         )
     capacity_assessment_builder = CapacityAssessmentBuilder(
         viability_stale_sec=viability_stale_sec
@@ -892,6 +935,8 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         metadata_probe_coordinator=metadata_probe_coordinator,
         bot_add_ingress_coordinator=bot_add_ingress_coordinator,
         checked_add_service=checked_add_service,
+        qbt_tag_janitor=qbt_tag_janitor,
+        qbt_tag_janitor_interval_sec=add_tag_gc_interval_sec,
         junk_file_refresh_limit=int(os.environ.get("QBT_ORCH_JUNK_FILE_REFRESH_LIMIT", "3")),
         carousel_service=carousel_service,
         carousel_enabled=carousel_enabled,

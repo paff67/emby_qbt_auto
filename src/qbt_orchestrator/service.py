@@ -356,6 +356,8 @@ class DaemonRuntime:
         metadata_probe_coordinator=None,
         bot_add_ingress_coordinator=None,
         checked_add_service=None,
+        qbt_tag_janitor=None,
+        qbt_tag_janitor_interval_sec: int = 300,
         junk_file_refresh_limit: int = 3,
         carousel_service=None,
         carousel_enabled: bool = True,
@@ -498,6 +500,10 @@ class DaemonRuntime:
         self.metadata_probe_coordinator = metadata_probe_coordinator
         self.bot_add_ingress_coordinator = bot_add_ingress_coordinator
         self.checked_add_service = checked_add_service
+        self.qbt_tag_janitor = qbt_tag_janitor
+        self.qbt_tag_janitor_interval_sec = max(
+            30, int(qbt_tag_janitor_interval_sec or 300)
+        )
         self.path_reconciler = path_reconciler
         self.preemption_service = preemption_service
         self.soak_dry_run = soak_dry_run or dry_run
@@ -674,6 +680,15 @@ class DaemonRuntime:
                     max_runtime_sec=2,
                 )
             )
+        if self.qbt_tag_janitor is not None:
+            tasks.append(
+                LoopTask(
+                    "qbt_tag_janitor",
+                    self.qbt_tag_janitor_interval_sec,
+                    self.qbt_tag_janitor_tick,
+                    max_runtime_sec=5,
+                )
+            )
         tasks.append(
             LoopTask(
                 "batch_summary",
@@ -708,6 +723,15 @@ class DaemonRuntime:
             return {"status": "disabled"}
         _snapshots, sync_healthy, _sampled = self._capture_safety_snapshot()
         return self.checked_add_service.tick(sync_healthy=sync_healthy)
+
+    def qbt_tag_janitor_tick(self) -> dict:
+        if self.qbt_tag_janitor is None:
+            return {"status": "disabled"}
+        snapshots, sync_healthy, _sampled = self._capture_safety_snapshot()
+        return self.qbt_tag_janitor.tick(
+            snapshots=snapshots,
+            sync_healthy=sync_healthy,
+        )
 
     def maintenance_tick(self) -> dict:
         snapshots = {h: vars(snapshot) for h, snapshot in self.monitor.sync.snapshots.items()}
@@ -1725,6 +1749,12 @@ class DaemonRuntime:
                 "bot_add_ingress": self.bot_add_ingress_coordinator is not None,
                 "metadata_probe": self.metadata_probe_coordinator is not None,
                 "checked_add": self.checked_add_service is not None,
+                "qbt_tag_janitor": self.qbt_tag_janitor is not None,
+                "qbt_tag_janitor_dry_run": (
+                    None
+                    if self.qbt_tag_janitor is None
+                    else bool(getattr(self.qbt_tag_janitor, "dry_run", True))
+                ),
                 "scheduler_alerts": bool(self.scheduler_alert_service.config.enabled)
                 if hasattr(self.scheduler_alert_service, "config")
                 else False,
