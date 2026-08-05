@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .torrent_ownership import has_transient_add_fence
+
 
 @dataclass(frozen=True)
 class CleanupEligibility:
@@ -32,6 +34,8 @@ def cleanup_eligibility(
     """Evaluate hard safety gates, then independent release conditions."""
     observed_at = int(time.time()) if now is None else int(now)
     tags = _tags(torrent)
+    if has_transient_add_fence(torrent):
+        return CleanupEligibility(False, "transient_add_fence", None)
     if not canonical_remote_verified:
         return CleanupEligibility(False, "remote_not_canonical", None)
     if "hold" in tags:

@@ -12,6 +12,7 @@ from .hash_identity import canonical_torrent_hash
 from .observability import redact
 from .scheduler_intents import SchedulerIntent, SchedulerIntentRepository
 
+from .torrent_ownership import is_managed_auto
 
 MIB = 1024**2
 GIB = 1024**3
@@ -32,8 +33,7 @@ def _tags(torrent: Mapping[str, Any]) -> set[str]:
 
 
 def _is_managed(torrent: Mapping[str, Any]) -> bool:
-    tags = _tags(torrent)
-    return (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
+    return is_managed_auto(torrent)
 
 
 def _completed_bytes(snapshot: Mapping[str, Any]) -> int:

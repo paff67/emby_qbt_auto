@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from .db import write_transaction
 from .hash_identity import canonical_torrent_hash
+from .torrent_ownership import has_transient_add_fence, is_managed_auto
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,12 @@ def scheduler_admission(
     torrent can finish under the remaining capacity budget.
     """
 
-    if cooldown or reclaim_locked or has_hold(snapshot):
+    if (
+        cooldown
+        or reclaim_locked
+        or has_hold(snapshot)
+        or has_transient_add_fence(snapshot)
+    ):
         return "blocked"
     if evidence.full_finish_viable:
         return "full_finish"
@@ -149,14 +155,7 @@ class CapacityAssessmentBuilder:
             torrent_hash = canonical_torrent_hash(
                 torrent.get("hash") or fallback_hash
             )
-            tags = {
-                part.strip()
-                for part in str(torrent.get("tags") or "").split(",")
-                if part.strip()
-            }
-            managed = (
-                str(torrent.get("category") or "") == "auto" or "auto" in tags
-            ) and "hold" not in tags
+            managed = is_managed_auto(torrent)
             amount_left = max(0, int(torrent.get("amount_left") or 0))
             raw_availability = torrent.get("availability")
             availability = (

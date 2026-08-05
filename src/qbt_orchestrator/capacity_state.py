@@ -11,6 +11,7 @@ from .capacity_assessment import CapacityAssessment
 from .db import readonly_connect, write_transaction
 from .hash_identity import canonical_torrent_hash
 from .observability import redact
+from .torrent_ownership import is_managed_auto
 
 
 SCHEDULER_MODES = frozenset({"emergency", "drain", "normal", "explore"})
@@ -237,8 +238,7 @@ def build_capacity_observation(
     for fallback_hash, raw in snapshots.items():
         torrent = dict(raw)
         torrent_hash = str(torrent.get("hash") or fallback_hash)
-        tags = {part.strip() for part in str(torrent.get("tags") or "").split(",") if part.strip()}
-        managed = (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
+        managed = is_managed_auto(torrent)
         amount_left = max(0, int(torrent.get("amount_left") or 0))
         if not managed or amount_left <= 0:
             continue

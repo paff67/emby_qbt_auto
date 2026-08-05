@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .db import readonly_connect, write_transaction
 from .observability import redact
 
+from .torrent_ownership import is_managed_auto
 
 DEFAULT_HARD_PATTERNS = (
     r"(?i)(最新地址|收藏不迷路|官方指定|博彩|赌场|telegram|996gg\.cc)",
@@ -29,8 +30,7 @@ def _tags(torrent: Mapping[str, Any]) -> set[str]:
 
 
 def _is_managed(torrent: Mapping[str, Any]) -> bool:
-    tags = _tags(torrent)
-    return (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
+    return is_managed_auto(torrent)
 
 
 class JunkJanitorService:

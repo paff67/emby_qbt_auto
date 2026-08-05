@@ -6,6 +6,9 @@ from enum import Enum
 from typing import Any, Mapping
 
 
+from .torrent_ownership import has_transient_add_fence
+
+
 class WorkKind(str, Enum):
     FULL_FINISH = "full_finish"
     BATCH_DELIVERY = "batch_delivery"
@@ -81,7 +84,12 @@ def build_full_finish_work_items(
         tags = _tags(torrent)
         managed = str(torrent.get("category") or "") == "auto" or "auto" in tags
         amount_left = max(0, int(torrent.get("amount_left") or 0))
-        if not managed or not torrent_hash or amount_left <= 0:
+        if (
+            has_transient_add_fence(torrent)
+            or not managed
+            or not torrent_hash
+            or amount_left <= 0
+        ):
             continue
 
         piece_size = max(0, int(torrent.get("piece_size") or torrent.get("piece_size_bytes") or 0))

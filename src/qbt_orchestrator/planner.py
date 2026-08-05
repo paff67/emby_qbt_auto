@@ -19,6 +19,7 @@ from .observability import redact
 from .policies.download_mode import desired_seq_dl
 from .scheduler_intents import SchedulerIntentRepository
 
+from .torrent_ownership import is_managed_auto
 
 STOPPED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "stopped"}
 AVAILABILITY_PROBE_RESERVE_BYTES = 512 * 1024**2
@@ -105,8 +106,7 @@ def _tags(torrent: Mapping[str, Any]) -> set[str]:
 
 
 def _is_managed(torrent: Mapping[str, Any]) -> bool:
-    tags = _tags(torrent)
-    return (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
+    return is_managed_auto(torrent)
 
 
 def _is_running_download(torrent: Mapping[str, Any]) -> bool:

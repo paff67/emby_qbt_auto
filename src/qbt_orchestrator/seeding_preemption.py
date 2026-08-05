@@ -12,6 +12,7 @@ from .io_governor import JobPriority
 from .observability import redact
 from .runtime import TorrentJobRepository
 
+from .torrent_ownership import is_managed_auto
 GIB = 1024**3
 MIB = 1024**2
 
@@ -21,8 +22,7 @@ def _tags(torrent: Mapping[str, Any]) -> set[str]:
 
 
 def _is_managed(torrent: Mapping[str, Any]) -> bool:
-    tags = _tags(torrent)
-    return (str(torrent.get("category") or "") == "auto" or "auto" in tags) and "hold" not in tags
+    return is_managed_auto(torrent)
 
 
 def _name_or_hash(torrent: Mapping[str, Any]) -> str:
