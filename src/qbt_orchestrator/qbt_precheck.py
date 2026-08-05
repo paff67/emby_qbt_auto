@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import base64
-import re
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
 
 from .hash_identity import canonical_torrent_hash
-
-
-_PRECHECK_TAG = re.compile(r"^add-item-[a-f0-9]{16,64}$")
+from .torrent_ownership import LEGACY_ADD_TAG_RE
 
 
 class QbtPrecheckGateway:
@@ -316,7 +313,7 @@ class QbtPrecheckGateway:
     @staticmethod
     def _tag(value: str) -> str:
         tag = str(value or "").strip()
-        if not _PRECHECK_TAG.fullmatch(tag):
+        if not LEGACY_ADD_TAG_RE.fullmatch(tag):
             raise ValueError("qbt_precheck_tag")
         return tag
 

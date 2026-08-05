@@ -637,3 +637,18 @@ def test_real_precheck_gateway_enrollment_writes_use_existing_executor():
         ("/api/v2/torrents/removeTags", {"hashes": h, "tags": "precheck,metadata-probe"}),
         ("/api/v2/torrents/setForceStart", {"hashes": h, "value": "false"}),
     ]
+
+
+def test_transient_add_tag_is_a_hard_ownership_fence():
+    from qbt_orchestrator.torrent_ownership import has_transient_add_fence
+
+    assert has_transient_add_fence({"tags": "checked,add-item-" + "a" * 32})
+    assert not has_transient_add_fence({"tags": "checked,add-item-user-label"})
+
+
+def test_only_current_32_hex_tags_are_gc_eligible():
+    from qbt_orchestrator.torrent_ownership import is_gc_eligible_add_tag
+
+    assert is_gc_eligible_add_tag("add-item-" + "a" * 32)
+    assert not is_gc_eligible_add_tag("add-item-" + "a" * 16)
+    assert not is_gc_eligible_add_tag("add-item-" + "a" * 64)
