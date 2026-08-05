@@ -652,3 +652,43 @@ def test_only_current_32_hex_tags_are_gc_eligible():
     assert is_gc_eligible_add_tag("add-item-" + "a" * 32)
     assert not is_gc_eligible_add_tag("add-item-" + "a" * 16)
     assert not is_gc_eligible_add_tag("add-item-" + "a" * 64)
+
+
+def test_precheck_gateway_delete_tags_is_guarded_and_gc_eligible_only():
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    class Qbt:
+        def torrent_tags(self):
+            return ["add-item-" + "a" * 32, "checked", "add-item-" + "b" * 16]
+
+        def torrents_by_tag(self, tag):
+            return []
+
+    class Executor:
+        def __init__(self):
+            self.posts = []
+
+        def qbt_post_guarded(self, path, payload, *, guard):
+            assert guard() is True
+            self.posts.append((path, payload))
+            return True
+
+    tag = "add-item-" + "a" * 32
+    executor = Executor()
+    gateway = QbtPrecheckGateway(Qbt(), executor)
+    assert gateway.list_tags() == {tag, "checked", "add-item-" + "b" * 16}
+    assert gateway.torrents_by_tag(tag) == []
+    assert gateway.delete_tags([tag, tag], guard=lambda: True) is True
+    assert executor.posts == [
+        ("/api/v2/torrents/deleteTags", {"tags": tag}),
+    ]
+    try:
+        gateway.delete_tags(["checked"])
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert str(exc) == "qbt_precheck_tag"
+    try:
+        gateway.delete_tags(["add-item-" + "b" * 16])
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert str(exc) == "qbt_precheck_tag"

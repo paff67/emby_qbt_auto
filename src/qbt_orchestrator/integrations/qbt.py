@@ -200,6 +200,26 @@ class QbtDockerClient:
     def torrent_properties(self, hash: str) -> dict[str, Any]:
         return json.loads(self._curl("/api/v2/torrents/properties", {"hash": hash}))
 
+    def torrent_tags(self, timeout: float | None = None) -> list[str]:
+        rows = json.loads(self._curl("/api/v2/torrents/tags", timeout=timeout))
+        if not isinstance(rows, list):
+            raise RuntimeError("qBT tags response must be a JSON array")
+        return [str(tag) for tag in rows]
+
+    def torrents_by_tag(
+        self, tag: str, timeout: float | None = None
+    ) -> list[dict[str, Any]]:
+        rows = json.loads(
+            self._curl(
+                "/api/v2/torrents/info",
+                {"tag": str(tag)},
+                timeout=timeout,
+            )
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("qBT torrents-by-tag response must be a JSON array")
+        return [dict(row) for row in rows]
+
     def get_preferences(self) -> dict[str, Any]:
         return json.loads(self._curl("/api/v2/app/preferences"))
 
@@ -420,6 +440,29 @@ class QbtHttpClient:
 
     def torrent_properties(self, hash: str) -> dict[str, Any]:
         return json.loads(self._request("GET", "/api/v2/torrents/properties", {"hash": hash}))
+
+    def torrent_tags(self, timeout: float | None = None) -> list[str]:
+        rows = json.loads(
+            self._request("GET", "/api/v2/torrents/tags", timeout=timeout)
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("qBT tags response must be a JSON array")
+        return [str(tag) for tag in rows]
+
+    def torrents_by_tag(
+        self, tag: str, timeout: float | None = None
+    ) -> list[dict[str, Any]]:
+        rows = json.loads(
+            self._request(
+                "GET",
+                "/api/v2/torrents/info",
+                {"tag": str(tag)},
+                timeout=timeout,
+            )
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("qBT torrents-by-tag response must be a JSON array")
+        return [dict(row) for row in rows]
 
     def get_preferences(self) -> dict[str, Any]:
         return json.loads(self._request("GET", "/api/v2/app/preferences"))

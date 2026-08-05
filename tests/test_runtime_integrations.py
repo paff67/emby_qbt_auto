@@ -762,3 +762,73 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
+
+
+def test_qbt_docker_client_torrent_tags_and_torrents_by_tag():
+    from qbt_orchestrator.integrations.qbt import QbtDockerClient
+
+    tag = "add-item-" + "a" * 32
+    calls = []
+
+    def runner(argv, input_text, timeout):
+        calls.append((argv, input_text))
+        url = argv[-1]
+        if url.endswith("/api/v2/torrents/tags"):
+            return 0, f'["{tag}","checked"]', ""
+        if f"tag={tag}" in url:
+            return 0, '[{"hash":"h1","tags":"' + tag + '"}]', ""
+        raise AssertionError(url)
+
+    client = QbtDockerClient(container="qbittorrent", runner=runner)
+    assert client.torrent_tags() == [tag, "checked"]
+    assert client.torrents_by_tag(tag) == [{"hash": "h1", "tags": tag}]
+    assert any("/api/v2/torrents/tags" in " ".join(argv) for argv, _ in calls)
+    assert any(f"tag={tag}" in " ".join(argv) for argv, _ in calls)
+
+
+def test_qbt_http_client_torrent_tags_and_torrents_by_tag():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    tag = "add-item-" + "b" * 32
+    calls = []
+
+    def transport(method, url, body, headers, timeout):
+        calls.append((method, url, body))
+        if url.endswith("/api/v2/auth/login"):
+            return 200, "Ok.", {"Set-Cookie": "SID=abc; Path=/"}
+        if url.endswith("/api/v2/torrents/tags"):
+            return 200, f'["{tag}"]', {}
+        if f"tag={tag}" in url:
+            return 200, "[]", {}
+        raise AssertionError(url)
+
+    client = QbtHttpClient(username="u", password="p", transport=transport, auth_mode="required")
+    assert client.torrent_tags() == [tag]
+    assert client.torrents_by_tag(tag) == []
+    assert any(method == "GET" and url.endswith("/api/v2/torrents/tags") for method, url, _ in calls)
+
+
+def test_qbt_clients_reject_non_list_tag_payloads():
+    from qbt_orchestrator.integrations.qbt import QbtDockerClient, QbtHttpClient
+
+    def docker_runner(argv, input_text, timeout):
+        return 0, '{"tags":[]}', ""
+
+    docker = QbtDockerClient(runner=docker_runner)
+    try:
+        docker.torrent_tags()
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "JSON array" in str(exc)
+
+    def transport(method, url, body, headers, timeout):
+        if url.endswith("/api/v2/auth/login"):
+            return 200, "Ok.", {"Set-Cookie": "SID=abc; Path=/"}
+        return 200, '{"oops":true}', {}
+
+    http = QbtHttpClient(username="u", password="p", transport=transport, auth_mode="required")
+    try:
+        http.torrents_by_tag("add-item-" + "c" * 32)
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "JSON array" in str(exc)

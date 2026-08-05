@@ -5,7 +5,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
 
 from .hash_identity import canonical_torrent_hash
-from .torrent_ownership import LEGACY_ADD_TAG_RE
+from .torrent_ownership import LEGACY_ADD_TAG_RE, is_gc_eligible_add_tag
 
 
 class QbtPrecheckGateway:
@@ -231,6 +231,44 @@ class QbtPrecheckGateway:
         guard: Callable[[], bool] | None = None,
     ) -> bool:
         return self._write_tags("removeTags", torrent_hash, tags, guard)
+
+    def list_tags(self) -> set[str]:
+        rows = self.qbt.torrent_tags()
+        if not isinstance(rows, list):
+            raise RuntimeError("qBT tags response must be a JSON array")
+        return {str(tag).strip() for tag in rows if str(tag).strip()}
+
+    def torrents_by_tag(self, tag: str) -> list[dict[str, Any]]:
+        safe_tag = self._tag(tag)
+        rows = self.qbt.torrents_by_tag(safe_tag)
+        if not isinstance(rows, list):
+            raise RuntimeError("qBT torrents-by-tag response must be a JSON array")
+        return [dict(row) for row in rows]
+
+    def delete_tags(
+        self,
+        tags: Sequence[str],
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        parts: list[str] = []
+        for raw in tags:
+            tag = str(raw or "").strip()
+            if not tag:
+                continue
+            if not is_gc_eligible_add_tag(tag):
+                raise ValueError("qbt_precheck_tag")
+            parts.append(tag)
+        ordered = sorted(dict.fromkeys(parts))
+        if not ordered:
+            raise ValueError("qbt_precheck_tag")
+        return bool(
+            self._post(
+                "/api/v2/torrents/deleteTags",
+                {"tags": ",".join(ordered)},
+                guard,
+            )
+        )
 
     def set_force_start(
         self,
