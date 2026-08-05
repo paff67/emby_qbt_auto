@@ -91,3 +91,10 @@ the torrent as unmanaged.
 4. Verify torrent count, downloaded bytes, and local files are unchanged.
 5. Watch `enrolling` age, WarningInbox, and journal for repeated
    `qbt_precheck_not_stopped` / `qbt_write_fenced` storms.
+
+## Local verification (2026-08-05)
+
+- Branch: `cursor/qbt-transient-add-tag-c210`
+- `python -m pytest -q`: **1141 passed, 3 skipped**
+- `python -m compileall -q src` and `git diff --check`: clean
+- VPS dry-run/live GC rollout remains an operator step using the checklist above
