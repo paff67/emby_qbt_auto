@@ -915,12 +915,15 @@ class CheckedAddService:
         for item in self._items_in_states({"enrolling"}, max_items):
             try:
                 finished = self._finish_enrollment(dict(item))
-                result["recovered"].append(int(item["id"]))
-                result["enrolled"].append(int(finished["id"]))
+                if str(finished.get("state") or "") in {"enrolled", "enrolled_hold"}:
+                    result["recovered"].append(int(item["id"]))
+                    result["enrolled"].append(int(finished["id"]))
             except (ValueError, RuntimeError):
                 result["errors"] += 1
 
-        remaining = max(0, max_items - len(result["recovered"]))
+        remaining = max(
+            0, max_items - len(result["recovered"]) - int(result["errors"])
+        )
         prechecking = self._items_in_states({"prechecking"}, remaining)
         if prechecking and self.matcher.remote_index.backfill_db is not None:
             self.matcher.remote_index.refresh()
@@ -1171,46 +1174,94 @@ class CheckedAddService:
         token = (self.owner, int(lease["metadata_lease_generation"]))
         current = self.repository.get_item(item_id)
         opaque_tag = str(current.get("qbt_precheck_tag") or "")
-        self._owned_snapshot(current)
+        self._opaque_owned_snapshot(current)
         held = bool(current.get("approved_by")) or current.get("decision") == "needs_confirmation"
         added_tags = "checked,maybe-duplicate,hold" if held else "checked,hold"
         removed_tags = "precheck,metadata-probe"
-        guard = lambda: self._lease_owned_guard(item_id, token)
-        files = self.gateway.torrent_files(str(current["qbt_hash"]))
+        torrent_hash = str(current["qbt_hash"])
+        guard = lambda: self._enrollment_guard(item_id, token, torrent_hash, opaque_tag)
+
+        def fail(code: str) -> dict[str, Any]:
+            return self._record_enrollment_failure(item_id, token, code)
+
+        # 3) stop first so later writes can re-enter after crashes.
+        if not self.gateway.stop(torrent_hash, guard=guard):
+            return fail("qbt_write_fenced")
+        try:
+            self._require_stopped(current)
+        except ValueError as exc:
+            return fail(str(exc) or "qbt_stop_not_observed")
+
+        files = self.gateway.torrent_files(torrent_hash)
         primary = select_primary_video(files)
         if primary is None:
-            raise ValueError("primary_video_not_found")
+            return fail("primary_video_not_found")
         all_indices = [
             int(row["index"])
             for row in files
             if type(row.get("index")) is int and row["index"] >= 0
         ]
         if len(all_indices) != len(files) or not all_indices:
-            raise ValueError("file_index")
-        priority_actions = []
+            return fail("file_index")
+
+        # 4-5) converge file priorities while opaque tag + hold remain.
         if any(int(row.get("priority") or 0) != 0 for row in files):
-            priority_actions.append(
-                (self.gateway.set_file_priorities, (str(current["qbt_hash"]), all_indices, 0))
-            )
-        priority_actions.append(
-            (self.gateway.set_file_priorities, (str(current["qbt_hash"]), [primary.index], 1))
-        )
-        actions = tuple(priority_actions) + (
-            (self.gateway.set_category, (str(current["qbt_hash"]), "auto")),
-            (self.gateway.add_tags, (str(current["qbt_hash"]), added_tags)),
-            (self.gateway.remove_tags, (str(current["qbt_hash"]), removed_tags)),
-            (self.gateway.set_force_start, (str(current["qbt_hash"]), False)),
-            (self.gateway.stop, (str(current["qbt_hash"]),)),
-        )
-        for action, args in actions:
-            if not action(*args, guard=guard):
-                raise ValueError("qbt_write_fenced")
-        verified_files = self.gateway.torrent_files(str(current["qbt_hash"]))
+            if not self.gateway.set_file_priorities(
+                torrent_hash, all_indices, 0, guard=guard
+            ):
+                return fail("qbt_write_fenced")
+        if not self.gateway.set_file_priorities(
+            torrent_hash, [primary.index], 1, guard=guard
+        ):
+            return fail("qbt_write_fenced")
+
+        # 6-8) tags and force_start before category=auto.
+        if not self.gateway.add_tags(torrent_hash, added_tags, guard=guard):
+            return fail("qbt_write_fenced")
+        if not self.gateway.remove_tags(torrent_hash, removed_tags, guard=guard):
+            return fail("qbt_write_fenced")
+        if not self.gateway.set_force_start(torrent_hash, False, guard=guard):
+            return fail("qbt_write_fenced")
+
+        # 9) absorb filePrio auto-resume.
+        if not self.gateway.stop(torrent_hash, guard=guard):
+            return fail("qbt_write_fenced")
+        try:
+            self._require_stopped(current)
+        except ValueError as exc:
+            return fail(str(exc) or "qbt_stop_not_observed")
+
+        # 10) set category=auto only after the torrent is owned+stopped.
+        if not self.gateway.set_category(torrent_hash, "auto", guard=guard):
+            return fail("qbt_write_fenced")
+
+        # 11) final stop + verify category/tags/force_start/priorities/stopped.
+        if not self.gateway.stop(torrent_hash, guard=guard):
+            return fail("qbt_write_fenced")
+        snapshot = self._opaque_owned_snapshot(current)
+        if str(snapshot.get("state") or "").strip().lower() not in self._STOPPED_STATES:
+            return fail("qbt_stop_not_observed")
+        if str(snapshot.get("category") or "") != "auto":
+            return fail("qbt_category_verification_failed")
+        tags = self._tags(snapshot)
+        required = {"checked", "hold", opaque_tag}
+        if held:
+            required.add("maybe-duplicate")
+        if not required <= tags:
+            return fail("qbt_tag_verification_failed")
+        if {"precheck", "metadata-probe"} & tags:
+            return fail("qbt_tag_verification_failed")
+        if bool(snapshot.get("force_start")):
+            return fail("qbt_force_start_verification_failed")
+        verified_files = self.gateway.torrent_files(torrent_hash)
         if not verified_files or any(
-            int(row.get("priority") or 0) != (1 if int(row.get("index", -1)) == primary.index else 0)
+            int(row.get("priority") or 0)
+            != (1 if int(row.get("index", -1)) == primary.index else 0)
             for row in verified_files
         ):
-            raise ValueError("file_priority_verification_failed")
+            return fail("file_priority_verification_failed")
+
+        # 12) commit SQLite while opaque fence remains.
         approval_generation = int(current["approval_generation"])
         finished = self.repository.transition_item(
             item_id,
@@ -1221,10 +1272,56 @@ class CheckedAddService:
             metadata_lease_generation=token[1],
             approval_generation=approval_generation,
         )
+        self._resolve_enrollment_warning(item_id)
         try:
             return self._finalize_enrollment(finished, opaque_tag=opaque_tag)
         except Exception:
             return finished
+
+    def _record_enrollment_failure(
+        self, item_id: int, token: tuple[str, int], error_code: str
+    ) -> dict[str, Any]:
+        code = str(error_code or "enrollment_failed").strip() or "enrollment_failed"
+        now = int(self.now())
+        attempts = int(self.repository.get_item(item_id).get("attempts") or 0) + 1
+        delay = min(300, 5 * (2 ** min(attempts, 6)))
+        try:
+            updated = self.repository.record_enrollment_retry(
+                item_id,
+                metadata_lease_owner=token[0],
+                metadata_lease_generation=token[1],
+                error_code=code,
+                next_run_at=now + delay,
+            )
+        except ValueError:
+            return self.repository.get_item(item_id)
+        if int(updated.get("attempts") or 0) >= 3 and self.warning_service is not None:
+            self.warning_service.report_once(
+                warning_key=f"checked_add:enrollment_stuck:{item_id}",
+                severity="warning",
+                topic="checked_add",
+                safe_message=f"enrollment stuck for item {item_id}: {code}",
+                related_item_id=item_id,
+            )
+        return updated
+
+    def _resolve_enrollment_warning(self, item_id: int) -> None:
+        if self.warning_service is None:
+            return
+        key = f"checked_add:enrollment_stuck:{item_id}"
+        now = int(self.now())
+
+        def txn(con: sqlite3.Connection) -> None:
+            con.execute(
+                "update bot_warning_inbox set resolved=1, resolved_at=?, "
+                "resolved_by=?, updated_at=? where warning_key=? and resolved=0",
+                (now, "checked-add", now, key),
+            )
+
+        try:
+            write_transaction(self.repository.state_db, txn)
+        except Exception:
+            return
 
     def _notify_confirmation(self, item: Mapping[str, Any]) -> None:
         if self.notifications is None:
@@ -1266,14 +1363,16 @@ class CheckedAddService:
             return []
         values = sorted(states)
         placeholders = ",".join("?" for _ in values)
+        now = int(self.now())
         con = readonly_connect(self.repository.state_db)
         try:
             return [
                 dict(row)
                 for row in con.execute(
                     f"select * from bot_add_items where state in ({placeholders}) "
+                    "and (next_run_at is null or next_run_at<=?) "
                     "order by updated_at,id limit ?",
-                    (*values, int(limit)),
+                    (*values, now, int(limit)),
                 )
             ]
         finally:
@@ -1358,7 +1457,7 @@ class CheckedAddService:
             item_id, self.owner, now + self.lease_sec
         )
 
-    def _owned_snapshot(
+    def _opaque_owned_snapshot(
         self, item: Mapping[str, Any], *, missing_ok: bool = False
     ) -> dict[str, Any] | None:
         torrent_hash = str(item.get("qbt_hash") or "").lower()
@@ -1372,9 +1471,23 @@ class CheckedAddService:
             raise ValueError("qbt_precheck_hash_mismatch")
         if not tag or tag not in self._tags(snapshot):
             raise ValueError("qbt_precheck_tag_mismatch")
+        return dict(snapshot)
+
+    def _require_stopped(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        snapshot = self._opaque_owned_snapshot(item)
+        if str(snapshot.get("state") or "").strip().lower() not in self._STOPPED_STATES:
+            raise ValueError("qbt_stop_not_observed")
+        return snapshot
+
+    def _owned_snapshot(
+        self, item: Mapping[str, Any], *, missing_ok: bool = False
+    ) -> dict[str, Any] | None:
+        snapshot = self._opaque_owned_snapshot(item, missing_ok=missing_ok)
+        if snapshot is None:
+            return None
         if str(snapshot.get("state") or "").strip().lower() not in self._STOPPED_STATES:
             raise ValueError("qbt_precheck_not_stopped")
-        return dict(snapshot)
+        return snapshot
 
     def _managed_snapshot(self, item: Mapping[str, Any]) -> dict[str, Any]:
         torrent_hash = str(item.get("qbt_hash") or "").lower()
@@ -1384,6 +1497,24 @@ class CheckedAddService:
         if str(snapshot.get("category") or "") != "auto" or "checked" not in self._tags(snapshot):
             raise ValueError("qbt_enrolled_ownership")
         return dict(snapshot)
+
+    def _enrollment_guard(
+        self, item_id: int, token: tuple[str, int], torrent_hash: str, tag: str
+    ) -> bool:
+        try:
+            current = self.repository.get_item(item_id)
+            if (
+                current.get("state") != "enrolling"
+                or str(current.get("metadata_lease_owner") or "") != token[0]
+                or int(current.get("metadata_lease_generation") or 0) != token[1]
+                or int(current.get("metadata_lease_until") or 0) <= int(self.now())
+                or str(current.get("qbt_hash") or "").lower() != str(torrent_hash).lower()
+                or str(current.get("qbt_precheck_tag") or "") != tag
+            ):
+                return False
+            return self._opaque_owned_snapshot(current) is not None
+        except Exception:
+            return False
 
     def _lease_owned_guard(self, item_id: int, token: tuple[str, int]) -> bool:
         try:
@@ -1395,7 +1526,7 @@ class CheckedAddService:
                 or int(current.get("metadata_lease_until") or 0) <= int(self.now())
             ):
                 return False
-            return self._owned_snapshot(current) is not None
+            return self._opaque_owned_snapshot(current) is not None
         except Exception:
             return False
 

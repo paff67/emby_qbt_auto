@@ -53,7 +53,11 @@ class FakeGateway:
         return True
 
     def stop(self, torrent_hash, *, guard=None):
-        return self._write("stop", {"hashes": torrent_hash}, guard)
+        ok = self._write("stop", {"hashes": torrent_hash}, guard)
+        if ok:
+            self.snapshot["state"] = "stoppedDL"
+            self.snapshot["force_start"] = False
+        return ok
 
     def set_category(self, torrent_hash, category, *, guard=None):
         ok = self._write("category", {"hashes": torrent_hash, "category": category}, guard)
@@ -219,10 +223,16 @@ def test_priority_write_failure_leaves_enrolling_held_and_retry_recovers(tmp_pat
     queue, gateway, service, item_id = _fixture(tmp_path)
     gateway.fail_next_priority_write = True
 
-    assert service.tick()["errors"] == 1
-    assert queue.get_item(item_id)["state"] == "enrolling"
+    first = service.tick()
+    assert first["errors"] == 0
+    assert first["enrolled"] == []
+    item = queue.get_item(item_id)
+    assert item["state"] == "enrolling"
+    assert item["attempts"] == 1
+    assert item["last_error"] == "qbt_write_fenced"
     assert "hold" in gateway._tags()
 
+    service.now.value = int(item["next_run_at"])
     assert service.tick()["enrolled"] == [item_id]
     assert gateway.files[0]["priority"] == 1
 
@@ -230,7 +240,7 @@ def test_priority_write_failure_leaves_enrolling_held_and_retry_recovers(tmp_pat
 def test_batch_cancel_rejects_active_enrollment_without_mutating_lease_or_marker(tmp_path):
     queue, gateway, service, item_id = _fixture(tmp_path)
     gateway.fail_next_priority_write = True
-    assert service.tick()["errors"] == 1
+    assert service.tick()["enrolled"] == []
     before = queue.get_item(item_id)
 
     with pytest.raises(ValueError, match="^batch_requires_guarded_cancel$"):
@@ -238,6 +248,7 @@ def test_batch_cancel_rejects_active_enrollment_without_mutating_lease_or_marker
 
     after = queue.get_item(item_id)
     assert after == before
+    service.now.value = int(after["next_run_at"])
     assert service.tick()["enrolled"] == [item_id]
     assert gateway.removed is False
 
@@ -478,10 +489,12 @@ def test_enrollment_qbt_writes_then_db_failure_reconciles_without_start(
         return original(item, expected, new_state, *args, **kwargs)
 
     monkeypatch.setattr(queue, "transition_item", fail_once)
-    assert service.tick()["errors"] == 1
+    first = service.tick()
+    assert first["errors"] == 1
     assert queue.get_item(item_id)["state"] == "enrolling"
     assert "add-item-" in gateway.snapshot["tags"]
 
+    # Enrollment writes already converged; next tick only needs DB commit.
     recovered = service.tick()
 
     assert recovered["enrolled"] == [item_id]
@@ -692,3 +705,119 @@ def test_precheck_gateway_delete_tags_is_guarded_and_gc_eligible_only():
         raise AssertionError("expected ValueError")
     except ValueError as exc:
         assert str(exc) == "qbt_precheck_tag"
+
+
+def test_enrolling_running_auto_recovers_without_start(tmp_path):
+    queue, gateway, service, item_id = _fixture(tmp_path)
+    opaque_tag = "add-item-" + "b" * 32
+    queue.transition_item(
+        item_id,
+        {"prechecking"},
+        "ready",
+        "manual",
+        {
+            "decision": "unique",
+            "decision_reason": "unique",
+            "normalized_media_id": "SONE-792",
+            "primary_video_size": gateway.files[0]["size"],
+            "display_name": "SONE-792.mkv",
+        },
+    )
+    queue.transition_item(item_id, {"ready"}, "enrolling", "automatic_enrollment")
+    gateway.snapshot.update(
+        {
+            "state": "downloading",
+            "category": "auto",
+            "tags": f"checked,hold,{opaque_tag}",
+            "force_start": False,
+        }
+    )
+    gateway.files[0]["priority"] = 1
+
+    result = service.tick()
+
+    item = queue.get_item(item_id)
+    assert result["enrolled"] == [item_id]
+    assert item["state"] == "enrolled"
+    assert item["qbt_precheck_tag"] is None
+    assert gateway.snapshot["state"] == "stoppedDL"
+    assert gateway.snapshot["force_start"] is False
+    assert gateway.snapshot["category"] == "auto"
+    assert gateway.files[0]["priority"] == 1
+    assert opaque_tag not in gateway._tags()
+    assert "hold" not in gateway._tags()
+    assert "checked" in gateway._tags()
+    assert not any(name == "start" for name, _ in gateway.posts)
+
+
+def test_enrollment_replay_after_each_injected_failure(tmp_path):
+    queue, gateway, service, item_id = _fixture(tmp_path)
+    torrent_hash = gateway.torrent_hash
+    fail_names = [
+        "stop",
+        "file_priority",
+        "file_priority",
+        "add_tags",
+        "remove_tags",
+        "force",
+        "category",
+    ]
+    original_write = gateway._write
+    calls = {"n": 0}
+
+    def flaky_write(name, payload, guard):
+        # Fail once on the first occurrence of each target write name in order.
+        if calls["n"] < len(fail_names) and name == fail_names[calls["n"]]:
+            calls["n"] += 1
+            if guard is not None and not guard():
+                return False
+            gateway.posts.append((f"fail_{name}", dict(payload)))
+            return False
+        return original_write(name, payload, guard)
+
+    gateway._write = flaky_write
+
+    # Drive through each injected failure with backoff advances.
+    for _ in range(len(fail_names)):
+        result = service.tick()
+        item = queue.get_item(item_id)
+        assert item["state"] == "enrolling"
+        assert result["enrolled"] == []
+        assert item["next_run_at"] is not None
+        service.now.value = int(item["next_run_at"])
+
+    gateway._write = original_write
+    final = service.tick()
+    item = queue.get_item(item_id)
+    assert final["enrolled"] == [item_id]
+    assert item["state"] == "enrolled"
+    assert item["qbt_hash"] == torrent_hash
+    assert item["qbt_precheck_tag"] is None
+    assert sum(name == "delete" for name, _ in gateway.posts) == 0
+    assert not any(name == "start" for name, _ in gateway.posts)
+
+
+def test_enrollment_stuck_warning_after_three_failures(tmp_path):
+    from qbt_orchestrator.warning_inbox import WarningInboxRepository, WarningService
+
+    queue, gateway, service, item_id = _fixture(tmp_path)
+    warnings = WarningService(queue.state_db, now=service.now)
+    service.warning_service = warnings
+    gateway.fail_next_priority_write = True
+
+    for _ in range(3):
+        gateway.fail_next_priority_write = True
+        service.tick()
+        item = queue.get_item(item_id)
+        service.now.value = int(item["next_run_at"])
+
+    inbox = WarningInboxRepository(queue.state_db, now=service.now)
+    rows = inbox.list_unread(limit=20)
+    keys = {row["warning_key"] for row in rows}
+    assert f"checked_add:enrollment_stuck:{item_id}" in keys
+
+    gateway.fail_next_priority_write = False
+    service.tick()
+    rows = inbox.list_unread(limit=20)
+    keys = {row["warning_key"] for row in rows}
+    assert f"checked_add:enrollment_stuck:{item_id}" not in keys

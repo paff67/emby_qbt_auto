@@ -163,6 +163,7 @@ _AUTOMATIC_TERMINAL_CLEAR_FIELDS = frozenset(
         "metadata_lease_owner",
         "metadata_lease_until",
         "next_run_at",
+        "last_error",
     }
 )
 _RAW_INPUT_FIELDS = frozenset({"raw_input", "raw_input_expires_at"})
@@ -1193,6 +1194,7 @@ class BotAddQueueRepository:
             if target_state in _AUTOMATIC_TERMINAL_ITEM_STATES:
                 for field in _AUTOMATIC_TERMINAL_CLEAR_FIELDS:
                     assignments[field] = None
+                assignments["attempts"] = 0
                 if target_state not in {"enrolled", "enrolled_hold"}:
                     assignments["qbt_precheck_tag"] = None
                 if target_state in _RAW_CLEAR_ITEM_STATES:
@@ -1302,6 +1304,58 @@ class BotAddQueueRepository:
             )
             if cursor.rowcount != 1:
                 raise ValueError("enrollment_marker_conflict")
+            return self._safe_item_in_transaction(con, item_key)
+
+        return dict(write_transaction(self.state_db, txn))
+
+    def record_enrollment_retry(
+        self,
+        item_id: int,
+        *,
+        metadata_lease_owner: str,
+        metadata_lease_generation: int,
+        error_code: str,
+        next_run_at: int,
+    ) -> dict[str, Any]:
+        item_key = self._positive_id(item_id, "item_id")
+        owner = self._identity(metadata_lease_owner, "owner")
+        generation = int(metadata_lease_generation)
+        if generation <= 0:
+            raise ValueError("metadata_lease_generation")
+        code = str(error_code or "").strip()
+        if not _SAFE_CODE.fullmatch(code):
+            raise ValueError("last_error")
+        now = self._timestamp()
+        due_at = self._future_timestamp(next_run_at, now, "next_run_at")
+
+        def txn(con: sqlite3.Connection) -> dict[str, Any]:
+            self._begin_immediate(con)
+            row = self._item_in_transaction(con, item_key)
+            if str(row["state"]) != "enrolling":
+                raise ValueError("state_conflict")
+            if (
+                str(row["metadata_lease_owner"] or "") != owner
+                or int(row["metadata_lease_generation"] or 0) != generation
+            ):
+                raise ValueError("metadata_lease_conflict")
+            attempts = int(row["attempts"] or 0) + 1
+            cursor = con.execute(
+                "update bot_add_items set attempts=?, last_error=?, next_run_at=?, "
+                "updated_at=? where id=? and state=? and metadata_lease_owner=? "
+                "and metadata_lease_generation=?",
+                (
+                    attempts,
+                    code,
+                    due_at,
+                    now,
+                    item_key,
+                    "enrolling",
+                    owner,
+                    generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("state_conflict")
             return self._safe_item_in_transaction(con, item_key)
 
         return dict(write_transaction(self.state_db, txn))
