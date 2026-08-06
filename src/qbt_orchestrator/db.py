@@ -1044,6 +1044,11 @@ def migration_sql() -> list[str]:
         "alter table telegram_panel_session add column last_refresh_attempt_at integer",
         "insert or ignore into schema_migrations(version,name,applied_at) "
         "values(24,'telegram_panel_refresh_attempt_v1',strftime('%s','now'))",
+        # Migration 25: /start recreate generation + start update idempotency.
+        "alter table telegram_panel_session add column panel_generation integer not null default 0",
+        "alter table telegram_panel_session add column last_start_update_id integer",
+        "insert or ignore into schema_migrations(version,name,applied_at) "
+        "values(25,'telegram_panel_recreate_generation_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

@@ -2453,3 +2453,25 @@ def test_concurrent_submits_enforce_global_backlog_without_partial_shards(tmp_pa
     assert sorted(states) == ["draft", "queued"]
     assert sorted(len(queues[0].list_shards(batch["id"])) for batch in batches) == [0, 2]
     assert queues[0].submitted_nonterminal_count() == 6
+
+
+def test_magnet_dn_is_stored_as_display_name(tmp_path):
+    from qbt_orchestrator.bot_add_queue import BotAddQueueRepository
+    from qbt_orchestrator.db import migrate
+
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(db, now=lambda: 2_000_000_000)
+    batch = queue.open_draft("1", "1")
+    magnet = (
+        "magnet:?"
+        + "xt=urn:btih:"
+        + "a" * 40
+        + "&dn=BBAN-523"
+    )
+    queue.append_message(batch["id"], 1, [magnet])
+    item = queue.list_items(batch["id"])[0]
+    assert item["display_name"] == "BBAN-523"
+    assert item["raw_input"] is None or "magnet" in str(
+        queue.get_item(item["id"], include_raw=True).get("raw_input") or ""
+    )

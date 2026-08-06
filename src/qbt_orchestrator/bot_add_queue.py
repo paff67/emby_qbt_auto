@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .db import readonly_connect, write_transaction
 
@@ -355,8 +355,9 @@ class BotAddQueueRepository:
                 cursor = con.execute(
                     "insert or ignore into bot_add_items("
                     "batch_id,source_message_id,source_index,input_kind,raw_input,"
-                    "raw_input_expires_at,redacted_input,input_sha256,state,created_at,updated_at"
-                    ") values(?,?,?,?,?,?,?,?,?,?,?)",
+                    "raw_input_expires_at,redacted_input,input_sha256,display_name,"
+                    "state,created_at,updated_at"
+                    ") values(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         batch_key,
                         source_message_id,
@@ -366,6 +367,7 @@ class BotAddQueueRepository:
                         expires_at,
                         link["redacted_input"],
                         link["input_sha256"],
+                        link.get("display_name"),
                         "received",
                         now,
                         now,
@@ -1508,11 +1510,27 @@ class BotAddQueueRepository:
                     "input_kind": kind,
                     "input_sha256": digest,
                     "redacted_input": self._redact_input(value, kind),
+                    "display_name": self._display_name_from_input(value, kind),
                 }
             )
         if sum(int(link["byte_length"]) for link in result) > self.limits.max_draft_bytes:
             raise ValueError("draft_byte_limit")
         return result
+
+    @staticmethod
+    def _display_name_from_input(value: str, kind: str) -> str | None:
+        if kind != "magnet":
+            return None
+        try:
+            names = parse_qs(urlsplit(value).query).get("dn") or []
+        except (TypeError, ValueError):
+            return None
+        if not names:
+            return None
+        raw = unquote(str(names[0] or "")).strip()
+        if not raw:
+            return None
+        return raw[:160]
 
     @staticmethod
     def _classify(value: str) -> str:
