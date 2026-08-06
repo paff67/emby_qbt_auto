@@ -832,3 +832,51 @@ def test_qbt_clients_reject_non_list_tag_payloads():
         raise AssertionError("expected RuntimeError")
     except RuntimeError as exc:
         assert "JSON array" in str(exc)
+
+
+def test_telegram_http_api_delete_message_and_missing_is_idempotent(monkeypatch):
+    import io
+    from urllib import error
+
+    from qbt_orchestrator.integrations.telegram import TelegramHttpApi
+
+    calls = []
+
+    class FakeResp:
+        def __init__(self, status, body):
+            self.status = status
+            self._body = body.encode("utf-8")
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        calls.append((req.full_url, req.data, timeout))
+        method = req.full_url.rsplit("/", 1)[-1]
+        if method == "deleteMessage" and b"message_id=99" in (req.data or b""):
+            raise error.HTTPError(
+                req.full_url,
+                400,
+                "Bad Request",
+                hdrs=None,
+                fp=io.BytesIO(
+                    b'{"ok":false,"description":"Bad Request: message to delete not found"}'
+                ),
+            )
+        return FakeResp(200, '{"ok":true,"result":true}')
+
+    monkeypatch.setattr(
+        "qbt_orchestrator.integrations.telegram.request.urlopen", fake_urlopen
+    )
+    api = TelegramHttpApi("123:ABC", timeout=5)
+    assert api.delete_message(7, 55)["ok"] is True
+    assert "deleteMessage" in calls[0][0]
+    assert b"chat_id=7" in calls[0][1]
+    assert b"message_id=55" in calls[0][1]
+    assert api.delete_message(7, 99)["ok"] is True

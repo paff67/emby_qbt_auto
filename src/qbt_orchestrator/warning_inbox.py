@@ -281,6 +281,37 @@ class WarningInboxRepository:
 
         return int(write_transaction(self.state_db, txn))
 
+    def resolve_by_item(
+        self,
+        item_id: int,
+        admin_id: str = "system",
+        *,
+        states: frozenset[str] | set[str] | None = None,
+    ) -> int:
+        """Resolve checked_add:batch_failed warnings for an item in recovered states."""
+        item_key = int(item_id)
+        if item_key <= 0:
+            raise ValueError("item_id")
+        now = int(self.now())
+        allowed = states
+
+        def txn(con) -> int:
+            if allowed is not None:
+                row = con.execute(
+                    "select state from bot_add_items where id=?", (item_key,)
+                ).fetchone()
+                if row is None or str(row["state"]) not in allowed:
+                    return 0
+            cur = con.execute(
+                "update bot_warning_inbox set resolved=1,resolved_at=?,resolved_by=?,"
+                "updated_at=? where resolved=0 and related_item_id=? "
+                "and warning_key like 'checked_add:batch_failed:%'",
+                (now, str(admin_id)[:128], now, item_key),
+            )
+            return int(cur.rowcount)
+
+        return int(write_transaction(self.state_db, txn))
+
     def copy_summary(self, warning_id: int) -> str:
         con = readonly_connect(self.state_db)
         try:

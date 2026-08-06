@@ -45,6 +45,7 @@ class TelegramApiProtocol(Protocol):
     def edit_message_text(
         self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None
     ) -> Any: ...
+    def delete_message(self, chat_id: int, message_id: int) -> Any: ...
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> Any: ...
     def send_document(
         self, chat_id: int, path: str, *, filename: str | None = None, caption: str | None = None
@@ -128,6 +129,12 @@ class TelegramHttpApi:
                     and "message is not modified" in description.lower()
                 ):
                     return {"ok": True, "result": True, "description": description}
+                if (
+                    method == "deleteMessage"
+                    and http_status == 400
+                    and "message to delete not found" in description.lower()
+                ):
+                    return {"ok": True, "result": True, "description": description}
                 retry_after = self._retry_after(body)
                 if retry_on_429 and http_status == 429 and attempts == 1:
                     self.sleeper(min(int(retry_after or 1), 30))
@@ -149,6 +156,11 @@ class TelegramHttpApi:
             if (
                 method == "editMessageText"
                 and "message is not modified" in description.lower()
+            ):
+                return {"ok": True, "result": True, "description": description}
+            if (
+                method == "deleteMessage"
+                and "message to delete not found" in description.lower()
             ):
                 return {"ok": True, "result": True, "description": description}
             retry_after = self._retry_after(body)
@@ -214,6 +226,12 @@ class TelegramHttpApi:
         if reply_markup is not None:
             payload["reply_markup"] = json.dumps(reply_markup)
         return self._post_form("editMessageText", payload, retry_on_429=True)
+
+    def delete_message(self, chat_id: int, message_id: int) -> Any:
+        return self._post_form(
+            "deleteMessage",
+            {"chat_id": int(chat_id), "message_id": int(message_id)},
+        )
 
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> Any:
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}

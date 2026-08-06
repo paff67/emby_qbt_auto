@@ -471,15 +471,22 @@ class MetadataProbeCoordinator:
     def _notify_metadata_unavailable(self, item: Mapping[str, Any]) -> bool:
         if self.warning_service is None:
             return False
+        from .batch_failure_warnings import item_label
+
         item_id = int(item["id"])
         try:
             generation = int(item["approval_generation"])
             batch_id = int(item["batch_id"])
+            label = item_label(item)
             self.warning_service.report(
                 warning_key=f"checked_add:metadata_unavailable:{item_id}",
                 severity="warning",
                 topic="metadata_probe",
-                safe_message="暂时无法获取元数据，请从批次详情选择重试或取消。",
+                safe_message=(
+                    f"暂时无法获取元数据：{label}\n"
+                    f"批次：#{batch_id}；原因：连续探测失败\n"
+                    "请从批次详情选择重试或取消。"
+                ),
                 related_batch_id=batch_id,
                 related_item_id=item_id,
                 projection_payload={

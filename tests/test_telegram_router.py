@@ -12,6 +12,7 @@ class FakeApi:
         self.edits: list[tuple] = []
         self.callbacks: list[tuple] = []
         self.documents: list[tuple] = []
+        self.deletes: list[tuple] = []
         self._next_id = 10
 
     def get_updates(self, offset, timeout):
@@ -24,6 +25,10 @@ class FakeApi:
 
     def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
         self.edits.append((chat_id, message_id, text, reply_markup))
+        return {"ok": True}
+
+    def delete_message(self, chat_id, message_id):
+        self.deletes.append((chat_id, message_id))
         return {"ok": True}
 
     def answer_callback_query(self, callback_query_id, text=None):
@@ -511,3 +516,69 @@ def test_authorized_admin_can_rebind_panel_via_start_in_new_chat(tmp_path):
     assert str(session["chat_id"]) == "8"
     assert int(session["message_id"]) != old_id
     assert any(chat_id == 8 for chat_id, _text, _markup in api.messages)
+
+
+def test_stale_panel_callback_is_rejected_without_side_effects(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    api = FakeApi()
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    router.handle_update(
+        {
+            "update_id": 10,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 7},
+                "from": {"id": 42},
+                "text": "/start",
+            },
+        }
+    )
+    current_id = api._next_id
+    router.handle_update(
+        {
+            "update_id": 11,
+            "message": {
+                "message_id": 2,
+                "chat": {"id": 7},
+                "from": {"id": 42},
+                "text": "/start",
+            },
+        }
+    )
+    assert len(api.messages) == 2
+    assert api.deletes
+    # Old message callback must not navigate.
+    edits_before = len(api.edits)
+    router.handle_update(
+        {
+            "update_id": 12,
+            "callback_query": {
+                "id": "stale",
+                "from": {"id": 42},
+                "message": {"message_id": current_id, "chat": {"id": 7}},
+                "data": "n:q:0",
+            },
+        }
+    )
+    assert len(api.edits) == edits_before
+    assert api.callbacks[-1][1] == "控制台已刷新，请使用最新消息"
+    # Current panel still works.
+    router.handle_update(
+        {
+            "update_id": 13,
+            "callback_query": {
+                "id": "fresh",
+                "from": {"id": 42},
+                "message": {"message_id": api._next_id, "chat": {"id": 7}},
+                "data": "n:q:0",
+            },
+        }
+    )
+    assert len(api.edits) > edits_before

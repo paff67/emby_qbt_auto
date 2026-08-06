@@ -125,8 +125,13 @@ class TelegramUpdateRouter:
             if command in MUTATING_COMMANDS and not self._can_mutate(user_id):
                 self._panel_error(chat_id, "只读账号不能执行此操作")
                 return
-            if command in {"start", "help"}:
-                self.panel.open_home(chat_id)
+            if command == "start":
+                self.panel.open_home(
+                    chat_id, update_id=int(update.get("update_id") or 0)
+                )
+                return
+            if command == "help":
+                self.panel.navigate(chat_id, "n:h")
                 return
             if command == "status":
                 self.panel.navigate(chat_id, "n:s:0")
@@ -261,6 +266,24 @@ class TelegramUpdateRouter:
         if not self.authorizer.role_for(user_id):
             self._answer(callback_id, "无权访问")
             return
+
+        # Reject callbacks from a bound console's retired/stale message.
+        # External confirmation messages (different message_id) stay allowed.
+        session = self.panel.sessions.get()
+        bound = (
+            session is not None
+            and session.get("message_id") is not None
+            and str(session.get("chat_id") or "") == str(chat_id)
+        )
+        if bound and data.startswith(("n:", "a:", "w:")):
+            if int(session["message_id"]) != int(message_id):
+                self._answer(callback_id, "控制台已刷新，请使用最新消息")
+                return
+        if bound and data.startswith("i:"):
+            retired = session.get("last_retired_message_id")
+            if retired is not None and int(retired) == int(message_id):
+                self._answer(callback_id, "控制台已刷新，请使用最新消息")
+                return
 
         parts = data.split(":")
         try:

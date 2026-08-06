@@ -15,6 +15,7 @@ class FakeApi:
     def __init__(self):
         self.messages: list[tuple] = []
         self.edits: list[tuple] = []
+        self.deletes: list[tuple] = []
         self._next_id = 100
 
     def send_message(self, chat_id, text, reply_markup=None):
@@ -24,6 +25,10 @@ class FakeApi:
 
     def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
         self.edits.append((chat_id, message_id, text, reply_markup))
+        return {"ok": True, "result": True}
+
+    def delete_message(self, chat_id, message_id):
+        self.deletes.append((chat_id, message_id))
         return {"ok": True, "result": True}
 
 
@@ -43,7 +48,7 @@ def test_panel_session_bind_and_route(tmp_path):
     assert row["last_render_hash"] == "abc"
 
 
-def test_persistent_panel_edits_existing_and_skips_unchanged(tmp_path):
+def test_start_creates_new_console_and_retires_old(tmp_path):
     db = tmp_path / "panel.sqlite"
     migrate(db)
     api = FakeApi()
@@ -53,13 +58,37 @@ def test_persistent_panel_edits_existing_and_skips_unchanged(tmp_path):
         renderer=TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000),
         now=lambda: 1000,
     )
-    controller.open_home(7)
+    controller.open_home(7, update_id=1)
     assert len(api.messages) == 1
-    assert len(api.edits) == 0
+    first_id = api.messages[0][3]
+    controller.open_home(7, update_id=2)
+    assert len(api.messages) == 2
+    second_id = api.messages[1][3]
+    assert second_id != first_id
+    session = controller.sessions.get()
+    assert int(session["message_id"]) == second_id
+    assert api.deletes == [(7, first_id)]
+    # Duplicate update id is a no-op.
+    controller.open_home(7, update_id=2)
+    assert len(api.messages) == 2
+
+
+def test_persistent_panel_refresh_edits_current_and_skips_unchanged(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+    api = FakeApi()
+    controller = PersistentPanelController(
+        db,
+        api=api,
+        renderer=TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000),
+        now=lambda: 1000,
+    )
+    controller.open_home(7, update_id=1)
+    assert len(api.messages) == 1
     message_id = api.messages[0][3]
-    controller.open_home(7)
-    assert len(api.messages) == 1
-    assert len(api.edits) == 0  # digest unchanged
+    controller.refresh_now()
+    assert len(api.edits) == 1
+    assert api.edits[0][1] == message_id
     write_execute(
         db,
         "insert into torrent_health("
@@ -67,9 +96,35 @@ def test_persistent_panel_edits_existing_and_skips_unchanged(tmp_path):
         "values('h1','SONE-792',1,100,0.5,1,1)",
     )
     controller.refresh_now()
-    assert len(api.edits) == 1
-    assert api.edits[0][1] == message_id
-    assert "SONE-792" in api.edits[0][2]
+    assert len(api.edits) == 2
+    assert api.edits[-1][1] == message_id
+    assert "SONE-792" in api.edits[-1][2]
+
+
+def test_open_home_keeps_old_session_when_send_fails(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+
+    class FailSendApi(FakeApi):
+        def send_message(self, chat_id, text, reply_markup=None):
+            if self.messages:
+                raise RuntimeError("send failed")
+            return super().send_message(chat_id, text, reply_markup)
+
+    api = FailSendApi()
+    controller = PersistentPanelController(
+        db,
+        api=api,
+        renderer=TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000),
+        now=lambda: 1000,
+    )
+    controller.open_home(7, update_id=1)
+    first_id = api.messages[0][3]
+    with pytest.raises(RuntimeError):
+        controller.open_home(7, update_id=2)
+    session = controller.sessions.get()
+    assert int(session["message_id"]) == first_id
+    assert api.deletes == []
 
 
 def test_refresh_if_due_only_on_home(tmp_path):

@@ -53,6 +53,7 @@ from .runtime import (
 from .scheduler_engine import SchedulerEngine
 from .soak_queue import SoakQueueConfig, SoakQueueResult, SoakQueueService
 from .telegram_batch_summary import BatchSummaryProjector
+from .batch_failure_warnings import BatchFailureWarningProjector
 from .telegram_control import TelegramAuthorizer
 from .work_items import build_full_finish_work_items
 
@@ -387,6 +388,7 @@ class DaemonRuntime:
         warning_service=None,
         processed_media=None,
         batch_summary_projector=None,
+        batch_failure_warning_projector=None,
         sync_repeated_full_limit: int = 3,
         sync_degraded_interval_sec: float = 10.0,
         safety_event_sample_interval_sec: float = 60.0,
@@ -558,6 +560,15 @@ class DaemonRuntime:
         self.batch_summary_projector = (
             batch_summary_projector or BatchSummaryProjector(self.state_db)
         )
+        if batch_failure_warning_projector is not None:
+            self.batch_failure_warning_projector = batch_failure_warning_projector
+        elif warning_service is not None:
+            self.batch_failure_warning_projector = BatchFailureWarningProjector(
+                self.state_db,
+                warning_service,
+            )
+        else:
+            self.batch_failure_warning_projector = None
         self.loop_tasks = loop_tasks if loop_tasks is not None else self._default_loop_tasks()
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -689,6 +700,15 @@ class DaemonRuntime:
                     max_runtime_sec=5,
                 )
             )
+        if self.batch_failure_warning_projector is not None:
+            tasks.append(
+                LoopTask(
+                    "batch_failure_warnings",
+                    15,
+                    self.batch_failure_warning_tick,
+                    max_runtime_sec=2,
+                )
+            )
         tasks.append(
             LoopTask(
                 "batch_summary",
@@ -703,6 +723,11 @@ class DaemonRuntime:
         if self.batch_summary_projector is None:
             return {"status": "disabled"}
         return self.batch_summary_projector.tick()
+
+    def batch_failure_warning_tick(self) -> dict:
+        if self.batch_failure_warning_projector is None:
+            return {"status": "disabled"}
+        return self.batch_failure_warning_projector.tick()
 
     def bot_add_ingress_tick(self) -> dict:
         if self.bot_add_ingress_coordinator is None:

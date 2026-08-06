@@ -352,9 +352,13 @@ class DashboardRepository:
             total = con.execute("select count(*) from bot_warning_inbox").fetchone()[0]
             rows = list(
                 con.execute(
-                    "select id,severity,topic,safe_message,occurrence_count,resolved,"
-                    "last_occurred_at from bot_warning_inbox "
-                    "order by resolved asc, last_occurred_at desc, id desc "
+                    "select w.id,w.severity,w.topic,w.safe_message,w.occurrence_count,"
+                    "w.resolved,w.last_occurred_at,w.related_batch_id,w.related_item_id,"
+                    "i.normalized_media_id,i.display_name,i.source_index,i.state as item_state,"
+                    "i.last_error,i.canonical_identity "
+                    "from bot_warning_inbox w "
+                    "left join bot_add_items i on i.id=w.related_item_id "
+                    "order by w.resolved asc, w.last_occurred_at desc, w.id desc "
                     "limit ? offset ?",
                     (PAGE_SIZE, offset),
                 )
@@ -629,18 +633,33 @@ class TelegramPanelRenderer:
         return PanelView(text=text, reply_markup={"inline_keyboard": buttons})
 
     def render_warnings(self, page: int = 0) -> PanelView:
+        from .batch_failure_warnings import failure_stage_label, item_label
+
         rows, total = self.dashboard.warning_pages(page=page)
-        lines = ["⚠️ 警告中心", f"第 {page + 1} 页"]
+        lines = ["⚠️ 警告中心", f"第 {page + 1} 页", ""]
         buttons: list[list[dict[str, Any]]] = []
         if not rows:
             lines.append("当前没有警告。")
         view_row: list[dict[str, Any]] = []
         for row in rows:
-            marker = "未读" if int(row["resolved"] or 0) == 0 else "已读"
-            lines.append(
-                f"#{row['id']} [{row['severity']}] {marker} {row['topic']} "
-                f"x{row['occurrence_count']}: {str(row['safe_message'])[:80]}"
+            marker = "❌" if int(row["resolved"] or 0) == 0 else "✅"
+            if row.get("related_item_id") is not None:
+                label = item_label(row)
+                stage = failure_stage_label(str(row.get("item_state") or row.get("topic") or ""))
+                title = f"{marker} {label} · {stage}"
+            else:
+                title = f"{marker} {str(row.get('safe_message') or row.get('topic') or '警告')[:80]}"
+            batch_bit = (
+                f"批次 #{row['related_batch_id']} · "
+                if row.get("related_batch_id") is not None
+                else ""
             )
+            lines.append(title)
+            lines.append(
+                f"{batch_bit}最近发生：{_fmt_shanghai(row.get('last_occurred_at'))} · "
+                f"第 {int(row['occurrence_count'] or 1)} 次"
+            )
+            lines.append("")
             view_row.append(
                 _btn(
                     f"查看 #{row['id']}",
@@ -654,7 +673,7 @@ class TelegramPanelRenderer:
                 view_row = []
         if view_row:
             buttons.append(view_row)
-        text = _clip_body("\n".join(lines))
+        text = _clip_body("\n".join(lines).rstrip())
         buttons.append(
             [_btn("全部标为已读", encode_callback(["w", "ra", "0"]))]
         )
@@ -688,6 +707,12 @@ class TelegramPanelRenderer:
                     ]
                 },
             )
+        # Enrich with related item fields when available.
+        pages, _total = self.dashboard.warning_pages(page=0)
+        for row in pages:
+            if int(row["id"]) == int(warning_id):
+                warning = {**warning, **row}
+                break
         return self.render_warning_detail(
             warning, copy_text=repo.copy_summary(int(warning_id))
         )
@@ -695,16 +720,26 @@ class TelegramPanelRenderer:
     def render_warning_detail(
         self, warning: Mapping[str, Any], *, copy_text: str
     ) -> PanelView:
+        from .batch_failure_warnings import failure_stage_label, item_label
+
         lines = [
             f"⚠️ 警告 #{warning['id']}",
-            f"级别：{warning['severity']}",
-            f"主题：{warning['topic']}",
-            f"首次时间：{_fmt_shanghai(warning.get('first_occurred_at'))}",
-            f"最后时间：{_fmt_shanghai(warning.get('last_occurred_at'))}",
-            f"累计次数：{warning['occurrence_count']}",
-            "",
-            str(warning["safe_message"]),
         ]
+        if warning.get("related_item_id") is not None:
+            lines.append(f"项目：{item_label(warning)}")
+            if warning.get("related_batch_id") is not None:
+                lines.append(f"批次：#{warning['related_batch_id']}")
+            if warning.get("item_state"):
+                lines.append(f"阶段：{failure_stage_label(str(warning['item_state']))}")
+        lines.extend(
+            [
+                f"首次时间：{_fmt_shanghai(warning.get('first_occurred_at'))}",
+                f"最后时间：{_fmt_shanghai(warning.get('last_occurred_at'))}",
+                f"累计次数：{warning['occurrence_count']}",
+                "",
+                str(warning["safe_message"]),
+            ]
+        )
         text = _clip_body("\n".join(lines))
         occ = int(warning["occurrence_count"])
         wid = int(warning["id"])

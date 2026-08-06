@@ -93,6 +93,77 @@ class PanelSessionRepository:
 
         write_transaction(self.state_db, txn)
 
+    def is_current(self, chat_id: int | str, message_id: int) -> bool:
+        session = self.get()
+        if session is None or session.get("message_id") is None:
+            return False
+        return (
+            str(session.get("chat_id") or "") == str(chat_id)
+            and int(session["message_id"]) == int(message_id)
+        )
+
+    def bind_new(
+        self,
+        chat_id: int | str,
+        message_id: int,
+        route: str,
+        digest: str,
+        now: int,
+        *,
+        start_update_id: int | None = None,
+        retired_message_id: int | None = None,
+    ) -> int:
+        route_text = str(route or "n:h")[:64]
+        digest_text = str(digest or "")[:128]
+        observed = int(now)
+
+        def txn(con) -> int:
+            existing = con.execute(
+                "select panel_generation from telegram_panel_session where id=1"
+            ).fetchone()
+            if existing is None:
+                generation = 1
+                con.execute(
+                    "insert into telegram_panel_session("
+                    "id,chat_id,message_id,current_route,last_render_hash,"
+                    "last_refreshed_at,panel_generation,last_start_update_id,"
+                    "last_retired_message_id,updated_at) "
+                    "values(1,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(chat_id),
+                        int(message_id),
+                        route_text,
+                        digest_text,
+                        observed,
+                        generation,
+                        start_update_id,
+                        retired_message_id,
+                        observed,
+                    ),
+                )
+                return generation
+            generation = int(existing["panel_generation"] or 0) + 1
+            con.execute(
+                "update telegram_panel_session set chat_id=?, message_id=?, "
+                "current_route=?, last_render_hash=?, last_refreshed_at=?, "
+                "panel_generation=?, last_start_update_id=?, "
+                "last_retired_message_id=?, updated_at=? where id=1",
+                (
+                    str(chat_id),
+                    int(message_id),
+                    route_text,
+                    digest_text,
+                    observed,
+                    generation,
+                    start_update_id,
+                    retired_message_id,
+                    observed,
+                ),
+            )
+            return generation
+
+        return int(write_transaction(self.state_db, txn))
+
     def set_route(self, route: str) -> None:
         now = int(self.now())
         route_text = str(route or "n:h")[:64]
@@ -161,9 +232,73 @@ class PersistentPanelController:
         self.now = now or (lambda: int(time.time()))
         self.sessions = sessions or PanelSessionRepository(self.state_db, now=self.now)
 
-    def open_home(self, chat_id: int) -> None:
-        # /start is the only path allowed to rebind the singleton to a new chat.
-        self.navigate(chat_id, "n:h", allow_rebind=True)
+    def open_home(self, chat_id: int, *, update_id: int | None = None) -> None:
+        """Force a brand-new console message for /start and retire the old one."""
+        session = self.sessions.get()
+        if (
+            update_id is not None
+            and session is not None
+            and session.get("last_start_update_id") is not None
+            and int(session["last_start_update_id"]) == int(update_id)
+        ):
+            return
+        old_chat = (
+            int(session["chat_id"])
+            if session is not None and str(session.get("chat_id") or "").strip()
+            else None
+        )
+        old_message_id = (
+            int(session["message_id"])
+            if session is not None and session.get("message_id") is not None
+            else None
+        )
+        view = self.renderer.render_home()
+        digest = _view_digest(view)
+        response = self.api.send_message(
+            chat_id, view.text, reply_markup=view.reply_markup
+        )
+        new_id = _extract_message_id(response)
+        if new_id is None:
+            # Do not overwrite the old binding when Telegram did not acknowledge.
+            return
+        now = int(self.now())
+        self.sessions.bind_new(
+            chat_id,
+            new_id,
+            "n:h",
+            digest,
+            now,
+            start_update_id=int(update_id) if update_id is not None else None,
+            retired_message_id=old_message_id,
+        )
+        if (
+            old_message_id is not None
+            and old_chat is not None
+            and (old_chat != int(chat_id) or old_message_id != int(new_id))
+        ):
+            self._retire_old_panel(old_chat, old_message_id)
+
+    def _retire_old_panel(self, chat_id: int, message_id: int) -> None:
+        from .integrations.telegram import TelegramApiError
+
+        try:
+            self.api.delete_message(chat_id, message_id)
+            return
+        except Exception as exc:
+            if isinstance(exc, TelegramApiError):
+                text = str(exc.description or "").lower()
+                if "message to delete not found" in text:
+                    return
+            # Best-effort archive: strip buttons so old callbacks die visually.
+            try:
+                self.api.edit_message_text(
+                    chat_id,
+                    message_id,
+                    "此控制台已刷新，请使用最新控制台消息。",
+                    reply_markup=None,
+                )
+            except Exception:
+                return
 
     def navigate(
         self, chat_id: int, route: str, *, allow_rebind: bool = False
