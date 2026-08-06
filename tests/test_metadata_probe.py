@@ -683,6 +683,60 @@ def test_metadata_tick_backfills_missing_warning_inbox(tmp_path):
     assert int(again["warning_backfilled"]) == 0
 
 
+def test_metadata_tick_enriches_legacy_warning_without_new_occurrence(tmp_path):
+    from qbt_orchestrator.db import write_execute
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.warning_inbox import WarningService
+
+    queue, gateway, _coordinator, clock, item_ids, db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    item_id = int(item_ids[0])
+    item = queue.get_item(item_id)
+    write_execute(
+        db,
+        "update bot_add_items set state='metadata_unavailable',approval_generation=1,"
+        "display_name='BBAN-523' where id=?",
+        (item_id,),
+    )
+    write_execute(
+        db,
+        "insert into bot_warning_inbox("
+        "warning_key,severity,topic,safe_message,related_batch_id,related_item_id,"
+        "occurrence_count,first_occurred_at,last_occurred_at,updated_at,resolved) "
+        "values(?,?,?,?,?,?,1,1,1,1,0)",
+        (
+            f"checked_add:metadata_unavailable:{item_id}",
+            "warning",
+            "metadata_probe",
+            "暂时无法获取元数据，请从批次详情选择重试或取消。",
+            int(item["batch_id"]),
+            item_id,
+        ),
+    )
+    coordinator = MetadataProbeCoordinator(
+        queue,
+        gateway,
+        owner="worker-a",
+        now=clock,
+        warning_service=WarningService(db, now=clock),
+    )
+    result = coordinator.tick(sync_healthy=False)
+    assert int(result["warning_backfilled"]) == 1
+    con = readonly_connect(db)
+    try:
+        warning = con.execute(
+            "select safe_message,occurrence_count,occurrence_fingerprint "
+            "from bot_warning_inbox where warning_key=?",
+            (f"checked_add:metadata_unavailable:{item_id}",),
+        ).fetchone()
+    finally:
+        con.close()
+    assert "BBAN-523" in str(warning["safe_message"])
+    assert int(warning["occurrence_count"]) == 1
+    assert str(warning["occurrence_fingerprint"]).startswith("metadata:")
+
+
 def test_timeout_never_touches_same_hash_without_item_tag_and_marks_duplicate(tmp_path):
     from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
     from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway

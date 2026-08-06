@@ -439,7 +439,7 @@ class MetadataProbeCoordinator:
     def _backfill_missing_metadata_warnings(
         self, *, limit: int = _WARNING_BACKFILL_LIMIT
     ) -> int:
-        """Recreate WarningInbox rows lost after metadata_unavailable persistence."""
+        """Create missing rows and enrich pre-fingerprint metadata warnings once."""
         if self.warning_service is None:
             return 0
         bound = max(1, min(int(_WARNING_BACKFILL_LIMIT), int(limit)))
@@ -448,16 +448,18 @@ class MetadataProbeCoordinator:
             rows = list(
                 con.execute(
                     "select i.id,i.batch_id,i.approval_generation,i.state,"
+                    "i.metadata_probe_attempt,"
                     "i.normalized_media_id,i.display_name,i.source_index,"
                     "i.canonical_identity "
                     "from bot_add_items i "
                     "where i.state='metadata_unavailable' "
-                    "and not exists ("
-                    "  select 1 from bot_warning_inbox w "
-                    "  where w.warning_key=("
-                    "    'checked_add:metadata_unavailable:' || i.id"
-                    "  )"
-                    ") "
+                    "and (not exists ("
+                    "  select 1 from bot_warning_inbox w where w.warning_key=("
+                    "    'checked_add:metadata_unavailable:' || i.id))"
+                    "or exists ("
+                    "  select 1 from bot_warning_inbox w where w.warning_key=("
+                    "    'checked_add:metadata_unavailable:' || i.id)"
+                    "  and w.occurrence_fingerprint is null)) "
                     "order by i.updated_at,i.id limit ?",
                     (bound,),
                 )
@@ -491,6 +493,10 @@ class MetadataProbeCoordinator:
                 ),
                 related_batch_id=batch_id,
                 related_item_id=item_id,
+                occurrence_fingerprint=(
+                    f"metadata:{item_id}:{generation}:"
+                    f"{int(item.get('metadata_probe_attempt') or 0)}"
+                ),
                 projection_payload={
                     "item_id": item_id,
                     "batch_id": batch_id,
