@@ -267,23 +267,13 @@ class TelegramUpdateRouter:
             self._answer(callback_id, "无权访问")
             return
 
-        # Reject callbacks from a bound console's retired/stale message.
-        # External confirmation messages (different message_id) stay allowed.
-        session = self.panel.sessions.get()
-        bound = (
-            session is not None
-            and session.get("message_id") is not None
-            and str(session.get("chat_id") or "") == str(chat_id)
-        )
-        if bound and data.startswith(("n:", "a:", "w:")):
-            if int(session["message_id"]) != int(message_id):
-                self._answer(callback_id, "控制台已刷新，请使用最新消息")
-                return
-        if bound and data.startswith("i:"):
-            retired = session.get("last_retired_message_id")
-            if retired is not None and int(retired) == int(message_id):
-                self._answer(callback_id, "控制台已刷新，请使用最新消息")
-                return
+        # Fence only messages that were actually bound as an old panel. Buttons
+        # on independent batch summaries and confirmation notifications remain valid.
+        if data.startswith(("n:", "a:", "i:", "w:")) and self.panel.sessions.is_retired(
+            chat_id, message_id
+        ):
+            self._answer(callback_id, "控制台已刷新，请使用最新消息")
+            return
 
         parts = data.split(":")
         try:

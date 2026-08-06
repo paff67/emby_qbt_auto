@@ -395,7 +395,7 @@ def test_static_guard_single_get_updates_path():
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         if '"getUpdates"' in text or "'getUpdates'" in text:
-            hits.append(str(path))
+            hits.append(path.as_posix())
     assert hits == ["src/qbt_orchestrator/integrations/telegram.py"]
     checked = Path("src/qbt_orchestrator/checked_add.py").read_text(encoding="utf-8")
     assert checked.index("is_permanently_blocked") < checked.index(
@@ -582,3 +582,81 @@ def test_stale_panel_callback_is_rejected_without_side_effects(tmp_path):
         }
     )
     assert len(api.edits) > edits_before
+
+
+def test_retired_panel_history_fences_older_item_callback(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    api = FakeApi()
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        add_queue=BotAddQueueRepository(db),
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    panel_ids = []
+    for update_id in (20, 21, 22):
+        router.handle_update(
+            {
+                "update_id": update_id,
+                "message": {
+                    "message_id": update_id,
+                    "chat": {"id": 7},
+                    "from": {"id": 42},
+                    "text": "/start",
+                },
+            }
+        )
+        panel_ids.append(int(router.panel.sessions.get()["message_id"]))
+    router.handle_update(
+        {
+            "update_id": 23,
+            "callback_query": {
+                "id": "old-item",
+                "from": {"id": 42},
+                "message": {"message_id": panel_ids[0], "chat": {"id": 7}},
+                "data": "i:x:999:1",
+            },
+        }
+    )
+    assert api.callbacks[-1][1] == "控制台已刷新，请使用最新消息"
+
+
+def test_external_batch_summary_navigation_is_not_fenced(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    api = FakeApi()
+    router = TelegramUpdateRouter(
+        api=api,
+        authorizer=TelegramAuthorizer(admins={42}, single_admin_id=42),
+        state_db=db,
+        add_queue=BotAddQueueRepository(db),
+        panel_enabled=True,
+        admin_user_id="42",
+    )
+    router.handle_update(
+        {
+            "update_id": 30,
+            "message": {
+                "message_id": 30,
+                "chat": {"id": 7},
+                "from": {"id": 42},
+                "text": "/start",
+            },
+        }
+    )
+    router.handle_update(
+        {
+            "update_id": 31,
+            "callback_query": {
+                "id": "external-home",
+                "from": {"id": 42},
+                "message": {"message_id": 999, "chat": {"id": 7}},
+                "data": "n:q:0",
+            },
+        }
+    )
+    assert api.callbacks[-1] == ("external-home", None)
+    assert api.edits and api.edits[-1][1] == int(router.panel.sessions.get()["message_id"])

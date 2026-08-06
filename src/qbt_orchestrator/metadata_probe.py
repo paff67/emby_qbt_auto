@@ -447,7 +447,9 @@ class MetadataProbeCoordinator:
         try:
             rows = list(
                 con.execute(
-                    "select i.id,i.batch_id,i.approval_generation,i.state "
+                    "select i.id,i.batch_id,i.approval_generation,i.state,"
+                    "i.normalized_media_id,i.display_name,i.source_index,"
+                    "i.canonical_identity "
                     "from bot_add_items i "
                     "where i.state='metadata_unavailable' "
                     "and not exists ("

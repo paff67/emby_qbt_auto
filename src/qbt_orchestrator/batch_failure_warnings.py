@@ -8,7 +8,9 @@ from typing import Any, Callable, Mapping
 from .db import readonly_connect
 from .observability import redact
 
-_FAILURE_STATES = frozenset({"failed", "invalid", "metadata_unavailable"})
+# metadata_unavailable is projected at the actual probe exhaustion transition by
+# MetadataProbeCoordinator. Re-projecting it here would duplicate that warning.
+_FAILURE_STATES = frozenset({"failed", "invalid"})
 _RESOLVED_STATES = frozenset(
     {
         "ready",
@@ -115,16 +117,18 @@ class BatchFailureWarningProjector:
         label = item_label(item)
         reason = safe_failure_reason(item)
         severity = "error" if state == "failed" else "warning"
+        stage = failure_stage_label(state)
         self.warning_service.report(
             warning_key=f"{_WARNING_KEY_PREFIX}{batch_id}:{item_id}",
             severity=severity,
             topic="checked_add_failure",
             safe_message=(
                 f"批次 #{batch_id} 处理失败：{label}；"
-                f"阶段：{state}；原因：{reason}"
+                f"阶段：{stage}；原因：{reason}"
             ),
             related_batch_id=batch_id,
             related_item_id=item_id,
+            occurrence_fingerprint=str(item["occurrence_fingerprint"]),
         )
 
     def _list_failure_items(self) -> list[dict[str, Any]]:
@@ -132,10 +136,25 @@ class BatchFailureWarningProjector:
         con = readonly_connect(self.state_db)
         try:
             rows = con.execute(
-                "select id,batch_id,state,source_index,normalized_media_id,"
-                "display_name,canonical_identity,last_error,decision_reason "
-                f"from bot_add_items where state in ({placeholders}) "
-                "order by updated_at,id limit ?",
+                "with candidates as ("
+                "select i.id,i.batch_id,i.state,i.source_index,i.normalized_media_id,"
+                "i.display_name,i.canonical_identity,i.last_error,i.decision_reason,"
+                "i.updated_at,i.attempts,i.metadata_probe_attempt,i.approval_generation,"
+                "coalesce("
+                "  'event:' || (select max(e.id) from bot_add_events e "
+                "               where e.item_id=i.id and e.to_state=i.state),"
+                "  'row:' || i.state || ':' || i.updated_at || ':' || i.attempts || ':' || "
+                "  i.metadata_probe_attempt || ':' || i.approval_generation"
+                ") as occurrence_fingerprint "
+                f"from bot_add_items i where i.state in ({placeholders})"
+                ") "
+                "select c.* from candidates c "
+                "left join bot_warning_inbox w on w.warning_key=("
+                "  'checked_add:batch_failed:' || c.batch_id || ':' || c.id"
+                ") "
+                "where w.id is null or coalesce(w.occurrence_fingerprint,'') "
+                "<> c.occurrence_fingerprint "
+                "order by c.updated_at,c.id limit ?",
                 (*sorted(_FAILURE_STATES), self.limit),
             )
             return [dict(row) for row in rows]
@@ -150,7 +169,8 @@ class BatchFailureWarningProjector:
                 "from bot_warning_inbox w "
                 "join bot_add_items i on i.id=w.related_item_id "
                 "where w.resolved=0 "
-                "and w.warning_key like 'checked_add:batch_failed:%' "
+                "and (w.warning_key like 'checked_add:batch_failed:%' "
+                "     or w.warning_key like 'checked_add:metadata_unavailable:%') "
                 f"and i.state in ({','.join('?' for _ in sorted(_RESOLVED_STATES))}) "
                 "order by w.related_item_id limit ?",
                 (*sorted(_RESOLVED_STATES), self.limit),

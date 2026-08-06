@@ -127,6 +127,35 @@ def test_open_home_keeps_old_session_when_send_fails(tmp_path):
     assert api.deletes == []
 
 
+def test_retire_fallback_removes_old_inline_keyboard(tmp_path):
+    db = tmp_path / "panel.sqlite"
+    migrate(db)
+
+    class CannotDeleteApi(FakeApi):
+        def delete_message(self, chat_id, message_id):
+            raise TelegramApiError(
+                "deleteMessage", http_status=400, description="message can't be deleted"
+            )
+
+    api = CannotDeleteApi()
+    controller = PersistentPanelController(
+        db,
+        api=api,
+        renderer=TelegramPanelRenderer(DashboardRepository(db), now=lambda: 1000),
+        now=lambda: 1000,
+    )
+    controller.open_home(7, update_id=1)
+    first_id = api.messages[0][3]
+    controller.open_home(7, update_id=2)
+    assert api.edits[-1] == (
+        7,
+        first_id,
+        "此控制台已刷新，请使用最新控制台消息。",
+        {"inline_keyboard": []},
+    )
+    assert controller.sessions.is_retired(7, first_id) is True
+
+
 def test_refresh_if_due_only_on_home(tmp_path):
     db = tmp_path / "panel.sqlite"
     migrate(db)

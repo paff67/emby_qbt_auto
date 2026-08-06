@@ -525,7 +525,7 @@ def test_migration_16_repairs_legacy_item_lease_schema_without_losing_rows(tmp_p
     try:
         assert "metadata_lease_until" in _columns(con, "bot_add_items")
         assert con.execute("select id from bot_add_items where id=?", (item_id,)).fetchone()
-        assert con.execute("select max(version) from schema_migrations").fetchone()[0] == 24
+        assert con.execute("select max(version) from schema_migrations").fetchone()[0] == 26
     finally:
         con.close()
 
@@ -2475,3 +2475,14 @@ def test_magnet_dn_is_stored_as_display_name(tmp_path):
     assert item["raw_input"] is None or "magnet" in str(
         queue.get_item(item["id"], include_raw=True).get("raw_input") or ""
     )
+
+
+def test_magnet_dn_display_name_collapses_control_characters(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    queue = BotAddQueueRepository(db, now=lambda: 2_000_000_000)
+    batch = queue.open_draft("1", "1")
+    magnet = "magnet:?xt=urn:btih:" + "b" * 40 + "&dn=BBAN-524%0AFAKE-WARNING"
+    queue.append_message(batch["id"], 1, [magnet])
+    item = queue.list_items(batch["id"])[0]
+    assert item["display_name"] == "BBAN-524 FAKE-WARNING"

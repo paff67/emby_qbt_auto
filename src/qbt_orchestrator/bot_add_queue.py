@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .db import readonly_connect, write_transaction
 
@@ -1527,7 +1527,9 @@ class BotAddQueueRepository:
             return None
         if not names:
             return None
-        raw = unquote(str(names[0] or "")).strip()
+        # parse_qs already URL-decodes. Collapse control/whitespace characters so
+        # a crafted dn cannot inject extra lines into Telegram warning messages.
+        raw = re.sub(r"[\x00-\x20\x7f]+", " ", str(names[0] or "")).strip()
         if not raw:
             return None
         return raw[:160]

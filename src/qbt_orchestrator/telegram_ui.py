@@ -367,6 +367,21 @@ class DashboardRepository:
             con.close()
         return [dict(row) for row in rows], int(total or 0)
 
+    def warning_detail(self, warning_id: int) -> dict[str, Any] | None:
+        con = readonly_connect(self.state_db)
+        try:
+            row = con.execute(
+                "select w.*,i.normalized_media_id,i.display_name,i.source_index,"
+                "i.state as item_state,i.last_error,i.canonical_identity "
+                "from bot_warning_inbox w "
+                "left join bot_add_items i on i.id=w.related_item_id "
+                "where w.id=?",
+                (int(warning_id),),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            con.close()
+
     def history_pages(
         self, kind: str, *, page: int = 0
     ) -> tuple[list[dict[str, Any]], int]:
@@ -697,7 +712,7 @@ class TelegramPanelRenderer:
         from .warning_inbox import WarningInboxRepository
 
         repo = WarningInboxRepository(self.dashboard.state_db)
-        warning = repo.get(int(warning_id))
+        warning = self.dashboard.warning_detail(int(warning_id))
         if warning is None:
             return PanelView(
                 text="该警告已不存在或无法读取。",
@@ -707,12 +722,6 @@ class TelegramPanelRenderer:
                     ]
                 },
             )
-        # Enrich with related item fields when available.
-        pages, _total = self.dashboard.warning_pages(page=0)
-        for row in pages:
-            if int(row["id"]) == int(warning_id):
-                warning = {**warning, **row}
-                break
         return self.render_warning_detail(
             warning, copy_text=repo.copy_summary(int(warning_id))
         )

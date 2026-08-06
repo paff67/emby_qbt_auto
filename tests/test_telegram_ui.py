@@ -225,3 +225,38 @@ def test_warning_detail_actions_and_copy_summary_limit(state_db):
     assert "w:r:1:1" in callbacks
     assert "w:x:1:1" in callbacks
     assert "n:w:0" in callbacks
+
+
+def test_warning_detail_enriches_related_item_outside_first_page(state_db):
+    write_execute(
+        state_db,
+        "insert into bot_add_batches("
+        "batch_key,chat_id,user_id,state,created_at,updated_at) "
+        "values('b-warning','1','1','complete',1,1)",
+    )
+    write_execute(
+        state_db,
+        "insert into bot_add_items("
+        "batch_id,source_message_id,source_index,input_kind,redacted_input,input_sha256,"
+        "display_name,state,created_at,updated_at) "
+        "values(1,1,0,'magnet','redacted','sha-warning','BBAN-523','failed',1,1)",
+    )
+    write_execute(
+        state_db,
+        "insert into bot_warning_inbox("
+        "warning_key,severity,topic,safe_message,related_batch_id,related_item_id,"
+        "occurrence_count,first_occurred_at,last_occurred_at,updated_at,resolved) "
+        "values('old-related','error','checked_add_failure','failed',1,1,1,1,1,1,0)",
+    )
+    for index in range(8):
+        write_execute(
+            state_db,
+            "insert into bot_warning_inbox("
+            "warning_key,severity,topic,safe_message,occurrence_count,first_occurred_at,"
+            "last_occurred_at,updated_at,resolved) values(?,?,?,?,?,?,?,?,0)",
+            (f"new-{index}", "warning", "test", "new", 1, 2 + index, 2 + index, 2 + index),
+        )
+    renderer = TelegramPanelRenderer(DashboardRepository(state_db))
+    view = renderer.render_warning_detail_by_id(1)
+    assert "项目：BBAN-523" in view.text
+    assert "阶段：处理失败" in view.text

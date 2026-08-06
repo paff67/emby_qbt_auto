@@ -102,6 +102,18 @@ class PanelSessionRepository:
             and int(session["message_id"]) == int(message_id)
         )
 
+    def is_retired(self, chat_id: int | str, message_id: int) -> bool:
+        con = readonly_connect(self.state_db)
+        try:
+            row = con.execute(
+                "select 1 from telegram_panel_retired_messages "
+                "where chat_id=? and message_id=?",
+                (str(chat_id), int(message_id)),
+            ).fetchone()
+            return row is not None
+        finally:
+            con.close()
+
     def bind_new(
         self,
         chat_id: int | str,
@@ -119,7 +131,8 @@ class PanelSessionRepository:
 
         def txn(con) -> int:
             existing = con.execute(
-                "select panel_generation from telegram_panel_session where id=1"
+                "select chat_id,message_id,panel_generation "
+                "from telegram_panel_session where id=1"
             ).fetchone()
             if existing is None:
                 generation = 1
@@ -142,6 +155,22 @@ class PanelSessionRepository:
                     ),
                 )
                 return generation
+            previous_chat = str(existing["chat_id"] or "")
+            previous_message = existing["message_id"]
+            if previous_chat and previous_message is not None and (
+                previous_chat != str(chat_id)
+                or int(previous_message) != int(message_id)
+            ):
+                con.execute(
+                    "insert or replace into telegram_panel_retired_messages("
+                    "chat_id,message_id,retired_at) values(?,?,?)",
+                    (previous_chat, int(previous_message), observed),
+                )
+                con.execute(
+                    "delete from telegram_panel_retired_messages where rowid in ("
+                    "select rowid from telegram_panel_retired_messages "
+                    "order by retired_at desc,message_id desc limit -1 offset 256)"
+                )
             generation = int(existing["panel_generation"] or 0) + 1
             con.execute(
                 "update telegram_panel_session set chat_id=?, message_id=?, "
@@ -295,7 +324,7 @@ class PersistentPanelController:
                     chat_id,
                     message_id,
                     "此控制台已刷新，请使用最新控制台消息。",
-                    reply_markup=None,
+                    reply_markup={"inline_keyboard": []},
                 )
             except Exception:
                 return

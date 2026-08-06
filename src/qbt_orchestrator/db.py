@@ -1050,6 +1050,17 @@ def migration_sql() -> list[str]:
         "alter table telegram_panel_session add column last_retired_message_id integer",
         "insert or ignore into schema_migrations(version,name,applied_at) "
         "values(25,'telegram_panel_recreate_generation_v1',strftime('%s','now'))",
+        # Migration 26: idempotent warning occurrences + durable retired-panel fence.
+        "alter table bot_warning_inbox add column occurrence_fingerprint text",
+        "create table if not exists telegram_panel_retired_messages("
+        "chat_id text not null,"
+        "message_id integer not null,"
+        "retired_at integer not null,"
+        "primary key(chat_id,message_id))",
+        "create index if not exists idx_telegram_panel_retired_time "
+        "on telegram_panel_retired_messages(retired_at)",
+        "insert or ignore into schema_migrations(version,name,applied_at) "
+        "values(26,'telegram_warning_occurrence_and_panel_fence_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

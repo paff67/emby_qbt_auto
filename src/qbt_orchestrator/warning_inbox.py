@@ -41,6 +41,7 @@ class WarningInboxRepository:
         related_job_id: int | None = None,
         related_batch_id: int | None = None,
         related_item_id: int | None = None,
+        occurrence_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         key = str(warning_key or "").strip()
         if not key:
@@ -49,6 +50,11 @@ class WarningInboxRepository:
             raise ValueError("severity")
         topic_text = str(topic or "").strip() or "general"
         message = str(redact(str(safe_message)))[:2000]
+        fingerprint = (
+            str(occurrence_fingerprint or "").strip()[:256]
+            if occurrence_fingerprint is not None
+            else None
+        )
         now = int(self.now())
 
         def txn(con) -> dict[str, Any]:
@@ -60,7 +66,8 @@ class WarningInboxRepository:
                     "insert into bot_warning_inbox("
                     "warning_key,severity,topic,safe_message,related_hash,related_job_id,"
                     "related_batch_id,related_item_id,occurrence_count,first_occurred_at,"
-                    "last_occurred_at,updated_at,resolved) values(?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                    "last_occurred_at,updated_at,resolved,occurrence_fingerprint) "
+                    "values(?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
                     (
                         key,
                         severity,
@@ -74,10 +81,42 @@ class WarningInboxRepository:
                         now,
                         now,
                         now,
+                        fingerprint,
                     ),
                 )
                 warning_id = int(cur.lastrowid)
             else:
+                existing_fingerprint = existing["occurrence_fingerprint"]
+                if fingerprint is not None and (
+                    existing_fingerprint is None
+                    or str(existing_fingerprint) == fingerprint
+                ):
+                    con.execute(
+                        "update bot_warning_inbox set severity=?,topic=?,safe_message=?,"
+                        "related_hash=coalesce(?,related_hash),"
+                        "related_job_id=coalesce(?,related_job_id),"
+                        "related_batch_id=coalesce(?,related_batch_id),"
+                        "related_item_id=coalesce(?,related_item_id),"
+                        "occurrence_fingerprint=?,updated_at=? where id=?",
+                        (
+                            severity,
+                            topic_text,
+                            message,
+                            related_hash,
+                            related_job_id,
+                            related_batch_id,
+                            related_item_id,
+                            fingerprint,
+                            now,
+                            int(existing["id"]),
+                        ),
+                    )
+                    warning_id = int(existing["id"])
+                    return _row_dict(
+                        con.execute(
+                            "select * from bot_warning_inbox where id=?", (warning_id,)
+                        ).fetchone()
+                    ) or {}
                 resolved = int(existing["resolved"] or 0)
                 if resolved == 0:
                     current_rank = _SEVERITY_RANK.get(str(existing["severity"]), 0)
@@ -93,7 +132,8 @@ class WarningInboxRepository:
                         "related_job_id=coalesce(?,related_job_id),"
                         "related_batch_id=coalesce(?,related_batch_id),"
                         "related_item_id=coalesce(?,related_item_id),"
-                        "occurrence_count=occurrence_count+1,last_occurred_at=?,updated_at=? "
+                        "occurrence_fingerprint=?,occurrence_count=occurrence_count+1,"
+                        "last_occurred_at=?,updated_at=? "
                         "where id=?",
                         (
                             next_severity,
@@ -103,6 +143,7 @@ class WarningInboxRepository:
                             related_job_id,
                             related_batch_id,
                             related_item_id,
+                            fingerprint,
                             now,
                             now,
                             int(existing["id"]),
@@ -115,7 +156,8 @@ class WarningInboxRepository:
                         "related_job_id=coalesce(?,related_job_id),"
                         "related_batch_id=coalesce(?,related_batch_id),"
                         "related_item_id=coalesce(?,related_item_id),"
-                        "occurrence_count=occurrence_count+1,last_occurred_at=?,updated_at=?,"
+                        "occurrence_fingerprint=?,occurrence_count=occurrence_count+1,"
+                        "last_occurred_at=?,updated_at=?,"
                         "resolved=0,resolved_at=null,resolved_by=null where id=?",
                         (
                             severity,
@@ -125,6 +167,7 @@ class WarningInboxRepository:
                             related_job_id,
                             related_batch_id,
                             related_item_id,
+                            fingerprint,
                             now,
                             now,
                             int(existing["id"]),
@@ -573,6 +616,7 @@ class WarningService:
         related_job_id: int | None = None,
         related_batch_id: int | None = None,
         related_item_id: int | None = None,
+        occurrence_fingerprint: str | None = None,
         projection_payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         del projection_payload  # No longer projected to Telegram notifications.
@@ -585,6 +629,7 @@ class WarningService:
             related_job_id=related_job_id,
             related_batch_id=related_batch_id,
             related_item_id=related_item_id,
+            occurrence_fingerprint=occurrence_fingerprint,
         )
 
     def report_once(

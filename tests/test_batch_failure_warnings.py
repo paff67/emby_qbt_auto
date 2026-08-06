@@ -78,9 +78,17 @@ def test_projector_creates_one_warning_per_failure_state(tmp_path):
         )
 
     service = WarningService(db, now=lambda: 2_000_000_100)
+    service.report(
+        warning_key=f"checked_add:metadata_unavailable:{items[2]['id']}",
+        severity="warning",
+        topic="metadata_probe",
+        safe_message="暂时无法获取元数据：BBAN-525",
+        related_batch_id=int(batch["id"]),
+        related_item_id=int(items[2]["id"]),
+    )
     projector = BatchFailureWarningProjector(db, service, now=lambda: 2_000_000_100)
     first = projector.tick()
-    assert first["projected"] == 3
+    assert first["projected"] == 2
     inbox = WarningInboxRepository(db)
     rows = inbox.list_unread(limit=20)
     assert len(rows) == 3
@@ -89,10 +97,10 @@ def test_projector_creates_one_warning_per_failure_state(tmp_path):
     assert "failed_code" in messages or "invalid_code" in messages
 
     second = projector.tick()
-    assert second["projected"] == 3
+    assert second["projected"] == 0
     rows = inbox.list_unread(limit=20)
     assert len(rows) == 3
-    assert all(int(row["occurrence_count"]) >= 2 for row in rows)
+    assert all(int(row["occurrence_count"]) == 1 for row in rows)
 
 
 def test_projector_uses_source_index_fallback_without_media_id(tmp_path):
@@ -132,7 +140,8 @@ def test_projector_resolves_after_recovery_and_reopens_on_repeat_failure(tmp_pat
     write_transaction(
         db,
         lambda con: con.execute(
-            "update bot_add_items set state='enrolled' where id=?", (item["id"],)
+            "update bot_add_items set state='enrolled',updated_at=2000000001 where id=?",
+            (item["id"],),
         ),
     )
     projector.tick()
@@ -141,7 +150,8 @@ def test_projector_resolves_after_recovery_and_reopens_on_repeat_failure(tmp_pat
     write_transaction(
         db,
         lambda con: con.execute(
-            "update bot_add_items set state='failed', last_error='again' where id=?",
+            "update bot_add_items set state='failed', last_error='again',"
+            "updated_at=2000000002 where id=?",
             (item["id"],),
         ),
     )
