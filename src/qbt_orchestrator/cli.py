@@ -28,6 +28,7 @@ from .maintenance import SQLiteMaintenanceService
 from .media import EmbyRefreshWorker, MediaPipelineJobRunner, MediaPipelineService
 from .observe_promotion import ObservePromotionConfig, ObservePromotionService
 from .metadata_probe import MetadataProbeCoordinator
+from .managed_metadata_adoption import ManagedMetadataAdopter
 from .orphan_janitor import OrphanJanitorService
 from .path_reconcile import QbtPathReconciler
 from .preferences import QbtPreferencesGuard
@@ -433,6 +434,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         bot_add_queue = BotAddQueueRepository(state_db)
         precheck_gateway = QbtPrecheckGateway(qbt, executor)
     metadata_probe_coordinator = None
+    managed_metadata_adopter = None
     if (
         metadata_probe_enabled
         and not dry_run
@@ -442,6 +444,12 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         metadata_probe_coordinator = MetadataProbeCoordinator(
             bot_add_queue,
             precheck_gateway,
+            warning_service=warning_service,
+        )
+        managed_metadata_adopter = ManagedMetadataAdopter(
+            bot_add_queue,
+            precheck_gateway,
+            limit=max(1, int(os.environ.get("QBT_ORCH_METADATA_ADOPTION_LIMIT", "20"))),
             warning_service=warning_service,
         )
     bot_add_ingress_coordinator = None
@@ -933,6 +941,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         junk_janitor=junk_janitor,
         observe_promotion_service=observe_promotion_service,
         metadata_probe_coordinator=metadata_probe_coordinator,
+        managed_metadata_adopter=managed_metadata_adopter,
         bot_add_ingress_coordinator=bot_add_ingress_coordinator,
         checked_add_service=checked_add_service,
         qbt_tag_janitor=qbt_tag_janitor,

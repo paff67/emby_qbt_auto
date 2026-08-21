@@ -355,6 +355,7 @@ class DaemonRuntime:
         junk_janitor=None,
         observe_promotion_service: ObservePromotionService | None = None,
         metadata_probe_coordinator=None,
+        managed_metadata_adopter=None,
         bot_add_ingress_coordinator=None,
         checked_add_service=None,
         qbt_tag_janitor=None,
@@ -500,6 +501,7 @@ class DaemonRuntime:
         self.junk_janitor = junk_janitor
         self.observe_promotion_service = observe_promotion_service
         self.metadata_probe_coordinator = metadata_probe_coordinator
+        self.managed_metadata_adopter = managed_metadata_adopter
         self.bot_add_ingress_coordinator = bot_add_ingress_coordinator
         self.checked_add_service = checked_add_service
         self.qbt_tag_janitor = qbt_tag_janitor
@@ -682,6 +684,15 @@ class DaemonRuntime:
                     max_runtime_sec=2,
                 )
             )
+        if self.managed_metadata_adopter is not None:
+            tasks.append(
+                LoopTask(
+                    "managed_metadata_adoption",
+                    5,
+                    self.managed_metadata_adoption_tick,
+                    max_runtime_sec=3,
+                )
+            )
         if self.checked_add_service is not None:
             tasks.append(
                 LoopTask(
@@ -741,6 +752,14 @@ class DaemonRuntime:
         return self.metadata_probe_coordinator.tick(
             sync_healthy=sync_healthy,
             snapshots=snapshots,
+        )
+
+    def managed_metadata_adoption_tick(self) -> dict:
+        if self.managed_metadata_adopter is None:
+            return {"status": "disabled"}
+        snapshots, sync_healthy, _sampled = self._capture_safety_snapshot()
+        return self.managed_metadata_adopter.tick(
+            snapshots, sync_healthy=sync_healthy
         )
 
     def checked_add_tick(self) -> dict:
