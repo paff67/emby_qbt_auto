@@ -137,15 +137,35 @@ class QbtPrecheckGateway:
             or payload_limit_bps <= 0
         ):
             raise ValueError("payload_limit_bps")
-        if not self._post(
-            "/api/v2/torrents/setDownloadLimit",
-            {"hashes": safe_hash, "limit": str(payload_limit_bps)},
-            guard,
+        if not self.set_download_limit(
+            safe_hash, payload_limit_bps, guard=guard
         ):
             return False
         return bool(
             self._post(
                 "/api/v2/torrents/start", {"hashes": safe_hash}, guard
+            )
+        )
+
+    def set_download_limit(
+        self,
+        torrent_hash: str,
+        limit_bps: int,
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        safe_hash = self._hash(torrent_hash)
+        if (
+            isinstance(limit_bps, bool)
+            or not isinstance(limit_bps, int)
+            or limit_bps < 0
+        ):
+            raise ValueError("download_limit_bps")
+        return bool(
+            self._post(
+                "/api/v2/torrents/setDownloadLimit",
+                {"hashes": safe_hash, "limit": str(limit_bps)},
+                guard,
             )
         )
 

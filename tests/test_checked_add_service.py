@@ -30,6 +30,7 @@ class FakeGateway:
             "tags": f"precheck,metadata-probe,hold,{tag}",
             "category": "precheck",
             "force_start": False,
+            "dl_limit": 1024,
         }
         self.files = [{"index": 0, "name": name, "size": size, "priority": 0}]
         self.posts: list[tuple[str, dict]] = []
@@ -87,6 +88,16 @@ class FakeGateway:
         ok = self._write("force", {"hashes": torrent_hash, "value": str(value).lower()}, guard)
         if ok:
             self.snapshot["force_start"] = bool(value)
+        return ok
+
+    def set_download_limit(self, torrent_hash, limit_bps, *, guard=None):
+        ok = self._write(
+            "download_limit",
+            {"hashes": torrent_hash, "limit": str(limit_bps)},
+            guard,
+        )
+        if ok:
+            self.snapshot["dl_limit"] = int(limit_bps)
         return ok
 
     def set_file_priorities(self, torrent_hash, indices, priority, *, guard=None):
@@ -183,6 +194,8 @@ def test_unique_prechecked_item_is_enrolled_stopped_without_direct_start(tmp_pat
     assert "checked" in gateway._tags()
     assert not {"precheck", "metadata-probe", "hold"} & gateway._tags()
     assert gateway.files[0]["priority"] == 1
+    assert gateway.snapshot["dl_limit"] == 0
+    assert any(name == "download_limit" for name, _ in gateway.posts)
     assert not any(name == "start" for name, _ in gateway.posts)
 
 

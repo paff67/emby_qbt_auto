@@ -1222,6 +1222,8 @@ class CheckedAddService:
             return fail("qbt_write_fenced")
         if not self.gateway.set_force_start(torrent_hash, False, guard=guard):
             return fail("qbt_write_fenced")
+        if not self.gateway.set_download_limit(torrent_hash, 0, guard=guard):
+            return fail("qbt_write_fenced")
 
         # 9) absorb filePrio auto-resume.
         if not self.gateway.stop(torrent_hash, guard=guard):
@@ -1253,6 +1255,8 @@ class CheckedAddService:
             return fail("qbt_tag_verification_failed")
         if bool(snapshot.get("force_start")):
             return fail("qbt_force_start_verification_failed")
+        if int(snapshot.get("dl_limit") or 0) != 0:
+            return fail("qbt_download_limit_verification_failed")
         verified_files = self.gateway.torrent_files(torrent_hash)
         if not verified_files or any(
             int(row.get("priority") or 0)
