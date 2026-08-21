@@ -250,6 +250,16 @@ class MetadataProbeCoordinator:
                 {"qbt_hash": torrent_hash, "last_error": None},
             )
             if not self.gateway.metadata_ready(snapshot):
+                if self._is_stopped_state(snapshot.get("state")):
+                    self._require_write(
+                        self.gateway.start_metadata_probe(
+                            torrent_hash,
+                            payload_limit_bps=self.config.payload_limit_bps,
+                            guard=self._owned_write_guard(
+                                item_id, token, torrent_hash, tag
+                            ),
+                        )
+                    )
                 self._schedule_poll(item_id, token, now)
                 return
             self._require_write(

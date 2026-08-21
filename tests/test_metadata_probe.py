@@ -35,11 +35,14 @@ class RecordingExecutor:
 
 
 class SnapshotQbt:
-    def __init__(self, files=None, *, state="stoppedDL", tags=""):
+    def __init__(
+        self, files=None, *, state="stoppedDL", tags="", has_metadata=None
+    ):
         self.files = list(files or [])
         self.file_reads: list[str] = []
         self.state = state
         self.tags = tags
+        self.has_metadata = has_metadata
         self.info_reads: list[str] = []
 
     def torrent_files(self, torrent_hash):
@@ -48,7 +51,12 @@ class SnapshotQbt:
 
     def torrent_info(self, torrent_hash):
         self.info_reads.append(torrent_hash)
-        return {"hash": torrent_hash, "state": self.state, "tags": self.tags}
+        return {
+            "hash": torrent_hash,
+            "state": self.state,
+            "tags": self.tags,
+            "has_metadata": self.has_metadata,
+        }
 
 
 def test_precheck_gateway_uses_existing_executor_and_fixed_safe_payload():
@@ -87,6 +95,24 @@ def test_precheck_gateway_uses_existing_executor_and_fixed_safe_payload():
             "/api/v2/torrents/delete",
             {"hashes": "c" * 40, "deleteFiles": "false"},
         ),
+    ]
+
+
+def test_precheck_gateway_starts_owned_metadata_probe_with_payload_limit():
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    executor = RecordingExecutor()
+    gateway = QbtPrecheckGateway(SnapshotQbt(), executor)
+
+    assert gateway.start_metadata_probe(
+        "c" * 40, payload_limit_bps=1024, guard=lambda: True
+    ) is True
+    assert executor.posts == [
+        (
+            "/api/v2/torrents/setDownloadLimit",
+            {"hashes": "c" * 40, "limit": "1024"},
+        ),
+        ("/api/v2/torrents/start", {"hashes": "c" * 40}),
     ]
 
 
@@ -484,6 +510,39 @@ def test_existing_same_hash_without_item_tag_finishes_as_duplicate_without_qbt_w
     assert batch["duplicate_count"] == 1
     assert batch["state"] == "complete"
     assert executor.posts == []
+
+
+def test_owned_existing_stopped_magnet_is_started_to_fetch_metadata(tmp_path):
+    from qbt_orchestrator.metadata_probe import MetadataProbeCoordinator
+    from qbt_orchestrator.qbt_precheck import QbtPrecheckGateway
+
+    queue, _gateway, _coordinator, clock, item_ids, _db = _probe_fixture(
+        tmp_path, batches=[1]
+    )
+    item = queue.get_item(item_ids[0])
+    tag = MetadataProbeCoordinator._tag_for(item)
+    qbt = SnapshotQbt(
+        state="stoppedDL", tags=f"auto,checked,{tag}", has_metadata=False
+    )
+    executor = RecordingExecutor()
+
+    result = MetadataProbeCoordinator(
+        queue,
+        QbtPrecheckGateway(qbt, executor),
+        owner="worker",
+        now=clock,
+    ).tick(snapshots={})
+
+    stored = queue.get_item(item_ids[0])
+    assert result["started"] == [item_ids[0]]
+    assert stored["state"] == "metadata_wait"
+    assert executor.posts == [
+        (
+            "/api/v2/torrents/setDownloadLimit",
+            {"hashes": stored["qbt_hash"], "limit": "1024"},
+        ),
+        ("/api/v2/torrents/start", {"hashes": stored["qbt_hash"]}),
+    ]
 
 
 def test_realtime_tag_removal_before_ready_write_never_stops_or_zeroes_foreign_torrent(

@@ -123,6 +123,32 @@ class QbtPrecheckGateway:
             )
         )
 
+    def start_metadata_probe(
+        self,
+        torrent_hash: str,
+        *,
+        payload_limit_bps: int,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        safe_hash = self._hash(torrent_hash)
+        if (
+            isinstance(payload_limit_bps, bool)
+            or not isinstance(payload_limit_bps, int)
+            or payload_limit_bps <= 0
+        ):
+            raise ValueError("payload_limit_bps")
+        if not self._post(
+            "/api/v2/torrents/setDownloadLimit",
+            {"hashes": safe_hash, "limit": str(payload_limit_bps)},
+            guard,
+        ):
+            return False
+        return bool(
+            self._post(
+                "/api/v2/torrents/start", {"hashes": safe_hash}, guard
+            )
+        )
+
     def torrent_files(self, torrent_hash: str) -> list[dict[str, Any]]:
         safe_hash = self._hash(torrent_hash)
         return [dict(row) for row in self.qbt.torrent_files(safe_hash)]
