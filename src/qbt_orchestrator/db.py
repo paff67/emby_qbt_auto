@@ -670,6 +670,13 @@ def migration_sql() -> list[str]:
         "create table if not exists media_promotions(id integer primary key autoincrement, upload_job_id integer not null, hash text, media_group_id integer, normalized_id text not null, metadata_title text not null, display_title text not null, source_remote text not null, target_remote text not null, expected_size integer not null, expected_hashes_json text not null default '{}', state text not null default 'planned', verification_method text, verification_result_json text, attempts integer not null default 0, max_attempts integer not null default 6, lease_owner text, lease_until integer, next_run_at integer, last_error text, created_at integer not null, updated_at integer not null, verified_at integer)",
         "create unique index if not exists idx_media_promotions_identity on media_promotions(upload_job_id,source_remote,target_remote)",
         "create index if not exists idx_media_promotions_claim on media_promotions(state,next_run_at,id)",
+        "create table if not exists media_promotion_source_prunes("
+        "id integer primary key autoincrement,source_parent text not null unique,"
+        "target_parent text not null,state text not null default 'pending',"
+        "attempts integer not null default 0,next_run_at integer,last_error text,"
+        "created_at integer not null,updated_at integer not null,pruned_at integer)",
+        "create index if not exists idx_media_promotion_source_prunes_claim "
+        "on media_promotion_source_prunes(state,next_run_at,id)",
         "create table if not exists sidecar_manifests(id integer primary key autoincrement, media_group_id integer, staging_dir text, artifacts_json text, state text, created_at integer, updated_at integer)",
         "alter table sidecar_manifests add column local_artifact_dir text",
         "alter table sidecar_manifests add column artifact_manifest_json text",
@@ -1061,6 +1068,8 @@ def migration_sql() -> list[str]:
         "on telegram_panel_retired_messages(retired_at)",
         "insert or ignore into schema_migrations(version,name,applied_at) "
         "values(26,'telegram_warning_occurrence_and_panel_fence_v1',strftime('%s','now'))",
+        "insert or ignore into schema_migrations(version,name,applied_at) "
+        "values(27,'media_promotion_source_prune_v1',strftime('%s','now'))",
     ]
 
 def migrate(path: str | Path, dry_run: bool = False) -> list[str]:

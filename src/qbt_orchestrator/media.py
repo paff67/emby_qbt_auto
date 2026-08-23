@@ -101,6 +101,7 @@ class MediaPipelineService:
         backfill,
         *,
         emby_prefix: str = "/media/gcrypt",
+        canonical_remote: str = "gcrypt:",
         debounce_sec: int = 300,
         max_debounce_wait_sec: int = 900,
         normalizer: FilenameNormalizerProtocol | None = None,
@@ -113,6 +114,7 @@ class MediaPipelineService:
         self.state_db = state_db
         self.backfill = backfill
         self.emby_prefix = emby_prefix.rstrip("/")
+        self.canonical_remote = canonical_remote.rstrip("/")
         self.debounce_sec = int(debounce_sec)
         self.max_debounce_wait_sec = int(max_debounce_wait_sec)
         self.normalizer = normalizer or FallbackFilenameNormalizer()
@@ -207,9 +209,9 @@ class MediaPipelineService:
                     "metadata_title": canonical_name.metadata_title,
                     "display_title": canonical_name.display_title,
                     "canonical_basename": canonical_name.canonical_basename,
-                    "canonical_remote_dir": canonical_name.remote_dir("gcrypt:"),
+                    "canonical_remote_dir": canonical_name.remote_dir(self.canonical_remote),
                 }
-                canonical_remote_dir = canonical_name.remote_dir("gcrypt:")
+                canonical_remote_dir = canonical_name.remote_dir(self.canonical_remote)
                 canonical_basename = canonical_name.canonical_basename
             valid_artifacts, missing_outputs = self._validate_sidecar_artifacts(scrape.get("artifacts") or [])
             if scrape.get("status") == "sidecar_verified" and valid_artifacts:
@@ -260,8 +262,8 @@ class MediaPipelineService:
             self._queue_emby_refresh(emby_dir, key, manifest_id, state)
         return PipelineRun(key, state)
 
-    @staticmethod
     def _canonical_name_from_scrape(
+        self,
         key: str,
         scrape: dict,
     ) -> CanonicalMediaName | None:
@@ -274,7 +276,7 @@ class MediaPipelineService:
         supplied_dir = str(scrape.get("canonical_remote_dir") or "").rstrip("/")
         if supplied_basename and supplied_basename != value.canonical_basename:
             raise ValueError("scraper canonical basename disagrees with naming policy")
-        if supplied_dir and supplied_dir != value.remote_dir("gcrypt:"):
+        if supplied_dir and supplied_dir != value.remote_dir(self.canonical_remote):
             raise ValueError("scraper canonical directory disagrees with naming policy")
         return value
 
@@ -295,7 +297,7 @@ class MediaPipelineService:
             ).name
             basename = canonical_file_basename(canonical, source_name)
             suffix = PurePosixPath(source_name).suffix.lower() or ".mp4"
-            target = f"{canonical.remote_dir('gcrypt:')}/{basename}{suffix}"
+            target = f"{canonical.remote_dir(self.canonical_remote)}/{basename}{suffix}"
             if target in occupied:
                 digest = hashlib.sha1(file.remote_path.encode("utf-8")).hexdigest()[:8]
                 basename = canonical_file_basename(
@@ -303,7 +305,7 @@ class MediaPipelineService:
                     source_name,
                     collision_digest=digest,
                 )
-                target = f"{canonical.remote_dir('gcrypt:')}/{basename}{suffix}"
+                target = f"{canonical.remote_dir(self.canonical_remote)}/{basename}{suffix}"
             occupied.add(target)
             self.promotions.enqueue(
                 upload_job_id=int(upload_job_id),
@@ -353,8 +355,8 @@ class MediaPipelineService:
             )
         return remote_dir, primary_name, manifest
 
-    @staticmethod
     def _retarget_sidecar_artifacts(
+        self,
         canonical: CanonicalMediaName,
         artifacts: list[dict],
     ) -> list[dict]:
@@ -390,7 +392,7 @@ class MediaPipelineService:
                 target_name = f"{canonical.canonical_basename}-thumb{suffix}"
             else:
                 target_name = local_name
-            row["remote"] = f"{canonical.remote_dir('gcrypt:')}/{target_name}"
+            row["remote"] = f"{canonical.remote_dir(self.canonical_remote)}/{target_name}"
             out.append(row)
         return out
 

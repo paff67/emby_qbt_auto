@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .db import readonly_connect, write_transaction
 from .io_governor import JobPriority
 from .observability import redact
+
+
+def _remote_parent(remote_path: str) -> str:
+    remote, path = str(remote_path).split(":", 1)
+    parent = str(PurePosixPath(path).parent).rstrip("/")
+    return f"{remote}:{parent}"
 
 
 class MediaPromotionRepository:
@@ -67,6 +73,15 @@ class MediaPromotionRepository:
                 "select id from media_promotions where upload_job_id=? and source_remote=? and target_remote=?",
                 (int(upload_job_id), str(source_remote), str(target_remote)),
             ).fetchone()
+            source_parent = _remote_parent(str(source_remote))
+            target_parent = _remote_parent(str(target_remote))
+            if source_parent != target_parent and not source_parent.endswith(":"):
+                con.execute(
+                    "insert or ignore into media_promotion_source_prunes("
+                    "source_parent,target_parent,state,created_at,updated_at"
+                    ") values(?,?,'pending',?,?)",
+                    (source_parent, target_parent, now, now),
+                )
             return int(row["id"])
 
         return int(write_transaction(self.state_db, txn))
@@ -228,6 +243,78 @@ class MediaPromotionRepository:
         finally:
             con.close()
 
+    def claim_next_source_parent(self) -> dict[str, Any] | None:
+        now = int(self.now())
+
+        def txn(con):
+            row = con.execute(
+                "select * from media_promotion_source_prunes "
+                "where state in ('pending','retry_wait') "
+                "and (next_run_at is null or next_run_at<=?) order by id limit 1",
+                (now,),
+            ).fetchone()
+            if not row:
+                return None
+            con.execute(
+                "update media_promotion_source_prunes set state='running',"
+                "attempts=attempts+1,updated_at=? where id=?",
+                (now, int(row["id"])),
+            )
+            return dict(
+                con.execute(
+                    "select * from media_promotion_source_prunes where id=?",
+                    (int(row["id"]),),
+                ).fetchone()
+            )
+
+        return write_transaction(self.state_db, txn)
+
+    def record_source_parent_pruned(self, source_parent: str) -> None:
+        now = int(self.now())
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update media_promotion_source_prunes set state='pruned',"
+                "next_run_at=null,last_error=null,pruned_at=?,updated_at=? "
+                "where source_parent=?",
+                (now, now, str(source_parent)),
+            ),
+        )
+
+    def record_source_parent_attempt(self, source_parent: str) -> None:
+        now = int(self.now())
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "update media_promotion_source_prunes set state='running',"
+                "attempts=attempts+1,updated_at=? where source_parent=?",
+                (now, str(source_parent)),
+            ),
+        )
+
+    def schedule_source_parent_retry(self, source_parent: str, error: str) -> None:
+        now = int(self.now())
+
+        def txn(con):
+            row = con.execute(
+                "select attempts from media_promotion_source_prunes where source_parent=?",
+                (str(source_parent),),
+            ).fetchone()
+            attempts = int(row["attempts"] or 0) if row else 0
+            delay = min(86400, 60 * (2 ** min(max(0, attempts - 1), 10)))
+            con.execute(
+                "update media_promotion_source_prunes set state='retry_wait',"
+                "next_run_at=?,last_error=?,updated_at=? where source_parent=?",
+                (
+                    now + delay,
+                    str(redact(str(error)))[:500],
+                    now,
+                    str(source_parent),
+                ),
+            )
+
+        write_transaction(self.state_db, txn)
+
 
 class MediaPromotionRunner:
     def __init__(
@@ -250,9 +337,34 @@ class MediaPromotionRunner:
         raw = row.get("Size", row.get("size"))
         return int(raw) if raw is not None else None
 
+    def _prune_source_parent(self, source: str, target: str) -> None:
+        source_parent = _remote_parent(source)
+        if source_parent.endswith(":") or source_parent == _remote_parent(target):
+            return
+        self.repo.record_source_parent_attempt(source_parent)
+        try:
+            self.rclone.rmdir(source_parent)
+        except Exception as exc:
+            self.repo.schedule_source_parent_retry(source_parent, str(exc))
+        else:
+            self.repo.record_source_parent_pruned(source_parent)
+
+    def _prune_next_source_parent(self) -> None:
+        row = self.repo.claim_next_source_parent()
+        if not row:
+            return
+        source_parent = str(row["source_parent"])
+        try:
+            self.rclone.rmdir(source_parent)
+        except Exception as exc:
+            self.repo.schedule_source_parent_retry(source_parent, str(exc))
+        else:
+            self.repo.record_source_parent_pruned(source_parent)
+
     def run_next(self) -> int | None:
         row = self.repo.claim_next(owner=self.owner)
         if not row:
+            self._prune_next_source_parent()
             return None
         promotion_id = int(row["id"])
         source = str(row["source_remote"])
@@ -275,6 +387,7 @@ class MediaPromotionRunner:
                     method="path_size",
                     details={"verified": True, "mismatches": []},
                 )
+                self._prune_source_parent(source, target)
             else:
                 self.repo.record_failed(promotion_id, "source_absent")
             return promotion_id
@@ -325,6 +438,7 @@ class MediaPromotionRunner:
             method="path_size",
             details={"verified": True, "mismatches": []},
         )
+        self._prune_source_parent(source, target)
         return promotion_id
 
 

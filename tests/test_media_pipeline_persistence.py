@@ -268,6 +268,63 @@ def test_verified_ingest_enqueues_canonical_promotion_and_colocated_sidecars():
         assert rows(db, "select * from emby_refresh_tasks") == []
 
 
+def test_verified_ingest_respects_configured_canonical_remote():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        staging = "/var/lib/qbt-orchestrator/sidecar-staging/WAAA-614"
+        service = MediaPipelineService(
+            db,
+            backfill=RecordingBackfill(
+                {
+                    "status": "sidecar_verified",
+                    "staging_dir": staging,
+                    "normalized_id": "WAAA-614",
+                    "metadata_title": "影片名称",
+                    "display_title": "WAAA-614 影片名称",
+                    "canonical_basename": "WAAA-614 影片名称",
+                    "canonical_remote_dir": "gcrypt:/av/WAAA-614",
+                    "artifacts": [
+                        {"local": f"{staging}/movie.nfo", "remote": "gcrypt:/av/WAAA-614/movie.nfo", "size": 100},
+                        {"local": f"{staging}/poster.jpg", "remote": "gcrypt:/av/WAAA-614/poster.jpg", "size": 200},
+                        {"local": f"{staging}/fanart.jpg", "remote": "gcrypt:/av/WAAA-614/fanart.jpg", "size": 300},
+                    ],
+                }
+            ),
+            normalizer=RecordingNormalizer(
+                {"normalized_id": "WAAA-614", "confidence": 0.95}
+            ),
+            canonical_remote="gcrypt:/av",
+            emby_prefix="/media/gcrypt/av",
+            now=lambda: 4_200,
+        )
+
+        service.handle_upload_verified(
+            "upload-job-7",
+            [UploadedFile("gcrypt:/_incoming/WAAA-614-hash/raw.mp4", 1024**3, 120)],
+            upload_job_id=7,
+            torrent_hash="hash",
+        )
+
+        promotion = rows(db, "select source_remote,target_remote from media_promotions")[0]
+        assert promotion == {
+            "source_remote": "gcrypt:/_incoming/WAAA-614-hash/raw.mp4",
+            "target_remote": "gcrypt:/av/WAAA-614/WAAA-614 影片名称.mp4",
+        }
+        payloads = [
+            json.loads(row["payload_json"])
+            for row in rows(db, "select payload_json from torrent_jobs where job_type='sidecar_upload'")
+        ]
+        assert {payload["remote"] for payload in payloads} == {
+            "gcrypt:/av/WAAA-614/WAAA-614 影片名称.nfo",
+            "gcrypt:/av/WAAA-614/poster.jpg",
+            "gcrypt:/av/WAAA-614/fanart.jpg",
+        }
+
+
 def test_media_pipeline_propagates_passthrough_policy_to_sidecar_upload_jobs():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.media import MediaPipelineService, UploadedFile

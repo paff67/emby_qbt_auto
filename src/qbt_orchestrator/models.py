@@ -73,6 +73,8 @@ class EmbyConfig:
 class RcloneConfig:
     config: str = "/root/.config/rclone/rclone.conf"
     remote: str = "gcrypt:"
+    upload_remote: str = "gcrypt:"
+    canonical_remote: str = "gcrypt:"
     transfers: int = 1
     checkers: int = 2
 

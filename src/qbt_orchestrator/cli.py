@@ -61,14 +61,14 @@ def _build_normalizer_from_env(env=os.environ):
     return FilenameNormalizeScript(script_path=script, timeout_sec=timeout)
 
 
-def _build_backfill_from_env(env=os.environ):
+def _build_backfill_from_env(env=os.environ, default_remote: str | None = None):
     enabled = _truthy(env.get("QBT_ORCH_BACKFILL_SCRAPER"))
     if not enabled:
         return PassthroughBackfill()
     script = env.get("QBT_ORCH_BACKFILL_SCRIPT", "/opt/qbt/gdrive-backfill/bin/javinizer_scrape_one.sh")
     staging = env.get("QBT_ORCH_SIDECAR_STAGING_ROOT", "/var/lib/qbt-orchestrator/sidecar-staging")
     timeout = int(env.get("QBT_ORCH_BACKFILL_TIMEOUT_SEC", "1020"))
-    remote = env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:")
+    remote = env.get("QBT_ORCH_CANONICAL_REMOTE", default_remote or env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:"))
     lock_file = env.get("QBT_ORCH_BACKFILL_LOCK_FILE", "/tmp/gdrive-backfill.lock")
     command_mode = env.get("QBT_ORCH_BACKFILL_COMMAND_MODE", "auto")
     return GDriveBackfillScraper(script_path=script, staging_root=staging, remote=remote, timeout_sec=timeout, lock_file=lock_file, command_mode=command_mode)
@@ -95,7 +95,10 @@ def _build_preemption_from_env(state_db: Path, executor, env=os.environ, global_
         config=config,
         host_downloads=env.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
         container_downloads=env.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
-        remote=env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:"),
+        remote=env.get(
+            "QBT_ORCH_UPLOAD_REMOTE",
+            env.get("QBT_ORCH_RCLONE_REMOTE", "gcrypt:"),
+        ),
     )
 
 def _disk_floor_bytes_from_env(env=os.environ) -> int:
@@ -651,6 +654,14 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
     planner_env = _truthy(os.environ.get("QBT_ORCH_PLANNER_DRY_RUN"))
     planner_dry_run = True if dry_run else (planner_env if planner_env is not None else True)
     rclone_cfg = cfg.rclone if cfg else None
+    upload_remote = os.environ.get(
+        "QBT_ORCH_UPLOAD_REMOTE",
+        rclone_cfg.upload_remote if rclone_cfg else "gcrypt:",
+    ).rstrip("/")
+    canonical_remote = os.environ.get(
+        "QBT_ORCH_CANONICAL_REMOTE",
+        rclone_cfg.canonical_remote if rclone_cfg else "gcrypt:",
+    ).rstrip("/")
     free_bytes_provider = _free_bytes_for(disk_path)
     io_governor_enabled_env = _truthy(os.environ.get("QBT_ORCH_IO_GOVERNOR_ENABLED"))
     io_governor = IoGovernor(
@@ -706,8 +717,9 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         TorrentJobRepository(state_db),
         MediaPipelineService(
             state_db,
-            _build_backfill_from_env(os.environ),
+            _build_backfill_from_env(os.environ, default_remote=canonical_remote),
             emby_prefix=cfg.emby.container_media_prefix if cfg else "/media/gcrypt",
+            canonical_remote=canonical_remote,
             normalizer=_build_normalizer_from_env(os.environ),
             min_normalize_confidence=float(os.environ.get("QBT_ORCH_FILENAME_NORMALIZE_MIN_CONFIDENCE", "0.8")),
             allow_unrecognized_passthrough=(_truthy(os.environ.get("QBT_ORCH_MEDIA_ALLOW_UNRECOGNIZED_PASSTHROUGH")) is not False),
@@ -927,7 +939,7 @@ def _build_runtime(ns, db: Path, force_dry_run: bool | None = None) -> tuple[Dae
         upload_backpressure_policy=upload_backpressure_policy,
         host_downloads=os.environ.get("QBT_ORCH_HOST_DOWNLOADS", "/data/downloads"),
         container_downloads=os.environ.get("QBT_ORCH_CONTAINER_DOWNLOADS", "/downloads"),
-        rclone_remote=rclone_cfg.remote if rclone_cfg else "gcrypt:",
+        rclone_remote=upload_remote,
         media_promotion_runner=media_promotion_runner,
         media_promotion_dry_run=media_promotion_dry_run,
         media_pipeline_runner=media_runner,

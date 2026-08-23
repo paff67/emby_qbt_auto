@@ -191,6 +191,11 @@ def write_sidecar_from_db(work_dir: str | Path, movie_id: str, env: Optional[Dic
     content_id = _text(movie["content_id"] or movie["id"] or movie_id)
     source_title = _text(movie["display_title"] or movie["title"] or movie["original_title"] or content_id)
     name = canonical_media_name(content_id, source_title)
+    canonical_remote = (
+        os.environ.get("QBT_ORCH_CANONICAL_REMOTE")
+        or env.get("QBT_ORCH_CANONICAL_REMOTE")
+        or "gcrypt:"
+    ).rstrip("/")
     genres = load_genres(conn, content_id)
     actresses = load_actresses(conn, content_id)
     nfo = wd / f"{name.canonical_basename}.nfo"
@@ -214,7 +219,7 @@ def write_sidecar_from_db(work_dir: str | Path, movie_id: str, env: Optional[Dic
         "metadata_title": name.metadata_title,
         "display_title": name.display_title,
         "canonical_basename": name.canonical_basename,
-        "canonical_remote_dir": name.remote_dir("gcrypt:"),
+        "canonical_remote_dir": name.remote_dir(canonical_remote),
     }
     (wd / "media_metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",

@@ -36,9 +36,12 @@ def load_config_from_dict(data: Mapping[str, Any]) -> AppConfig:
         save_path=str(qbt_raw.get("save_path", "/downloads/active")),
         temp_path=str(qbt_raw.get("temp_path", "/downloads/incomplete")),
     )
+    rclone_remote = str(rclone_raw.get("remote", "gcrypt:")).rstrip("/")
     rclone = RcloneConfig(
         config=str(rclone_raw.get("config", "/root/.config/rclone/rclone.conf")),
-        remote=str(rclone_raw.get("remote", "gcrypt:")),
+        remote=rclone_remote,
+        upload_remote=str(rclone_raw.get("upload_remote", rclone_remote)).rstrip("/"),
+        canonical_remote=str(rclone_raw.get("canonical_remote", rclone_remote)).rstrip("/"),
         transfers=int(rclone_raw.get("transfers", 1)),
         checkers=int(rclone_raw.get("checkers", 2)),
     )

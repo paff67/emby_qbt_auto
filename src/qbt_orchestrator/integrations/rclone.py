@@ -153,6 +153,11 @@ class RcloneClient:
         if rc != 0:
             raise RuntimeError(f"rclone moveto failed rc={rc}: {err[-400:]}")
 
+    def rmdir(self, remote: str) -> None:
+        rc, _out, err = self.runner(self._base() + ["rmdir", remote], None, 300)
+        if rc != 0:
+            raise RuntimeError(f"rclone rmdir failed rc={rc}: {err[-400:]}")
+
     def lsjson_size(self, remote: str) -> int | None:
         rc, out, err = self.runner(self._base() + ["lsjson", remote], None, 300)
         if rc != 0:

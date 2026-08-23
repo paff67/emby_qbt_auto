@@ -34,14 +34,16 @@ class FakeExecutor:
 
 
 class FakeRclone:
-    def __init__(self, copy_ok=True, remote_sizes=None, remote_listing=None, moved_size=None):
+    def __init__(self, copy_ok=True, remote_sizes=None, remote_listing=None, moved_size=None, rmdir_error=None):
         self.copy_ok = copy_ok
         self.remote_sizes = remote_sizes or {}
         self.remote_listing = remote_listing or []
         self.copies = []
         self.dir_copies = []
         self.movetos = []
+        self.rmdirs = []
         self.moved_size = moved_size
+        self.rmdir_error = rmdir_error
 
     def copyto(self, local, remote):
         self.copies.append((local, remote))
@@ -69,6 +71,11 @@ class FakeRclone:
         if self.moved_size is not None and len(self.movetos) == 1:
             size = self.moved_size
         self.remote_sizes[target] = size
+
+    def rmdir(self, remote):
+        self.rmdirs.append(remote)
+        if self.rmdir_error:
+            raise RuntimeError(self.rmdir_error)
 
 
 class BudgetedQbtFake:

@@ -29,7 +29,27 @@ def test_config_merges_legacy_with_vps_runtime_defaults():
     assert cfg.disk.emergency_free_bytes == 2 * 1024**3
     assert cfg.qbt_preferences.preallocate_all is False
     assert cfg.qbt_preferences.incomplete_files_ext_desired is None
+    assert cfg.rclone.upload_remote == "gcrypt:"
+    assert cfg.rclone.canonical_remote == "gcrypt:"
     assert "incomplete_files_ext" in cfg.runtime_warnings[0]
+
+
+def test_config_reads_separate_upload_and_canonical_remotes():
+    from qbt_orchestrator.config import load_config_from_dict
+
+    cfg = load_config_from_dict(
+        {
+            "rclone": {
+                "remote": "gcrypt:",
+                "upload_remote": "gcrypt:/_incoming",
+                "canonical_remote": "gcrypt:/av",
+            }
+        }
+    )
+
+    assert cfg.rclone.remote == "gcrypt:"
+    assert cfg.rclone.upload_remote == "gcrypt:/_incoming"
+    assert cfg.rclone.canonical_remote == "gcrypt:/av"
 
 
 def test_config_reads_explicit_qbt_preferences_guard_values():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import sqlite3
 from pathlib import Path
 
 
@@ -91,7 +92,46 @@ def test_promotion_moves_and_verifies_exact_destination():
                 "gcrypt:/BBAN-582/BBAN-582 影片名称.mp4",
             )
         ]
+        assert rclone.rmdirs == ["gcrypt:/ingest"]
         assert repo.get(promotion_id)["state"] == "verified"
+
+
+def test_promotion_empty_parent_cleanup_retries_durably_after_verification():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = [1_000]
+        repo = MediaPromotionRepository(db, now=lambda: clock[0])
+        promotion_id = _enqueue(repo)
+        rclone = FakeRclone(
+            remote_sizes={"gcrypt:/ingest/raw.mp4": 123},
+            rmdir_error="directory not empty",
+        )
+
+        assert MediaPromotionRunner(repo, rclone).run_next() == promotion_id
+        assert rclone.rmdirs == ["gcrypt:/ingest"]
+        assert repo.get(promotion_id)["state"] == "verified"
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        row = dict(con.execute("select * from media_promotion_source_prunes").fetchone())
+        con.close()
+        assert row["state"] == "retry_wait"
+        assert row["attempts"] == 1
+
+        rclone.rmdir_error = None
+        clock[0] = 1_060
+        assert MediaPromotionRunner(repo, rclone).run_next() is None
+        assert rclone.rmdirs == ["gcrypt:/ingest", "gcrypt:/ingest"]
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        row = dict(con.execute("select * from media_promotion_source_prunes").fetchone())
+        con.close()
+        assert row["state"] == "pruned"
+        assert row["pruned_at"] == 1_060
 
 
 def test_promotion_reverses_move_when_destination_verification_fails():
