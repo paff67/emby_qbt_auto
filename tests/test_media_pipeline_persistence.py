@@ -641,7 +641,7 @@ def test_transient_emby_failure_retries_with_backoff_and_attempt_limit():
         clock[0] = 261
         assert worker.run_next() == 1
         assert rows(db, "select state,attempts,next_run_at from emby_refresh_tasks") == [
-            {"state": "done", "attempts": 2, "next_run_at": 260}
+            {"state": "done", "attempts": 2, "next_run_at": None}
         ]
 
 

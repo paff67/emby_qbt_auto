@@ -760,7 +760,7 @@ class EmbyRefreshWorker:
         write_transaction(
             self.state_db,
             lambda con: con.execute(
-                "update emby_refresh_tasks set state=?, last_error=?, updated_at=? where id=?",
+                "update emby_refresh_tasks set state=?, last_error=?, next_run_at=null, updated_at=? where id=?",
                 (state, error, int(self.now()), task_id),
             ),
         )
