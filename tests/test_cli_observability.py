@@ -10,6 +10,8 @@ import tempfile
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
@@ -65,7 +67,9 @@ def test_cli_status_subcommands_are_readonly_views():
         assert json.loads(run_cli(["status", "perf", "--state-db", str(db), "--json"])[1])["recent_events"] >= 1
 
 
-def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes():
+def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes(
+    monkeypatch,
+):
     from qbt_orchestrator import cli
 
     class FakeQbt:
@@ -83,18 +87,36 @@ def test_cli_once_dry_run_executes_one_safety_and_planner_tick_without_writes():
 
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "state.sqlite"
-        old_qbt = cli.QbtDockerClient
-        old_disk = os.environ.get("QBT_ORCH_DISK_PATH")
-        cli.QbtDockerClient = lambda *a, **kw: FakeQbt()
-        os.environ["QBT_ORCH_DISK_PATH"] = td
-        try:
-            rc, out = run_cli(["once", "--dry-run", "--state-db", str(db)])
-        finally:
-            cli.QbtDockerClient = old_qbt
-            if old_disk is None:
-                os.environ.pop("QBT_ORCH_DISK_PATH", None)
-            else:
-                os.environ["QBT_ORCH_DISK_PATH"] = old_disk
+        monkeypatch.setattr(
+            cli,
+            "_build_qbt_client_from_env",
+            lambda *_args, **_kwargs: FakeQbt(),
+        )
+        monkeypatch.setattr(
+            cli,
+            "_free_bytes_for",
+            lambda _path: lambda: 16 * 1024**3,
+        )
+        monkeypatch.setenv("QBT_ORCH_DISK_PATH", td)
+        for key, value in {
+            "QBT_ORCH_DISK_FLOOR_GB": "3",
+            "QBT_ORCH_EMERGENCY_FLOOR_GB": "1.5",
+            "QBT_ORCH_RECOVERY_ENTER_GB": "3.5",
+            "QBT_ORCH_DRAIN_EXIT_GB": "5",
+            "QBT_ORCH_EXPLORE_ENTER_GB": "8",
+            "QBT_ORCH_RECOVERY_MODE": "1",
+            "QBT_ORCH_RECOVERY_MARGIN_MB": "256",
+            "QBT_ORCH_ACTIVE_SLOTS": "5",
+            "QBT_ORCH_RECOVERY_ACTIVE_SLOTS": "4",
+            "QBT_ORCH_RECOVERY_MAX_REMAINING_GB": "1.5",
+            "QBT_ORCH_SOAK_ENABLED": "0",
+            "QBT_ORCH_SCHEDULER_ENGINE": "legacy",
+            "QBT_ORCH_CAPACITY_RECLAIM": "0",
+            "QBT_ORCH_BACKGROUND_PERIODIC_WORKERS": "0",
+        }.items():
+            monkeypatch.setenv(key, value)
+
+        rc, out = run_cli(["once", "--dry-run", "--state-db", str(db)])
 
         assert rc == 0
         assert "once dry-run completed" in out
@@ -329,7 +351,7 @@ def test_cli_wires_qbt_preferences_guard_into_maintenance_loop():
         con.close()
         result = json.loads(loop_json)["result"]
         assert result["qbt_preferences"]["would_set"] == {"preallocate_all": False}
-        assert result["qbt_preferences"]["drift"]["incomplete_files_ext"]["desired"] is None
+        assert result["qbt_preferences"]["observed"]["incomplete_files_ext"] is False
         assert action == ("qbt_preferences", "dry_run", 1)
 
 
@@ -405,6 +427,358 @@ def test_cli_runtime_disables_batch_pipeline_by_default_and_enables_with_env(mon
         assert runtime.batch_pipeline_enabled is True
 
 
+def test_cli_build_migrates_before_creating_shared_executor_with_state_db(
+    monkeypatch,
+    tmp_path,
+):
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("test should not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = False
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    db = tmp_path / "existing-but-unmigrated.sqlite"
+    db.touch()
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+    monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+
+    runtime, _ = cli._build_runtime(Ns(), db)
+    try:
+        assert runtime.executor.state_db == db
+        con = sqlite3.connect(db)
+        try:
+            assert con.execute(
+                "select count(*) from sqlite_master "
+                "where type='table' and name='capacity_reclaims'"
+            ).fetchone()[0] == 1
+        finally:
+            con.close()
+    finally:
+        runtime.executor.close(timeout=1)
+
+
+def test_cli_wires_capacity_assessment_thresholds_without_conflating_ages(
+    monkeypatch,
+    tmp_path,
+):
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("configuration test must not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = False
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    db = tmp_path / "state.sqlite"
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+    monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM", "1")
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_DRY_RUN", "1")
+    monkeypatch.setenv("QBT_ORCH_HOST_DOWNLOADS", str(tmp_path))
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_ROOT", str(managed))
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC", "555")
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_MIN_NO_PROGRESS_SEC", "7200")
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_MIN_DEAD_SEC", "999")
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_MIN_RECLAIMABLE_SEC", "1234")
+
+    runtime, _ = cli._build_runtime(Ns(), db)
+    try:
+        assert runtime.capacity_assessment_builder.viability_stale_sec == 555
+        assert runtime.capacity_assessment_store.min_no_progress_sec == 7200
+        assert runtime.capacity_reclaimer.min_reclaimable_age_sec == 1234
+        snapshot = runtime._effective_config_snapshot()
+        assert snapshot["limits"]["capacity_reclaim_min_no_progress_sec"] == 7200
+        assert snapshot["limits"]["capacity_reclaim_min_reclaimable_sec"] == 1234
+        assert (
+            snapshot["config_sources"]["capacity_reclaim_min_no_progress_sec"]
+            == "QBT_ORCH_CAPACITY_RECLAIM_MIN_NO_PROGRESS_SEC"
+        )
+    finally:
+        runtime.executor.close(timeout=1)
+
+
+def test_cli_capacity_no_progress_uses_legacy_dead_age_only_as_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("configuration test must not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = False
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    db = tmp_path / "state.sqlite"
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+    monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+    monkeypatch.delenv(
+        "QBT_ORCH_CAPACITY_RECLAIM_MIN_NO_PROGRESS_SEC", raising=False
+    )
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_MIN_DEAD_SEC", "8123")
+
+    runtime, _ = cli._build_runtime(Ns(), db)
+    try:
+        snapshot = runtime._effective_config_snapshot()
+        assert runtime.capacity_assessment_store.min_no_progress_sec == 8123
+        assert (
+            snapshot["config_sources"]["capacity_reclaim_min_no_progress_sec"]
+            == "QBT_ORCH_CAPACITY_RECLAIM_MIN_DEAD_SEC"
+        )
+    finally:
+        runtime.executor.close(timeout=1)
+
+
+@pytest.mark.parametrize(
+    ("env_name", "message"),
+    [
+        (
+            "QBT_ORCH_CAPACITY_RECLAIM_MIN_NO_PROGRESS_SEC",
+            "capacity reclaim min no-progress",
+        ),
+        (
+            "QBT_ORCH_CAPACITY_RECLAIM_MIN_RECLAIMABLE_SEC",
+            "capacity reclaim min reclaimable",
+        ),
+    ],
+)
+def test_cli_rejects_negative_capacity_reclaim_ages(
+    monkeypatch,
+    tmp_path,
+    env_name,
+    message,
+):
+    from qbt_orchestrator import cli
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("configuration test must not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = False
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(tmp_path / "state.sqlite"))
+    monkeypatch.setenv(env_name, "-1")
+
+    with pytest.raises(ValueError, match=message):
+        cli._build_runtime(Ns(), tmp_path / "fallback.sqlite")
+
+
+@pytest.mark.parametrize(
+    ("capacity_enabled", "expects_regular_reclaimer"),
+    [("0", False), ("1", True)],
+)
+def test_cli_constructs_live_recovery_only_reclaimer_for_durable_rows(
+    monkeypatch,
+    tmp_path,
+    capacity_enabled,
+    expects_regular_reclaimer,
+):
+    from qbt_orchestrator import cli
+    from qbt_orchestrator.db import migrate
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("runtime construction must not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = False
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    db = tmp_path / "state.sqlite"
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((managed / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+    monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM", capacity_enabled)
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_DRY_RUN", "1")
+    monkeypatch.setenv("QBT_ORCH_HOST_DOWNLOADS", str(tmp_path))
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_ROOT", str(managed))
+
+    runtime, _ = cli._build_runtime(Ns(), db)
+    try:
+        assert (runtime.capacity_reclaimer is not None) is expects_regular_reclaimer
+        if runtime.capacity_reclaimer is not None:
+            assert runtime.capacity_reclaimer.dry_run is True
+        assert runtime.capacity_recovery_reclaimer is not None
+        assert runtime.capacity_recovery_reclaimer.dry_run is False
+        assert runtime.capacity_recovery_reclaimer.max_per_tick == 0
+        snapshot = runtime._effective_config_snapshot()
+        assert snapshot["feature_flags"]["capacity_reclaim_recovery"] is True
+        assert (
+            snapshot["feature_flags"]["capacity_reclaim_recovery_dry_run"]
+            is False
+        )
+    finally:
+        runtime.executor.close(timeout=1)
+
+
+def test_cli_fails_closed_when_durable_recovery_is_required_in_global_dry_run(
+    monkeypatch,
+    tmp_path,
+):
+    from qbt_orchestrator import cli
+    from qbt_orchestrator.db import migrate
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("runtime construction must not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = True
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    db = tmp_path / "state.sqlite"
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((managed / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+    monkeypatch.setenv("QBT_ORCH_HOST_DOWNLOADS", str(tmp_path))
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_ROOT", str(managed))
+
+    with pytest.raises(RuntimeError, match="global dry-run cannot safely reconcile"):
+        cli._build_runtime(Ns(), db)
+
+
+@pytest.mark.parametrize(
+    "manual_state",
+    ["aborted_paused", "partial_or_unknown", "stop_unknown", "reclaimed"],
+)
+def test_cli_global_dry_run_allows_manual_terminal_reclaim_leases(
+    monkeypatch,
+    tmp_path,
+    manual_state,
+):
+    from qbt_orchestrator import cli
+    from qbt_orchestrator.db import migrate
+
+    class FakeQbt:
+        def post(self, path, payload):
+            raise AssertionError("runtime construction must not post to qBT")
+
+    class Ns:
+        cmd = "once"
+        config = None
+        dry_run = True
+        safety_interval = 0
+        max_safety_ticks = 1
+
+    db = tmp_path / "state.sqlite"
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,?,1,1,1)",
+        (
+            str((managed / "h").resolve()),
+            "/downloads/incomplete/h",
+            manual_state,
+        ),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(
+        cli,
+        "_build_qbt_client_from_env",
+        lambda *_args, **_kwargs: FakeQbt(),
+    )
+    monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM", "0")
+    monkeypatch.setenv("QBT_ORCH_HOST_DOWNLOADS", str(tmp_path))
+    monkeypatch.setenv("QBT_ORCH_CAPACITY_RECLAIM_ROOT", str(managed))
+
+    runtime, _ = cli._build_runtime(Ns(), db)
+    try:
+        assert runtime.capacity_reclaimer is None
+        assert runtime.capacity_recovery_reclaimer is None
+    finally:
+        runtime.executor.close(timeout=1)
+
+
 def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
     from qbt_orchestrator.cli import _build_runtime
     from qbt_orchestrator.db import migrate
@@ -425,6 +799,7 @@ def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
         monkeypatch.setenv("QBT_ORCH_BATCH_ALLOW_TAG", "batch-canary")
         monkeypatch.setenv("QBT_ORCH_BATCH_MAX_LIVE_BATCH_BYTES_GB", "1.5")
         monkeypatch.setenv("QBT_ORCH_BATCH_MAX_NEW_PER_TICK", "1")
+        monkeypatch.setenv("QBT_ORCH_BATCH_INVENTORY_LIMIT", "6")
 
         runtime, _ = _build_runtime(Ns(), db)
 
@@ -434,6 +809,37 @@ def test_cli_runtime_wires_batch_live_canary_env(monkeypatch):
         assert runtime.batch_allow_tag == "batch-canary"
         assert runtime.batch_max_live_batch_bytes == int(1.5 * 1024**3)
         assert runtime.batch_max_new_per_tick == 1
+        assert runtime.batch_inventory_limit == 6
+
+
+def test_cli_runtime_wires_disk_adaptive_cleanup_policy_env(monkeypatch):
+    from qbt_orchestrator.cli import _build_runtime
+    from qbt_orchestrator.db import migrate
+
+    class Ns:
+        config = None
+        dry_run = False
+        safety_interval = 0
+        cmd = "once"
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        monkeypatch.setenv("QBT_ORCH_STATE_DB", str(db))
+        monkeypatch.setenv("QBT_ORCH_DRY_RUN", "0")
+        monkeypatch.setenv("QBT_ORCH_FULL_CLEANUP", "1")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_PRESSURE_FREE_GB", "5.5")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MIN_SEED_SEC", "901")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MIN_RATIO", "1.25")
+        monkeypatch.setenv("QBT_ORCH_CLEANUP_MAX_RETENTION_SEC", "7300")
+
+        runtime, _ = _build_runtime(Ns(), db)
+
+        assert runtime.cleanup_pressure_free_bytes == int(5.5 * 1024**3)
+        assert runtime.cleanup_min_seed_sec == 901
+        assert runtime.cleanup_min_ratio == 1.25
+        assert runtime.cleanup_max_retention_sec == 7300
+        assert runtime.full_cleanup_runner.pressure_free_bytes == int(5.5 * 1024**3)
 
 
 def test_cli_runtime_enables_background_event_workers_only_for_live_daemon(monkeypatch):
@@ -631,6 +1037,27 @@ def test_status_queue_includes_soak_counts():
         assert payload["scheduler_by_state"]["soak_resident"] == 1
         assert payload["scheduler_by_state"]["soak_hot"] == 1
         assert payload["soak_probe_reserved_bytes"] == 384
+
+
+def test_status_queue_includes_media_promotion_counts():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into media_promotions(upload_job_id,normalized_id,metadata_title,display_title,"
+            "source_remote,target_remote,expected_size,expected_hashes_json,state,max_attempts,created_at,updated_at) "
+            "values(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (1, "ABC-123", "Title", "ABC-123 Title", "gcrypt:/old.mp4", "gcrypt:/ABC-123/ABC-123 Title.mp4", 10, "{}", "retry_wait", 6, 1, 1),
+        )
+        con.commit()
+        con.close()
+
+        payload = json.loads(run_cli(["status", "queue", "--state-db", str(db), "--json"])[1])
+
+        assert payload["promotions_by_state"] == {"retry_wait": 1}
 
 
 if __name__ == "__main__":

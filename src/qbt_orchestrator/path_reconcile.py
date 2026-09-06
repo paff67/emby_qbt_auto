@@ -38,6 +38,15 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root + "/")
 
 
+def drift_identity(drift: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(drift.get("hash") or ""),
+        str(drift.get("reason") or ""),
+        str(drift.get("save_path") or ""),
+        str(drift.get("content_path") or ""),
+    )
+
+
 class QbtPathReconciler:
     """Read-only qBT path drift detector.
 
@@ -108,8 +117,12 @@ class QbtPathReconciler:
                 "select data_json from events_v2 where component='qbt_reconcile' and event_type='path_drift' and hash=? order by id desc limit 1",
                 (drift.get("hash"),),
             ).fetchone()
-            if row and (row[0] or "") == data_json:
-                return
+            if row:
+                try:
+                    if drift_identity(json.loads(row[0] or "{}")) == drift_identity(drift):
+                        return
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
             write_transaction(
                 self.state_db,
                 lambda wcon: wcon.execute(

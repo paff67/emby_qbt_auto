@@ -48,12 +48,17 @@ def load_config_from_dict(data: Mapping[str, Any]) -> AppConfig:
         debounce_sec=int(emby_raw.get("debounce_sec", 300)),
         max_debounce_wait_sec=int(emby_raw.get("max_debounce_wait_sec", 900)),
     )
+    ok_free_bytes = int(float(disk_raw.get("ok_free_gb", 5)) * 1024**3)
+    guard_free_bytes = int(float(disk_raw.get("guard_free_gb", disk_raw.get("target_min_free_gb", 3))) * 1024**3)
     disk = DiskConfig(
-        ok_free_bytes=int(float(disk_raw.get("ok_free_gb", 5)) * 1024**3),
+        ok_free_bytes=ok_free_bytes,
         watch_free_bytes=int(float(disk_raw.get("watch_free_gb", 4)) * 1024**3),
-        guard_free_bytes=int(float(disk_raw.get("guard_free_gb", disk_raw.get("target_min_free_gb", 3))) * 1024**3),
+        guard_free_bytes=guard_free_bytes,
         critical_free_bytes=int(float(disk_raw.get("critical_free_gb", 2)) * 1024**3),
-        emergency_free_bytes=2 * 1024**3,
+        emergency_free_bytes=int(float(disk_raw.get("pause_all_downloads_free_below_gb", 2)) * 1024**3),
+        drain_enter_bytes=int(float(disk_raw.get("pause_new_free_below_gb", guard_free_bytes / 1024**3)) * 1024**3),
+        drain_exit_bytes=int(float(disk_raw.get("drain_exit_gb", ok_free_bytes / 1024**3)) * 1024**3),
+        explore_enter_bytes=int(float(disk_raw.get("explore_free_gb", 8)) * 1024**3),
     )
     incomplete_desired = qbt_prefs_raw.get("incomplete_files_ext_desired", qbt_prefs_raw.get("incomplete_files_ext", None))
     qbt_preferences = QbtPreferencesConfig(

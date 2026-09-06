@@ -182,6 +182,92 @@ def test_persistent_media_pipeline_uses_filename_normalizer_for_grouping_and_scr
         assert rows(db, "select count(*) as n from emby_refresh_tasks")[0]["n"] == 0
 
 
+def test_verified_ingest_enqueues_canonical_promotion_and_colocated_sidecars():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        staging = "/var/lib/qbt-orchestrator/sidecar-staging/WAAA-614"
+        normalizer = RecordingNormalizer(
+            {
+                "normalized_id": "WAAA-614",
+                "confidence": 0.95,
+                "raw_basename": "489155.com@WAAA-614",
+                "reason": "domain_prefix_removed_and_standard_jav_id_matched",
+            }
+        )
+        backfill = RecordingBackfill(
+            {
+                "status": "sidecar_verified",
+                "staging_dir": staging,
+                "normalized_id": "WAAA-614",
+                "metadata_title": "影片名称",
+                "display_title": "WAAA-614 影片名称",
+                "canonical_basename": "WAAA-614 影片名称",
+                "canonical_remote_dir": "gcrypt:/WAAA-614",
+                "artifacts": [
+                    {"local": f"{staging}/WAAA-614 影片名称.nfo", "remote": "gcrypt:/WAAA-614/WAAA-614 影片名称.nfo", "size": 100},
+                    {"local": f"{staging}/WAAA-614 影片名称-poster.jpg", "remote": "gcrypt:/WAAA-614/WAAA-614 影片名称-poster.jpg", "size": 200},
+                    {"local": f"{staging}/WAAA-614 影片名称-fanart.jpg", "remote": "gcrypt:/WAAA-614/WAAA-614 影片名称-fanart.jpg", "size": 300},
+                ],
+            }
+        )
+        service = MediaPipelineService(
+            db,
+            backfill=backfill,
+            normalizer=normalizer,
+            now=lambda: 4_200,
+        )
+
+        result = service.handle_upload_verified(
+            "upload-job-7",
+            [
+                UploadedFile(
+                    "gcrypt:/WAAA-614-8cfce204ec0e/489155.com@WAAA-614.mp4",
+                    size=5_542_877_598,
+                    duration_sec=120,
+                )
+            ],
+            upload_job_id=7,
+            torrent_hash="8cfce204",
+        )
+
+        assert result.media_group_key == "WAAA-614"
+        assert result.state == "SidecarUploadQueued"
+        promotion = rows(db, "select * from media_promotions")[0]
+        assert promotion["source_remote"] == "gcrypt:/WAAA-614-8cfce204ec0e/489155.com@WAAA-614.mp4"
+        assert promotion["target_remote"] == "gcrypt:/WAAA-614/WAAA-614 影片名称.mp4"
+        assert promotion["expected_size"] == 5_542_877_598
+
+        payloads = [
+            json.loads(row["payload_json"])
+            for row in rows(
+                db,
+                "select payload_json from torrent_jobs where job_type='sidecar_upload' order by id",
+            )
+        ]
+        assert [payload["remote"] for payload in payloads] == [
+            "gcrypt:/WAAA-614/WAAA-614 影片名称.nfo",
+            "gcrypt:/WAAA-614/WAAA-614 影片名称-poster.jpg",
+            "gcrypt:/WAAA-614/WAAA-614 影片名称-fanart.jpg",
+        ]
+        run = rows(
+            db,
+            "select canonical_remote_dir,canonical_basename,canonical_video_manifest_json from media_pipeline_runs",
+        )[0]
+        assert run["canonical_remote_dir"] == "gcrypt:/WAAA-614"
+        assert run["canonical_basename"] == "WAAA-614 影片名称"
+        assert json.loads(run["canonical_video_manifest_json"]) == [
+            {
+                "remote_path": "gcrypt:/WAAA-614/WAAA-614 影片名称.mp4",
+                "size": 5_542_877_598,
+            }
+        ]
+        assert rows(db, "select * from emby_refresh_tasks") == []
+
+
 def test_media_pipeline_propagates_passthrough_policy_to_sidecar_upload_jobs():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.media import MediaPipelineService, UploadedFile
@@ -243,6 +329,47 @@ def test_persistent_media_pipeline_low_confidence_normalize_passthrough_skips_sc
         }
         assert rows(db, "select count(*) as n from torrent_jobs")[0]["n"] == 0
         assert rows(db, "select emby_media_dir from emby_refresh_tasks") == [{"emby_media_dir": "/media/gcrypt/raw-upload"}]
+
+
+def test_low_confidence_live_upload_uses_verified_identity_promotion_barrier():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import MediaPipelineService, UploadedFile
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        normalizer = RecordingNormalizer(
+            {"normalized_id": "", "confidence": 0.2, "reason": "no_jav_id"}
+        )
+        service = MediaPipelineService(
+            db,
+            backfill=RecordingBackfill({"status": "not_found", "artifacts": []}),
+            normalizer=normalizer,
+            now=lambda: 5100,
+        )
+        source = "gcrypt:/raw-upload/random_home_video.mp4"
+
+        result = service.handle_upload_verified(
+            "upload-job-99",
+            [UploadedFile(source, size=1024**3, duration_sec=120)],
+            upload_job_id=99,
+            torrent_hash="h99",
+        )
+
+        assert result.state == "PassthroughAllowed"
+        promotion = rows(db, "select * from media_promotions")[0]
+        assert promotion["source_remote"] == source
+        assert promotion["target_remote"] == source
+        run = rows(
+            db,
+            "select canonical_remote_dir,canonical_basename,canonical_video_manifest_json from media_pipeline_runs",
+        )[0]
+        assert run["canonical_remote_dir"] == "gcrypt:/raw-upload"
+        assert run["canonical_basename"] == "random_home_video"
+        assert json.loads(run["canonical_video_manifest_json"]) == [
+            {"remote_path": source, "size": 1024**3}
+        ]
+        assert rows(db, "select * from emby_refresh_tasks") == []
 
 
 def test_persistent_media_pipeline_requires_core_sidecar_artifacts_before_upload_job():
@@ -343,6 +470,122 @@ def test_emby_refresh_worker_calls_precise_media_updated_and_rejects_root_path()
         assert states[0]["state"] == "done"
         assert states[1]["state"] == "blocked"
         assert "too broad" in states[1]["last_error"]
+
+
+def test_emby_refresh_flushes_mount_cache_before_notifying_emby():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker
+
+    class RecordingFlusher:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def flush(self, path):
+            self.calls.append(("flush", path))
+
+    class RecordingEmby:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def media_updated(self, path):
+            self.calls.append(("emby", path))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            ("/media/gcrypt/WAAA-614", "queued", 1, 1, "{}", 1, 1),
+        )
+        con.commit()
+        con.close()
+        calls = []
+        worker = EmbyRefreshWorker(
+            db,
+            RecordingEmby(calls),
+            cache_flusher=RecordingFlusher(calls),
+            now=lambda: 100,
+        )
+
+        assert worker.run_next() == 1
+        assert calls == [
+            ("flush", "/media/gcrypt/WAAA-614"),
+            ("emby", "/media/gcrypt/WAAA-614"),
+        ]
+
+
+def test_emby_refresh_worker_prefers_recursive_path_refresh():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker
+
+    class RecursiveEmby:
+        def __init__(self):
+            self.calls = []
+
+        def media_updated(self, path):
+            raise AssertionError("refresh_path should own the notification sequence")
+
+        def refresh_path(self, path):
+            self.calls.append(path)
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            ("/media/gcrypt/ABC-123", "queued", 1, 1, "{}", 1, 1),
+        )
+        con.commit()
+        con.close()
+        emby = RecursiveEmby()
+        worker = EmbyRefreshWorker(db, emby, now=lambda: 100)
+
+        assert worker.run_next() == 1
+        assert emby.calls == ["/media/gcrypt/ABC-123"]
+        assert rows(db, "select state from emby_refresh_tasks") == [{"state": "done"}]
+
+
+def test_transient_emby_failure_retries_with_backoff_and_attempt_limit():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.media import EmbyRefreshWorker
+
+    class TransientEmby:
+        def __init__(self):
+            self.calls = 0
+
+        def media_updated(self, path):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("emby timeout")
+            return {"ok": True}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into emby_refresh_tasks(emby_media_dir,state,earliest_run_at,max_run_at,payload_json,created_at,updated_at) "
+            "values('/media/gcrypt/ABC-123','queued',100,500,'{}',1,1)"
+        )
+        con.commit()
+        con.close()
+        clock = [200]
+        emby = TransientEmby()
+        worker = EmbyRefreshWorker(db, emby, now=lambda: clock[0], retry_delay_sec=60)
+
+        assert worker.run_next() == 1
+        assert rows(db, "select state,attempts,next_run_at from emby_refresh_tasks") == [
+            {"state": "retry_wait", "attempts": 1, "next_run_at": 260}
+        ]
+        assert worker.run_next() is None
+
+        clock[0] = 261
+        assert worker.run_next() == 1
+        assert rows(db, "select state,attempts,next_run_at from emby_refresh_tasks") == [
+            {"state": "done", "attempts": 2, "next_run_at": 260}
+        ]
 
 
 if __name__ == "__main__":

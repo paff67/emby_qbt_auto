@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, Dict, Set
 
 from .db import write_transaction
+from .hash_identity import canonical_torrent_hash
 
 VIEWER = {"status", "trace", "perf"}
 OPERATOR = VIEWER | {"pause", "resume", "queue"}
@@ -36,10 +37,33 @@ class SQLiteBotCommandStore:
     def __init__(self, state_db: str | Path): self.state_db = Path(state_db)
     def insert_command(self, command_id, chat_id, user_id, command, payload):
         now = int(time.time())
+        command_name = str(command)
+        durable_payload = dict(payload or {})
+        for key in ("hash", "target"):
+            if key in durable_payload:
+                durable_payload[key] = canonical_torrent_hash(
+                    durable_payload[key]
+                )
+        if command_name in {
+            "pause",
+            "resume",
+            "queue",
+            "force_upload",
+            "cleanup",
+            "preempt",
+        }:
+            args = durable_payload.get("args")
+            if isinstance(args, list):
+                durable_payload["args"] = [
+                    canonical_torrent_hash(value)
+                    if index < (2 if command_name == "preempt" else 1)
+                    else value
+                    for index, value in enumerate(args)
+                ]
         write_transaction(
             self.state_db,
             lambda con: con.execute(
                 "insert or ignore into bot_commands(command_id,chat_id,user_id,command,payload_json,state,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
-                (str(command_id), str(chat_id), str(user_id), str(command), json.dumps(payload, ensure_ascii=False), "queued", now, now),
+                (str(command_id), str(chat_id), str(user_id), command_name, json.dumps(durable_payload, ensure_ascii=False), "queued", now, now),
             ),
         )

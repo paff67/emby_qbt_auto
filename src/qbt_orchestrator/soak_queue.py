@@ -7,8 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from .budget import future_growth_by_hash, resource_claims_from_rows
 from .db import readonly_connect, write_transaction
+from .decision_recorder import DecisionRecorder
 from .observability import redact
+from .scheduler_intents import SchedulerIntent, SchedulerIntentRepository
 
 
 STOPPED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "stopped"}
@@ -18,6 +21,11 @@ STOPPED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "s
 class SoakQueueConfig:
     enabled: bool = True
     resident_slots: int = 8
+    allowed_modes: tuple[str, ...] = ("normal", "explore")
+    require_swarm: bool = True
+    max_cold_partial_bytes: int = 4 * 1024**3
+    max_cold_partial_torrents: int = 8
+    max_new_per_hour: int = 4
     # Deprecated compatibility knob: retained for config traceability, but no
     # longer acts as a hard gate. Disk-floor budget below decides starts.
     min_free_bytes: int = 0
@@ -49,6 +57,8 @@ class SoakQueueResult:
     throttled_hashes: list[str] = field(default_factory=list)
     unthrottled_hashes: list[str] = field(default_factory=list)
     reserved_bytes: int = 0
+    cold_partial_bytes: int = 0
+    cold_partial_torrents: int = 0
     blocked_reason: str | None = None
     dry_run: bool = True
 
@@ -67,6 +77,8 @@ class SoakQueueResult:
             "throttled_hashes": list(self.throttled_hashes),
             "unthrottled_hashes": list(self.unthrottled_hashes),
             "reserved_bytes": int(self.reserved_bytes),
+            "cold_partial_bytes": int(self.cold_partial_bytes),
+            "cold_partial_torrents": int(self.cold_partial_torrents),
             "blocked_reason": self.blocked_reason,
             "dry_run": bool(self.dry_run),
         }
@@ -107,6 +119,8 @@ class SoakQueueService:
         self.dry_run = bool(dry_run)
         self.config = config or SoakQueueConfig()
         self.now = now or (lambda: int(time.time()))
+        self.intent_repository = SchedulerIntentRepository(self.state_db)
+        self.decision_recorder = DecisionRecorder(self.state_db, now=self.now)
 
     def calculate_exposure(self, torrent: Mapping[str, Any], ema_dlspeed_bps: int) -> int:
         amount_left = max(0, int(torrent.get("amount_left") or 0))
@@ -125,8 +139,10 @@ class SoakQueueService:
         free_bytes: int,
         sync_healthy: bool,
         active_hashes: set[str] | None = None,
+        scheduler_mode: str = "normal",
     ) -> SoakQueueResult:
         now = int(self.now())
+        scheduler_mode = str(scheduler_mode or "normal").strip().lower()
         managed = [dict(t, hash=str(t.get("hash") or h)) for h, t in snapshots.items() if _is_managed(t) and int(t.get("amount_left") or 0) > 0]
         rows = self._state_rows()
         ema_by_hash = self._update_samples(managed, rows, now)
@@ -150,15 +166,60 @@ class SoakQueueService:
             and str((rows.get(str(t["hash"])) or {}).get("state") or "") in {"soak_resident", "soak_hot"}
             and str(t["hash"]) not in cooldown_hashes
         ]
-        candidates = [
+        all_candidates = [
             t
             for t in managed
             if str(t["hash"]) not in active_like
             and str(t["hash"]) not in cooldown_hashes
             and _is_stopped_download(t)
         ]
+        candidates: list[dict[str, Any]] = []
+        for torrent in all_candidates:
+            h = str(torrent["hash"])
+            if self.config.require_swarm and not self._has_swarm(torrent):
+                self._decision(h, "blocked", "swarm_required", {"scheduler_mode": scheduler_mode})
+                continue
+            candidates.append(torrent)
         candidates.sort(key=lambda t: self._candidate_sort_key(t, ema_by_hash.get(str(t["hash"]), 0)))
 
+        cold_partial_bytes, cold_partial_torrents = self._cold_partial_debt(managed)
+        recent_probe_count = self._recent_probe_count(now)
+        blocked_reason: str | None = None
+        if all_candidates and scheduler_mode not in self._allowed_modes():
+            blocked_reason = "mode_disallows_new_probe"
+        elif all_candidates and self._partial_debt_cap_reached(cold_partial_bytes, cold_partial_torrents):
+            blocked_reason = "cold_partial_debt_cap_reached"
+        elif all_candidates and recent_probe_count >= max(0, int(self.config.max_new_per_hour)):
+            blocked_reason = "hourly_probe_cap_reached"
+        elif all_candidates and not candidates and self.config.require_swarm:
+            blocked_reason = "swarm_required"
+
+        if blocked_reason is not None:
+            for torrent in candidates:
+                self._decision(
+                    str(torrent["hash"]),
+                    "blocked",
+                    blocked_reason,
+                    {
+                        "scheduler_mode": scheduler_mode,
+                        "cold_partial_bytes": cold_partial_bytes,
+                        "cold_partial_torrents": cold_partial_torrents,
+                        "recent_probe_count": recent_probe_count,
+                    },
+                )
+            candidates = []
+        else:
+            hourly_remaining = max(0, int(self.config.max_new_per_hour) - recent_probe_count)
+            candidates = candidates[:hourly_remaining]
+
+        self._record_partial_debt_metric(
+            now,
+            scheduler_mode=scheduler_mode,
+            cold_partial_bytes=cold_partial_bytes,
+            cold_partial_torrents=cold_partial_torrents,
+            recent_probe_count=recent_probe_count,
+            blocked_reason=blocked_reason,
+        )
         selected = list(existing_residents)
         remaining_slots = max(0, int(self.config.resident_slots) - len(selected))
         startable = min(remaining_slots, available_qbt_slots)
@@ -176,15 +237,50 @@ class SoakQueueService:
             now=now,
         )
         selected_hashes = {str(t["hash"]) for t in selected}
+        started = [str(t["hash"]) for t in selected if _is_stopped_download(t)]
+
+        if self.dry_run:
+            hot_hashes = {
+                str(t["hash"])
+                for t in selected
+                if self._is_hot_ready(
+                    str(t["hash"]),
+                    rows.get(str(t["hash"])) or {},
+                    ema_by_hash.get(str(t["hash"]), 0),
+                    now,
+                )
+            }
+            resident_hashes = [str(t["hash"]) for t in selected if str(t["hash"]) not in hot_hashes]
+            managed_by_hash = {str(t["hash"]): t for t in managed}
+            stopped = [
+                h
+                for h, row in rows.items()
+                if str(row.get("state") or "") in {"soak_resident", "soak_hot"}
+                and h not in selected_hashes
+                and h in managed_by_hash
+                and _is_running_download(managed_by_hash[h])
+            ]
+            for h in started:
+                self._decision(h, "resident_start_preview", "dry_run", {"exposure_bytes": exposures.get(h, 0)})
+            return SoakQueueResult(
+                started=started,
+                stopped=stopped,
+                resident_hashes=resident_hashes,
+                hot_hashes=sorted(hot_hashes),
+                cooldown_hashes=sorted(cooldown_hashes | set(preempted_hashes)),
+                preempted_hashes=preempted_hashes,
+                reserved_bytes=sum(int(v) for v in exposures.values()),
+                cold_partial_bytes=cold_partial_bytes,
+                cold_partial_torrents=cold_partial_torrents,
+                blocked_reason=blocked_reason,
+                dry_run=True,
+            )
 
         hot_hashes = self._update_resident_state(selected, rows, ema_by_hash, exposures, now)
         resident_hashes = [str(t["hash"]) for t in selected if str(t["hash"]) not in hot_hashes]
-        started = [str(t["hash"]) for t in selected if _is_stopped_download(t)]
         stopped = self._pause_stale_residents(managed, selected_hashes, rows, now)
         self._release_stale_reservations(selected_hashes, now, reason="soak_reallocated")
         self._sync_reservations(exposures, now)
-        self._apply_seq_false(sorted(selected_hashes))
-        self._qbt_post("/api/v2/torrents/start", started)
         throttled_hashes, unthrottled_hashes = self._apply_low_capacity_download_limits(
             selected_hashes,
             rows=rows,
@@ -208,7 +304,95 @@ class SoakQueueService:
             throttled_hashes=throttled_hashes,
             unthrottled_hashes=unthrottled_hashes,
             reserved_bytes=sum(int(v) for v in exposures.values()),
+            cold_partial_bytes=cold_partial_bytes,
+            cold_partial_torrents=cold_partial_torrents,
+            blocked_reason=blocked_reason,
             dry_run=self.dry_run,
+        )
+
+    def _allowed_modes(self) -> set[str]:
+        return {str(mode).strip().lower() for mode in self.config.allowed_modes if str(mode).strip()}
+
+    @staticmethod
+    def _has_swarm(torrent: Mapping[str, Any]) -> bool:
+        return (
+            int(torrent.get("num_seeds") or torrent.get("num_complete") or 0) > 0
+            or int(torrent.get("num_peers") or torrent.get("num_incomplete") or 0) > 0
+        )
+
+    @staticmethod
+    def _completed_bytes(torrent: Mapping[str, Any]) -> int:
+        explicit = int(
+            torrent.get("completed_bytes")
+            or torrent.get("completed")
+            or torrent.get("downloaded")
+            or 0
+        )
+        size = max(0, int(torrent.get("size") or torrent.get("total_size") or 0))
+        amount_left = max(0, int(torrent.get("amount_left") or 0))
+        inferred = max(0, size - amount_left) if size > 0 else 0
+        progress_inferred = int(size * max(0.0, min(1.0, float(torrent.get("progress") or 0))))
+        return max(0, min(size, max(explicit, inferred, progress_inferred))) if size > 0 else max(0, explicit)
+
+    def _cold_partial_debt(self, managed: list[Mapping[str, Any]]) -> tuple[int, int]:
+        completed = [
+            self._completed_bytes(torrent)
+            for torrent in managed
+            if _is_stopped_download(torrent) and int(torrent.get("amount_left") or 0) > 0
+        ]
+        positive = [value for value in completed if value > 0]
+        return sum(positive), len(positive)
+
+    def _partial_debt_cap_reached(self, cold_bytes: int, cold_torrents: int) -> bool:
+        bytes_cap = int(self.config.max_cold_partial_bytes)
+        torrent_cap = int(self.config.max_cold_partial_torrents)
+        return (
+            (bytes_cap > 0 and int(cold_bytes) >= bytes_cap)
+            or (torrent_cap > 0 and int(cold_torrents) >= torrent_cap)
+        )
+
+    def _recent_probe_count(self, now: int) -> int:
+        con = readonly_connect(self.state_db)
+        try:
+            return int(
+                con.execute(
+                    "select count(*) from decision_log "
+                    "where component='soak_queue' and decision='resident_start' and ts>?",
+                    (int(now) - 3600,),
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+
+    def _record_partial_debt_metric(
+        self,
+        now: int,
+        *,
+        scheduler_mode: str,
+        cold_partial_bytes: int,
+        cold_partial_torrents: int,
+        recent_probe_count: int,
+        blocked_reason: str | None,
+    ) -> None:
+        metrics = {
+            "scheduler_mode": scheduler_mode,
+            "allowed_modes": sorted(self._allowed_modes()),
+            "require_swarm": bool(self.config.require_swarm),
+            "cold_partial_bytes": int(cold_partial_bytes),
+            "cold_partial_torrents": int(cold_partial_torrents),
+            "max_cold_partial_bytes": int(self.config.max_cold_partial_bytes),
+            "max_cold_partial_torrents": int(self.config.max_cold_partial_torrents),
+            "recent_probe_count": int(recent_probe_count),
+            "max_new_per_hour": int(self.config.max_new_per_hour),
+            "blocked_new_probes": blocked_reason is not None,
+            "blocked_reason": blocked_reason,
+        }
+        write_transaction(
+            self.state_db,
+            lambda con: con.execute(
+                "insert into metrics_snapshots(ts,component,metrics_json) values(?,?,?)",
+                (int(now), "soak_partial_debt", json.dumps(redact(metrics), ensure_ascii=False, sort_keys=True)),
+            ),
         )
 
     def _state_rows(self) -> dict[str, dict[str, Any]]:
@@ -271,7 +455,9 @@ class SoakQueueService:
         now: int,
     ) -> tuple[list[Mapping[str, Any]], dict[str, int], list[str]]:
         recovery_mode = int(self.config.emergency_floor_bytes) <= int(free_bytes) < int(self.config.disk_floor_bytes)
-        safe_budget = max(0, int(free_bytes) - int(self.config.disk_floor_bytes) - self._non_soak_reservation_bytes(now))
+        budget_floor = int(self.config.emergency_floor_bytes) if recovery_mode else int(self.config.disk_floor_bytes)
+        recovery_margin = int(self.config.recovery_margin_bytes) if recovery_mode else 0
+        safe_budget = max(0, int(free_bytes) - budget_floor - recovery_margin - self._non_soak_reservation_bytes(now))
         cap = min(int(self.config.max_total_exposure_bytes), safe_budget)
         out: list[Mapping[str, Any]] = []
         used = 0
@@ -279,20 +465,6 @@ class SoakQueueService:
         for torrent in selected:
             h = str(torrent["hash"])
             exposure = int(exposures.get(h) or 0)
-            if recovery_mode and self._is_existing_running_resident(h, torrent, rows):
-                out.append(torrent)
-                exposures[h] = 0
-                self._decision(
-                    h,
-                    "resident_keep",
-                    "soak_recovery_preserve",
-                    {
-                        "free_bytes": int(free_bytes),
-                        "disk_floor_bytes": int(self.config.disk_floor_bytes),
-                        "emergency_floor_bytes": int(self.config.emergency_floor_bytes),
-                    },
-                )
-                continue
             if used + exposure > cap:
                 if self._is_hot_ready(h, rows.get(h) or {}, ema_by_hash.get(h, 0), now):
                     needed = used + exposure - cap
@@ -311,12 +483,6 @@ class SoakQueueService:
             used += exposure
         return out, {str(t["hash"]): int(exposures.get(str(t["hash"]), 0)) for t in out}, preempted
 
-    def _is_existing_running_resident(self, hash: str, torrent: Mapping[str, Any], rows: dict[str, dict[str, Any]]) -> bool:
-        return (
-            str((rows.get(str(hash)) or {}).get("state") or "") in {"soak_resident", "soak_hot"}
-            and _is_running_download(torrent)
-        )
-
     def _is_hot_ready(self, hash: str, row: dict[str, Any], ema: int, now: int) -> bool:
         hot_since = row.get("hot_since")
         return (
@@ -328,23 +494,17 @@ class SoakQueueService:
     def _non_soak_reservation_bytes(self, now: int) -> int:
         con = readonly_connect(self.state_db)
         try:
-            grouped: dict[str, dict[str, int]] = {}
-            for row in con.execute(
-                "select id,hash,kind,bytes from resource_reservations where state='active' and (expires_at is null or expires_at>?)",
+            rows = con.execute(
+                "select id,hash,kind,accounting_class,bytes from resource_reservations "
+                "where state='active' and (expires_at is null or expires_at>?)",
                 (int(now),),
-            ).fetchall():
-                kind = str(row["kind"] or "")
-                if kind == "soak_probe":
-                    continue
-                key = str(row["hash"] or f"{kind}:{row['id']}")
-                bucket = grouped.setdefault(key, {"active_download": 0, "batch": 0, "other": 0})
-                if kind == "active_download":
-                    bucket["active_download"] += int(row["bytes"] or 0)
-                elif kind == "batch":
-                    bucket["batch"] += int(row["bytes"] or 0)
-                else:
-                    bucket["other"] += int(row["bytes"] or 0)
-            return sum(max(v["active_download"], v["batch"]) + v["other"] for v in grouped.values())
+            ).fetchall()
+            return sum(
+                future_growth_by_hash(
+                    resource_claims_from_rows(rows),
+                    ignored_kinds={"soak_probe"},
+                ).values()
+            )
         finally:
             con.close()
 
@@ -403,7 +563,6 @@ class SoakQueueService:
     def _preempt_active(self, hashes: list[str], now: int) -> None:
         if not hashes:
             return
-        self._qbt_post("/api/v2/torrents/stop", hashes)
         if self.dry_run:
             for h in hashes:
                 self._decision(h, "active_preempted", "hot_soak_preempted_active", {"dry_run": True})
@@ -416,11 +575,16 @@ class SoakQueueService:
                     "where kind='active_download' and state='active' and hash=?",
                     (now, "hot_soak_preempted_active", h),
                 )
-                con.execute(
-                    "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason) "
-                    "values(?,?,?,?,?,?,?,?,?) "
-                    "on conflict(hash) do update set desired_state=excluded.desired_state,applied_state=excluded.applied_state,slot_kind=excluded.slot_kind,priority_score=excluded.priority_score,reserved_bytes=excluded.reserved_bytes,desired_seq_dl=excluded.desired_seq_dl,allocated_at=excluded.allocated_at,reason=excluded.reason",
-                    (h, "soak_cooldown", "soak_cooldown", "soak_cooldown", 0, 0, 0, now, "hot_soak_preempted_active"),
+                self.intent_repository.upsert_in_transaction(
+                    con,
+                    SchedulerIntent(
+                        "soak",
+                        h,
+                        "cooldown",
+                        30,
+                        now + int(self.config.cooldown_sec),
+                        {"reason": "hot_soak_preempted_active"},
+                    ),
                 )
                 con.execute(
                     "insert into soak_state(hash,state,ema_dlspeed_bps,cooldown_until,last_stopped_at,exposure_bytes,last_sample_at,updated_at,reason) "
@@ -463,17 +627,15 @@ class SoakQueueService:
                 elif ema < int(self.config.low_bps):
                     hot_since = None
                 resident_since = old.get("resident_since") or now
+                old_state = str(old.get("state") or "")
+                last_started_at = old.get("last_started_at")
+                if last_started_at is None or (_is_stopped_download(torrent) and old_state not in {"soak_resident", "soak_hot"}):
+                    last_started_at = now
                 con.execute(
                     "insert into soak_state(hash,state,ema_dlspeed_bps,hot_since,resident_since,cooldown_until,last_started_at,exposure_bytes,last_sample_at,updated_at,reason) "
                     "values(?,?,?,?,?,?,?,?,?,?,?) "
-                    "on conflict(hash) do update set state=excluded.state,ema_dlspeed_bps=excluded.ema_dlspeed_bps,hot_since=excluded.hot_since,resident_since=excluded.resident_since,cooldown_until=null,last_started_at=coalesce(soak_state.last_started_at,excluded.last_started_at),exposure_bytes=excluded.exposure_bytes,last_sample_at=excluded.last_sample_at,updated_at=excluded.updated_at,reason=excluded.reason",
-                    (h, state, ema, hot_since, resident_since, None, now, int(exposures.get(h, 0)), now, now, reason),
-                )
-                con.execute(
-                    "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason) "
-                    "values(?,?,?,?,?,?,?,?,?) "
-                    "on conflict(hash) do update set desired_state=excluded.desired_state,applied_state=excluded.applied_state,slot_kind=excluded.slot_kind,priority_score=excluded.priority_score,reserved_bytes=excluded.reserved_bytes,desired_seq_dl=excluded.desired_seq_dl,allocated_at=excluded.allocated_at,reason=excluded.reason",
-                    (h, state, state, state, 0, int(exposures.get(h, 0)), 0, now, reason),
+                    "on conflict(hash) do update set state=excluded.state,ema_dlspeed_bps=excluded.ema_dlspeed_bps,hot_since=excluded.hot_since,resident_since=excluded.resident_since,cooldown_until=null,last_started_at=excluded.last_started_at,exposure_bytes=excluded.exposure_bytes,last_sample_at=excluded.last_sample_at,updated_at=excluded.updated_at,reason=excluded.reason",
+                    (h, state, ema, hot_since, resident_since, None, last_started_at, int(exposures.get(h, 0)), now, now, reason),
                 )
 
         write_transaction(self.state_db, txn)
@@ -500,7 +662,6 @@ class SoakQueueService:
                 if str((rows.get(h) or {}).get("reason") or "") == "low_capacity_throttled":
                     self._set_download_limit(h, 0)
                     self._decision(h, "download_unlimited", "resident_reallocated", {"limit_bps": 0})
-            self._qbt_post("/api/v2/torrents/stop", stale)
         if stale:
             def txn(con: sqlite3.Connection) -> None:
                 for h in stale:
@@ -508,11 +669,16 @@ class SoakQueueService:
                         "update soak_state set state='soak_cooldown', cooldown_until=?, last_stopped_at=?, exposure_bytes=0, updated_at=?, reason=? where hash=?",
                         (now + int(self.config.cooldown_sec), now, now, "resident_pause", h),
                     )
-                    con.execute(
-                        "insert into scheduler_allocations(hash,desired_state,applied_state,slot_kind,priority_score,reserved_bytes,desired_seq_dl,allocated_at,reason) "
-                        "values(?,?,?,?,?,?,?,?,?) "
-                        "on conflict(hash) do update set desired_state=excluded.desired_state,applied_state=excluded.applied_state,slot_kind=excluded.slot_kind,priority_score=excluded.priority_score,reserved_bytes=excluded.reserved_bytes,desired_seq_dl=excluded.desired_seq_dl,allocated_at=excluded.allocated_at,reason=excluded.reason",
-                        (h, "soak_cooldown", "soak_cooldown", "soak_cooldown", 0, 0, 0, now, "resident_pause"),
+                    self.intent_repository.upsert_in_transaction(
+                        con,
+                        SchedulerIntent(
+                            "soak",
+                            h,
+                            "cooldown",
+                            30,
+                            now + int(self.config.cooldown_sec),
+                            {"reason": "resident_pause"},
+                        ),
                     )
                     self._decision(h, "resident_pause", "resident_reallocated", {"cooldown_until": now + int(self.config.cooldown_sec)})
             write_transaction(self.state_db, txn)
@@ -527,10 +693,17 @@ class SoakQueueService:
                     f"update resource_reservations set state='released', released_at=?, reason=? where kind='soak_probe' and state='active' and hash not in ({placeholders})",
                     (now, reason, *sorted(selected_hashes)),
                 )
+                con.execute(
+                    f"delete from scheduler_intents where component='soak' and intent='probe' and hash not in ({placeholders})",
+                    tuple(sorted(selected_hashes)),
+                )
             else:
                 con.execute(
                     "update resource_reservations set state='released', released_at=?, reason=? where kind='soak_probe' and state='active'",
                     (now, reason),
+                )
+                con.execute(
+                    "delete from scheduler_intents where component='soak' and intent='probe'"
                 )
 
         write_transaction(self.state_db, txn)
@@ -544,17 +717,31 @@ class SoakQueueService:
                 ids = existing.get(h) or []
                 keep_id = ids[0] if ids else None
                 expires_at = now + 120
+                self.intent_repository.upsert_in_transaction(
+                    con,
+                    SchedulerIntent(
+                        "soak",
+                        h,
+                        "probe",
+                        30,
+                        expires_at,
+                        {"exposure_bytes": int(bytes_reserved)},
+                    ),
+                )
                 if keep_id is None:
                     reason = "soak_resident_recovery_preserve" if int(bytes_reserved) <= 0 else "soak_resident"
                     con.execute(
-                        "insert into resource_reservations(hash,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?)",
-                        (h, "soak_probe", int(bytes_reserved), "active", now, expires_at, reason),
+                        "insert into resource_reservations("
+                        "hash,kind,accounting_class,owner,bytes,state,created_at,expires_at,last_observed_at,reason) "
+                        "values(?,?,?,?,?,?,?,?,?,?)",
+                        (h, "soak_probe", "future_growth", "soak_queue", int(bytes_reserved), "active", now, expires_at, now, reason),
                     )
                 else:
                     reason = "soak_resident_recovery_preserve" if int(bytes_reserved) <= 0 else "soak_resident"
                     con.execute(
-                        "update resource_reservations set bytes=?, expires_at=?, released_at=null, reason=? where id=?",
-                        (int(bytes_reserved), expires_at, reason, keep_id),
+                        "update resource_reservations set accounting_class='future_growth',owner='soak_queue',bytes=?,"
+                        "expires_at=?,released_at=null,lease_generation=lease_generation+1,last_observed_at=?,reason=? where id=?",
+                        (int(bytes_reserved), expires_at, now, reason, keep_id),
                     )
                     if len(ids) > 1:
                         placeholders = ",".join("?" for _ in ids[1:])
@@ -564,22 +751,6 @@ class SoakQueueService:
                         )
 
         write_transaction(self.state_db, txn)
-
-    def _apply_seq_false(self, hashes: list[str]) -> None:
-        if not hashes or not hasattr(self.executor, "set_seq_dl"):
-            return
-        for h in hashes:
-            payload = {"hashes": h, "desired": False}
-            if self.dry_run:
-                self._action("/api/v2/torrents/toggleSequentialDownload", payload, "dry_run", True)
-                continue
-            try:
-                changed = bool(self.executor.set_seq_dl(h, False))
-                if changed:
-                    self._action("/api/v2/torrents/toggleSequentialDownload", payload, "succeeded", False)
-            except Exception as exc:
-                self._action("/api/v2/torrents/toggleSequentialDownload", payload, "failed", False, str(exc))
-                raise
 
     def _apply_low_capacity_download_limits(
         self,
@@ -658,28 +829,8 @@ class SoakQueueService:
             ),
         )
 
-    def _qbt_post(self, path: str, hashes: list[str]) -> None:
-        if not hashes:
-            return
-        payload = {"hashes": "|".join(hashes)}
-        if self.dry_run:
-            self._action(path, payload, "dry_run", True)
-            return
-        try:
-            self.executor.qbt_post(path, payload)
-            self._action(path, payload, "succeeded", False)
-        except Exception as exc:
-            self._action(path, payload, "failed", False, str(exc))
-            raise
-
     def _decision(self, hash: str | None, decision: str, reason_code: str, data: dict[str, Any]) -> None:
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
-                "insert into decision_log(ts,component,hash,decision,reason_code,data_json) values(?,?,?,?,?,?)",
-                (int(self.now()), "soak_queue", hash, decision, reason_code, json.dumps(redact(data), ensure_ascii=False)),
-            ),
-        )
+        self.decision_recorder.record("soak_queue", hash, decision, reason_code, data)
 
     def _action(self, path: str, payload: dict[str, Any], status: str, dry_run: bool, error: str | None = None) -> None:
         write_transaction(

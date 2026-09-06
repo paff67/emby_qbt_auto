@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 import sys
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -27,6 +31,1820 @@ class FakeExecutor:
 
     def qbt_post(self, path, payload):
         self.posts.append((path, payload))
+
+
+@pytest.fixture
+def runtime_fixture(tmp_path, monkeypatch):
+    from qbt_orchestrator.capacity_assessment import (
+        CapacityAssessmentBuilder,
+        CapacityAssessmentStore,
+    )
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator import service
+
+    snapshots = {
+        "viable": {
+            "hash": "viable",
+            "name": "Viable",
+            "category": "auto",
+            "tags": "auto",
+            "state": "stoppedDL",
+            "amount_left": 100,
+            "size": 200,
+            "progress": 0.5,
+            "num_seeds": 1,
+        },
+        "dead": {
+            "hash": "dead",
+            "name": "Dead",
+            "category": "auto",
+            "tags": "auto",
+            "state": "stoppedDL",
+            "amount_left": 200,
+            "size": 300,
+            "progress": 0.25,
+            "availability": 0.5,
+            "num_seeds": 0,
+        },
+    }
+
+    class SnapshotQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": snapshots,
+                "server_state": {},
+            }
+
+    class RecordingBuilder(CapacityAssessmentBuilder):
+        def __init__(self):
+            super().__init__(viability_stale_sec=1_800)
+            self.built = []
+
+        def build(self, *args, **kwargs):
+            assessment = super().build(*args, **kwargs)
+            self.built.append(assessment)
+            return assessment
+
+    class RecordingStore(CapacityAssessmentStore):
+        def __init__(self, state_db):
+            super().__init__(state_db, min_no_progress_sec=21_600)
+            self.committed = []
+
+        def commit(self, assessment):
+            committed = super().commit(assessment)
+            self.committed.append((assessment, committed))
+            return committed
+
+    class RecordingReclaimer:
+        dry_run = True
+
+        def __init__(self):
+            self.calls = []
+
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            self.calls.append(
+                {
+                    "snapshots": snapshots,
+                    "assessment": assessment,
+                    "capacity_state": capacity_state,
+                    "free_bytes": free_bytes,
+                    "target_free_bytes": target_free_bytes,
+                }
+            )
+            return CapacityReclaimResult(
+                dry_run=True,
+                assessment_generation=(
+                    0 if assessment is None else assessment.generation
+                ),
+            )
+
+    original_planner = service.DownloadPlanner
+    fixture = type("RuntimeFixture", (), {})()
+    fixture.planner_assessment = None
+
+    class RecordingPlanner(original_planner):
+        def plan_and_apply(self, *args, capacity_assessment=None, **kwargs):
+            fixture.planner_assessment = capacity_assessment
+            return super().plan_and_apply(
+                *args,
+                capacity_assessment=capacity_assessment,
+                **kwargs,
+            )
+
+    monkeypatch.setattr(service, "DownloadPlanner", RecordingPlanner)
+    fixture.db = tmp_path / "state.sqlite"
+    fixture.builder = RecordingBuilder()
+    fixture.store = RecordingStore(fixture.db)
+
+    def build_with_recording_reclaimer():
+        fixture.reclaimer = RecordingReclaimer()
+        runtime = service.DaemonRuntime(
+            state_db=fixture.db,
+            qbt=SnapshotQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            planner_dry_run=False,
+            safety_interval=0,
+            capacity_assessment_builder=fixture.builder,
+            capacity_assessment_store=fixture.store,
+            capacity_reclaimer=fixture.reclaimer,
+            scheduler_engine_mode="shadow",
+        )
+        runtime.tick_safety()
+        return runtime
+
+    fixture.build_with_recording_reclaimer = build_with_recording_reclaimer
+    return fixture
+
+
+def test_planner_capacity_and_reclaimer_share_generation(runtime_fixture):
+    runtime = runtime_fixture.build_with_recording_reclaimer()
+
+    payload = runtime.planner_tick()
+
+    generation = payload["capacity"]["assessment_generation"]
+    assert generation > 0
+    assert runtime_fixture.planner_assessment.generation == generation
+    reclaim_call = runtime_fixture.reclaimer.calls[0]
+    assert reclaim_call["assessment"] is runtime_fixture.store.committed[0][1]
+    assert reclaim_call["assessment"] is runtime_fixture.planner_assessment
+    assert reclaim_call["assessment"].generation == generation
+    assert reclaim_call["capacity_state"] == payload["capacity"]["state"]
+    assert reclaim_call["free_bytes"] == reclaim_call["assessment"].free_bytes
+    assert (
+        reclaim_call["target_free_bytes"]
+        == reclaim_call["assessment"].target_free_bytes
+    )
+    assert payload["capacity_reclaim"]["assessment_generation"] == generation
+    assert payload["scheduler_engine"]["assessment_generation"] == generation
+    assert len(runtime_fixture.builder.built) == 1
+    assert len(runtime_fixture.store.committed) == 1
+
+    con = sqlite3.connect(runtime_fixture.db)
+    assessment_generation = con.execute(
+        "select current_generation from capacity_assessment_state where id=1"
+    ).fetchone()[0]
+    capacity_generation = con.execute(
+        "select assessment_generation from capacity_state where id=1"
+    ).fetchone()[0]
+    metric = con.execute(
+        "select metrics_json from metrics_snapshots "
+        "where component='scheduler_engine_shadow' order by id desc limit 1"
+    ).fetchone()[0]
+    con.close()
+    assert assessment_generation == capacity_generation == generation
+    assert json.loads(metric)["assessment_generation"] == generation
+
+
+def test_scheduler_engine_canonicalizes_assessment_hash_lookup(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+
+    class MixedCaseQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    " ABCDEF ": {
+                        "name": "mixed",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 1,
+                        "size": 2,
+                        "progress": 0.5,
+                        "num_seeds": 1,
+                    }
+                },
+                "server_state": {},
+            }
+
+    original_planner = service.DownloadPlanner
+    planner_assessments = []
+
+    class RecordingPlanner(original_planner):
+        def plan_and_apply(self, *args, capacity_assessment=None, **kwargs):
+            planner_assessments.append(capacity_assessment)
+            return super().plan_and_apply(
+                *args,
+                capacity_assessment=capacity_assessment,
+                **kwargs,
+            )
+
+    monkeypatch.setattr(service, "DownloadPlanner", RecordingPlanner)
+    daemon = service.DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=MixedCaseQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+        scheduler_engine_mode="shadow",
+    )
+    daemon.tick_safety()
+
+    payload = daemon.planner_tick()
+
+    generation = payload["capacity"]["assessment_generation"]
+    assert planner_assessments[0].generation == generation
+    assert planner_assessments[0].torrents["abcdef"].viable is True
+    assert payload["scheduler_engine"]["assessment_generation"] == generation
+
+
+def test_capacity_state_uses_actual_planner_budget_and_selected_hashes(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+    from qbt_orchestrator.planner import PlannerResult
+
+    gib = 1024**3
+
+    class OneTorrentQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "planned": {
+                        "hash": "planned",
+                        "name": "planned",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": gib,
+                        "size": 2 * gib,
+                        "progress": 0.5,
+                        "num_seeds": 1,
+                    }
+                },
+                "server_state": {},
+            }
+
+    class PlannedDownload:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def plan_and_apply(self, *_args, **_kwargs):
+            return PlannerResult(
+                selected_hashes=["planned"],
+                paused_hashes=[],
+                budget_bytes=int(1.45 * gib),
+                mode="recovery",
+            )
+
+    monkeypatch.setattr(service, "DownloadPlanner", PlannedDownload)
+    daemon = service.DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=OneTorrentQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: int(3.2 * gib),
+        dry_run=True,
+    )
+    daemon.tick_safety()
+
+    payload = daemon.planner_tick()
+
+    assert payload["capacity"]["state"] == "progress_possible"
+    assert payload["capacity"]["details"]["feasible_full_finish"] == 1
+    assert payload["capacity"]["details"]["available_growth_bytes"] == int(
+        1.45 * gib
+    )
+    assert payload["capacity"]["details"]["assessment_incumbent_count"] == 0
+    assert payload["capacity"]["details"]["planned_selected_count"] == 1
+
+
+def test_assessment_and_planner_share_current_progress_health(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+
+    class ProgressQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    " H ": {
+                        "hash": " H ",
+                        "name": "progressed",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 100,
+                        "size": 200,
+                        "completed": 100,
+                        "progress": 0.5,
+                        "availability": 0.5,
+                        "num_seeds": 0,
+                        "dlspeed": 0,
+                    }
+                },
+                "server_state": {},
+            }
+
+    monkeypatch.setattr(service.time, "time", lambda: 2_000)
+    db = tmp_path / "state.sqlite"
+    daemon = service.DaemonRuntime(
+        state_db=db,
+        qbt=ProgressQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 10 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        planner_active_slots=1,
+    )
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into torrent_health("
+        "hash,sampled_at,completed_bytes,progress,no_progress_since,"
+        "reclaimable_since,capacity_generation,updated_at) "
+        "values('h',1,0,0.4,1,1,0,1)"
+    )
+    con.commit()
+    con.close()
+    daemon.tick_safety()
+
+    payload = daemon.planner_tick()
+
+    assert payload["selected"] == ["h"]
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "select completed_bytes,last_completed_bytes,progress,no_progress_since,"
+        "reclaimable_since,capacity_generation,capacity_viable,capacity_reason "
+        "from torrent_health where hash='h'"
+    ).fetchone()
+    con.close()
+    assert row == (100, 0, 0.5, None, None, 1, 1, "recent_progress")
+
+
+def test_first_planner_tick_samples_sync_and_commits_empty_unhealthy_generation(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+
+    class OfflineQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            raise RuntimeError("offline")
+
+    class ForbiddenPlanner:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("unhealthy sync must not instantiate Planner")
+
+    class ForbiddenEngine:
+        def select(self, *_args, **_kwargs):
+            raise AssertionError("unhealthy sync must not run scheduler engine")
+
+    class ForbiddenReclaimer:
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            raise AssertionError("unhealthy sync must not run live reclaimer")
+
+    monkeypatch.setattr(service, "DownloadPlanner", ForbiddenPlanner)
+    qbt = OfflineQbt()
+    daemon = service.DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 2 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=ForbiddenReclaimer(),
+        scheduler_engine=ForbiddenEngine(),
+        scheduler_engine_mode="live",
+    )
+
+    payload = daemon.planner_tick()
+
+    assert qbt.rids == [0]
+    assert payload["capacity"]["state"] == "sync_unhealthy"
+    assert payload["capacity"]["details"]["sync_healthy"] is False
+    assert payload["selected"] == []
+    assert payload["capacity_reclaim"] is None
+    con = sqlite3.connect(daemon.state_db)
+    generation, summary_json = con.execute(
+        "select current_generation,summary_json from capacity_assessment_state where id=1"
+    ).fetchone()
+    metrics = con.execute(
+        "select metrics_json from metrics_snapshots "
+        "where component='capacity_assessment' order by id"
+    ).fetchall()
+    health_count = con.execute("select count(*) from torrent_health").fetchone()[0]
+    con.close()
+    assert generation == 1
+    assert json.loads(summary_json)["torrent_count"] == 0
+    assert health_count == 0
+    assert len(metrics) == 1
+    assert json.loads(metrics[0][0])["sync_healthy"] is False
+
+
+def test_planner_safety_capture_is_atomic_while_next_sync_is_in_flight(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    poll_started = threading.Event()
+    release_poll = threading.Event()
+
+    class OfflineThenBarrierQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            if len(self.rids) == 1:
+                raise RuntimeError("initially offline")
+            poll_started.set()
+            assert release_poll.wait(2)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "new": {
+                        "hash": "new",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 1,
+                    }
+                },
+                "server_state": {},
+            }
+
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=OfflineThenBarrierQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+    )
+    daemon.tick_safety()
+    safety_thread = threading.Thread(target=daemon.tick_safety)
+    safety_thread.start()
+    assert poll_started.wait(1)
+
+    captured = []
+    capture_done = threading.Event()
+
+    def capture_for_planner():
+        captured.append(daemon._capture_safety_snapshot())
+        capture_done.set()
+
+    capture_thread = threading.Thread(target=capture_for_planner)
+    capture_thread.start()
+    assert capture_done.wait(0.5), "qBT network poll held the safety snapshot lock"
+    old_snapshots, old_healthy, old_sampled = captured[0]
+    assert old_snapshots == {}
+    assert old_healthy is False
+    assert old_sampled is True
+
+    release_poll.set()
+    safety_thread.join(timeout=2)
+    capture_thread.join(timeout=2)
+    assert not safety_thread.is_alive()
+    new_snapshots, new_healthy, new_sampled = daemon._capture_safety_snapshot()
+    assert set(new_snapshots) == {"new"}
+    assert new_healthy is True
+    assert new_sampled is True
+
+
+def test_concurrent_safety_ticks_serialize_rid_and_publish_in_poll_order(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    slow_poll_started = threading.Event()
+    release_slow_poll = threading.Event()
+    second_poll_started = threading.Event()
+
+    class OrderedBarrierQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            call = len(self.rids)
+            if call == 1:
+                return {
+                    "rid": 1,
+                    "full_update": True,
+                    "torrents": {
+                        "baseline": {
+                            "hash": "baseline",
+                            "category": "auto",
+                            "state": "stoppedDL",
+                        }
+                    },
+                    "server_state": {},
+                }
+            if call == 2:
+                slow_poll_started.set()
+                assert release_slow_poll.wait(2)
+                return {
+                    "rid": 2,
+                    "full_update": True,
+                    "torrents": {
+                        "old": {
+                            "hash": "old",
+                            "category": "auto",
+                            "state": "stoppedDL",
+                        }
+                    },
+                    "server_state": {},
+                }
+            second_poll_started.set()
+            return {
+                "rid": 3,
+                "full_update": True,
+                "torrents": {
+                    "new": {
+                        "hash": "new",
+                        "category": "auto",
+                        "state": "stoppedDL",
+                    }
+                },
+                "server_state": {},
+            }
+
+    qbt = OrderedBarrierQbt()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+    )
+    daemon.tick_safety()
+    first = threading.Thread(target=daemon.tick_safety)
+    second = threading.Thread(target=daemon.tick_safety)
+    first.start()
+    assert slow_poll_started.wait(1)
+    second.start()
+
+    captured = []
+    capture_done = threading.Event()
+
+    def capture_for_planner():
+        captured.append(daemon._capture_safety_snapshot())
+        capture_done.set()
+
+    capture = threading.Thread(target=capture_for_planner)
+    capture.start()
+    assert capture_done.wait(0.5), "slow poll blocked planner snapshot capture"
+    snapshots, healthy, sampled = captured[0]
+    assert set(snapshots) == {"baseline"}
+    assert healthy is True
+    assert sampled is True
+    assert not second_poll_started.wait(0.1), "second sync poll was not serialized"
+
+    release_slow_poll.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    capture.join(timeout=2)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    final_snapshots, final_healthy, final_sampled = daemon._capture_safety_snapshot()
+    assert qbt.rids == [0, 1, 2]
+    assert daemon.monitor.sync.rid == 3
+    assert set(final_snapshots) == {"new"}
+    assert final_healthy is True
+    assert final_sampled is True
+
+
+def test_direct_planner_tick_recovery_precedes_emergency_qbt_post(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator.planner import PlannerResult
+
+    order = []
+
+    class ActiveQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "active": {
+                        "hash": "active",
+                        "name": "active",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "downloading",
+                        "amount_left": 100,
+                        "size": 200,
+                    }
+                },
+                "server_state": {},
+            }
+
+    class OrderedExecutor(FakeExecutor):
+        def qbt_post(self, path, payload):
+            order.append(("qbt_post", path))
+            super().qbt_post(path, payload)
+
+    class Recovery:
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            assert snapshots == {}
+            assert assessment is None
+            assert capacity_state == "recovery_preflight"
+            assert free_bytes == 1024**3
+            order.append(("recovery_preflight", target_free_bytes))
+            con = sqlite3.connect(db)
+            con.execute(
+                "update capacity_reclaims set state='aborted_paused' "
+                "where state='stopping'"
+            )
+            con.commit()
+            con.close()
+            return CapacityReclaimResult(dry_run=False)
+
+    class NoopPlanner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def plan_and_apply(self, *_args, **_kwargs):
+            return PlannerResult([], [], budget_bytes=0, mode="emergency")
+
+    monkeypatch.setattr(service, "DownloadPlanner", NoopPlanner)
+    db = tmp_path / "state.sqlite"
+    executor = OrderedExecutor()
+    daemon = service.DaemonRuntime(
+        state_db=db,
+        qbt=ActiveQbt(),
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_recovery_reclaimer=Recovery(),
+    )
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    payload = daemon.planner_tick()
+
+    assert payload["capacity"]["assessment_generation"] == 1
+    assert order[:2] == [
+        ("recovery_preflight", daemon.drain_exit_bytes),
+        ("qbt_post", "/api/v2/torrents/stop"),
+    ]
+
+
+def test_direct_planner_tick_recovery_failure_precedes_safety(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class FailingRecovery:
+        def run(self, *_args, **_kwargs):
+            raise RuntimeError("direct recovery failed")
+
+    qbt = FakeQbt()
+    executor = FakeExecutor()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_recovery_reclaimer=FailingRecovery(),
+    )
+    con = sqlite3.connect(daemon.state_db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="direct recovery failed"):
+        daemon.planner_tick()
+
+    assert qbt.rids == []
+    assert executor.posts == []
+    con = sqlite3.connect(daemon.state_db)
+    assert con.execute("select count(*) from capacity_assessment_state").fetchone()[0] == 0
+    con.close()
+
+
+@pytest.mark.parametrize("signature_error", [TypeError("opaque"), ValueError("opaque")])
+def test_runtime_rejects_uninspectable_capacity_reclaimer_signature(
+    tmp_path,
+    monkeypatch,
+    signature_error,
+):
+    from qbt_orchestrator import service
+
+    class OpaqueReclaimer:
+        def run(self, *_args, **_kwargs):
+            raise AssertionError("not called")
+
+    monkeypatch.setattr(
+        service.inspect,
+        "signature",
+        lambda _callable: (_ for _ in ()).throw(signature_error),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="capacity reclaimer run signature cannot be inspected safely",
+    ):
+        service.DaemonRuntime(
+            state_db=tmp_path / "state.sqlite",
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            capacity_reclaimer=OpaqueReclaimer(),
+        )
+
+
+@pytest.mark.parametrize("scheduler_engine_mode", ["legacy", "shadow", "live"])
+def test_capacity_assessment_metric_is_once_per_generation_in_all_scheduler_modes(
+    tmp_path,
+    scheduler_engine_mode,
+):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    daemon = DaemonRuntime(
+        state_db=tmp_path / f"{scheduler_engine_mode}.sqlite",
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+        scheduler_engine_mode=scheduler_engine_mode,
+    )
+    daemon.tick_safety()
+
+    first = daemon.planner_tick()
+    second = daemon.planner_tick()
+
+    con = sqlite3.connect(daemon.state_db)
+    rows = con.execute(
+        "select metrics_json from metrics_snapshots "
+        "where component='capacity_assessment' order by id"
+    ).fetchall()
+    con.close()
+    metrics = [json.loads(row[0]) for row in rows]
+    assert [item["generation"] for item in metrics] == [
+        first["capacity"]["assessment_generation"],
+        second["capacity"]["assessment_generation"],
+    ]
+    assert set(metrics[0]) == {
+        "generation",
+        "managed_incomplete",
+        "viable_finish",
+        "nonviable_finish",
+        "feasible_full_finish",
+        "free_bytes",
+        "target_free_bytes",
+        "actual_budget_bytes",
+        "planned_selected_count",
+        "mature_reclaimable_count",
+        "sync_healthy",
+    }
+    assert metrics[0]["sync_healthy"] is True
+
+
+def test_unhealthy_generation_breaks_reclaimable_continuity_after_long_outage(
+    tmp_path,
+    monkeypatch,
+):
+    from qbt_orchestrator import service
+
+    clock = [10_000]
+    torrent = {
+        "hash": "stale",
+        "name": "stale",
+        "category": "auto",
+        "tags": "auto",
+        "state": "stoppedDL",
+        "amount_left": 100,
+        "size": 200,
+        "progress": 0.5,
+        "availability": 0.5,
+        "num_seeds": 0,
+        "dlspeed": 0,
+    }
+
+    class FlakyQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.offline = False
+
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            if self.offline:
+                raise RuntimeError("offline")
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {"stale": torrent},
+                "server_state": {},
+            }
+
+    monkeypatch.setattr(service.time, "time", lambda: clock[0])
+    qbt = FlakyQbt()
+    daemon = service.DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 2 * 1024**3,
+        dry_run=True,
+        capacity_reclaim_min_no_progress_sec=0,
+        capacity_reclaim_min_reclaimable_sec=3_600,
+    )
+    con = sqlite3.connect(daemon.state_db)
+    con.execute(
+        "insert into torrent_health("
+        "hash,sampled_at,completed_bytes,progress,no_progress_since,updated_at) "
+        "values('stale',0,0,0.5,0,0)"
+    )
+    con.commit()
+    con.close()
+
+    daemon.tick_safety()
+    assert daemon.planner_tick()["capacity"]["assessment_generation"] == 1
+    con = sqlite3.connect(daemon.state_db)
+    assert con.execute(
+        "select reclaimable_since,capacity_generation from torrent_health where hash='stale'"
+    ).fetchone() == (10_000, 1)
+    con.close()
+
+    clock[0] += 3_600
+    qbt.offline = True
+    daemon.tick_safety()
+    outage = daemon.planner_tick()
+    assert outage["capacity"]["state"] == "sync_unhealthy"
+    assert outage["capacity"]["assessment_generation"] == 2
+
+    clock[0] += 3_600
+    qbt.offline = False
+    daemon.tick_safety()
+    recovered = daemon.planner_tick()
+    con = sqlite3.connect(daemon.state_db)
+    reclaimable_since, generation = con.execute(
+        "select reclaimable_since,capacity_generation from torrent_health where hash='stale'"
+    ).fetchone()
+    metric_rows = con.execute(
+        "select metrics_json from metrics_snapshots "
+        "where component='capacity_assessment' order by id"
+    ).fetchall()
+    con.close()
+    assert recovered["capacity"]["assessment_generation"] == 3
+    assert generation == 3
+    assert reclaimable_since != 10_000
+    assert [json.loads(row[0])["mature_reclaimable_count"] for row in metric_rows] == [
+        0,
+        0,
+        0,
+    ]
+
+
+def test_capacity_recovery_preflight_failure_retries_without_committing_or_planning(
+    tmp_path,
+):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class FailingReclaimer:
+        dry_run = True
+
+        def __init__(self):
+            self.fail = True
+            self.calls = []
+
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            self.calls.append(assessment)
+            if assessment is None and not self.fail:
+                con = sqlite3.connect(db)
+                con.execute(
+                    "update capacity_reclaims set state='aborted_paused' "
+                    "where state='stopping'"
+                )
+                con.commit()
+                con.close()
+            return CapacityReclaimResult(
+                dry_run=True,
+                assessment_generation=(
+                    0 if assessment is None else assessment.generation
+                ),
+                errors=["recovery failed"] if assessment is None and self.fail else [],
+            )
+
+    db = tmp_path / "state.sqlite"
+    reclaimer = FailingReclaimer()
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=reclaimer,
+    )
+    daemon.tick_safety()
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="recovery preflight failed"):
+        daemon.planner_tick()
+
+    con = sqlite3.connect(db)
+    assert (
+        con.execute("select count(*) from capacity_assessment_state").fetchone()[0]
+        == 0
+    )
+    assert con.execute("select count(*) from scheduler_allocations").fetchone()[0] == 0
+    con.close()
+    assert daemon._capacity_recovery_preflight_done is False
+
+    reclaimer.fail = False
+    first = daemon.planner_tick()
+    second = daemon.planner_tick()
+
+    assert first["capacity"]["assessment_generation"] == 1
+    assert second["capacity"]["assessment_generation"] == 2
+    assert reclaimer.calls[0:2] == [None, None]
+    assert [item.generation for item in reclaimer.calls[2:]] == [1]
+    assert daemon._capacity_recovery_preflight_done is True
+
+
+def test_capacity_recovery_gate_rechecks_pending_rows_after_first_generation(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class Recovery:
+        dry_run = False
+
+        def __init__(self):
+            self.fail_recovery = False
+            self.assessments = []
+
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            self.assessments.append(assessment)
+            if assessment is None:
+                if self.fail_recovery:
+                    return CapacityReclaimResult(
+                        dry_run=False,
+                        errors=["retry later"],
+                    )
+                con = sqlite3.connect(db)
+                con.execute(
+                    "update capacity_reclaims set state='aborted_paused' "
+                    "where state='stopping'"
+                )
+                con.commit()
+                con.close()
+            return CapacityReclaimResult(
+                dry_run=False,
+                assessment_generation=0 if assessment is None else assessment.generation,
+            )
+
+    db = tmp_path / "state.sqlite"
+    recovery = Recovery()
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=recovery,
+    )
+    daemon.tick_safety()
+    assert daemon.planner_tick()["capacity"]["assessment_generation"] == 1
+
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    recovery.fail_recovery = True
+    with pytest.raises(RuntimeError, match="retry later"):
+        daemon.planner_tick()
+    assert daemon._capacity_recovery_preflight_done is False
+    con = sqlite3.connect(db)
+    assert con.execute(
+        "select current_generation from capacity_assessment_state where id=1"
+    ).fetchone()[0] == 1
+    con.close()
+
+    recovery.fail_recovery = False
+    assert daemon.planner_tick()["capacity"]["assessment_generation"] == 2
+    assert recovery.assessments[-2:] == [None, None]
+
+
+def test_capacity_recovery_preflight_fails_closed_without_reclaimer(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class LockedQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "h": {
+                        "name": "locked",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 1,
+                        "size": 2,
+                        "num_seeds": 1,
+                    }
+                },
+                "server_state": {},
+            }
+
+    db = tmp_path / "state.sqlite"
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=LockedQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+    )
+    daemon.tick_safety()
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="recovery reclaimer is unavailable"):
+        daemon.planner_tick()
+
+    con = sqlite3.connect(db)
+    assert con.execute("select count(*) from capacity_assessment_state").fetchone()[0] == 0
+    assert con.execute("select count(*) from scheduler_allocations").fetchone()[0] == 0
+    con.execute(
+        "update capacity_reclaims set state='aborted_paused' where id=1"
+    )
+    con.commit()
+    con.close()
+    assert daemon._capacity_recovery_preflight_done is False
+
+    payload = daemon.planner_tick()
+
+    assert payload["capacity"]["assessment_generation"] == 1
+    assert payload["planner"]["selected_hashes"] == ["h"]
+    assert daemon._capacity_recovery_preflight_done is True
+
+
+@pytest.mark.parametrize(
+    ("runtime_dry_run", "planner_dry_run"),
+    [(True, False), (False, True)],
+)
+def test_capacity_recovery_preflight_dry_run_never_calls_live_reclaimer(
+    tmp_path,
+    runtime_dry_run,
+    planner_dry_run,
+):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class LiveRecovery:
+        dry_run = False
+
+        def __init__(self):
+            self.called = False
+
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            self.called = True
+            raise AssertionError("dry-run runtime must not invoke live recovery")
+
+    db = tmp_path / "state.sqlite"
+    live_recovery = LiveRecovery()
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=runtime_dry_run,
+        planner_dry_run=planner_dry_run,
+        capacity_recovery_reclaimer=live_recovery,
+    )
+    daemon.tick_safety()
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="dry-run requires live recovery"):
+        daemon.planner_tick()
+
+    assert live_recovery.called is False
+    con = sqlite3.connect(db)
+    assert con.execute("select count(*) from capacity_assessment_state").fetchone()[0] == 0
+    con.close()
+    assert daemon._capacity_recovery_preflight_done is False
+
+
+def test_capacity_recovery_preflight_fails_on_no_durable_progress(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class StalledRecovery:
+        dry_run = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            self.calls += 1
+            return CapacityReclaimResult(dry_run=False)
+
+    db = tmp_path / "state.sqlite"
+    recovery = StalledRecovery()
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_recovery_reclaimer=recovery,
+    )
+    daemon.tick_safety()
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="no durable state progress"):
+        daemon.planner_tick()
+
+    con = sqlite3.connect(db)
+    event = json.loads(
+        con.execute(
+            "select data_json from events_v2 where "
+            "event_type='recovery_preflight_failed' order by id desc limit 1"
+        ).fetchone()[0]
+    )
+    con.close()
+    assert recovery.calls == 1
+    assert event["rounds"] == 1
+    assert event["pending"] == [{"id": 1, "state": "stopping"}]
+    assert daemon._capacity_recovery_preflight_done is False
+
+
+def test_capacity_recovery_preflight_dry_run_without_pending_rows_skips_live_recovery(
+    tmp_path,
+):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class LiveRecovery:
+        dry_run = False
+        called = False
+
+        def run(self, *_args, **_kwargs):
+            self.called = True
+            raise AssertionError("no recovery call is needed without pending rows")
+
+    recovery = LiveRecovery()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=FakeQbt(),
+        executor=FakeExecutor(),
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+        capacity_recovery_reclaimer=recovery,
+    )
+    daemon.tick_safety()
+
+    payload = daemon.planner_tick()
+
+    assert payload["capacity"]["assessment_generation"] == 1
+    assert recovery.called is False
+    assert daemon._capacity_recovery_preflight_done is True
+
+
+def test_daemon_startup_recovery_failure_precedes_safety_and_workers(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class FailingRecovery:
+        dry_run = True
+
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            assert assessment is None
+            raise RuntimeError("startup recovery failed")
+
+    qbt = FakeQbt()
+    executor = FakeExecutor()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=FailingRecovery(),
+        background_event_workers=True,
+        background_periodic_workers=True,
+    )
+    con = sqlite3.connect(daemon.state_db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="startup recovery failed"):
+        daemon.run(max_safety_ticks=1)
+
+    assert qbt.rids == []
+    assert executor.posts == []
+    assert daemon._event_worker_threads == []
+    assert daemon._periodic_workers == []
+    con = sqlite3.connect(daemon.state_db)
+    event = json.loads(
+        con.execute(
+            "select data_json from events_v2 where "
+            "event_type='recovery_preflight_failed' order by id desc limit 1"
+        ).fetchone()[0]
+    )
+    con.close()
+    assert event["rounds"] == 1
+    assert event["errors"] == ["startup recovery failed"]
+
+
+def test_daemon_startup_recovery_precedes_emergency_qbt_post(tmp_path):
+    from qbt_orchestrator.capacity_reclaim import CapacityReclaimResult
+    from qbt_orchestrator.service import DaemonRuntime
+
+    order = []
+
+    class ActiveQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "active": {
+                        "hash": "active",
+                        "name": "active",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "downloading",
+                        "amount_left": 100,
+                        "size": 200,
+                    }
+                },
+                "server_state": {},
+            }
+
+    class OrderedExecutor(FakeExecutor):
+        def qbt_post(self, path, payload):
+            order.append(("qbt_post", path))
+            super().qbt_post(path, payload)
+
+    class SuccessfulRecovery:
+        def run(
+            self,
+            snapshots,
+            *,
+            assessment=None,
+            capacity_state,
+            free_bytes,
+            target_free_bytes,
+        ):
+            assert snapshots == {}
+            assert assessment is None
+            assert capacity_state == "recovery_preflight"
+            assert free_bytes == 1024**3
+            order.append(("recovery_preflight", target_free_bytes))
+            con = sqlite3.connect(db)
+            con.execute(
+                "update capacity_reclaims set state='aborted_paused' "
+                "where state='stopping'"
+            )
+            con.commit()
+            con.close()
+            return CapacityReclaimResult(dry_run=False)
+
+    db = tmp_path / "state.sqlite"
+    executor = OrderedExecutor()
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=ActiveQbt(),
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_recovery_reclaimer=SuccessfulRecovery(),
+        loop_tasks=[],
+        safety_interval=0,
+    )
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    assert daemon.run(max_safety_ticks=1) == 1
+
+    assert order == [
+        ("recovery_preflight", daemon.drain_exit_bytes),
+        ("qbt_post", "/api/v2/torrents/stop"),
+    ]
+    assert executor.posts == [
+        ("/api/v2/torrents/stop", {"hashes": "active"})
+    ]
+
+
+def test_daemon_startup_dry_run_pending_recovery_fails_before_safety(tmp_path):
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class ForbiddenRecovery:
+        called = False
+
+        def run(self, *_args, **_kwargs):
+            self.called = True
+            raise AssertionError("dry-run startup must not invoke live recovery")
+
+    qbt = FakeQbt()
+    executor = FakeExecutor()
+    recovery = ForbiddenRecovery()
+    daemon = DaemonRuntime(
+        state_db=tmp_path / "state.sqlite",
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 1024**3,
+        dry_run=True,
+        capacity_recovery_reclaimer=recovery,
+        background_event_workers=True,
+        background_periodic_workers=True,
+    )
+    con = sqlite3.connect(daemon.state_db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'stopping',1,1,1)",
+        (str((tmp_path / "incomplete" / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(RuntimeError, match="dry-run requires live recovery"):
+        daemon.run(max_safety_ticks=1)
+
+    assert recovery.called is False
+    assert qbt.rids == []
+    assert executor.posts == []
+    assert daemon._event_worker_threads == []
+    assert daemon._periodic_workers == []
+
+
+def test_runtime_calls_real_dead_partial_reclaimer_with_committed_assessment(
+    tmp_path,
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.service import DaemonRuntime
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    executor = FakeExecutor()
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=True,
+        max_per_tick=0,
+    )
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=FakeQbt(),
+        executor=executor,
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=True,
+        capacity_reclaimer=reclaimer,
+    )
+    daemon.tick_safety()
+
+    payload = daemon.planner_tick()
+
+    generation = payload["capacity"]["assessment_generation"]
+    assert generation == 1
+    assert payload["capacity_reclaim"]["assessment_generation"] == generation
+
+
+@pytest.mark.parametrize("lease_state", ["stopping", "quarantined"])
+def test_real_capacity_recovery_preflight_converges_before_new_generation(
+    tmp_path,
+    lease_state,
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.service import DaemonRuntime
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+
+    class RecoveryQbt(FakeQbt):
+        def post(self, path, payload):
+            raise AssertionError("recovery fixture should not need a qBT mutation")
+
+        def torrent_info(self, torrent_hash, timeout=None):
+            return {
+                "hash": torrent_hash,
+                "category": "auto",
+                "tags": "auto",
+                "state": "stoppedDL",
+                "amount_left": 1,
+                "availability": 0.5,
+                "num_seeds": 0,
+                "num_complete": 0,
+                "content_path": f"/downloads/incomplete/{torrent_hash}",
+            }
+
+    quarantine_path = None
+    filesystem_dev = None
+    filesystem_ino = None
+    host_path = managed / "h"
+    if lease_state == "quarantined":
+        quarantine_path = managed / ".qbt-orchestrator-reclaim" / "reclaim-1"
+        quarantine_path.mkdir(parents=True)
+        (quarantine_path / "part").write_bytes(b"payload")
+        metadata = quarantine_path.lstat()
+        filesystem_dev = int(metadata.st_dev)
+        filesystem_ino = int(metadata.st_ino)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,quarantine_path,filesystem_dev,filesystem_ino,"
+        "created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "h:1",
+            "h",
+            "H",
+            "mag" + "net:?xt=urn:btih:h",
+            str(host_path.resolve()),
+            "/downloads/incomplete/h",
+            lease_state,
+            1,
+            None if quarantine_path is None else str(quarantine_path.resolve()),
+            filesystem_dev,
+            filesystem_ino,
+            1,
+            1,
+        ),
+    )
+    con.commit()
+    con.close()
+
+    qbt = RecoveryQbt()
+    executor = Executor(qbt, dry_run=False, state_db=db)
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        max_per_tick=0,
+        disk_free_bytes=lambda _path: 0,
+    )
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=reclaimer,
+    )
+    try:
+        daemon.tick_safety()
+        payload = daemon.planner_tick()
+
+        con = sqlite3.connect(db)
+        recovered_state = con.execute(
+            "select state from capacity_reclaims where id=1"
+        ).fetchone()[0]
+        generation = con.execute(
+            "select current_generation from capacity_assessment_state where id=1"
+        ).fetchone()[0]
+        con.close()
+        assert recovered_state == "cancelled"
+        assert generation == payload["capacity"]["assessment_generation"] == 1
+        if lease_state == "quarantined":
+            assert host_path.exists()
+            assert not quarantine_path.exists()
+    finally:
+        executor.close(timeout=1)
+
+
+def test_real_capacity_recovery_preflight_runs_multiple_rounds_to_reclaimed(
+    tmp_path,
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.service import DaemonRuntime
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_assessment_state("
+        "id,current_generation,observed_at,summary_json) values(1,1,1,'{}')"
+    )
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'deleting',1,1,1)",
+        (str((managed / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    class RecoveryQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, payload))
+            return True
+
+    qbt = RecoveryQbt()
+    executor = Executor(qbt, dry_run=False, state_db=db)
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        max_per_tick=0,
+        disk_free_bytes=lambda _path: 0,
+    )
+    real_run = reclaimer.run
+    recovery_assessments = []
+
+    def recording_run(
+        snapshots,
+        *,
+        assessment=None,
+        capacity_state,
+        free_bytes,
+        target_free_bytes,
+    ):
+        recovery_assessments.append(assessment)
+        return real_run(
+            snapshots,
+            assessment=assessment,
+            capacity_state=capacity_state,
+            free_bytes=free_bytes,
+            target_free_bytes=target_free_bytes,
+        )
+
+    reclaimer.run = recording_run
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=reclaimer,
+    )
+    try:
+        daemon.tick_safety()
+        payload = daemon.planner_tick()
+
+        con = sqlite3.connect(db)
+        state = con.execute(
+            "select state from capacity_reclaims where id=1"
+        ).fetchone()[0]
+        event = con.execute(
+            "select data_json from events_v2 where "
+            "component='capacity_reclaim' and "
+            "event_type='recovery_preflight_completed' "
+            "order by id desc limit 1"
+        ).fetchone()[0]
+        con.close()
+        assert state == "reclaimed"
+        assert recovery_assessments[0:2] == [None, None]
+        assert recovery_assessments[2].generation == payload["capacity"]["assessment_generation"]
+        assert json.loads(event)["rounds"] == 2
+        assert qbt.posts == [("/api/v2/torrents/recheck", {"hashes": "h"})]
+    finally:
+        executor.close(timeout=1)
+
+
+def test_real_capacity_recovery_recheck_failure_retries_without_generation(
+    tmp_path,
+):
+    from qbt_orchestrator.capacity_reclaim import DeadPartialReclaimer
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.service import DaemonRuntime
+
+    managed = tmp_path / "incomplete"
+    managed.mkdir()
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into capacity_assessment_state("
+        "id,current_generation,observed_at,summary_json) values(1,1,1,'{}')"
+    )
+    con.execute(
+        "insert into capacity_reclaims("
+        "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,"
+        "capacity_generation,created_at,updated_at) "
+        "values('h:1','h','H','magnet:?xt=h',?,?,'deleted',1,1,1)",
+        (str((managed / "h").resolve()), "/downloads/incomplete/h"),
+    )
+    con.commit()
+    con.close()
+
+    class FailingRecheckQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, payload))
+            raise RuntimeError("recheck failed")
+
+    qbt = FailingRecheckQbt()
+    executor = Executor(qbt, dry_run=False, state_db=db)
+    reclaimer = DeadPartialReclaimer(
+        db,
+        executor,
+        host_downloads=tmp_path,
+        container_downloads="/downloads",
+        managed_root=managed,
+        dry_run=False,
+        max_per_tick=0,
+        disk_free_bytes=lambda _path: 0,
+    )
+    daemon = DaemonRuntime(
+        state_db=db,
+        qbt=qbt,
+        executor=executor,
+        free_bytes_provider=lambda: 6 * 1024**3,
+        dry_run=False,
+        planner_dry_run=False,
+        capacity_reclaimer=reclaimer,
+    )
+    try:
+        daemon.tick_safety()
+        with pytest.raises(RuntimeError, match="recovery preflight failed"):
+            daemon.planner_tick()
+        with pytest.raises(RuntimeError, match="recovery preflight failed"):
+            daemon.planner_tick()
+
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select state from capacity_reclaims where id=1"
+        ).fetchone()
+        generation = con.execute(
+            "select current_generation from capacity_assessment_state where id=1"
+        ).fetchone()[0]
+        capacity_count = con.execute("select count(*) from capacity_state").fetchone()[0]
+        con.close()
+        assert row[0] == "recheck_pending"
+        assert generation == 1
+        assert capacity_count == 0
+        assert len(qbt.posts) == 2
+        assert daemon._capacity_recovery_preflight_done is False
+    finally:
+        executor.close(timeout=1)
 
 
 def test_daemon_runtime_runs_safety_ticks_and_persists_disk_state():
@@ -53,7 +1871,83 @@ def test_daemon_runtime_runs_safety_ticks_and_persists_disk_state():
         event_count = con.execute("select count(*) from events_v2 where component='daemon' and event_type='safety_tick'").fetchone()[0]
         con.close()
         assert row == ("ok", 6 * 1024**3)
-        assert event_count == 2
+    assert event_count == 1
+
+
+def test_daemon_safety_event_sampling_keeps_transitions_immediate():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = [0.0]
+        free_bytes = [6 * 1024**3]
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: free_bytes[0],
+            dry_run=True,
+            safety_interval=0,
+            monotonic=lambda: clock[0],
+            safety_event_sample_interval_sec=60,
+        )
+
+        daemon.tick_safety()
+        clock[0] = 1
+        daemon.tick_safety()
+        free_bytes[0] = 1024**3
+        clock[0] = 2
+        daemon.tick_safety()
+
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "select message,data_json from events_v2 "
+            "where component='daemon' and event_type='safety_tick' order by id"
+        ).fetchall()
+        con.close()
+        assert len(rows) == 2
+        assert "disk=emergency" in rows[-1][0]
+        assert json.loads(rows[-1][1])["state_changed"] is True
+
+
+def test_daemon_emits_one_event_when_sync_session_becomes_degraded():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    class RepeatedFullQbt(FakeQbt):
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {"rid": rid + 1, "full_update": True, "torrents": {}, "server_state": {}}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = RepeatedFullQbt()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0,
+            sync_repeated_full_limit=1,
+            sync_degraded_interval_sec=60,
+        )
+
+        daemon.tick_safety()
+        daemon.tick_safety()
+        daemon.tick_safety()
+
+        con = sqlite3.connect(db)
+        events = con.execute(
+            "select event_type,data_json from events_v2 where component='qbt' and event_type='sync_session_degraded'"
+        ).fetchall()
+        con.close()
+        assert len(events) == 1
+        assert json.loads(events[0][1])["repeated_full_updates"] == 1
+        assert qbt.rids == [0, 1]
 
 
 def test_daemon_runtime_emergency_tick_pauses_managed_downloads():
@@ -435,6 +2329,96 @@ def test_daemon_runtime_runs_design_multirate_loops_and_records_events():
         events = con.execute("select event_type,count(*) from events_v2 group by event_type").fetchall()
         con.close()
         assert ("loop_tick", 8) in events
+
+
+class SequenceMonotonic:
+    def __init__(self, values):
+        self._values = iter(values)
+
+    def __call__(self):
+        return float(next(self._values))
+
+
+def test_loop_task_records_duration_and_deadline_miss():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = SequenceMonotonic([0.0, 0.0, 7.5])
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            monotonic=clock,
+            loop_tasks=[LoopTask("file_batch", 60, lambda: {"ok": True}, max_runtime_sec=5)],
+        )
+
+        assert daemon.run_due_loop_tasks() == 1
+
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select component,metrics_json from metrics_snapshots where component='loop_runtime:file_batch'"
+        ).fetchone()
+        con.close()
+        assert row is not None
+        metrics = json.loads(row[1])
+        assert metrics["duration_ms"] == 7500
+        assert metrics["max_runtime_ms"] == 5000
+        assert metrics["deadline_missed"] is True
+        assert metrics["sample_count"] == 1
+        assert metrics["deadline_miss_count"] == 1
+
+
+def test_loop_runtime_metric_rolls_up_and_records_failed_callbacks():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    outcomes = iter([False, True])
+
+    def callback():
+        if next(outcomes):
+            raise RuntimeError("planned failure")
+        return {"ok": True}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = SequenceMonotonic([0.0, 0.0, 1.0, 61.0, 61.0, 68.5])
+        task = LoopTask("file_batch", 60, callback, max_runtime_sec=5)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            monotonic=clock,
+            loop_tasks=[task],
+        )
+
+        assert daemon.run_due_loop_tasks() == 1
+        assert daemon.run_due_loop_tasks() == 1
+
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "select metrics_json from metrics_snapshots where component='loop_runtime:file_batch'"
+        ).fetchall()
+        failed_events = con.execute(
+            "select count(*) from events_v2 where component='file_batch' and event_type='loop_failed'"
+        ).fetchone()[0]
+        con.close()
+        assert len(rows) == 1
+        metrics = json.loads(rows[0][0])
+        assert metrics["sample_count"] == 2
+        assert metrics["failure_count"] == 1
+        assert metrics["deadline_miss_count"] == 1
+        assert metrics["recent_duration_ms"] == [1000, 7500]
+        assert metrics["p50_duration_ms"] == 1000
+        assert metrics["p95_duration_ms"] == 7500
+        assert failed_events == 1
 
 
 def test_daemon_maintenance_records_qbt_path_drift_from_sync_cache():
@@ -830,6 +2814,51 @@ def test_daemon_background_event_workers_do_not_block_safety_loop():
         assert runner.calls >= 1
 
 
+def test_daemon_background_periodic_workers_do_not_block_safety_loop():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime, LoopTask
+
+    class BlockingInventory:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def __call__(self):
+            self.started.set()
+            self.release.wait(timeout=2)
+            return {"released": self.release.is_set()}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        blocker = BlockingInventory()
+        qbt = FakeQbt()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=True,
+            safety_interval=0.01,
+            loop_tasks=[LoopTask("file_batch", 60, blocker, max_runtime_sec=0.05)],
+            background_periodic_workers=True,
+            periodic_worker_join_timeout=0.01,
+            sync_repeated_full_limit=999,
+        )
+
+        started = time.monotonic()
+        try:
+            daemon.run(max_safety_ticks=5)
+            elapsed = time.monotonic() - started
+            assert blocker.started.wait(timeout=0.2)
+            assert qbt.rids == [0, 1, 2, 3, 4]
+            assert elapsed < 0.5
+        finally:
+            blocker.release.set()
+            for worker in list(daemon._periodic_workers):
+                worker.join(timeout=1)
+
+
 class RecordingBackfill:
     def __init__(self, result=None):
         self.result = result or {"status": "not_found", "artifacts": []}
@@ -937,6 +2966,148 @@ def test_daemon_media_pipeline_then_emby_refresh_live_path():
         assert refresh_state == "done"
         assert ("media_pipeline", "media_pipeline_job_processed") in events
         assert ("emby", "emby_refresh_processed") in events
+
+
+def test_daemon_background_workers_include_media_promotion_worker():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(
+                MediaPromotionRepository(db), FakeRclone()
+            ),
+            media_promotion_dry_run=False,
+        )
+
+        worker_names = [name for name, _callback in daemon._background_event_worker_specs()]
+
+        assert "promotion" in worker_names
+
+
+def test_daemon_media_promotion_dry_run_does_not_claim_job():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = MediaPromotionRepository(db, now=lambda: 1000)
+        promotion_id = repo.enqueue(
+            upload_job_id=1,
+            hash="h1",
+            media_group_id=None,
+            normalized_id="ABC-123",
+            metadata_title="Title",
+            display_title="ABC-123 Title",
+            source_remote="gcrypt:/old.mp4",
+            target_remote="gcrypt:/ABC-123/ABC-123 Title.mp4",
+            expected_size=10,
+        )
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(repo, FakeRclone()),
+            media_promotion_dry_run=True,
+        )
+        daemon.tick_safety()
+
+        assert daemon.process_media_promotion_jobs() == 1
+        assert repo.get(promotion_id)["state"] == "planned"
+        assert repo.get(promotion_id)["attempts"] == 0
+
+
+def test_daemon_live_promotion_moves_media_and_opens_finalization_barrier():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.promotion import MediaPromotionRepository, MediaPromotionRunner
+    from qbt_orchestrator.runtime import TorrentJobRepository
+    from qbt_orchestrator.service import DaemonRuntime
+    from tests.fakes import FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        jobs = TorrentJobRepository(db, now=lambda: 1000)
+        upload_id = jobs.enqueue("h1", None, "upload", {"full_torrent": True}, priority=1)
+        con = sqlite3.connect(db)
+        con.execute(
+            "update torrent_jobs set state='promotion_wait',phase='promotion_wait' where id=?",
+            (upload_id,),
+        )
+        con.execute(
+            "insert into media_groups(id,media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?,?)",
+            (1, "ABC-123", "ABC-123", "/media/gcrypt/ABC-123", 100, 100),
+        )
+        con.execute(
+            "insert into media_pipeline_runs(upload_manifest_id,media_group_id,state,created_at,updated_at,canonical_remote_dir,canonical_basename,canonical_video_manifest_json) "
+            "values(?,?,?,?,?,?,?,?)",
+            (
+                f"upload-job-{upload_id}",
+                1,
+                "SidecarVerified",
+                100,
+                100,
+                "gcrypt:/ABC-123",
+                "ABC-123 Title",
+                '[{"remote_path":"gcrypt:/ABC-123/ABC-123 Title.mp4","size":10}]',
+            ),
+        )
+        con.commit()
+        con.close()
+        promotions = MediaPromotionRepository(db, now=lambda: 1000)
+        promotion_id = promotions.enqueue(
+            upload_job_id=upload_id,
+            hash="h1",
+            media_group_id=1,
+            normalized_id="ABC-123",
+            metadata_title="Title",
+            display_title="ABC-123 Title",
+            source_remote="gcrypt:/hash/raw.mp4",
+            target_remote="gcrypt:/ABC-123/ABC-123 Title.mp4",
+            expected_size=10,
+        )
+        rclone = FakeRclone(remote_sizes={"gcrypt:/hash/raw.mp4": 10})
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=FakeQbt(),
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: 6 * 1024**3,
+            dry_run=False,
+            safety_interval=0,
+            media_promotion_runner=MediaPromotionRunner(promotions, rclone),
+            media_promotion_dry_run=False,
+        )
+        daemon.tick_safety()
+
+        assert daemon.process_media_promotion_jobs() == 1
+
+        assert rclone.movetos == [
+            ("gcrypt:/hash/raw.mp4", "gcrypt:/ABC-123/ABC-123 Title.mp4")
+        ]
+        assert promotions.get(promotion_id)["state"] == "verified"
+        assert jobs.get(upload_id)["state"] == "cleanup_wait"
+        con = sqlite3.connect(db)
+        assert con.execute(
+            "select count(*) from torrent_jobs where job_type='cleanup_full_torrent'"
+        ).fetchone()[0] == 1
+        assert con.execute("select count(*) from emby_refresh_tasks").fetchone()[0] == 1
+        con.close()
 
 
 def test_daemon_default_file_batch_loop_uses_sync_cache_and_dry_run_records_upload():
@@ -1080,7 +3251,81 @@ def test_daemon_file_batch_loop_creates_pipeline_batch_from_qbt_file_list():
         assert '"batches_created": 1' in loop
 
 
-def test_daemon_file_batch_live_respects_upload_backpressure_policy():
+def test_daemon_drain_file_batch_does_not_call_torrent_files():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.service import DaemonRuntime
+
+    gib = 1024**3
+
+    class DrainQbt(FakeQbt):
+        def __init__(self):
+            super().__init__()
+            self.heavy_calls = []
+
+        def get_maindata(self, rid):
+            self.rids.append(rid)
+            return {
+                "rid": rid + 1,
+                "full_update": True,
+                "torrents": {
+                    "big": {
+                        "name": "Big",
+                        "category": "auto",
+                        "tags": "auto",
+                        "state": "stoppedDL",
+                        "amount_left": 5 * gib,
+                        "size": 5 * gib,
+                        "progress": 0.0,
+                    }
+                },
+                "server_state": {},
+            }
+
+        def torrent_files(self, hash):
+            self.heavy_calls.append(("torrent_files", hash))
+            return [{"index": 0, "name": "A.mp4", "size": 5 * gib, "progress": 0.0, "priority": 0}]
+
+        def torrent_properties(self, hash):
+            self.heavy_calls.append(("torrent_properties", hash))
+            return {"piece_size": 16 * 1024**2}
+
+    class RecordingJunkJanitor:
+        def __init__(self):
+            self.file_lists = None
+
+        def reconcile(self, snapshots, file_lists, sync_healthy):
+            self.file_lists = file_lists
+            return {"scanned": len(snapshots)}
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        qbt = DrainQbt()
+        junk_janitor = RecordingJunkJanitor()
+        daemon = DaemonRuntime(
+            state_db=db,
+            qbt=qbt,
+            executor=FakeExecutor(),
+            free_bytes_provider=lambda: int(2.2 * gib),
+            dry_run=False,
+            safety_interval=0,
+            file_batch_dry_run=False,
+            batch_pipeline_enabled=True,
+            disk_floor_bytes=3 * gib,
+            junk_janitor=junk_janitor,
+        )
+        daemon.tick_safety()
+
+        result = daemon.file_batch_tick()
+
+        assert qbt.heavy_calls == []
+        assert result["batches_created"] == 0
+        assert result["batches_blocked"] == 1
+        assert result["blocked_reasons"] == {"mode_disallows_batch": 1}
+        assert junk_janitor.file_lists == {}
+
+
+def test_daemon_file_batch_live_bypasses_backpressure_for_disk_releasing_upload():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.io_governor import UploadBackpressurePolicy
     from qbt_orchestrator.maintenance import SQLiteMaintenanceService
@@ -1136,8 +3381,8 @@ def test_daemon_file_batch_live_respects_upload_backpressure_policy():
         jobs = con.execute("select hash from torrent_jobs order by id").fetchall()
         event = con.execute("select component,event_type from events_v2 where component='upload_backpressure' order by id desc limit 1").fetchone()
         con.close()
-        assert jobs == [("old",)]
-        assert event == ("upload_backpressure", "new_upload_blocked")
+        assert jobs == [("old",), ("new",)]
+        assert event is None
 
 
 
@@ -1161,8 +3406,8 @@ def test_runtime_planner_tick_runs_soak_queue_before_planner_and_protects_reside
                 "rid": rid + 1,
                 "full_update": True,
                 "torrents": {
-                    "active": {"hash": "active", "name": "Active", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 10, "progress": 0.1},
-                    "soak": {"hash": "soak", "name": "Soak", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 9, "size": 10, "progress": 0.9},
+                    "active": {"hash": "active", "name": "Active", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 1, "size": 10, "progress": 0.1, "num_seeds": 1},
+                    "soak": {"hash": "soak", "name": "Soak", "category": "auto", "tags": "auto", "state": "pausedDL", "amount_left": 9, "size": 10, "progress": 0.9, "num_seeds": 1},
                 },
                 "server_state": {},
             }
@@ -1188,10 +3433,11 @@ def test_runtime_planner_tick_runs_soak_queue_before_planner_and_protects_reside
         result = daemon.planner_tick()
 
         assert result["soak_queue"]["started"] == ["soak"]
-        assert result["planner"]["selected_hashes"] == ["active"]
+        assert result["planner"]["selected_hashes"] == ["soak"]
+        assert result["planner"]["plan_generation"] == 1
         assert ("/api/v2/torrents/start", {"hashes": "soak"}) in executor.posts
-        assert ("/api/v2/torrents/start", {"hashes": "active"}) in executor.posts
-        assert ("/api/v2/torrents/stop", {"hashes": "soak"}) not in executor.posts
+        assert ("/api/v2/torrents/start", {"hashes": "active"}) not in executor.posts
+        assert executor.seq == [("active", False), ("soak", False)]
 
 
 def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
@@ -1225,6 +3471,10 @@ def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
             "insert into resource_reservations(hash,batch_id,kind,bytes,state,created_at,expires_at,reason) values(?,?,?,?,?,?,?,?)",
             ("batch", 1, "batch", 3 * gib, "active", 900, None, "batch_pipeline_reserved"),
         )
+        con.execute(
+            "insert into scheduler_intents(component,hash,intent,priority,expires_at,data_json) values(?,?,?,?,?,?)",
+            ("batch", "batch", "protect_batch", 20, None, '{"batch_id":1}'),
+        )
         con.commit(); con.close()
         executor = FakeExecutor()
         daemon = DaemonRuntime(
@@ -1242,8 +3492,8 @@ def test_runtime_planner_tick_protects_active_pipeline_batch_from_pause():
 
         result = daemon.planner_tick()
 
-        assert result["planner"]["selected_hashes"] == ["tiny"]
-        assert ("/api/v2/torrents/start", {"hashes": "tiny"}) in executor.posts
+        assert result["planner"]["selected_hashes"] == ["batch"]
+        assert ("/api/v2/torrents/start", {"hashes": "tiny"}) not in executor.posts
         assert not any(path == "/api/v2/torrents/stop" and payload == {"hashes": "batch"} for path, payload in executor.posts)
 
 
@@ -1256,11 +3506,16 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
     keys = [
         "QBT_ORCH_STATE_DB", "QBT_ORCH_DRY_RUN", "QBT_ORCH_PLANNER_DRY_RUN", "QBT_ORCH_SOAK_ENABLED",
         "QBT_ORCH_SOAK_DRY_RUN", "QBT_ORCH_SOAK_RESIDENT_SLOTS", "QBT_ORCH_SOAK_MIN_FREE_GB",
+        "QBT_ORCH_SOAK_ALLOWED_MODES", "QBT_ORCH_SOAK_REQUIRE_SWARM", "QBT_ORCH_MAX_COLD_PARTIAL_GB",
+        "QBT_ORCH_MAX_COLD_PARTIAL_TORRENTS", "QBT_ORCH_SOAK_MAX_NEW_PER_HOUR",
         "QBT_ORCH_SOAK_MAX_EXPOSURE_GB", "QBT_ORCH_SOAK_MAX_PER_TORRENT_EXPOSURE_MB",
         "QBT_ORCH_DISK_FLOOR_GB", "QBT_ORCH_SOAK_LOW_CAPACITY_THROTTLE_MARGIN_GB",
         "QBT_ORCH_SOAK_LOW_CAPACITY_LIMIT_BPS",
         "QBT_ORCH_DISK_PATH", "QBT_ORCH_ORPHAN_JANITOR", "QBT_ORCH_JUNK_JANITOR", "QBT_ORCH_CAROUSEL",
         "QBT_ORCH_QBT_PREFERENCES_GUARD", "QBT_ORCH_PATH_RECONCILE",
+        "QBT_ORCH_DRAIN_EXIT_GB", "QBT_ORCH_EXPLORE_ENTER_GB", "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS",
+        "QBT_ORCH_SCHEDULER_ENGINE",
+        "QBT_ORCH_FINISH_RESIDENT_MAX_STALL_SEC", "QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC",
     ]
     old = {k: os.environ.get(k) for k in keys}
     try:
@@ -1274,6 +3529,11 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
                 "QBT_ORCH_SOAK_ENABLED": "1",
                 "QBT_ORCH_SOAK_DRY_RUN": "0",
                 "QBT_ORCH_SOAK_RESIDENT_SLOTS": "8",
+                "QBT_ORCH_SOAK_ALLOWED_MODES": "normal,explore",
+                "QBT_ORCH_SOAK_REQUIRE_SWARM": "1",
+                "QBT_ORCH_MAX_COLD_PARTIAL_GB": "4",
+                "QBT_ORCH_MAX_COLD_PARTIAL_TORRENTS": "8",
+                "QBT_ORCH_SOAK_MAX_NEW_PER_HOUR": "4",
                 "QBT_ORCH_SOAK_MIN_FREE_GB": "8",
                 "QBT_ORCH_DISK_FLOOR_GB": "3",
                 "QBT_ORCH_SOAK_MAX_EXPOSURE_GB": "4",
@@ -1286,6 +3546,12 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
                 "QBT_ORCH_CAROUSEL": "0",
                 "QBT_ORCH_QBT_PREFERENCES_GUARD": "0",
                 "QBT_ORCH_PATH_RECONCILE": "0",
+                "QBT_ORCH_DRAIN_EXIT_GB": "5.5",
+                "QBT_ORCH_EXPLORE_ENTER_GB": "9",
+                "QBT_ORCH_CAPACITY_DEADLOCK_ALERTS": "0",
+                "QBT_ORCH_SCHEDULER_ENGINE": "shadow",
+                "QBT_ORCH_FINISH_RESIDENT_MAX_STALL_SEC": "2400",
+                "QBT_ORCH_CAPACITY_VIABILITY_STALE_SEC": "2100",
             })
             ns = argparse.Namespace(cmd="daemon", dry_run=False, config=None, safety_interval=0, max_safety_ticks=1)
             runtime, dry_run = _build_runtime(ns, db)
@@ -1295,6 +3561,11 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
             assert runtime.soak_queue_service is not None
             assert runtime.soak_queue_service.dry_run is False
             assert runtime.soak_queue_service.config.resident_slots == 8
+            assert runtime.soak_queue_service.config.allowed_modes == ("normal", "explore")
+            assert runtime.soak_queue_service.config.require_swarm is True
+            assert runtime.soak_queue_service.config.max_cold_partial_bytes == 4 * 1024**3
+            assert runtime.soak_queue_service.config.max_cold_partial_torrents == 8
+            assert runtime.soak_queue_service.config.max_new_per_hour == 4
             assert runtime.soak_queue_service.config.min_free_bytes == 8 * 1024**3
             assert runtime.soak_queue_service.config.disk_floor_bytes == 3 * 1024**3
             assert runtime.soak_queue_service.config.low_capacity_throttle_margin_bytes == 1024**3
@@ -1302,6 +3573,12 @@ def test_cli_builds_soak_queue_from_env_with_live_defaults():
             assert runtime.soak_queue_service.config.max_total_exposure_bytes == 4 * 1024**3
             assert runtime.soak_queue_service.config.max_per_torrent_exposure_bytes == 512 * 1024**2
             assert runtime.disk_floor_bytes == 3 * 1024**3
+            assert runtime.drain_exit_bytes == int(5.5 * 1024**3)
+            assert runtime.explore_enter_bytes == 9 * 1024**3
+            assert runtime.capacity_deadlock_alerts_enabled is False
+            assert runtime.scheduler_engine_mode == "shadow"
+            assert runtime.finish_resident_max_stall_sec == 2400
+            assert runtime.capacity_viability_stale_sec == 2100
     finally:
         for k, v in old.items():
             if v is None:

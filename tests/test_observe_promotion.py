@@ -6,9 +6,53 @@ import tempfile
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
+
+
+def test_observe_write_records_failed_not_success_when_lease_blocks(tmp_path):
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
+    from qbt_orchestrator.observe_promotion import ObservePromotionService
+
+    class Qbt:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    qbt = Qbt()
+    executor = Executor(qbt, dry_run=False)
+    assert executor.acquire_hash_mutation_lease("h", "reclaim:1:1") is True
+    service = ObservePromotionService(
+        db,
+        qbt,
+        executor,
+        dry_run=False,
+    )
+    try:
+        with pytest.raises(QbtMutationLeaseBlocked):
+            service._qbt_post(
+                " H ",
+                "/api/v2/torrents/setCategory",
+                {"hashes": " H ", "category": "auto"},
+            )
+    finally:
+        executor.close(timeout=1)
+
+    con = sqlite3.connect(db)
+    rows = con.execute(
+        "select status from action_log where action_type='observe_promotion'"
+    ).fetchall()
+    con.close()
+    assert rows == [("failed",)]
+    assert qbt.posts == []
 
 
 class FakeExecutor:

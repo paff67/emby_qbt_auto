@@ -5,7 +5,7 @@ class FakeQbtClient:
         self.posts = []
         self.heavy_calls = []
 
-    def get_maindata(self, rid):
+    def get_maindata(self, rid, timeout=None):
         if not self.maindata:
             return {"rid": rid, "full_update": False, "torrents": {}}
         item = self.maindata.pop(0)
@@ -13,7 +13,7 @@ class FakeQbtClient:
             raise item
         return item
 
-    def torrent_info(self, hash):
+    def torrent_info(self, hash, timeout=None):
         return self.info.get(hash, {"hash": hash, "seq_dl": False})
 
     def post(self, path, payload):
@@ -34,12 +34,14 @@ class FakeExecutor:
 
 
 class FakeRclone:
-    def __init__(self, copy_ok=True, remote_sizes=None, remote_listing=None):
+    def __init__(self, copy_ok=True, remote_sizes=None, remote_listing=None, moved_size=None):
         self.copy_ok = copy_ok
         self.remote_sizes = remote_sizes or {}
         self.remote_listing = remote_listing or []
         self.copies = []
         self.dir_copies = []
+        self.movetos = []
+        self.moved_size = moved_size
 
     def copyto(self, local, remote):
         self.copies.append((local, remote))
@@ -54,6 +56,63 @@ class FakeRclone:
 
     def lsjson(self, remote, recursive=False):
         return self.remote_listing
+
+    def stat(self, remote):
+        size = self.remote_sizes.get(remote)
+        return {"Path": remote.rsplit("/", 1)[-1], "Size": size} if size is not None else None
+
+    def moveto(self, source, target):
+        self.movetos.append((source, target))
+        if source not in self.remote_sizes:
+            raise RuntimeError("source not found")
+        size = self.remote_sizes.pop(source)
+        if self.moved_size is not None and len(self.movetos) == 1:
+            size = self.moved_size
+        self.remote_sizes[target] = size
+
+
+class BudgetedQbtFake:
+    """Virtual-time qBT fake for steady-state API budget assertions."""
+
+    def __init__(self, snapshots, now):
+        self.snapshots = snapshots
+        self.now = now
+        self.calls = []
+        self.maindata_calls = 0
+        self.delta_calls = 0
+
+    def get_maindata(self, rid, timeout=None):
+        self.maindata_calls += 1
+        full = int(rid) == 0
+        if not full:
+            self.delta_calls += 1
+        return {
+            "rid": int(rid) + 1,
+            "full_update": full,
+            "torrents": self.snapshots if full else {},
+            "server_state": {},
+        }
+
+    def torrent_files(self, torrent_hash, timeout=None):
+        self.calls.append((int(self.now()), "torrents/files", str(torrent_hash)))
+        return [{"index": 0, "name": f"{torrent_hash}.mp4", "size": 1024**3, "progress": 0.0, "priority": 0}]
+
+    def torrent_properties(self, torrent_hash):
+        self.calls.append((int(self.now()), "torrents/properties", str(torrent_hash)))
+        return {"piece_size": 16 * 1024**2}
+
+    def calls_per_minute(self, endpoint):
+        buckets = {}
+        for ts, called_endpoint, _hash in self.calls:
+            if called_endpoint != endpoint:
+                continue
+            bucket = int(ts) // 60
+            buckets[bucket] = buckets.get(bucket, 0) + 1
+        return max(buckets.values(), default=0)
+
+    @property
+    def delta_ratio(self):
+        return self.delta_calls / self.maindata_calls if self.maindata_calls else 0.0
 
 
 class FakeBackfill:

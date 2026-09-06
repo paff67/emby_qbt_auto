@@ -8,9 +8,52 @@ import tempfile
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
+
+
+def test_junk_priority_write_does_not_record_success_when_lease_blocks(tmp_path):
+    from qbt_orchestrator.db import migrate, readonly_connect
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
+    from qbt_orchestrator.junk_janitor import JunkJanitorService
+
+    class Qbt:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+
+    db = tmp_path / "state.sqlite"
+    migrate(db, dry_run=False)
+    qbt = Qbt()
+    executor = Executor(qbt, dry_run=False)
+    assert executor.acquire_hash_mutation_lease("h", "reclaim:1:1") is True
+    service = JunkJanitorService(
+        db,
+        executor,
+        managed_root=tmp_path,
+        trash_dir=tmp_path / "trash",
+        dry_run=False,
+    )
+    try:
+        with pytest.raises(QbtMutationLeaseBlocked):
+            service._set_file_priority_zero(
+                " H ", 0, 1, tmp_path / "junk.url", 10, 1
+            )
+    finally:
+        executor.close(timeout=1)
+
+    con = readonly_connect(db)
+    actions = con.execute(
+        "select status from action_log where action_type='junk_set_prio_zero'"
+    ).fetchall()
+    con.close()
+    assert actions == []
+    assert qbt.posts == []
 
 
 def _rows(db: Path, sql: str):
@@ -150,6 +193,31 @@ def test_junk_janitor_keeps_informational_txt_files_downloadable():
         assert txt.exists()
         assert executor.posts == []
         assert _rows(db, "select * from junk_janitor_events") == []
+
+
+def test_junk_janitor_persists_round_robin_cursor_and_dedupes_unchanged_skip():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.junk_janitor import JunkJanitorService
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        janitor = JunkJanitorService(db, FakeExecutor(), dry_run=True, now=lambda: 100)
+        snapshots = {
+            h: {"hash": h, "category": "auto", "tags": "auto"}
+            for h in ["c", "a", "b"]
+        }
+
+        assert janitor.select_scan_hashes(snapshots, 2) == ["a", "b"]
+        assert janitor.select_scan_hashes(snapshots, 2) == ["c", "a"]
+
+        missing = Path(td) / "missing-ad.txt"
+        janitor._record_event("a", 1, missing, 1, "skipped", "mtime_unstable", 0, None, {})
+        janitor._record_event("a", 1, missing, 1, "skipped", "mtime_unstable", 0, None, {})
+        assert _rows(db, "select action,reason from junk_janitor_events") == [
+            {"action": "skipped", "reason": "mtime_unstable"}
+        ]
 
 
 def test_junk_janitor_skips_unhealthy_current_batch_large_unstable_and_fast_active():

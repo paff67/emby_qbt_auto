@@ -43,19 +43,19 @@ class QbtPreferencesGuard:
         actual = self.qbt.get_preferences()
         drift: dict[str, dict[str, Any]] = {}
         to_set: dict[str, Any] = {}
+        observed: dict[str, Any] = {}
         if actual.get("preallocate_all") is not None and bool(actual.get("preallocate_all")) != self.desired_preallocate_all:
             drift["preallocate_all"] = {"actual": bool(actual.get("preallocate_all")), "desired": self.desired_preallocate_all}
             to_set["preallocate_all"] = self.desired_preallocate_all
         if actual.get("incomplete_files_ext") is not None:
             actual_incomplete = bool(actual.get("incomplete_files_ext"))
             if self.desired_incomplete_files_ext is None:
-                if actual_incomplete is False:
-                    drift["incomplete_files_ext"] = {"actual": actual_incomplete, "desired": None}
+                observed["incomplete_files_ext"] = actual_incomplete
             elif actual_incomplete != bool(self.desired_incomplete_files_ext):
                 drift["incomplete_files_ext"] = {"actual": actual_incomplete, "desired": bool(self.desired_incomplete_files_ext)}
                 to_set["incomplete_files_ext"] = bool(self.desired_incomplete_files_ext)
 
-        result: dict[str, Any] = {"drift": drift, "would_set": dict(to_set), "applied": {}}
+        result: dict[str, Any] = {"drift": drift, "observed": observed, "would_set": dict(to_set), "applied": {}}
         self._record_drift(drift, to_set)
         if not to_set:
             return result
@@ -76,28 +76,40 @@ class QbtPreferencesGuard:
             return
         now = int(self.now())
         data = {"drift": drift, "would_set": to_set, "dry_run": self.dry_run}
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
+        payload = json.dumps(redact(data), ensure_ascii=False, sort_keys=True)
+        def txn(con: sqlite3.Connection) -> None:
+            previous = con.execute(
+                "select data_json from events_v2 where component='qbt_preferences' and event_type='preferences_drift' order by id desc limit 1"
+            ).fetchone()
+            if previous and str(previous[0] or "") == payload:
+                return
+            con.execute(
                 "insert into events_v2(ts,level,component,event_type,message,data_json) values(?,?,?,?,?,?)",
-                (now, "warning", "qbt_preferences", "preferences_drift", "qBT preferences drift detected", json.dumps(redact(data), ensure_ascii=False)),
-            ),
-        )
+                (now, "warning", "qbt_preferences", "preferences_drift", "qBT preferences drift detected", payload),
+            )
+        write_transaction(self.state_db, txn)
 
     def _record_action(self, to_set: dict[str, Any], status: str, dry_run: bool, error: str | None = None) -> None:
         now = int(self.now())
-        write_transaction(
-            self.state_db,
-            lambda con: con.execute(
+        payload = json.dumps(redact({"set": to_set}), ensure_ascii=False, sort_keys=True)
+        redacted_error = str(redact(error)) if error else None
+        def txn(con: sqlite3.Connection) -> None:
+            previous = con.execute(
+                "select payload_json,status,dry_run,error from action_log where action_type='qbt_preferences' and path='/api/v2/app/setPreferences' order by id desc limit 1"
+            ).fetchone()
+            identity = (payload, status, 1 if dry_run else 0, redacted_error)
+            if previous and tuple(previous) == identity:
+                return
+            con.execute(
                 "insert into action_log(ts,action_type,path,payload_json,status,dry_run,error) values(?,?,?,?,?,?,?)",
                 (
                     now,
                     "qbt_preferences",
                     "/api/v2/app/setPreferences",
-                    json.dumps(redact({"set": to_set}), ensure_ascii=False),
+                    payload,
                     status,
                     1 if dry_run else 0,
-                    str(redact(error)) if error else None,
+                    redacted_error,
                 ),
-            ),
-        )
+            )
+        write_transaction(self.state_db, txn)

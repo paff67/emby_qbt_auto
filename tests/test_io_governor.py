@@ -20,7 +20,7 @@ def _rows(db: Path, sql: str):
     return rows
 
 
-def test_upload_backpressure_blocks_new_file_batch_jobs_and_records_metrics():
+def test_upload_backpressure_does_not_block_disk_releasing_full_upload_and_records_bypass():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.file_batch import FileBatchService
     from qbt_orchestrator.io_governor import UploadBackpressurePolicy
@@ -64,18 +64,19 @@ def test_upload_backpressure_blocks_new_file_batch_jobs_and_records_metrics():
         result = service.sync_completed(snapshots)
 
         assert result.eligible == 1
-        assert result.enqueued == 0
+        assert result.enqueued == 1
         jobs = _rows(db, "select hash,job_type,state from torrent_jobs order by id")
-        assert [j["hash"] for j in jobs] == ["old"]
-        events = _rows(db, "select component,event_type,message from events_v2 order by id")
-        assert events[-1]["component"] == "upload_backpressure"
-        assert events[-1]["event_type"] == "new_upload_blocked"
-        metrics = _rows(db, "select component,metrics_json from metrics_snapshots order by id")
+        assert [j["hash"] for j in jobs] == ["old", "newhash"]
+        metrics = _rows(
+            db,
+            "select component,metrics_json from metrics_snapshots "
+            "where component='upload_backpressure' order by id",
+        )
         assert metrics[-1]["component"] == "upload_backpressure"
         data = json.loads(metrics[-1]["metrics_json"])
-        assert data["allow_new_upload_jobs"] is False
+        assert data["allow_new_upload_jobs"] is True
         assert data["pending_bytes"] == 21 * gib
-        assert data["reason"] == "upload_backlog_over_limit"
+        assert data["reason"] == "disk_releasing_bypass"
 
 
 def test_io_governor_defaults_to_full_speed_without_bwlimit_even_under_pressure():

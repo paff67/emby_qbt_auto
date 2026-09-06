@@ -96,7 +96,9 @@ class GDriveBackfillScraper:
         artifacts = self._collect_artifacts(work_dir, key)
         if artifacts:
             artifact_manifest = self._write_artifact_manifest(work_dir, key, str(manifest_id), artifacts, command, int(getattr(proc, "returncode", 0) or 0), stdout)
-            return self._result("sidecar_verified", key, manifest_id, work_dir, artifacts, None, returncode=int(getattr(proc, "returncode", 0) or 0), artifact_manifest=artifact_manifest)
+            result = self._result("sidecar_verified", key, manifest_id, work_dir, artifacts, None, returncode=int(getattr(proc, "returncode", 0) or 0), artifact_manifest=artifact_manifest)
+            result.update(self._load_media_metadata(work_dir, key))
+            return result
         if int(getattr(proc, "returncode", 1) or 0) == 0:
             return self._result("not_found", key, manifest_id, work_dir, [], "scraper produced no sidecar artifacts", returncode=0)
         if not self.keep_failed_staging:
@@ -171,6 +173,35 @@ class GDriveBackfillScraper:
             remote_path = str(PurePosixPath("/", key, *rel.parts))
             artifacts.append({"local": str(path), "remote": f"{self.remote}{remote_path}", "size": size})
         return artifacts
+
+    def _load_media_metadata(self, work_dir: Path, key: str) -> dict[str, str]:
+        path = work_dir / "media_metadata.json"
+        if not path.is_file():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        normalized_id = str(raw.get("normalized_id") or "").strip().upper()
+        if normalized_id != str(key).strip().upper():
+            return {}
+        canonical_remote_dir = str(raw.get("canonical_remote_dir") or "").rstrip("/")
+        expected_remote_dir = f"{self.remote}/{key}".replace("://", ":/")
+        if canonical_remote_dir != expected_remote_dir:
+            return {}
+        fields = (
+            "normalized_id",
+            "metadata_title",
+            "display_title",
+            "canonical_basename",
+            "canonical_remote_dir",
+        )
+        result = {name: str(raw.get(name) or "").strip() for name in fields}
+        if not all(result.values()):
+            return {}
+        return result
 
     @staticmethod
     def _result(status: str, key: str, manifest_id: str, work_dir: Path, artifacts: list[dict[str, Any]], error: str | None, returncode: int | None = None, artifact_manifest: str | None = None) -> dict[str, Any]:

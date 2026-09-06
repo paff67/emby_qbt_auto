@@ -4,8 +4,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 import sys
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -18,6 +21,10 @@ def _rows(db: Path, sql: str):
     rows = [dict(r) for r in con.execute(sql)]
     con.close()
     return rows
+
+
+def _job_count(db: Path, job_type: str) -> int:
+    return int(_rows(db, f"select count(*) as count from torrent_jobs where job_type='{job_type}'")[0]["count"])
 
 
 def test_observability_store_persists_redacted_events_actions_and_trace():
@@ -38,7 +45,7 @@ def test_observability_store_persists_redacted_events_actions_and_trace():
         assert trace["events"][0]["event_type"] == "bot_rejected"
 
 
-def test_upload_job_runner_claims_job_updates_done_and_verify_pending():
+def test_upload_job_runner_claims_job_updates_promotion_wait_and_verify_pending():
     from qbt_orchestrator.db import migrate
     from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
     from tests.fakes import FakeExecutor, FakeRclone
@@ -52,10 +59,631 @@ def test_upload_job_runner_claims_job_updates_done_and_verify_pending():
 
         runner = UploadJobRunner(repo, FakeRclone(copy_ok=True, remote_sizes={"gcrypt:/A/a.mp4": 100, "gcrypt:/B/b.mp4": 99}), FakeExecutor())
         assert runner.run_next() == good
-        assert repo.get(good)["state"] == "done"
+        assert repo.get(good)["state"] == "promotion_wait"
+        assert _job_count(db, "cleanup_full_torrent") == 0
         assert runner.run_next() == bad
         assert repo.get(bad)["state"] == "verify_pending"
         assert repo.get(bad)["last_stderr_tail"] == "remote size mismatch"
+
+
+def test_upload_heartbeat_renews_lease_and_success_clears_retry_diagnostics():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor
+
+    class SlowRclone:
+        def copyto(self, local, remote):
+            time.sleep(0.06)
+            return True
+
+        def lsjson_size(self, remote):
+            return 100
+
+    class CountingRepo(TorrentJobRepository):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.renew_count = 0
+
+        def renew_lease(self, *args, **kwargs):
+            renewed = super().renew_lease(*args, **kwargs)
+            if renewed:
+                self.renew_count += 1
+            return renewed
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = CountingRepo(db, now=lambda: 100, lease_duration_sec=2)
+        job_id = repo.enqueue(
+            "h1",
+            None,
+            "upload",
+            {
+                "local": "/tmp/a.mp4",
+                "remote": "gcrypt:/A/a.mp4",
+                "size": 100,
+                "full_torrent": False,
+            },
+            priority=1,
+        )
+        con = sqlite3.connect(db)
+        con.execute(
+            "update torrent_jobs set last_stderr_tail='old failure',next_run_at=99 where id=?",
+            (job_id,),
+        )
+        con.commit()
+        con.close()
+        runner = UploadJobRunner(
+            repo,
+            SlowRclone(),
+            FakeExecutor(),
+            lease_heartbeat_interval_sec=0.01,
+        )
+
+        assert runner.run_next() == job_id
+
+        row = repo.get(job_id)
+        assert repo.renew_count >= 1
+        assert row["state"] == "cleanup_deferred"
+        assert row["lease_owner"] is None
+        assert row["lease_until"] is None
+        assert row["last_stderr_tail"] is None
+        assert row["next_run_at"] is None
+
+
+def test_upload_completion_is_fenced_by_lease_owner_and_generation():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.integrations.rclone import VerifyResult
+    from qbt_orchestrator.runtime import LeaseLostError, TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 100, lease_duration_sec=30)
+        payload = {
+            "local": "/tmp/a.mp4",
+            "remote": "gcrypt:/A/a.mp4",
+            "size": 100,
+            "full_torrent": False,
+        }
+        job_id = repo.enqueue("h1", None, "upload", payload, priority=1)
+        first = repo.claim_next("upload")
+        assert first is not None
+        assert first["lease_generation"] == 1
+
+        con = sqlite3.connect(db)
+        con.execute(
+            "update torrent_jobs set state='retry_wait',lease_owner=null,lease_until=null,next_run_at=100 where id=?",
+            (job_id,),
+        )
+        con.commit()
+        con.close()
+        second = repo.claim_next("upload")
+        assert second is not None
+        assert second["lease_generation"] == 2
+        assert second["lease_owner"] != first["lease_owner"]
+
+        try:
+            repo.finalize_verified(
+                first, payload, VerifyResult(True, "path_size", [])
+            )
+        except LeaseLostError:
+            pass
+        else:
+            raise AssertionError("stale lease generation finalized the upload")
+
+        current = repo.get(job_id)
+        assert current["state"] == "running"
+        assert current["lease_owner"] == second["lease_owner"]
+        assert current["lease_generation"] == 2
+
+
+def test_migration_clears_stale_diagnostics_from_successful_jobs():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_jobs(job_type,state,last_stderr_tail,next_run_at,created_at,updated_at) "
+            "values('upload','done','old lease error',123,1,1)"
+        )
+        con.execute(
+            "insert into torrent_jobs(job_type,state,last_stderr_tail,next_run_at,created_at,updated_at) "
+            "values('upload','retry_wait','current error',123,1,1)"
+        )
+        con.commit()
+        con.close()
+
+        migrate(db, dry_run=False)
+
+        rows = _rows(
+            db,
+            "select state,last_stderr_tail,next_run_at from torrent_jobs order by id",
+        )
+        assert rows == [
+            {"state": "done", "last_stderr_tail": None, "next_run_at": None},
+            {
+                "state": "retry_wait",
+                "last_stderr_tail": "current error",
+                "next_run_at": 123,
+            },
+        ]
+
+
+def test_full_upload_verification_waits_for_promotion_without_cleanup():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.integrations.rclone import VerifyResult
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1_000)
+        payload = {
+            "local": "/tmp/BBAN-582",
+            "remote": "gcrypt:/BBAN-582.torrent-hash",
+            "size": 123,
+            "full_torrent": True,
+            "media_files": [
+                {
+                    "remote_path": "gcrypt:/BBAN-582.torrent-hash/raw.mp4",
+                    "size": 123,
+                }
+            ],
+        }
+        upload_id = repo.enqueue("h", None, "upload", payload, priority=10)
+
+        state = repo.finalize_verified(
+            repo.get(upload_id),
+            payload,
+            VerifyResult(True, "path_size", []),
+        )
+
+        assert state == "promotion_wait"
+        assert repo.get(upload_id)["phase"] == "promotion_wait"
+        assert _job_count(db, "cleanup_full_torrent") == 0
+
+
+def test_finalization_barrier_creates_one_cleanup_after_promotion_and_sidecars():
+    from qbt_orchestrator.db import migrate, write_transaction
+    from qbt_orchestrator.integrations.rclone import VerifyResult
+    from qbt_orchestrator.promotion import (
+        MediaPromotionRepository,
+        finalize_canonical_upload,
+    )
+    from qbt_orchestrator.runtime import TorrentJobRepository
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        now = 1_000
+        repo = TorrentJobRepository(db, now=lambda: now)
+        payload = {
+            "local": "/tmp/BBAN-582",
+            "remote": "gcrypt:/BBAN-582.torrent-hash",
+            "size": 123,
+            "full_torrent": True,
+            "cleanup_policy_snapshot": {"tags": "auto"},
+        }
+        upload_id = repo.enqueue("h", None, "upload", payload, priority=10)
+        repo.finalize_verified(
+            repo.get(upload_id),
+            payload,
+            VerifyResult(True, "path_size", []),
+        )
+
+        def seed(con):
+            group_id = con.execute(
+                "insert into media_groups(media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?)",
+                ("BBAN-582", "BBAN-582", "/media/gcrypt/BBAN-582", now, now),
+            ).lastrowid
+            con.execute(
+                "insert into media_pipeline_runs(upload_manifest_id,media_group_id,state,created_at,updated_at,canonical_remote_dir,canonical_basename,canonical_video_manifest_json) values(?,?,?,?,?,?,?,?)",
+                (
+                    f"upload-job-{upload_id}",
+                    group_id,
+                    "SidecarVerified",
+                    now,
+                    now,
+                    "gcrypt:/BBAN-582",
+                    "BBAN-582 影片名称",
+                    '[{"remote_path":"gcrypt:/BBAN-582/BBAN-582 影片名称.mp4","size":123}]',
+                ),
+            )
+            return int(group_id)
+
+        group_id = write_transaction(db, seed)
+        promotions = MediaPromotionRepository(db, now=lambda: now)
+        promotion_id = promotions.enqueue(
+            upload_job_id=upload_id,
+            hash="h",
+            media_group_id=group_id,
+            normalized_id="BBAN-582",
+            metadata_title="影片名称",
+            display_title="BBAN-582 影片名称",
+            source_remote="gcrypt:/BBAN-582.torrent-hash/raw.mp4",
+            target_remote="gcrypt:/BBAN-582/BBAN-582 影片名称.mp4",
+            expected_size=123,
+        )
+        promotions.record_verified(
+            promotion_id,
+            method="path_size",
+            details={"verified": True, "mismatches": []},
+        )
+
+        assert finalize_canonical_upload(db, upload_id=upload_id, now=now) is True
+        assert finalize_canonical_upload(db, upload_id=upload_id, now=now) is False
+        cleanup = _rows(
+            db,
+            "select * from torrent_jobs where job_type='cleanup_full_torrent'",
+        )
+        assert len(cleanup) == 1
+        cleanup_payload = json.loads(cleanup[0]["payload_json"])
+        assert cleanup_payload["canonical_remote_verified"] is True
+        assert cleanup_payload["remote"] == "gcrypt:/BBAN-582"
+        assert repo.get(upload_id)["state"] == "cleanup_wait"
+        refresh = _rows(
+            db,
+            "select emby_media_dir,state,earliest_run_at,max_run_at,payload_json from emby_refresh_tasks",
+        )
+        assert len(refresh) == 1
+        assert refresh[0]["emby_media_dir"] == "/media/gcrypt/BBAN-582"
+        assert refresh[0]["state"] == "queued"
+        assert refresh[0]["earliest_run_at"] == now + 300
+        assert refresh[0]["max_run_at"] == now + 900
+        assert json.loads(refresh[0]["payload_json"])["trigger_state"] == "CanonicalRemoteVerified"
+
+
+def test_cleanup_policy_blocks_unverified_seed_long_and_transient_seed_wait():
+    from qbt_orchestrator.io_governor import JobPriority
+    from qbt_orchestrator.cleanup_policy import cleanup_eligibility
+
+    assert [int(value) for value in JobPriority] == [0, 10, 15, 50, 70, 80]
+
+    assert cleanup_eligibility(
+        {"tags": "auto", "seeding_time": 99_999, "ratio": 9.0},
+        canonical_remote_verified=False,
+        free_bytes=10 * 1024**3,
+        pressure_free_bytes=5 * 1024**3,
+        min_seed_sec=900,
+        min_ratio=1.0,
+        max_retention_sec=7200,
+        now=1_000,
+    ).reason == "remote_not_canonical"
+    seed_long = cleanup_eligibility(
+        {"tags": "auto,seed-long", "seeding_time": 99_999, "ratio": 9.0},
+        canonical_remote_verified=True,
+        free_bytes=10 * 1024**3,
+        pressure_free_bytes=5 * 1024**3,
+        min_seed_sec=900,
+        min_ratio=1.0,
+        max_retention_sec=7200,
+        now=1_000,
+    )
+    assert seed_long.allowed is False
+    assert seed_long.reason == "seed_long"
+    assert seed_long.next_check_at is None
+    waiting = cleanup_eligibility(
+        {"tags": "auto", "seeding_time": 899, "ratio": 9.0},
+        canonical_remote_verified=True,
+        free_bytes=10 * 1024**3,
+        pressure_free_bytes=5 * 1024**3,
+        min_seed_sec=900,
+        min_ratio=10.0,
+        max_retention_sec=7200,
+        now=1_000,
+    )
+    assert waiting.reason == "policy_wait"
+    assert waiting.next_check_at == 1_300
+
+
+def test_cleanup_releases_canonical_media_under_pressure_or_ratio_or_retention():
+    from qbt_orchestrator.cleanup_policy import cleanup_eligibility
+
+    base = {
+        "tags": "auto",
+        "seeding_time": 0,
+        "ratio": 0.0,
+        "completion_on": 9_900,
+        "state": "stoppedUP",
+    }
+    common = {
+        "canonical_remote_verified": True,
+        "pressure_free_bytes": 5 * 1024**3,
+        "min_seed_sec": 900,
+        "min_ratio": 1.0,
+        "max_retention_sec": 7200,
+        "now": 10_000,
+    }
+    pressure = cleanup_eligibility(
+        base, free_bytes=4 * 1024**3, **common
+    )
+    ratio = cleanup_eligibility(
+        {**base, "ratio": 3.13}, free_bytes=10 * 1024**3, **common
+    )
+    retention = cleanup_eligibility(
+        {**base, "completion_on": 1_000}, free_bytes=10 * 1024**3, **common
+    )
+
+    assert (pressure.allowed, pressure.reason) == (True, "disk_pressure")
+    assert (ratio.allowed, ratio.reason) == (True, "ratio")
+    assert (retention.allowed, retention.reason) == (True, "retention")
+
+
+def test_cleanup_hard_gates_override_disk_pressure():
+    from qbt_orchestrator.cleanup_policy import cleanup_eligibility
+
+    common = {
+        "free_bytes": 0,
+        "pressure_free_bytes": 5 * 1024**3,
+        "min_seed_sec": 0,
+        "min_ratio": 0,
+        "max_retention_sec": 0,
+        "now": 10_000,
+    }
+    cases = [
+        ({"tags": "hold"}, True, False, "hold"),
+        ({"tags": "seed-long"}, True, False, "seed_long"),
+        ({"tags": "auto"}, False, False, "remote_not_canonical"),
+        ({"tags": "auto"}, True, True, "promotion_conflict"),
+    ]
+    for torrent, verified, conflict, reason in cases:
+        decision = cleanup_eligibility(
+            torrent,
+            canonical_remote_verified=verified,
+            promotion_conflict=conflict,
+            **common,
+        )
+        assert decision.allowed is False
+        assert decision.reason == reason
+
+
+def test_full_cleanup_runner_never_deletes_seed_long_and_retries_transient_seed_policy():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import FullTorrentCleanupRunner, TorrentJobRepository
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        clock = [1_000]
+        repo = TorrentJobRepository(db, now=lambda: clock[0])
+        executor = FakeExecutor()
+
+        held_parent = repo.enqueue("held", None, "upload", {}, priority=10)
+        repo.update_state(held_parent, "cleanup_wait")
+        held_cleanup = repo.enqueue(
+            "held",
+            None,
+            "cleanup_full_torrent",
+            {"canonical_remote_verified": True, "cleanup_policy_snapshot": {"tags": "auto,seed-long", "seeding_time": 99_999, "ratio": 9.0}},
+            priority=10,
+            parent_job_id=held_parent,
+        )
+        held_runner = FullTorrentCleanupRunner(repo, executor, min_seed_sec=900, min_ratio=1.0)
+        assert held_runner.run_next() == held_cleanup
+        assert repo.get(held_cleanup)["state"] == "blocked"
+        assert repo.get(held_parent)["state"] == "cleanup_wait"
+        assert executor.posts == []
+
+        parent = repo.enqueue("ready-later", None, "upload", {}, priority=10)
+        repo.update_state(parent, "cleanup_wait")
+        cleanup = repo.enqueue(
+            "ready-later",
+            None,
+            "cleanup_full_torrent",
+            {"canonical_remote_verified": True, "cleanup_policy_snapshot": {}},
+            priority=10,
+            parent_job_id=parent,
+        )
+        live = {"tags": "auto", "seeding_time": 899, "ratio": 0.5}
+        runner = FullTorrentCleanupRunner(
+            repo,
+            executor,
+            torrent_provider=lambda _hash: dict(live),
+            min_seed_sec=900,
+            min_ratio=1.0,
+        )
+
+        assert runner.run_next() == cleanup
+        assert repo.get(cleanup)["state"] == "retry_wait"
+        assert repo.get(cleanup)["next_run_at"] == 1_300
+        assert executor.posts == []
+
+        clock[0] = 1_301
+        live.update({"seeding_time": 1_000, "ratio": 1.0})
+        assert runner.run_next() == cleanup
+        assert repo.get(cleanup)["state"] == "done"
+        assert repo.get(parent)["state"] == "done"
+        assert executor.posts == [
+            ("/api/v2/torrents/delete", {"hashes": "ready-later", "deleteFiles": "true"})
+        ]
+
+
+def test_full_cleanup_lease_block_retries_without_marking_job_done():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor
+    from qbt_orchestrator.runtime import FullTorrentCleanupRunner, TorrentJobRepository
+
+    class Qbt:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1_000)
+        cleanup_id = repo.enqueue(
+            " H ",
+            None,
+            "cleanup_full_torrent",
+            {"canonical_remote_verified": True},
+            priority=10,
+        )
+        assert repo.get(cleanup_id)["hash"] == "h"
+        qbt = Qbt()
+        executor = Executor(qbt, dry_run=False)
+        assert executor.acquire_hash_mutation_lease(
+            "h", "reclaim:1:1"
+        ) is True
+        runner = FullTorrentCleanupRunner(
+            repo,
+            executor,
+            torrent_provider=lambda _hash: {
+                "tags": "auto",
+                "seeding_time": 0,
+                "ratio": 0,
+            },
+            free_bytes_provider=lambda: 0,
+            pressure_free_bytes=1,
+        )
+        try:
+            assert runner.run_next() == cleanup_id
+        finally:
+            executor.close(timeout=1)
+
+        row = repo.get(cleanup_id)
+        assert row["state"] == "retry_wait"
+        assert "qBT mutation blocked by reclaim lease" in row["last_stderr_tail"]
+        assert qbt.posts == []
+
+
+def test_full_cleanup_runner_reclaims_largest_canonical_job_first_under_pressure():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import FullTorrentCleanupRunner, TorrentJobRepository
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1_000)
+        executor = FakeExecutor()
+        for torrent_hash, size in [("small", 10), ("large", 100)]:
+            parent = repo.enqueue(torrent_hash, None, "upload", {}, priority=10)
+            repo.update_state(parent, "cleanup_wait")
+            repo.enqueue(
+                torrent_hash,
+                None,
+                "cleanup_full_torrent",
+                {
+                    "canonical_remote_verified": True,
+                    "final_manifest": [
+                        {"remote_path": f"gcrypt:/{torrent_hash}.mp4", "size": size}
+                    ],
+                },
+                priority=10,
+                parent_job_id=parent,
+            )
+        runner = FullTorrentCleanupRunner(
+            repo,
+            executor,
+            torrent_provider=lambda h: {
+                "hash": h,
+                "tags": "auto",
+                "seeding_time": 0,
+                "ratio": 0,
+            },
+            free_bytes_provider=lambda: 4 * 1024**3,
+            pressure_free_bytes=5 * 1024**3,
+            max_retention_sec=7200,
+        )
+
+        assert runner.run_next() is not None
+
+        assert executor.posts == [
+            ("/api/v2/torrents/delete", {"hashes": "large", "deleteFiles": "true"})
+        ]
+
+
+def test_upload_phase_schema_and_verify_retry_does_not_repeat_copy_or_delete():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor
+
+    class RetryVerifyRclone:
+        def __init__(self):
+            self.copy_calls = 0
+            self.verify_calls = 0
+            self.verify_sizes = [99, 100]
+
+        def copyto(self, local, remote):
+            self.copy_calls += 1
+            return True
+
+        def lsjson_size(self, remote):
+            self.verify_calls += 1
+            return self.verify_sizes.pop(0)
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        columns = {row[1] for row in con.execute("pragma table_info(torrent_jobs)")}
+        con.close()
+        assert {"phase", "copy_completed_at", "verification_method", "verification_result_json", "verified_at", "parent_job_id"} <= columns
+
+        repo = TorrentJobRepository(db, now=lambda: 1_000)
+        upload_id = repo.enqueue(
+            "h1",
+            None,
+            "upload",
+            {"local": "/tmp/a.mp4", "remote": "gcrypt:/A/a.mp4", "size": 100, "full_torrent": True},
+            priority=1,
+        )
+        rclone = RetryVerifyRclone()
+        executor = FakeExecutor()
+        runner = UploadJobRunner(repo, rclone, executor)
+
+        assert repo.get(upload_id)["phase"] == "queued_copy"
+        assert runner.run_next() == upload_id
+        first = repo.get(upload_id)
+        assert first["state"] == "verify_pending"
+        assert first["phase"] == "verifying"
+        assert first["copy_completed_at"] == 1_000
+        assert _job_count(db, "cleanup_full_torrent") == 0
+
+        assert runner.run_next() == upload_id
+        second = repo.get(upload_id)
+        assert second["state"] == "promotion_wait"
+        assert second["phase"] == "promotion_wait"
+        assert second["verification_method"] == "single_size"
+        assert json.loads(second["verification_result_json"]) == {"mismatches": [], "verified": True}
+        assert second["verified_at"] == 1_000
+        assert rclone.copy_calls == 1
+        assert rclone.verify_calls == 2
+        assert executor.posts == []
+        assert _job_count(db, "cleanup_full_torrent") == 0
+        from qbt_orchestrator.service import DaemonRuntime
+
+        runtime = object.__new__(DaemonRuntime)
+        runtime.state_db = db
+        assert runtime._disk_releasing_job_count() == 1
+
+
+def test_migration_backfills_legacy_verify_pending_phase_without_recopying():
+    from qbt_orchestrator.db import migrate
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into torrent_jobs(hash,job_type,state,phase,payload_json,created_at,updated_at) "
+            "values('legacy','upload','verify_pending',null,'{}',1,1)"
+        )
+        con.commit()
+        con.close()
+
+        migrate(db, dry_run=False)
+
+        assert _rows(db, "select state,phase from torrent_jobs where hash='legacy'") == [
+            {"state": "verify_pending", "phase": "verifying"}
+        ]
 
 
 def test_upload_verified_enqueues_media_pipeline_and_sidecar_upload_uses_upload_worker():
@@ -95,7 +723,8 @@ def test_upload_verified_enqueues_media_pipeline_and_sidecar_upload_uses_upload_
         )
 
         assert runner.run_next() == upload_id
-        assert repo.get(upload_id)["state"] == "done"
+        assert repo.get(upload_id)["state"] == "promotion_wait"
+        assert _job_count(db, "cleanup_full_torrent") == 0
         media_job = repo.claim_next("media_pipeline")
         assert media_job is not None
         media_payload = json.loads(media_job["payload_json"])
@@ -164,6 +793,101 @@ def test_sidecar_upload_verified_marks_manifest_and_only_then_queues_emby_refres
         assert refresh[0]["earliest_run_at"] == 1300
         assert refresh[0]["max_run_at"] == 1900
         assert json.loads(refresh[0]["payload_json"])["trigger_state"] == "SidecarVerified"
+
+
+def test_sidecar_completion_finalizes_already_promoted_upload_without_early_refresh():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.integrations.rclone import VerifyResult
+    from qbt_orchestrator.promotion import MediaPromotionRepository
+    from qbt_orchestrator.runtime import TorrentJobRepository, UploadJobRunner
+    from tests.fakes import FakeExecutor, FakeRclone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        repo = TorrentJobRepository(db, now=lambda: 1000)
+        upload_payload = {
+            "local": "/tmp/ABC-123",
+            "remote": "gcrypt:/ABC-123-hash",
+            "size": 10,
+            "full_torrent": True,
+        }
+        upload_id = repo.enqueue("h1", None, "upload", upload_payload, priority=1)
+        repo.finalize_verified(
+            repo.get(upload_id), upload_payload, VerifyResult(True, "path_size", [])
+        )
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into media_groups(id,media_group_key,normalized_id,emby_media_dir,created_at,updated_at) values(?,?,?,?,?,?)",
+            (1, "ABC-123", "ABC-123", "/media/gcrypt/ABC-123", 100, 100),
+        )
+        con.execute(
+            "insert into media_pipeline_runs(id,upload_manifest_id,media_group_id,state,metadata_policy,metadata_quality,created_at,updated_at,canonical_remote_dir,canonical_basename,canonical_video_manifest_json) "
+            "values(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                1,
+                f"upload-job-{upload_id}",
+                1,
+                "SidecarUploadQueued",
+                "sidecar",
+                "normalized",
+                100,
+                100,
+                "gcrypt:/ABC-123",
+                "ABC-123 Title",
+                '[{"remote_path":"gcrypt:/ABC-123/ABC-123 Title.mp4","size":10}]',
+            ),
+        )
+        con.execute(
+            "insert into sidecar_manifests(id,media_group_id,staging_dir,artifacts_json,state,created_at,updated_at) values(?,?,?,?,?,?,?)",
+            (1, 1, "/staging/ABC-123", "[]", "local_sidecar_validated", 100, 100),
+        )
+        con.commit()
+        con.close()
+        promotions = MediaPromotionRepository(db, now=lambda: 1000)
+        promotion_id = promotions.enqueue(
+            upload_job_id=upload_id,
+            hash="h1",
+            media_group_id=1,
+            normalized_id="ABC-123",
+            metadata_title="Title",
+            display_title="ABC-123 Title",
+            source_remote="gcrypt:/ABC-123-hash/raw.mp4",
+            target_remote="gcrypt:/ABC-123/ABC-123 Title.mp4",
+            expected_size=10,
+        )
+        promotions.record_verified(
+            promotion_id, method="path_size", details={"verified": True}
+        )
+        sidecar_job = repo.enqueue(
+            None,
+            None,
+            "sidecar_upload",
+            {
+                "local": "/staging/ABC-123/movie.nfo",
+                "remote": "gcrypt:/ABC-123/ABC-123 Title.nfo",
+                "size": 5,
+                "full_torrent": False,
+                "sidecar_manifest_id": 1,
+            },
+            priority=1,
+        )
+        runner = UploadJobRunner(
+            repo,
+            FakeRclone(
+                copy_ok=True,
+                remote_sizes={"gcrypt:/ABC-123/ABC-123 Title.nfo": 5},
+            ),
+            FakeExecutor(),
+        )
+
+        assert runner.run_next() == sidecar_job
+
+        assert repo.get(upload_id)["state"] == "cleanup_wait"
+        assert _job_count(db, "cleanup_full_torrent") == 1
+        refresh = _rows(db, "select payload_json from emby_refresh_tasks")
+        assert len(refresh) == 1
+        assert json.loads(refresh[0]["payload_json"])["trigger_state"] == "CanonicalRemoteVerified"
 
 
 def test_sidecar_upload_verify_failure_at_max_attempts_uses_passthrough_not_verified():
@@ -281,8 +1005,20 @@ def test_upload_job_runner_marks_pipeline_batch_cleanup_deferred_and_counts_pend
         assert rclone.dir_copies == []
         batch = _rows(db, "select state,upload_job_id,local_pinned_bytes,cleanup_deferred_at from torrent_batches where id=1")[0]
         assert batch == {"state": "cleanup_deferred", "upload_job_id": job_id, "local_pinned_bytes": 10, "cleanup_deferred_at": 100}
-        reservation = _rows(db, "select kind,bytes,state,reason from resource_reservations where batch_id=1 and kind='cleanup_pending'")[0]
-        assert reservation == {"kind": "cleanup_pending", "bytes": 10, "state": "active", "reason": "batch_cleanup_deferred"}
+        reservation = _rows(
+            db,
+            "select kind,accounting_class,owner,last_observed_at,bytes,state,reason "
+            "from resource_reservations where batch_id=1 and kind='cleanup_pending'",
+        )[0]
+        assert reservation == {
+            "kind": "cleanup_pending",
+            "accounting_class": "current_pinned",
+            "owner": "upload_job_runner",
+            "last_observed_at": 100,
+            "bytes": 10,
+            "state": "active",
+            "reason": "batch_cleanup_deferred",
+        }
         media_job = repo.claim_next("media_pipeline")
         assert media_job is not None
         assert media_job["batch_id"] == 1
@@ -324,6 +1060,176 @@ def test_command_processor_executes_safe_commands_and_requires_cleanup_approval(
                 {"text": "Deny", "callback_data": "deny:approval-c3"},
             ]]
         }
+
+
+def test_resume_command_canonicalizes_hash_and_blocks_on_reclaim_lease():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.executor import Executor, QbtMutationLeaseBlocked
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+
+    class Qbt:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, payload):
+            self.posts.append((path, dict(payload)))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command(
+            "resume-locked", 100, 2, "resume", {"args": [" H "]}
+        )
+        stored = json.loads(commands.get("resume-locked")["payload_json"])
+        assert stored["args"] == ["h"]
+
+        qbt = Qbt()
+        executor = Executor(qbt, dry_run=False)
+        assert executor.acquire_hash_mutation_lease(
+            "h", "reclaim:7:4"
+        ) is True
+        try:
+            with pytest.raises(QbtMutationLeaseBlocked):
+                CommandProcessor(commands, executor).run_next()
+        finally:
+            executor.close(timeout=1)
+
+        command = commands.get("resume-locked")
+        assert command["state"] == "blocked"
+        assert command["last_error"] == (
+            "qBT mutation blocked by reclaim lease: "
+            "path=/api/v2/torrents/start hashes=h"
+        )
+        assert qbt.posts == []
+
+
+def test_queue_command_reclaim_trigger_becomes_blocked_without_creating_job():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into capacity_reclaims("
+            "reclaim_key,hash,name,magnet_uri,host_path,content_path,state,created_at,updated_at"
+            ") values(?,?,?,?,?,?,?,?,?)",
+            (
+                "reclaim:h",
+                "h",
+                "H",
+                "mag" + "net:?xt=urn:btih:h",
+                str(Path(td) / "h"),
+                "/downloads/h",
+                "stopping",
+                100,
+                100,
+            ),
+        )
+        con.commit()
+        con.close()
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command("queue-locked", 100, 2, "queue", {"args": [" H "]})
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="capacity_reclaim_locked",
+        ):
+            CommandProcessor(commands, FakeExecutor()).run_next()
+
+        command = commands.get("queue-locked")
+        assert command["state"] == "blocked"
+        assert command["last_error"] == "capacity_reclaim_locked"
+        assert _rows(db, "select * from torrent_jobs") == []
+
+
+def test_pause_timeout_fails_command_and_propagates_error():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+
+    class TimeoutExecutor:
+        def qbt_post(self, _path, _payload):
+            raise TimeoutError(
+                "qBT timed out token " + "123456:" + "secret-token"
+            )
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command("pause-timeout", 100, 2, "pause", {"args": ["h"]})
+        processor = CommandProcessor(commands, TimeoutExecutor())
+
+        with pytest.raises(TimeoutError, match="qBT timed out"):
+            processor.run_next()
+
+        command = commands.get("pause-timeout")
+        assert command["state"] == "failed"
+        assert "qBT timed out" in command["last_error"]
+        assert "secret-token" not in command["last_error"]
+
+
+def test_approved_dangerous_failure_is_terminal_and_never_replayed():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    class FailingPreemption:
+        def __init__(self):
+            self.calls = 0
+
+        def force_preempt_hash(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("preemption transport failed")
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 100)
+        commands.insert_command("preempt-failed", 100, 3, "preempt", {"args": ["seed"]})
+        preemption = FailingPreemption()
+        processor = CommandProcessor(
+            commands,
+            FakeExecutor(),
+            preemption_service=preemption,
+        )
+        assert processor.run_next() == "preempt-failed"
+        assert commands.approve_once("approval-preempt-failed", user_id=3) is True
+
+        with pytest.raises(RuntimeError, match="preemption transport failed"):
+            processor.run_next()
+
+        command = commands.get("preempt-failed")
+        assert command["state"] == "failed"
+        assert command["last_error"] == "preemption transport failed"
+        assert processor.run_next() is None
+        assert preemption.calls == 1
+
+
+def test_new_command_processor_recovers_stale_running_without_replay():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.runtime import BotCommandRepository, CommandProcessor
+    from tests.fakes import FakeExecutor
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        commands = BotCommandRepository(db, now=lambda: 200)
+        commands.insert_command("stale", 100, 3, "preempt", {"args": ["seed"]})
+        claimed = commands.claim_next()
+        assert claimed is not None and claimed["state"] == "running"
+
+        processor = CommandProcessor(commands, FakeExecutor())
+
+        command = commands.get("stale")
+        assert command["state"] == "failed"
+        assert command["last_error"] == (
+            "recovered stale running command; manual retry required"
+        )
+        assert processor.run_next() is None
 
 
 def test_approved_dangerous_command_executes_once_after_approval():
@@ -715,4 +1621,3 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn) and not inspect.signature(fn).parameters:
             fn()
     print("ok")
-

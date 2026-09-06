@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -26,6 +27,26 @@ def test_sqlite_bot_command_store_upserts_command_once():
         assert len(rows) == 1
         assert rows[0][:5] == ("tg-10", "100", "1", "status", "queued")
         assert "disk" in rows[0][5]
+
+
+def test_sqlite_bot_command_store_canonicalizes_torrent_hash_before_persisting():
+    from qbt_orchestrator.db import migrate
+    from qbt_orchestrator.telegram_control import SQLiteBotCommandStore
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db, dry_run=False)
+        SQLiteBotCommandStore(db).insert_command(
+            "tg-11", 100, 1, "resume", {"args": [" H "]}
+        )
+        con = sqlite3.connect(db)
+        payload = json.loads(
+            con.execute(
+                "select payload_json from bot_commands where command_id='tg-11'"
+            ).fetchone()[0]
+        )
+        con.close()
+        assert payload["args"] == ["h"]
 
 
 if __name__ == "__main__":

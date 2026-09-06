@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
@@ -36,7 +38,7 @@ def test_qbt_docker_client_uses_container_local_api_and_parses_json():
 
     assert client.get_maindata(1)["rid"] == 2
     assert client.torrent_info("h1")["seq_dl"] is False
-    assert client.torrent_files("h1") == [{"name": "a.mp4", "size": 10, "index": 0}, {"index": 9, "name": "b.nfo", "size": 1}]
+    assert client.torrent_files("h1", timeout=0.25) == [{"name": "a.mp4", "size": 10}, {"index": 9, "name": "b.nfo", "size": 1}]
     assert client.post("/api/v2/torrents/stop", {"hashes": "h1"}) == "Ok."
 
     first = runner.calls[0][0]
@@ -45,6 +47,7 @@ def test_qbt_docker_client_uses_container_local_api_and_parses_json():
     assert "--max-time" in first
     assert "http://127.0.0.1:8080/api/v2/sync/maindata?rid=1" in first
     assert runner.calls[3][1] == "hashes=h1"
+    assert 0 < runner.calls[2][2] <= 0.25
 
 
 def test_rclone_client_copyto_and_lsjson_size_use_root_config_with_redaction():
@@ -93,6 +96,81 @@ def test_emby_client_posts_precise_media_updated_payload_and_blocks_root():
         assert "too broad" in str(e)
     else:
         raise AssertionError("library root refresh must be blocked")
+
+
+def test_emby_client_notifies_then_recursively_refreshes_exact_folder():
+    from qbt_orchestrator.integrations.emby import EmbyClient
+
+    posts = []
+    gets = []
+
+    def transport(url, payload, headers, timeout):
+        posts.append((url, payload, headers, timeout))
+        return {}
+
+    def get_transport(url, headers, timeout):
+        gets.append((url, headers, timeout))
+        return {
+            "Items": [
+                {
+                    "Id": "folder-123",
+                    "Type": "Folder",
+                    "Path": "/media/gcrypt/ABC-123",
+                }
+            ]
+        }
+
+    client = EmbyClient(
+        base_url="http://127.0.0.1:8096",
+        api_key="secret",
+        media_prefix="/media/gcrypt",
+        transport=transport,
+        get_transport=get_transport,
+    )
+
+    result = client.refresh_path("/media/gcrypt/ABC-123")
+
+    assert result["refreshed_item_ids"] == ["folder-123"]
+    assert posts[0][0].endswith("/Library/Media/Updated")
+    assert "Path=%2Fmedia%2Fgcrypt%2FABC-123" in gets[0][0]
+    assert posts[1][0].startswith(
+        "http://127.0.0.1:8096/Items/folder-123/Refresh?"
+    )
+    assert "Recursive=true" in posts[1][0]
+    assert "MetadataRefreshMode=FullRefresh" in posts[1][0]
+    assert posts[1][1] == {"ReplaceThumbnailImages": False}
+
+
+def test_rclone_mount_cache_flusher_signals_only_configured_service():
+    from qbt_orchestrator.integrations.emby import RcloneMountCacheFlusher
+
+    calls = []
+
+    def runner(argv, timeout):
+        calls.append((list(argv), timeout))
+        return 0, "", ""
+
+    flusher = RcloneMountCacheFlusher(
+        service_name="rclone-gcrypt-emby.service",
+        runner=runner,
+        monotonic=lambda: 100.0,
+    )
+
+    flusher.flush("/media/gcrypt/WAAA-614")
+    flusher.flush("/media/gcrypt/BBAN-582")
+
+    assert calls == [
+        (
+            [
+                "systemctl",
+                "kill",
+                "--kill-who=main",
+                "--signal=HUP",
+                "rclone-gcrypt-emby.service",
+            ],
+            15,
+        )
+    ]
 
 
 def test_telegram_polling_writes_commands_and_rejects_unauthorized_users():
@@ -347,7 +425,56 @@ def test_qbt_http_client_logs_in_and_reuses_sid_cookie_for_host_api():
     assert client.post("/api/v2/torrents/stop", {"hashes": "h1|h2"}) == "Ok."
 
     assert [c[0] for c in calls] == ["POST", "GET", "POST"]
-    assert calls[0][4] == 7
+    assert 0 < calls[0][4] <= 7
+
+
+def test_qbt_sync_session_reuses_sid_and_observes_delta():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    request_cookies = []
+    responses = iter(
+        [
+            {"rid": 10, "full_update": True, "torrents": {"h": {"size": 1}}},
+            {"rid": 11, "full_update": False, "torrents": {"h": {"dlspeed": 2}}},
+        ]
+    )
+
+    def transport(method, url, body, headers, timeout):
+        if url.endswith("/api/v2/auth/login"):
+            return 200, "Ok.", {"Set-Cookie": "SID=abc; Path=/"}
+        request_cookies.append(headers.get("Cookie"))
+        return 200, json.dumps(next(responses)), {}
+
+    client = QbtHttpClient(username="u", password="p", transport=transport, auth_mode="required")
+    first = client.get_maindata(0)
+    second = client.get_maindata(first["rid"])
+
+    assert second["full_update"] is False
+    assert request_cookies == ["SID=abc", "SID=abc"]
+
+
+def test_qbt_client_builder_honors_required_auth_mode():
+    from qbt_orchestrator.cli import _build_qbt_client_from_env
+
+    client = _build_qbt_client_from_env(
+        env={
+            "QBT_ORCH_QBT_API_MODE": "host",
+            "QBT_ORCH_QBT_API_BASE": "http://127.0.0.1:8081",
+            "QBT_ORCH_QBT_USERNAME": "user",
+            "QBT_ORCH_QBT_PASSWORD": "pass",
+            "QBT_ORCH_QBT_AUTH_MODE": "required",
+        }
+    )
+
+    assert client.auth_mode == "required"
+
+
+def test_qbt_token_bucket_uses_a_thread_lock():
+    from qbt_orchestrator.integrations.qbt import TokenBucket
+
+    bucket = TokenBucket(1)
+
+    assert hasattr(bucket, "_lock")
 
 
 def test_qbt_http_client_reauthenticates_once_after_unauthorized_response():
@@ -390,7 +517,10 @@ def test_qbt_http_client_uses_same_public_methods_as_docker_client():
         "/api/v2/app/setPreferences": "Ok.",
     }
 
+    observed_timeouts = []
+
     def transport(method, url, body, headers, timeout):
+        observed_timeouts.append((url, timeout))
         suffix = url.removeprefix("http://127.0.0.1:8081")
         if suffix == "/api/v2/auth/login":
             return 200, "Ok.", {"Set-Cookie": "SID=abc; Path=/"}
@@ -401,9 +531,15 @@ def test_qbt_http_client_uses_same_public_methods_as_docker_client():
     client = QbtHttpClient(username="admin", password="secret", transport=transport)
 
     assert client.torrent_info("h1") == {"hash": "h1", "seq_dl": True}
-    assert client.torrent_files("h1") == [{"name": "a.mp4", "size": 1, "index": 0}]
+    assert client.torrent_files("h1", timeout=0.25) == [{"name": "a.mp4", "size": 1}]
     assert client.torrent_properties("h1") == {"piece_size": 4194304}
     assert client.set_preferences({"preallocate_all": True}) == "Ok."
+    files_timeout = next(
+        timeout
+        for url, timeout in observed_timeouts
+        if "/api/v2/torrents/files?hash=h1" in url
+    )
+    assert 0 < files_timeout <= 0.25
 
 
 def test_qbt_http_client_host_proxy_noauth_does_not_login_even_if_credentials_exist():
@@ -434,6 +570,177 @@ def test_qbt_http_client_host_proxy_noauth_does_not_login_even_if_credentials_ex
     assert client.app_version() == "v5.1.4"
     assert client.get_maindata(0)["rid"] == 7
     assert [c[0] for c in calls] == ["GET", "GET"]
+
+
+def test_qbt_client_builder_host_proxy_can_require_sid_authentication():
+    from qbt_orchestrator.cli import _build_qbt_client_from_env
+
+    client = _build_qbt_client_from_env(
+        env={
+            "QBT_ORCH_QBT_API_MODE": "host-proxy",
+            "QBT_ORCH_QBT_API_BASE": "http://127.0.0.1:18081",
+            "QBT_ORCH_QBT_HTTP_HOST_HEADER": "127.0.0.1:8080",
+            "QBT_ORCH_QBT_AUTH_MODE": "required",
+            "QBT_ORCH_QBT_USERNAME": "admin",
+            "QBT_ORCH_QBT_PASSWORD": "secret",
+        }
+    )
+
+    assert client.auth_mode == "required"
+    assert client.auth_enabled is True
+    assert client.username == "admin"
+    assert client.password == "secret"
+    assert client.default_headers == {"Host": "127.0.0.1:8080"}
+
+
+def test_qbt_token_bucket_respects_acquire_timeout_without_oversleeping():
+    from qbt_orchestrator.integrations.qbt import TokenBucket
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    bucket = TokenBucket(1, clock=clock.monotonic, sleeper=clock.sleep)
+
+    assert bucket.acquire() is True
+    assert bucket.acquire(timeout=0.05) is False
+    assert clock.now == pytest.approx(0.05)
+
+
+def test_qbt_token_bucket_lock_contention_respects_acquire_timeout():
+    from qbt_orchestrator.integrations.qbt import TokenBucket
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    class BusyLock:
+        def __init__(self, clock):
+            self.clock = clock
+            self.timeouts = []
+
+        def acquire(self, timeout=None):
+            self.timeouts.append(timeout)
+            self.clock.sleep(timeout)
+            return False
+
+        def release(self):
+            raise AssertionError("unacquired lock must not be released")
+
+    clock = FakeClock()
+    bucket = TokenBucket(1, clock=clock.monotonic, sleeper=clock.sleep)
+    busy_lock = BusyLock(clock)
+    bucket._lock = busy_lock
+
+    assert bucket.acquire(timeout=0.05) is False
+    assert busy_lock.timeouts == [0.05]
+    assert clock.now == pytest.approx(0.05)
+
+
+def test_qbt_docker_torrent_info_caps_runner_and_curl_timeout():
+    from qbt_orchestrator.integrations.qbt import QbtDockerClient
+
+    runner = RecordingRunner(outputs=[json.dumps([{"hash": "h"}])])
+    client = QbtDockerClient(
+        runner=runner, timeout=10, api_max_requests_per_sec=0,
+    )
+
+    assert client.torrent_info("h", timeout=0.05) == {"hash": "h"}
+
+    argv, _input, runner_timeout = runner.calls[0]
+    max_time = float(argv[argv.index("--max-time") + 1])
+    connect_timeout = float(argv[argv.index("--connect-timeout") + 1])
+    assert 0 < runner_timeout <= 0.05
+    assert 0 < max_time <= 0.05
+    assert 0 < connect_timeout <= 0.05
+
+
+def test_qbt_http_auth_retry_shares_one_request_deadline():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    calls = []
+
+    def transport(method, url, body, headers, timeout):
+        calls.append((url, timeout))
+        clock.sleep(min(0.02, timeout))
+        if url.endswith("/api/v2/auth/login"):
+            return 200, "Ok.", {"Set-Cookie": "SID=fresh; Path=/"}
+        if len([call for call in calls if "/torrents/info" in call[0]]) == 1:
+            return 401, "Unauthorized", {}
+        return 200, json.dumps([{"hash": "h"}]), {}
+
+    client = QbtHttpClient(
+        username="u", password="p", transport=transport, timeout=10,
+        api_max_requests_per_sec=0, clock=clock.monotonic, sleeper=clock.sleep,
+    )
+    client.cookie = "SID=stale"
+
+    assert client.torrent_info("h", timeout=0.05) == {"hash": "h"}
+    assert [url.rsplit("/", 1)[-1].split("?", 1)[0] for url, _ in calls] == [
+        "info", "login", "info",
+    ]
+    assert calls[0][1] <= 0.05
+    assert calls[1][1] <= 0.03 + 1e-9
+    assert calls[2][1] <= 0.01 + 1e-9
+    assert all(timeout > 0 for _url, timeout in calls)
+    assert clock.now <= 0.05 + 1e-9
+
+
+def test_qbt_http_rate_limit_wait_exits_at_request_deadline():
+    from qbt_orchestrator.integrations.qbt import QbtHttpClient
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    calls = []
+
+    def transport(method, url, body, headers, timeout):
+        calls.append((url, timeout))
+        return 200, json.dumps({"rid": 1, "full_update": True, "torrents": {}}), {}
+
+    client = QbtHttpClient(
+        transport=transport, auth_mode="none", timeout=10,
+        api_max_requests_per_sec=1, clock=clock.monotonic, sleeper=clock.sleep,
+    )
+    client.get_maindata(0)
+
+    with pytest.raises(TimeoutError):
+        client.get_maindata(0, timeout=0.05)
+
+    assert len(calls) == 1
+    assert clock.now == pytest.approx(0.05)
 
 
 if __name__ == "__main__":

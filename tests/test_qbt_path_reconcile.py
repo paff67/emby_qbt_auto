@@ -59,6 +59,7 @@ def test_path_reconciler_records_save_path_mismatch_but_does_not_duplicate_uncha
         }
 
         first = reconciler.reconcile(snapshots)
+        snapshots["h1"]["progress"] = 0.5
         second = reconciler.reconcile(snapshots)
 
         assert first["drift_count"] == 1

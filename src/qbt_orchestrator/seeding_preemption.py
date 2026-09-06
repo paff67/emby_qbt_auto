@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 
 from .db import readonly_connect, write_transaction
+from .io_governor import JobPriority
 from .observability import redact
 from .runtime import TorrentJobRepository
 
@@ -259,7 +260,7 @@ class SeedingPreemptionService:
             return decision
 
         self.executor.qbt_post("/api/v2/torrents/stop", {"hashes": h})
-        upload_job_id = self.jobs.enqueue(h, None, "upload", payload, priority=10)
+        upload_job_id = self.jobs.enqueue(h, None, "upload", payload, priority=int(JobPriority.PREEMPTION_RELEASE_UPLOAD))
         self._record(decision, seed, target, disk_state, upload_job_id, audit, action_status="succeeded", action_dry_run=False)
         return PreemptionDecision(
             accepted=decision.accepted,

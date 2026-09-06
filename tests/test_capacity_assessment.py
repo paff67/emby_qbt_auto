@@ -1,0 +1,465 @@
+from dataclasses import fields
+import sqlite3
+
+import pytest
+
+from qbt_orchestrator.capacity_assessment import (
+    CapacityAssessment,
+    CapacityAssessmentBuilder,
+    CapacityAssessmentStore,
+    TorrentCapacityEvidence,
+    project_progress_health,
+)
+from qbt_orchestrator.db import migrate, readonly_connect
+
+
+def _evidence(
+    torrent_hash="h", *, managed=True, incomplete=True, viable=True
+):
+    return TorrentCapacityEvidence(
+        hash=torrent_hash,
+        managed=managed,
+        incomplete=incomplete,
+        amount_left=1 if incomplete else 0,
+        completed_bytes=10,
+        availability=1.0 if viable else 0.5,
+        complete_sources=1 if viable else 0,
+        no_progress_since=100,
+        viable=viable,
+        viability_reason="complete_source" if viable else "stale_without_complete_source",
+    )
+
+
+def _assessment(torrents):
+    return CapacityAssessment(
+        generation=0,
+        observed_at=1900,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=frozenset(),
+        disk_releasing_jobs=0,
+        torrents=torrents,
+    )
+
+
+def test_progress_health_projection_clears_stall_on_completed_or_progress_growth():
+    projected = project_progress_health(
+        {
+            "hash": " H ",
+            "completed": 100,
+            "progress": 0.5,
+            "dlspeed": 0,
+        },
+        {
+            "completed_bytes": 0,
+            "progress": 0.4,
+            "no_progress_since": 1,
+        },
+        observed_at=2_000,
+    )
+
+    assert projected == {
+        "hash": "h",
+        "completed_bytes": 100,
+        "previous_completed_bytes": 0,
+        "progress": 0.5,
+        "dlspeed_bps": 0,
+        "no_progress_since": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("old_health", "expected"),
+    [
+        (
+            {"completed_bytes": 100, "progress": 0.5, "no_progress_since": 7},
+            7,
+        ),
+        (
+            {"completed_bytes": 100, "progress": 0.5, "no_progress_since": None},
+            2_000,
+        ),
+        ({}, None),
+    ],
+)
+def test_progress_health_projection_preserves_or_starts_stall_without_growth(
+    old_health,
+    expected,
+):
+    projected = project_progress_health(
+        {"hash": "h", "completed_bytes": 100, "progress": 0.5},
+        old_health,
+        observed_at=2_000,
+    )
+
+    assert projected["no_progress_since"] == expected
+
+
+def nonviable_assessment(*, observed_at, no_progress_since):
+    return CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 100,
+                "availability": 0.5,
+                "num_seeds": 0,
+                "num_complete": 0,
+            }
+        },
+        {"h": {"no_progress_since": no_progress_since}},
+        observed_at=observed_at,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    )
+
+
+def viable_assessment(*, observed_at, availability):
+    return CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 100,
+                "availability": availability,
+                "num_seeds": 0,
+                "num_complete": 0,
+            }
+        },
+        {"h": {"no_progress_since": 1000}},
+        observed_at=observed_at,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    )
+
+
+def test_capacity_assessment_exposes_read_only_torrents():
+    evidence = _evidence()
+    assessment = _assessment({"h": evidence})
+
+    with pytest.raises(TypeError):
+        assessment.torrents["other"] = evidence
+    with pytest.raises(AttributeError):
+        assessment.torrents.clear()
+
+
+def test_capacity_assessment_defensively_copies_torrents():
+    evidence = _evidence()
+    source = {"h": evidence}
+    assessment = _assessment(source)
+
+    source.clear()
+
+    assert assessment.torrents == {"h": evidence}
+
+
+def test_with_generation_preserves_isolated_read_only_evidence():
+    evidence = _evidence()
+    source = {"h": evidence}
+    assessment = _assessment(source)
+
+    updated = assessment.with_generation(7)
+    source.clear()
+
+    assert updated.generation == 7
+    for item in fields(CapacityAssessment):
+        if item.name != "generation":
+            assert getattr(updated, item.name) == getattr(assessment, item.name)
+    assert updated.torrents == assessment.torrents == {"h": evidence}
+    assert updated.torrents is not assessment.torrents
+    assert updated.torrents["h"] is assessment.torrents["h"]
+    with pytest.raises(TypeError):
+        updated.torrents["other"] = evidence
+
+
+def test_builder_contracts_cover_management_staleness_and_normalization():
+    assessment = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "boundary": {
+                "hash": "boundary",
+                "category": "auto",
+                "amount_left": 5,
+                "completed": -1,
+                "availability": 0.5,
+                "num_seeds": -1,
+                "num_complete": -2,
+                "dlspeed": -3,
+            },
+            "recent": {
+                "hash": "recent",
+                "tags": "auto",
+                "amount_left": 5,
+                "completed": 10,
+                "availability": 0.5,
+            },
+            "held": {
+                "hash": "held",
+                "category": "auto",
+                "tags": "auto, hold",
+                "amount_left": -5,
+                "completed": -10,
+                "availability": -1,
+                "num_seeds": -1,
+                "num_complete": -2,
+            },
+        },
+        {
+            "boundary": {"no_progress_since": 100},
+            "recent": {"no_progress_since": 101},
+            "held": {"no_progress_since": 100},
+        },
+        observed_at=1900,
+        scheduler_mode="drain",
+        free_bytes=-1,
+        target_free_bytes=-2,
+        available_growth_bytes=-3,
+        selected_hashes={"recent"},
+        disk_releasing_jobs=-4,
+    )
+
+    boundary = assessment.torrents["boundary"]
+    assert boundary.managed is True
+    assert boundary.viable is False
+    assert boundary.viability_reason == "stale_without_complete_source"
+    assert boundary.completed_bytes == 0
+    assert boundary.complete_sources == 0
+
+    recent = assessment.torrents["recent"]
+    assert recent.managed is True
+    assert recent.viable is True
+    assert recent.viability_reason == "recent_progress"
+
+    held = assessment.torrents["held"]
+    assert held.managed is False
+    assert held.incomplete is False
+    assert held.amount_left == 0
+    assert held.completed_bytes == 0
+    assert held.availability is None
+    assert held.complete_sources == 0
+
+    assert assessment.managed_incomplete == 2
+    assert assessment.viable_finish == 1
+    assert assessment.nonviable_finish == 1
+    assert assessment.free_bytes == 0
+    assert assessment.target_free_bytes == 0
+    assert assessment.available_growth_bytes == 0
+    assert assessment.disk_releasing_jobs == 0
+
+
+def test_builder_uses_canonical_hash_for_snapshot_health_and_selection():
+    assessment = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            " H ": {
+                "hash": " H ",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 100,
+                "availability": 0.5,
+            }
+        },
+        {"h": {"no_progress_since": 100}},
+        observed_at=1900,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes={" H "},
+        disk_releasing_jobs=0,
+    )
+
+    assert set(assessment.torrents) == {"h"}
+    assert assessment.torrents["h"].hash == "h"
+    assert assessment.torrents["h"].no_progress_since == 100
+    assert assessment.selected_hashes == frozenset({"h"})
+
+
+def test_store_updates_historical_mixed_case_health_without_inserting_duplicate(
+    tmp_path,
+):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "insert into torrent_health(hash,sampled_at,no_progress_since,updated_at) "
+        "values(' H ',100,100,100)"
+    )
+    con.commit()
+    con.close()
+
+    CapacityAssessmentStore(db, min_no_progress_sec=100).commit(
+        _assessment({"h": _evidence("h", viable=False)})
+    )
+
+    con = readonly_connect(db)
+    rows = con.execute(
+        "select hash,capacity_generation from torrent_health "
+        "where lower(trim(hash))='h'"
+    ).fetchall()
+    con.close()
+    assert [(row["hash"], row["capacity_generation"]) for row in rows] == [
+        (" H ", 1)
+    ]
+
+
+def test_leech_peer_does_not_make_incomplete_torrent_viable():
+    assessment = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 100,
+                "availability": 0.5,
+                "num_seeds": 0,
+                "num_complete": 0,
+                "num_peers": 4,
+            }
+        },
+        {"h": {"completed_bytes": 100, "progress": 0.1, "no_progress_since": 100}},
+        observed_at=7300,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    )
+    item = assessment.torrents["h"]
+    assert item.viable is False
+    assert item.viability_reason == "stale_without_complete_source"
+    assert item.complete_sources == 0
+
+
+def test_unknown_availability_is_not_reclaimable_evidence():
+    assessment = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {
+            "h": {
+                "hash": "h",
+                "category": "auto",
+                "amount_left": 900,
+                "completed": 100,
+                "availability": -1,
+                "num_seeds": 0,
+                "num_peers": 0,
+            }
+        },
+        {"h": {"completed_bytes": 100, "progress": 0.1, "no_progress_since": 100}},
+        observed_at=7300,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    )
+    assert assessment.torrents["h"].availability is None
+
+
+def test_capacity_assessment_schema_is_additive(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    con = readonly_connect(db)
+    try:
+        health = {row[1] for row in con.execute("pragma table_info(torrent_health)")}
+        capacity = {row[1] for row in con.execute("pragma table_info(capacity_state)")}
+        reclaims = {row[1] for row in con.execute("pragma table_info(capacity_reclaims)")}
+        assert {"reclaimable_since", "capacity_viable", "capacity_reason", "capacity_assessed_at", "capacity_generation"} <= health
+        assert "assessment_generation" in capacity
+        assert {
+            "reclaimable_since",
+            "capacity_generation",
+            "capacity_reason",
+            "assessment_json",
+            "quarantine_path",
+            "filesystem_dev",
+            "filesystem_ino",
+        } <= reclaims
+        row = con.execute("select current_generation from capacity_assessment_state where id=1").fetchone()
+        assert row is None
+    finally:
+        con.close()
+
+
+def test_reclaimable_since_survives_scheduler_state_changes(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    assessment = nonviable_assessment(observed_at=30_000, no_progress_since=1_000)
+    first = CapacityAssessmentStore(db, min_no_progress_sec=21_600).commit(assessment)
+    second = CapacityAssessmentStore(db, min_no_progress_sec=21_600).commit(
+        nonviable_assessment(observed_at=30_300, no_progress_since=1_000)
+    )
+    con = readonly_connect(db)
+    row = con.execute(
+        "select reclaimable_since,capacity_generation "
+        "from torrent_health where hash='h'"
+    ).fetchone()
+    con.close()
+    assert first.generation == 1
+    assert second.generation == 2
+    assert row["reclaimable_since"] == 30_000
+    assert row["capacity_generation"] == 2
+
+
+def test_complete_availability_clears_reclaimable_since(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    store = CapacityAssessmentStore(db, min_no_progress_sec=21_600)
+    store.commit(nonviable_assessment(observed_at=30_000, no_progress_since=1_000))
+    store.commit(viable_assessment(observed_at=30_300, availability=1.0))
+    con = readonly_connect(db)
+    value = con.execute(
+        "select reclaimable_since from torrent_health where hash='h'"
+    ).fetchone()[0]
+    con.close()
+    assert value is None
+
+
+def test_assessment_gap_resets_reclaimable_since(tmp_path):
+    db = tmp_path / "state.sqlite"
+    migrate(db)
+    store = CapacityAssessmentStore(db, min_no_progress_sec=21_600)
+    store.commit(nonviable_assessment(observed_at=30_000, no_progress_since=1_000))
+    con = readonly_connect(db)
+    initial = con.execute(
+        "select reclaimable_since from torrent_health where hash='h'"
+    ).fetchone()[0]
+    con.close()
+    assert initial == 30_000
+
+    empty = CapacityAssessmentBuilder(viability_stale_sec=1800).build(
+        {},
+        {},
+        observed_at=30_100,
+        scheduler_mode="drain",
+        free_bytes=100,
+        target_free_bytes=1000,
+        available_growth_bytes=100,
+        selected_hashes=set(),
+        disk_releasing_jobs=0,
+    )
+    store.commit(empty)
+    third = store.commit(
+        nonviable_assessment(observed_at=30_300, no_progress_since=1_000)
+    )
+    con = readonly_connect(db)
+    row = con.execute(
+        "select reclaimable_since,capacity_generation "
+        "from torrent_health where hash='h'"
+    ).fetchone()
+    con.close()
+
+    assert third.generation == 3
+    assert row["reclaimable_since"] == 30_300
+    assert row["capacity_generation"] == 3

@@ -106,6 +106,33 @@ def test_sync_db_actor_helpers_serialize_writes_and_readonly_connection_is_reado
             stop_write_actors()
 
 
+def test_sync_write_actor_reuses_one_connection(monkeypatch):
+    from qbt_orchestrator import db as db_module
+    from qbt_orchestrator.db import flush_write_actor, migrate, start_persistent_write_actor, stop_write_actors, write_execute
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.sqlite"
+        migrate(db)
+        stop_write_actors()
+        real_connect = db_module._connect
+        opened = []
+
+        def recording_connect(path):
+            opened.append(Path(path))
+            return real_connect(path)
+
+        monkeypatch.setattr(db_module, "_connect", recording_connect)
+        try:
+            start_persistent_write_actor(db)
+            write_execute(db, "insert into events_v2(ts,message) values(?,?)", (1, "one"))
+            write_execute(db, "insert into events_v2(ts,message) values(?,?)", (2, "two"))
+            flush_write_actor(db)
+
+            assert opened == [db]
+        finally:
+            stop_write_actors()
+
+
 
 def test_async_db_actor_supports_generic_transactions_metrics_and_readonly_pool():
     from qbt_orchestrator.db import DbActor, ReadonlyConnectionPool, migrate, stop_write_actors
