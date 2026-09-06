@@ -65,7 +65,8 @@ class GDriveBackfillScraper:
     ):
         self.script_path = Path(script_path)
         self.staging_root = Path(staging_root)
-        self.remote = remote.rstrip(":") + ":"
+        normalized_remote = str(remote or "gcrypt:").strip().rstrip("/")
+        self.remote = normalized_remote if ":" in normalized_remote else f"{normalized_remote}:"
         self.runner = runner
         self.timeout_sec = int(timeout_sec)
         self.lock_file = Path(lock_file) if lock_file else None

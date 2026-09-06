@@ -84,6 +84,14 @@ def test_gdrive_backfill_scraper_runs_script_only_in_local_staging_and_returns_u
         assert result["canonical_remote_dir"] == "gcrypt:/BBAN-582"
 
 
+def test_gdrive_backfill_scraper_preserves_canonical_remote_subdirectory():
+    from qbt_orchestrator.integrations.gdrive_backfill import GDriveBackfillScraper
+
+    scraper = GDriveBackfillScraper(remote="gcrypt:/av/")
+
+    assert scraper.remote == "gcrypt:/av"
+
+
 def test_gdrive_backfill_scraper_reports_not_found_without_remote_or_rclone_bypass():
     from qbt_orchestrator.integrations.gdrive_backfill import GDriveBackfillScraper
 
